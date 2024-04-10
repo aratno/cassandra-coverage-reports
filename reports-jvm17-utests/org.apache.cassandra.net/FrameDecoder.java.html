@@ -1,0 +1,403 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FrameDecoder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">FrameDecoder.java</span></div><h1>FrameDecoder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Deque;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPipeline;
+
+import static org.apache.cassandra.utils.ByteBufferUtil.copyBytes;
+
+/**
+ * A Netty inbound handler that decodes incoming frames and passes them forward to
+ * {@link InboundMessageHandler} for processing.
+ *
+ * Handles work stashing, and together with {@link InboundMessageHandler} - flow control.
+ *
+ * Unlike most Netty inbound handlers, doesn't use the pipeline to talk to its
+ * upstream handler. Instead, a {@link FrameProcessor} must be registered with
+ * the frame decoder, to be invoked on new frames. See {@link #deliver(FrameProcessor)}.
+ *
+ * See {@link #activate(FrameProcessor)}, {@link #reactivate()}, and {@link FrameProcessor}
+ * for flow control implementation.
+ *
+ * Five frame decoders currently exist, one used for each connection depending on flags and messaging version:
+ * 1. {@link FrameDecoderCrc}:
+          no compression; payload is protected by CRC32
+ * 2. {@link FrameDecoderLZ4}:
+          LZ4 compression with custom frame format; payload is protected by CRC32
+ * 3. {@link FrameDecoderUnprotected}:
+          no compression; no integrity protection
+ */
+public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
+{
+<span class="fc" id="L57">    private static final FrameProcessor NO_PROCESSOR =</span>
+<span class="nc" id="L58">        frame -&gt; { throw new IllegalStateException(&quot;Frame processor invoked on an unregistered FrameDecoder&quot;); };</span>
+
+<span class="fc" id="L60">    private static final FrameProcessor CLOSED_PROCESSOR =</span>
+<span class="nc" id="L61">        frame -&gt; { throw new IllegalStateException(&quot;Frame processor invoked on a closed FrameDecoder&quot;); };</span>
+
+    public interface FrameProcessor
+    {
+        /**
+         * Frame processor that the frames should be handed off to.
+         *
+         * @return true if more frames can be taken by the processor, false if the decoder should pause until
+         * it's explicitly resumed.
+         */
+        boolean process(Frame frame) throws IOException;
+    }
+
+    public abstract static class Frame
+    {
+        public final boolean isSelfContained;
+        public final int frameSize;
+
+        Frame(boolean isSelfContained, int frameSize)
+<span class="fc" id="L80">        {</span>
+<span class="fc" id="L81">            this.isSelfContained = isSelfContained;</span>
+<span class="fc" id="L82">            this.frameSize = frameSize;</span>
+<span class="fc" id="L83">        }</span>
+
+        abstract void release();
+        abstract boolean isConsumed();
+    }
+
+    /**
+     * The payload bytes of a complete frame, i.e. a frame stripped of its headers and trailers,
+     * with any verification supported by the protocol confirmed.
+     *
+     * If {@code isSelfContained} the payload contains one or more {@link Message}, all of which
+     * may be parsed entirely from the bytes provided.  Otherwise, only a part of exactly one
+     * {@link Message} is contained in the payload; it can be relied upon that this partial {@link Message}
+     * will only be delivered in its own unique {@link Frame}.
+     */
+    public final static class IntactFrame extends Frame
+    {
+        public final ShareableBytes contents;
+
+        IntactFrame(boolean isSelfContained, ShareableBytes contents)
+        {
+<span class="fc" id="L104">            super(isSelfContained, contents.remaining());</span>
+<span class="fc" id="L105">            this.contents = contents;</span>
+<span class="fc" id="L106">        }</span>
+
+        void release()
+        {
+<span class="fc" id="L110">            contents.release();</span>
+<span class="fc" id="L111">        }</span>
+
+        boolean isConsumed()
+        {
+<span class="fc bfc" id="L115" title="All 2 branches covered.">            return !contents.hasRemaining();</span>
+        }
+
+        public void consume()
+        {
+<span class="fc" id="L120">            contents.consume();</span>
+<span class="fc" id="L121">        }</span>
+    }
+
+    /**
+     * A corrupted frame was encountered; this represents the knowledge we have about this frame,
+     * and whether or not the stream is recoverable.
+     *
+     * Generally we consider a frame with corrupted header as unrecoverable, and frames with intact header,
+     * but corrupted payload - as recoverable, since we know and can skip payload size.
+     *
+     * {@link InboundMessageHandler} further has its own idea of which frames are and aren't recoverable.
+     * A recoverable {@link CorruptFrame} can be considered unrecoverable by {@link InboundMessageHandler}
+     * if it's the first frame of a large message (isn't self contained).
+     */
+    public final static class CorruptFrame extends Frame
+    {
+        public final int readCRC;
+        public final int computedCRC;
+
+        CorruptFrame(boolean isSelfContained, int frameSize, int readCRC, int computedCRC)
+        {
+<span class="fc" id="L142">            super(isSelfContained, frameSize);</span>
+<span class="fc" id="L143">            this.readCRC = readCRC;</span>
+<span class="fc" id="L144">            this.computedCRC = computedCRC;</span>
+<span class="fc" id="L145">        }</span>
+
+        static CorruptFrame recoverable(boolean isSelfContained, int frameSize, int readCRC, int computedCRC)
+        {
+<span class="fc" id="L149">            return new CorruptFrame(isSelfContained, frameSize, readCRC, computedCRC);</span>
+        }
+
+        static CorruptFrame unrecoverable(int readCRC, int computedCRC)
+        {
+<span class="fc" id="L154">            return new CorruptFrame(false, Integer.MIN_VALUE, readCRC, computedCRC);</span>
+        }
+
+        public boolean isRecoverable()
+        {
+<span class="fc bfc" id="L159" title="All 2 branches covered.">            return frameSize != Integer.MIN_VALUE;</span>
+        }
+
+<span class="fc" id="L162">        void release() { }</span>
+
+        boolean isConsumed()
+        {
+<span class="fc" id="L166">            return true;</span>
+        }
+    }
+
+    protected final BufferPoolAllocator allocator;
+
+<span class="fc" id="L172">    @VisibleForTesting</span>
+    final Deque&lt;Frame&gt; frames = new ArrayDeque&lt;&gt;(4);
+    ByteBuffer stash;
+
+    private boolean isActive;
+    private boolean isClosed;
+    private ChannelHandlerContext ctx;
+<span class="fc" id="L179">    private FrameProcessor processor = NO_PROCESSOR;</span>
+
+    FrameDecoder(BufferPoolAllocator allocator)
+<span class="fc" id="L182">    {</span>
+<span class="fc" id="L183">        this.allocator = allocator;</span>
+<span class="fc" id="L184">    }</span>
+
+    abstract void decode(Collection&lt;Frame&gt; into, ShareableBytes bytes);
+    abstract void addLastTo(ChannelPipeline pipeline);
+
+    /**
+     * @return true if we are actively decoding and processing frames
+     */
+    public boolean isActive()
+    {
+<span class="fc" id="L194">        return isActive;</span>
+    }
+    
+    /**
+     * For use by InboundMessageHandler (or other upstream handlers) that want to start receiving frames.
+     */
+    public void activate(FrameProcessor processor)
+    {
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">        if (this.processor != NO_PROCESSOR)</span>
+<span class="nc" id="L203">            throw new IllegalStateException(&quot;Attempted to activate an already active FrameDecoder&quot;);</span>
+
+<span class="fc" id="L205">        this.processor = processor;</span>
+
+<span class="fc" id="L207">        isActive = true;</span>
+<span class="fc" id="L208">        ctx.read();</span>
+<span class="fc" id="L209">    }</span>
+
+    /**
+     * For use by InboundMessageHandler (or other upstream handlers) that want to resume
+     * receiving frames after previously indicating that processing should be paused.
+     */
+    public void reactivate() throws IOException
+    {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">        if (isActive)</span>
+<span class="nc" id="L218">            throw new IllegalStateException(&quot;Tried to reactivate an already active FrameDecoder&quot;);</span>
+
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">        if (deliver(processor))</span>
+        {
+<span class="fc" id="L222">            isActive = true;</span>
+<span class="fc" id="L223">            onExhausted();</span>
+        }
+<span class="fc" id="L225">    }</span>
+
+    /**
+     * For use by InboundMessageHandler (or other upstream handlers) that want to resume
+     * receiving frames after previously indicating that processing should be paused.
+     *
+     * Does not reactivate processing or reading from the wire, but permits processing as many frames (or parts thereof)
+     * that are already waiting as the processor requires.
+     */
+    void processBacklog(FrameProcessor processor) throws IOException
+    {
+<span class="fc" id="L236">        deliver(processor);</span>
+<span class="fc" id="L237">    }</span>
+
+    /**
+     * For use by InboundMessageHandler (or other upstream handlers) that want to permanently
+     * stop receiving frames, e.g. because of an exception caught.
+     */
+    public void discard()
+    {
+<span class="fc" id="L245">        isActive = false;</span>
+<span class="fc" id="L246">        processor = CLOSED_PROCESSOR;</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">        if (stash != null)</span>
+        {
+<span class="fc" id="L249">            ByteBuffer bytes = stash;</span>
+<span class="fc" id="L250">            stash = null;</span>
+<span class="fc" id="L251">            allocator.put(bytes);</span>
+        }
+<span class="fc bfc" id="L253" title="All 2 branches covered.">        while (!frames.isEmpty())</span>
+<span class="fc" id="L254">            frames.poll().release();</span>
+<span class="fc" id="L255">    }</span>
+
+    /**
+     * Called by Netty pipeline when a new message arrives; we anticipate in normal operation
+     * this will receive messages of type {@link BufferPoolAllocator.Wrapped} or
+     * {@link BufferPoolAllocator.Wrapped}.
+     *
+     * These buffers are unwrapped and passed to {@link #decode(Collection, ShareableBytes)},
+     * which collects decoded frames into {@link #frames}, which we send upstream in {@link #deliver}
+     */
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws IOException
+    {
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">        if (msg instanceof BufferPoolAllocator.Wrapped)</span>
+        {
+<span class="fc" id="L270">            ByteBuffer buf = ((BufferPoolAllocator.Wrapped) msg).adopt();</span>
+            // netty will probably have mis-predicted the space needed
+<span class="fc" id="L272">            allocator.putUnusedPortion(buf);</span>
+<span class="fc" id="L273">            channelRead(ShareableBytes.wrap(buf));</span>
+<span class="fc" id="L274">        }</span>
+        else
+        {
+<span class="nc" id="L277">            throw new IllegalArgumentException();</span>
+        }
+<span class="fc" id="L279">    }</span>
+
+    void channelRead(ShareableBytes bytes) throws IOException
+    {
+<span class="fc" id="L283">        decode(frames, bytes);</span>
+
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">        if (isActive)</span>
+<span class="fc" id="L286">            isActive = deliver(processor);</span>
+<span class="fc" id="L287">    }</span>
+
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx)
+    {
+<span class="fc bfc" id="L292" title="All 2 branches covered.">        if (isActive)</span>
+<span class="fc" id="L293">            onExhausted();</span>
+<span class="fc" id="L294">    }</span>
+
+    /**
+     * Only to be invoked when frames.isEmpty().
+     *
+     * If we have been closed, we will now propagate up the channelInactive notification,
+     * and otherwise we will ask the channel for more data.
+     */
+    private void onExhausted()
+    {
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">        if (isClosed)</span>
+<span class="nc" id="L305">            close();</span>
+        else
+<span class="fc" id="L307">            ctx.read();</span>
+<span class="fc" id="L308">    }</span>
+
+    /**
+     * Deliver any waiting frames, including those that were incompletely read last time, to the provided processor
+     * until the processor returns {@code false}, or we finish the backlog.
+     *
+     * Propagate the final return value of the processor.
+     */
+    private boolean deliver(FrameProcessor processor) throws IOException
+    {
+<span class="fc" id="L318">        boolean deliver = true;</span>
+<span class="fc bfc" id="L319" title="All 4 branches covered.">        while (deliver &amp;&amp; !frames.isEmpty())</span>
+        {
+<span class="fc" id="L321">            Frame frame = frames.peek();</span>
+<span class="fc" id="L322">            deliver = processor.process(frame);</span>
+
+<span class="pc bpc" id="L324" title="1 of 4 branches missed.">            assert !deliver || frame.isConsumed();</span>
+<span class="fc bfc" id="L325" title="All 4 branches covered.">            if (deliver || frame.isConsumed())</span>
+            {
+<span class="fc" id="L327">                frames.poll();</span>
+<span class="fc" id="L328">                frame.release();</span>
+            }
+<span class="fc" id="L330">        }</span>
+<span class="fc" id="L331">        return deliver;</span>
+    }
+
+    void stash(ShareableBytes in, int stashLength, int begin, int length)
+    {
+<span class="fc" id="L336">        ByteBuffer out = allocator.getAtLeast(stashLength);</span>
+<span class="fc" id="L337">        copyBytes(in.get(), begin, out, 0, length);</span>
+<span class="fc" id="L338">        out.position(length);</span>
+<span class="fc" id="L339">        stash = out;</span>
+<span class="fc" id="L340">    }</span>
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx)
+    {
+<span class="fc" id="L345">        this.ctx = ctx;</span>
+<span class="fc" id="L346">        ctx.channel().config().setAutoRead(false);</span>
+<span class="fc" id="L347">    }</span>
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx)
+    {
+<span class="fc" id="L352">        isClosed = true;</span>
+<span class="fc bfc" id="L353" title="All 2 branches covered.">        if (frames.isEmpty())</span>
+<span class="fc" id="L354">            close();</span>
+<span class="fc" id="L355">    }</span>
+
+    private void close()
+    {
+<span class="fc" id="L359">        discard();</span>
+<span class="fc" id="L360">        ctx.fireChannelInactive();</span>
+<span class="fc" id="L361">        allocator.release();</span>
+<span class="fc" id="L362">    }</span>
+
+    /**
+     * Utility: fill {@code out} from {@code in} up to {@code toOutPosition},
+     * updating the position of both buffers with the result
+     * @return true if there were sufficient bytes to fill to {@code toOutPosition}
+     */
+    static boolean copyToSize(ByteBuffer in, ByteBuffer out, int toOutPosition)
+    {
+<span class="fc" id="L371">        int bytesToSize = toOutPosition - out.position();</span>
+<span class="fc bfc" id="L372" title="All 2 branches covered.">        if (bytesToSize &lt;= 0)</span>
+<span class="fc" id="L373">            return true;</span>
+
+<span class="fc bfc" id="L375" title="All 2 branches covered.">        if (bytesToSize &gt; in.remaining())</span>
+        {
+<span class="fc" id="L377">            out.put(in);</span>
+<span class="fc" id="L378">            return false;</span>
+        }
+
+<span class="fc" id="L381">        copyBytes(in, in.position(), out, out.position(), bytesToSize);</span>
+<span class="fc" id="L382">        in.position(in.position() + bytesToSize);</span>
+<span class="fc" id="L383">        out.position(toOutPosition);</span>
+<span class="fc" id="L384">        return true;</span>
+    }
+
+    /**
+     * @return {@code in} if has sufficient capacity, otherwise
+     *         a replacement from {@code BufferPool} that {@code in} is copied into
+     */
+    ByteBuffer ensureCapacity(ByteBuffer in, int capacity)
+    {
+<span class="fc bfc" id="L393" title="All 2 branches covered.">        if (in.capacity() &gt;= capacity)</span>
+<span class="fc" id="L394">            return in;</span>
+
+<span class="fc" id="L396">        ByteBuffer out = allocator.getAtLeast(capacity);</span>
+<span class="fc" id="L397">        in.flip();</span>
+<span class="fc" id="L398">        out.put(in);</span>
+<span class="fc" id="L399">        allocator.put(in);</span>
+<span class="fc" id="L400">        return out;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

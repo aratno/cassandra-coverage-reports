@@ -1,0 +1,903 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RowIndexEntry.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format.big</a> &gt; <span class="el_source">RowIndexEntry.java</span></div><h1>RowIndexEntry.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.format.big;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.List;
+
+import com.codahale.metrics.Histogram;
+import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ArrayClustering;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.MessageParams;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.RejectException;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
+import org.apache.cassandra.io.sstable.IndexInfo;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.big.BigFormat.Components;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.TrackedDataInputPlus;
+import org.apache.cassandra.metrics.DefaultNameFactory;
+import org.apache.cassandra.metrics.MetricNameFactory;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.ParamType;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.vint.VIntCoding;
+import org.github.jamm.Unmetered;
+
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
+
+/**
+ * Binary format of {@code RowIndexEntry} is defined as follows:
+ * {@code
+ * (long) position (64 bit long, vint encoded)
+ *  (int) serialized size of data that follows (32 bit int, vint encoded)
+ * -- following for indexed entries only (so serialized size &gt; 0)
+ *  (int) int/Uint DeletionTime.localDeletionTime (uint if version &gt;= &quot;oa&quot; (5.0))
+ * (long) DeletionTime.markedForDeletionAt
+ *  (int) number of IndexInfo objects (32 bit int, vint encoded)
+ *    (*) serialized IndexInfo objects, see below
+ *    (*) offsets of serialized IndexInfo objects, since version &quot;ma&quot; (3.0)
+ *        Each IndexInfo object's offset is relative to the first IndexInfo object.
+ * }
+ * &lt;p&gt;
+ * See {@link IndexInfo} for a description of the serialized format.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * For each partition, the layout of the index file looks like this:
+ * &lt;/p&gt;
+ * &lt;ol&gt;
+ *     &lt;li&gt;partition key - prefixed with {@code short} length&lt;/li&gt;
+ *     &lt;li&gt;serialized {@code RowIndexEntry} objects&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * &lt;p&gt;
+ *     Generally, we distinguish between index entries that have &lt;i&gt;index
+ *     samples&lt;/i&gt; (list of {@link IndexInfo} objects) and those who don't.
+ *     For each &lt;i&gt;portion&lt;/i&gt; of data for a single partition in the data file,
+ *     an index sample is created. The size of that &lt;i&gt;portion&lt;/i&gt; is defined
+ *     by {@link org.apache.cassandra.config.Config#column_index_size}.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     Index entries with less than 2 index samples, will just store the
+ *     position in the data file.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     Note: legacy sstables for index entries are those sstable formats that
+ *     do &lt;i&gt;not&lt;/i&gt; have an offsets table to index samples ({@link IndexInfo}
+ *     objects). These are those sstables created on Cassandra versions
+ *     earlier than 3.0.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     For index entries with index samples we store the index samples
+ *     ({@link IndexInfo} objects). The bigger the partition, the more
+ *     index samples are created. Since a huge amount of index samples
+ *     will &quot;pollute&quot; the heap and cause huge GC pressure, Cassandra 3.6
+ *     (CASSANDRA-11206) distinguishes between index entries with an
+ *     &quot;acceptable&quot; amount of index samples per partition and those
+ *     with an &quot;enormous&quot; amount of index samples. The barrier
+ *     is controlled by the configuration parameter
+ *     {@link org.apache.cassandra.config.Config#column_index_cache_size}.
+ *     Index entries with a total serialized size of index samples up to
+ *     {@code column_index_cache_size} will be held in an array.
+ *     Index entries exceeding that value will always be accessed from
+ *     disk.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     This results in these classes:
+ * &lt;/p&gt;
+ * &lt;ul&gt;
+ *     &lt;li&gt;{@link RowIndexEntry} just stores the offset in the data file.&lt;/li&gt;
+ *     &lt;li&gt;{@link IndexedEntry} is for index entries with index samples
+ *     and used for both current and legacy sstables, which do not exceed
+ *     {@link org.apache.cassandra.config.Config#column_index_cache_size}.&lt;/li&gt;
+ *     &lt;li&gt;{@link ShallowIndexedEntry} is for index entries with index samples
+ *     that exceed {@link org.apache.cassandra.config.Config#column_index_cache_size}
+ *     for sstables with an offset table to the index samples.&lt;/li&gt;
+ * &lt;/ul&gt;
+ * &lt;p&gt;
+ *     Since access to index samples on disk (obviously) requires some file
+ *     reader, that functionality is encapsulated in implementations of
+ *     {@link IndexInfoRetriever}. There is an implementation to access
+ *     index samples of legacy sstables (without the offsets table),
+ *     an implementation of access sstables with an offsets table.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ *     Until now (Cassandra 3.x), we still support reading from &lt;i&gt;legacy&lt;/i&gt; sstables -
+ *     i.e. sstables created by Cassandra &amp;lt; 3.0 (see {@link org.apache.cassandra.io.sstable.format.big.BigFormat}.
+ * &lt;/p&gt;
+ *
+ */
+public class RowIndexEntry extends AbstractRowIndexEntry
+{
+<span class="fc" id="L140">    private static final BigFormat FORMAT = BigFormat.getInstance();</span>
+<span class="fc" id="L141">    private static final long EMPTY_SIZE = ObjectSizes.measure(new RowIndexEntry(0));</span>
+
+    // constants for type of row-index-entry as serialized for saved-cache
+    static final int CACHE_NOT_INDEXED = 0;
+    static final int CACHE_INDEXED = 1;
+    static final int CACHE_INDEXED_SHALLOW = 2;
+
+    static final Histogram indexEntrySizeHistogram;
+    static final Histogram indexInfoCountHistogram;
+    static final Histogram indexInfoGetsHistogram;
+    static final Histogram indexInfoReadsHistogram;
+    static
+    {
+<span class="fc" id="L154">        MetricNameFactory factory = new DefaultNameFactory(&quot;Index&quot;, &quot;RowIndexEntry&quot;);</span>
+<span class="fc" id="L155">        indexEntrySizeHistogram = Metrics.histogram(factory.createMetricName(&quot;IndexedEntrySize&quot;), false);</span>
+<span class="fc" id="L156">        indexInfoCountHistogram = Metrics.histogram(factory.createMetricName(&quot;IndexInfoCount&quot;), false);</span>
+<span class="fc" id="L157">        indexInfoGetsHistogram = Metrics.histogram(factory.createMetricName(&quot;IndexInfoGets&quot;), false);</span>
+<span class="fc" id="L158">        indexInfoReadsHistogram = Metrics.histogram(factory.createMetricName(&quot;IndexInfoReads&quot;), false);</span>
+<span class="fc" id="L159">    }</span>
+
+    public RowIndexEntry(long position)
+    {
+<span class="fc" id="L163">        super(position);</span>
+<span class="fc" id="L164">    }</span>
+
+    /**
+     * @return true if this index entry contains the row-level tombstone and column summary.  Otherwise,
+     * caller should fetch these from the row header.
+     */
+    @Override
+    public boolean isIndexed()
+    {
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        return blockCount() &gt; 1;</span>
+    }
+
+    public boolean indexOnHeap()
+    {
+<span class="fc" id="L178">        return false;</span>
+    }
+
+    @Override
+    public DeletionTime deletionTime()
+    {
+<span class="nc" id="L184">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public int blockCount()
+    {
+<span class="fc" id="L190">        return 0;</span>
+    }
+
+    @Override
+    public BigFormat getSSTableFormat()
+    {
+<span class="fc" id="L196">        return FORMAT;</span>
+    }
+
+    @Override
+    public long unsharedHeapSize()
+    {
+<span class="fc" id="L202">        return EMPTY_SIZE;</span>
+    }
+
+    /**
+     * @param dataFilePosition  position of the partition in the {@link Components.Types#DATA} file
+     * @param indexFilePosition position in the {@link Components.Types#PRIMARY_INDEX} of the {@link RowIndexEntry}
+     * @param deletionTime      deletion time of {@link RowIndexEntry}
+     * @param headerLength      deletion time of {@link RowIndexEntry}
+     * @param columnIndexCount  number of {@link IndexInfo} entries in the {@link RowIndexEntry}
+     * @param indexedPartSize   serialized size of all serialized {@link IndexInfo} objects and their offsets
+     * @param indexSamples      list with IndexInfo offsets (if total serialized size is less than {@link org.apache.cassandra.config.Config#column_index_cache_size}
+     * @param offsets           offsets of IndexInfo offsets
+     * @param idxInfoSerializer the {@link IndexInfo} serializer
+     */
+    public static RowIndexEntry create(long dataFilePosition, long indexFilePosition,
+                                                  DeletionTime deletionTime, long headerLength, int columnIndexCount,
+                                                  int indexedPartSize,
+                                                  List&lt;IndexInfo&gt; indexSamples, int[] offsets,
+                                                  ISerializer&lt;IndexInfo&gt; idxInfoSerializer,
+                                                  Version version)
+    {
+        // If the &quot;partition building code&quot; in BigTableWriter.append() via ColumnIndex returns a list
+        // of IndexInfo objects, which is the case if the serialized size is less than
+        // Config.column_index_cache_size, AND we have more than one IndexInfo object, we
+        // construct an IndexedEntry object. (note: indexSamples.size() and columnIndexCount have the same meaning)
+<span class="fc bfc" id="L227" title="All 4 branches covered.">        if (indexSamples != null &amp;&amp; indexSamples.size() &gt; 1)</span>
+<span class="fc" id="L228">            return new IndexedEntry(dataFilePosition, deletionTime, headerLength,</span>
+<span class="fc" id="L229">                                    indexSamples.toArray(new IndexInfo[indexSamples.size()]), offsets,</span>
+                                    indexedPartSize, idxInfoSerializer, version);
+        // Here we have to decide whether we have serialized IndexInfo objects that exceeds
+        // Config.column_index_cache_size (not exceeding case covered above).
+        // Such a &quot;big&quot; indexed-entry is represented as a shallow one.
+<span class="fc bfc" id="L234" title="All 2 branches covered.">        if (columnIndexCount &gt; 1)</span>
+<span class="fc" id="L235">            return new ShallowIndexedEntry(dataFilePosition, indexFilePosition,</span>
+                                           deletionTime, headerLength, columnIndexCount,
+                                           indexedPartSize, idxInfoSerializer, version);
+        // Last case is that there are no index samples.
+<span class="fc" id="L239">        return new RowIndexEntry(dataFilePosition);</span>
+    }
+
+    public IndexInfoRetriever openWithIndex(FileHandle indexFile)
+    {
+<span class="nc" id="L244">        return null;</span>
+    }
+
+    public interface IndexSerializer
+    {
+        void serialize(RowIndexEntry rie, DataOutputPlus out, ByteBuffer indexInfo) throws IOException;
+
+        RowIndexEntry deserialize(DataInputPlus in, long indexFilePosition) throws IOException;
+        default RowIndexEntry deserialize(RandomAccessReader reader) throws IOException
+        {
+<span class="fc" id="L254">            return deserialize(reader, reader.getFilePointer());</span>
+
+        }
+
+        default RowIndexEntry deserialize(FileDataInput input) throws IOException
+        {
+<span class="fc" id="L260">            return deserialize(input, input.getFilePointer());</span>
+
+        }
+
+        void serializeForCache(RowIndexEntry rie, DataOutputPlus out) throws IOException;
+
+        RowIndexEntry deserializeForCache(DataInputPlus in) throws IOException;
+
+        long deserializePositionAndSkip(DataInputPlus in) throws IOException;
+
+        ISerializer indexInfoSerializer();
+    }
+
+<span class="fc" id="L273">    public static final class Serializer implements IndexSerializer</span>
+    {
+        private final IndexInfo.Serializer idxInfoSerializer;
+        private final Version version;
+        private final TableMetrics tableMetrics;
+
+        public Serializer(Version version, SerializationHeader header, TableMetrics tableMetrics)
+<span class="fc" id="L280">        {</span>
+<span class="fc" id="L281">            this.idxInfoSerializer = IndexInfo.serializer(version, header);</span>
+<span class="fc" id="L282">            this.version = version;</span>
+<span class="fc" id="L283">            this.tableMetrics = tableMetrics;</span>
+<span class="fc" id="L284">        }</span>
+
+        @Override
+        public IndexInfo.Serializer indexInfoSerializer()
+        {
+<span class="fc" id="L289">            return idxInfoSerializer;</span>
+        }
+
+        @Override
+        public void serialize(RowIndexEntry rie, DataOutputPlus out, ByteBuffer indexInfo) throws IOException
+        {
+<span class="fc" id="L295">            rie.serialize(out, indexInfo);</span>
+<span class="fc" id="L296">        }</span>
+
+        @Override
+        public void serializeForCache(RowIndexEntry rie, DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L301">            rie.serializeForCache(out);</span>
+<span class="nc" id="L302">        }</span>
+
+        @Override
+        public RowIndexEntry deserializeForCache(DataInputPlus in) throws IOException
+        {
+<span class="fc" id="L307">            long position = in.readUnsignedVInt();</span>
+
+<span class="pc bpc" id="L309" title="3 of 4 branches missed.">            switch (in.readByte())</span>
+            {
+                case CACHE_NOT_INDEXED:
+<span class="fc" id="L312">                    return new RowIndexEntry(position);</span>
+                case CACHE_INDEXED:
+<span class="nc" id="L314">                    return new IndexedEntry(position, in, idxInfoSerializer, version);</span>
+                case CACHE_INDEXED_SHALLOW:
+<span class="nc" id="L316">                    return new ShallowIndexedEntry(position, in, idxInfoSerializer, version);</span>
+                default:
+<span class="nc" id="L318">                    throw new AssertionError();</span>
+            }
+        }
+
+        public static void skipForCache(DataInputPlus in, Version version) throws IOException
+        {
+<span class="nc" id="L324">            in.readUnsignedVInt();</span>
+<span class="nc bnc" id="L325" title="All 4 branches missed.">            switch (in.readByte())</span>
+            {
+                case CACHE_NOT_INDEXED:
+<span class="nc" id="L328">                    break;</span>
+                case CACHE_INDEXED:
+<span class="nc" id="L330">                    IndexedEntry.skipForCache(in, version);</span>
+<span class="nc" id="L331">                    break;</span>
+                case CACHE_INDEXED_SHALLOW:
+<span class="nc" id="L333">                    ShallowIndexedEntry.skipForCache(in, version);</span>
+<span class="nc" id="L334">                    break;</span>
+                default:
+<span class="nc" id="L336">                    assert false;</span>
+            }
+<span class="nc" id="L338">        }</span>
+
+        @Override
+        public RowIndexEntry deserialize(DataInputPlus in, long indexFilePosition) throws IOException
+        {
+<span class="fc" id="L343">            long position = in.readUnsignedVInt();</span>
+
+<span class="fc" id="L345">            int size = in.readUnsignedVInt32();</span>
+<span class="fc bfc" id="L346" title="All 2 branches covered.">            if (size == 0)</span>
+            {
+<span class="fc" id="L348">                return new RowIndexEntry(position);</span>
+            }
+            else
+            {
+<span class="fc" id="L352">                long headerLength = in.readUnsignedVInt();</span>
+<span class="fc" id="L353">                DeletionTime deletionTime = DeletionTime.getSerializer(version).deserialize(in);</span>
+<span class="fc" id="L354">                int columnsIndexCount = in.readUnsignedVInt32();</span>
+
+<span class="fc" id="L356">                checkSize(columnsIndexCount, size);</span>
+
+<span class="fc" id="L358">                int indexedPartSize = size - serializedSize(deletionTime, headerLength, columnsIndexCount, version);</span>
+
+<span class="fc bfc" id="L360" title="All 2 branches covered.">                if (size &lt;= DatabaseDescriptor.getColumnIndexCacheSize())</span>
+                {
+<span class="fc" id="L362">                    return new IndexedEntry(position, in, deletionTime, headerLength, columnsIndexCount,</span>
+                                            idxInfoSerializer, indexedPartSize, version);
+                }
+                else
+                {
+<span class="fc" id="L367">                    in.skipBytes(indexedPartSize);</span>
+
+<span class="fc" id="L369">                    return new ShallowIndexedEntry(position,</span>
+                                                   indexFilePosition,
+                                                   deletionTime, headerLength, columnsIndexCount,
+                                                   indexedPartSize, idxInfoSerializer, version);
+                }
+            }
+        }
+
+        private void checkSize(int entries, int bytes)
+        {
+<span class="fc" id="L379">            ReadCommand command = ReadCommand.getCommand();</span>
+<span class="pc bpc" id="L380" title="1 of 6 branches missed.">            if (command == null || SchemaConstants.isSystemKeyspace(command.metadata().keyspace) || !DatabaseDescriptor.getReadThresholdsEnabled())</span>
+<span class="fc" id="L381">                return;</span>
+
+<span class="nc" id="L383">            DataStorageSpec.LongBytesBound warnThreshold = DatabaseDescriptor.getRowIndexReadSizeWarnThreshold();</span>
+<span class="nc" id="L384">            DataStorageSpec.LongBytesBound failThreshold = DatabaseDescriptor.getRowIndexReadSizeFailThreshold();</span>
+<span class="nc bnc" id="L385" title="All 4 branches missed.">            if (warnThreshold == null &amp;&amp; failThreshold == null)</span>
+<span class="nc" id="L386">                return;</span>
+
+<span class="nc" id="L388">            long estimatedMemory = estimateMaterializedIndexSize(entries, bytes);</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            if (tableMetrics != null)</span>
+<span class="nc" id="L390">                tableMetrics.rowIndexSize.update(estimatedMemory);</span>
+
+<span class="nc bnc" id="L392" title="All 4 branches missed.">            if (failThreshold != null &amp;&amp; estimatedMemory &gt; failThreshold.toBytes())</span>
+            {
+<span class="nc" id="L394">                String msg = String.format(&quot;Query %s attempted to access a large RowIndexEntry estimated to be %d bytes &quot; +</span>
+                                           &quot;in-memory (total entries: %d, total bytes: %d) but the max allowed is %s;&quot; +
+                                           &quot; query aborted  (see row_index_read_size_fail_threshold)&quot;,
+<span class="nc" id="L397">                                           command.toCQLString(), estimatedMemory, entries, bytes, failThreshold);</span>
+<span class="nc" id="L398">                MessageParams.remove(ParamType.ROW_INDEX_READ_SIZE_WARN);</span>
+<span class="nc" id="L399">                MessageParams.add(ParamType.ROW_INDEX_READ_SIZE_FAIL, estimatedMemory);</span>
+
+<span class="nc" id="L401">                throw new RowIndexEntryReadSizeTooLargeException(msg);</span>
+            }
+<span class="nc bnc" id="L403" title="All 4 branches missed.">            else if (warnThreshold != null &amp;&amp; estimatedMemory &gt; warnThreshold.toBytes())</span>
+            {
+                // use addIfLarger rather than add as a previous partition may be larger than this one
+<span class="nc" id="L406">                Long current = MessageParams.get(ParamType.ROW_INDEX_READ_SIZE_WARN);</span>
+<span class="nc bnc" id="L407" title="All 4 branches missed.">                if (current == null || current.compareTo(estimatedMemory) &lt; 0)</span>
+<span class="nc" id="L408">                    MessageParams.add(ParamType.ROW_INDEX_READ_SIZE_WARN, estimatedMemory);</span>
+            }
+<span class="nc" id="L410">        }</span>
+
+        private static long estimateMaterializedIndexSize(int entries, int bytes)
+        {
+<span class="nc" id="L414">            long overhead = IndexInfo.EMPTY_SIZE</span>
+                            + ArrayClustering.EMPTY_SIZE
+                            + DeletionTime.EMPTY_SIZE;
+
+<span class="nc" id="L418">            return (overhead * entries) + bytes;</span>
+        }
+
+        @Override
+        public long deserializePositionAndSkip(DataInputPlus in) throws IOException
+        {
+<span class="fc" id="L424">            long position = in.readUnsignedVInt();</span>
+
+<span class="fc" id="L426">            int size = in.readUnsignedVInt32();</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">            if (size &gt; 0)</span>
+<span class="fc" id="L428">                in.skipBytesFully(size);</span>
+
+<span class="fc" id="L430">            return position;</span>
+        }
+
+        /**
+         * Reads only the data 'position' of the index entry and returns it. Note that this left 'in' in the middle
+         * of reading an entry, so this is only useful if you know what you are doing and in most case 'deserialize'
+         * should be used instead.
+         */
+        public static long readPosition(DataInputPlus in) throws IOException
+        {
+<span class="fc" id="L440">            return in.readUnsignedVInt();</span>
+        }
+
+        public static void skip(DataInputPlus in, Version version) throws IOException
+        {
+<span class="fc" id="L445">            readPosition(in);</span>
+<span class="fc" id="L446">            skipPromotedIndex(in);</span>
+<span class="fc" id="L447">        }</span>
+
+        private static void skipPromotedIndex(DataInputPlus in) throws IOException
+        {
+<span class="fc" id="L451">            int size = in.readUnsignedVInt32();</span>
+<span class="fc bfc" id="L452" title="All 2 branches covered.">            if (size &lt;= 0)</span>
+<span class="fc" id="L453">                return;</span>
+
+<span class="fc" id="L455">            in.skipBytesFully(size);</span>
+<span class="fc" id="L456">        }</span>
+    }
+
+    private static int serializedSize(DeletionTime deletionTime, long headerLength, int columnIndexCount, Version version)
+    {
+<span class="fc" id="L461">        int dlt = (int) DeletionTime.getSerializer(version).serializedSize(deletionTime); </span>
+<span class="fc" id="L462">        return TypeSizes.sizeofUnsignedVInt(headerLength)</span>
+               + dlt
+<span class="fc" id="L464">               + TypeSizes.sizeofUnsignedVInt(columnIndexCount);</span>
+    }
+
+    public void serialize(DataOutputPlus out, ByteBuffer indexInfo) throws IOException
+    {
+<span class="fc" id="L469">        out.writeUnsignedVInt(position);</span>
+
+<span class="fc" id="L471">        out.writeUnsignedVInt32(0);</span>
+<span class="fc" id="L472">    }</span>
+
+    public void serializeForCache(DataOutputPlus out) throws IOException
+    {
+<span class="fc" id="L476">        out.writeUnsignedVInt(position);</span>
+
+<span class="fc" id="L478">        out.writeByte(CACHE_NOT_INDEXED);</span>
+<span class="fc" id="L479">    }</span>
+
+    /**
+     * An entry in the row index for a row whose columns are indexed - used for both legacy and current formats.
+     */
+    private static final class IndexedEntry extends RowIndexEntry
+    {
+        private static final long BASE_SIZE;
+
+        static
+        {
+<span class="fc" id="L490">            BASE_SIZE = ObjectSizes.measure(new IndexedEntry(0, DeletionTime.LIVE, 0, null, null, 0, null, BigFormat.getInstance().getLatestVersion()));</span>
+<span class="fc" id="L491">        }</span>
+
+        private final DeletionTime deletionTime;
+        private final long headerLength;
+
+        private final IndexInfo[] columnsIndex;
+        private final int[] offsets;
+        private final int indexedPartSize;
+        @Unmetered
+        private final ISerializer&lt;IndexInfo&gt; idxInfoSerializer;
+        
+        private final Version version;
+
+        private IndexedEntry(long dataFilePosition, DeletionTime deletionTime, long headerLength,
+                             IndexInfo[] columnsIndex, int[] offsets,
+                             int indexedPartSize, ISerializer&lt;IndexInfo&gt; idxInfoSerializer, Version version)
+        {
+<span class="fc" id="L508">            super(dataFilePosition);</span>
+
+<span class="fc" id="L510">            this.headerLength = headerLength;</span>
+<span class="fc" id="L511">            this.deletionTime = deletionTime;</span>
+
+<span class="fc" id="L513">            this.columnsIndex = columnsIndex;</span>
+<span class="fc" id="L514">            this.offsets = offsets;</span>
+<span class="fc" id="L515">            this.indexedPartSize = indexedPartSize;</span>
+<span class="fc" id="L516">            this.idxInfoSerializer = idxInfoSerializer;</span>
+<span class="fc" id="L517">            this.version = version;</span>
+<span class="fc" id="L518">        }</span>
+
+        private IndexedEntry(long dataFilePosition, DataInputPlus in,
+                             DeletionTime deletionTime, long headerLength, int columnIndexCount,
+                             IndexInfo.Serializer idxInfoSerializer, int indexedPartSize, Version version) throws IOException
+        {
+<span class="fc" id="L524">            super(dataFilePosition);</span>
+
+<span class="fc" id="L526">            this.headerLength = headerLength;</span>
+<span class="fc" id="L527">            this.deletionTime = deletionTime;</span>
+<span class="fc" id="L528">            int columnsIndexCount = columnIndexCount;</span>
+
+<span class="fc" id="L530">            this.columnsIndex = new IndexInfo[columnsIndexCount];</span>
+<span class="fc bfc" id="L531" title="All 2 branches covered.">            for (int i = 0; i &lt; columnsIndexCount; i++)</span>
+<span class="fc" id="L532">                this.columnsIndex[i] = idxInfoSerializer.deserialize(in);</span>
+
+<span class="fc" id="L534">            this.offsets = new int[this.columnsIndex.length];</span>
+<span class="fc bfc" id="L535" title="All 2 branches covered.">            for (int i = 0; i &lt; offsets.length; i++)</span>
+<span class="fc" id="L536">                offsets[i] = in.readInt();</span>
+
+<span class="fc" id="L538">            this.indexedPartSize = indexedPartSize;</span>
+
+<span class="fc" id="L540">            this.idxInfoSerializer = idxInfoSerializer;</span>
+<span class="fc" id="L541">            this.version = version;</span>
+<span class="fc" id="L542">        }</span>
+
+        /**
+         * Constructor called from {@link Serializer#deserializeForCache(org.apache.cassandra.io.util.DataInputPlus)}.
+         */
+        private IndexedEntry(long dataFilePosition, DataInputPlus in, ISerializer&lt;IndexInfo&gt; idxInfoSerializer, Version version) throws IOException
+        {
+<span class="nc" id="L549">            super(dataFilePosition);</span>
+
+<span class="nc" id="L551">            this.headerLength = in.readUnsignedVInt();</span>
+<span class="nc" id="L552">            this.version = version;</span>
+<span class="nc" id="L553">            this.deletionTime = DeletionTime.getSerializer(version).deserialize(in);</span>
+<span class="nc" id="L554">            int columnsIndexCount = in.readUnsignedVInt32();</span>
+
+
+<span class="nc" id="L557">            TrackedDataInputPlus trackedIn = new TrackedDataInputPlus(in);</span>
+
+<span class="nc" id="L559">            this.columnsIndex = new IndexInfo[columnsIndexCount];</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            for (int i = 0; i &lt; columnsIndexCount; i++)</span>
+<span class="nc" id="L561">                this.columnsIndex[i] = idxInfoSerializer.deserialize(trackedIn);</span>
+
+<span class="nc" id="L563">            this.offsets = null;</span>
+
+<span class="nc" id="L565">            this.indexedPartSize = (int) trackedIn.getBytesRead();</span>
+
+<span class="nc" id="L567">            this.idxInfoSerializer = idxInfoSerializer;</span>
+<span class="nc" id="L568">        }</span>
+
+        @Override
+        public boolean indexOnHeap()
+        {
+<span class="fc" id="L573">            return true;</span>
+        }
+
+        @Override
+        public int blockCount()
+        {
+<span class="fc" id="L579">            return columnsIndex.length;</span>
+        }
+
+        @Override
+        public DeletionTime deletionTime()
+        {
+<span class="fc" id="L585">            return deletionTime;</span>
+        }
+
+        @Override
+        public IndexInfoRetriever openWithIndex(FileHandle indexFile)
+        {
+<span class="fc" id="L591">            indexEntrySizeHistogram.update(serializedSize(deletionTime, headerLength, columnsIndex.length, version) + indexedPartSize);</span>
+<span class="fc" id="L592">            indexInfoCountHistogram.update(columnsIndex.length);</span>
+<span class="fc" id="L593">            return new IndexInfoRetriever()</span>
+<span class="fc" id="L594">            {</span>
+                private int retrievals;
+
+                @Override
+                public IndexInfo columnsIndex(int index)
+                {
+<span class="fc" id="L600">                    retrievals++;</span>
+<span class="fc" id="L601">                    return columnsIndex[index];</span>
+                }
+
+                @Override
+                public void close()
+                {
+<span class="fc" id="L607">                    indexInfoGetsHistogram.update(retrievals);</span>
+<span class="fc" id="L608">                }</span>
+            };
+        }
+
+        @Override
+        public long unsharedHeapSize()
+        {
+<span class="fc" id="L615">            long entrySize = 0;</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">            for (IndexInfo idx : columnsIndex)</span>
+<span class="fc" id="L617">                entrySize += idx.unsharedHeapSize();</span>
+<span class="fc" id="L618">            return BASE_SIZE</span>
+                + entrySize
+<span class="fc" id="L620">                + ObjectSizes.sizeOfReferenceArray(columnsIndex.length);</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus out, ByteBuffer indexInfo) throws IOException
+        {
+<span class="pc bpc" id="L626" title="1 of 2 branches missed.">            assert indexedPartSize != Integer.MIN_VALUE;</span>
+
+<span class="fc" id="L628">            out.writeUnsignedVInt(position);</span>
+
+<span class="fc" id="L630">            out.writeUnsignedVInt32(serializedSize(deletionTime, headerLength, columnsIndex.length, version) + indexedPartSize);</span>
+
+<span class="fc" id="L632">            out.writeUnsignedVInt(headerLength);</span>
+
+<span class="fc" id="L634">            DeletionTime.getSerializer(version).serialize(deletionTime, out);</span>
+<span class="fc" id="L635">            out.writeUnsignedVInt32(columnsIndex.length);</span>
+            
+<span class="fc bfc" id="L637" title="All 2 branches covered.">            for (IndexInfo info : columnsIndex)</span>
+<span class="fc" id="L638">                idxInfoSerializer.serialize(info, out);</span>
+<span class="fc bfc" id="L639" title="All 2 branches covered.">            for (int offset : offsets)</span>
+<span class="fc" id="L640">                out.writeInt(offset);</span>
+<span class="fc" id="L641">        }</span>
+
+        @Override
+        public void serializeForCache(DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L646">            out.writeUnsignedVInt(position);</span>
+<span class="nc" id="L647">            out.writeByte(CACHE_INDEXED);</span>
+
+<span class="nc" id="L649">            out.writeUnsignedVInt(headerLength);</span>
+<span class="nc" id="L650">            DeletionTime.getSerializer(version).serialize(deletionTime, out);</span>
+<span class="nc" id="L651">            out.writeUnsignedVInt32(blockCount());</span>
+
+<span class="nc bnc" id="L653" title="All 2 branches missed.">            for (IndexInfo indexInfo : columnsIndex)</span>
+<span class="nc" id="L654">                idxInfoSerializer.serialize(indexInfo, out);</span>
+<span class="nc" id="L655">        }</span>
+
+        static void skipForCache(DataInputPlus in, Version version) throws IOException
+        {
+<span class="nc" id="L659">            in.readUnsignedVInt();</span>
+<span class="nc" id="L660">            DeletionTime.getSerializer(version).skip(in);</span>
+<span class="nc" id="L661">            in.readUnsignedVInt();</span>
+
+<span class="nc" id="L663">            in.readUnsignedVInt();</span>
+<span class="nc" id="L664">        }</span>
+    }
+
+    /**
+     * An entry in the row index for a row whose columns are indexed and the {@link IndexInfo} objects
+     * are not read into the key cache.
+     */
+    private static final class ShallowIndexedEntry extends RowIndexEntry
+    {
+        private static final long BASE_SIZE;
+
+        static
+        {
+<span class="fc" id="L677">            BASE_SIZE = ObjectSizes.measure(new ShallowIndexedEntry(0, 0, DeletionTime.LIVE, 0, 10, 0, null, BigFormat.getInstance().getLatestVersion()));</span>
+<span class="fc" id="L678">        }</span>
+
+        private final long indexFilePosition;
+
+        private final DeletionTime deletionTime;
+        private final long headerLength;
+        private final int columnsIndexCount;
+
+        private final int indexedPartSize;
+        private final int offsetsOffset;
+        @Unmetered
+        private final ISerializer&lt;IndexInfo&gt; idxInfoSerializer;
+        private final int fieldsSerializedSize;
+        private final Version version;
+
+        /**
+         * See {@link #create(long, long, DeletionTime, long, int, int, List, int[], ISerializer, Version)} for a description
+         * of the parameters.
+         */
+        private ShallowIndexedEntry(long dataFilePosition, long indexFilePosition,
+                                    DeletionTime deletionTime, long headerLength, int columnIndexCount,
+                                    int indexedPartSize, ISerializer&lt;IndexInfo&gt; idxInfoSerializer, Version version)
+        {
+<span class="fc" id="L701">            super(dataFilePosition);</span>
+
+<span class="pc bpc" id="L703" title="1 of 2 branches missed.">            assert columnIndexCount &gt; 1;</span>
+
+<span class="fc" id="L705">            this.indexFilePosition = indexFilePosition;</span>
+<span class="fc" id="L706">            this.headerLength = headerLength;</span>
+<span class="fc" id="L707">            this.deletionTime = deletionTime;</span>
+<span class="fc" id="L708">            this.columnsIndexCount = columnIndexCount;</span>
+
+<span class="fc" id="L710">            this.indexedPartSize = indexedPartSize;</span>
+<span class="fc" id="L711">            this.idxInfoSerializer = idxInfoSerializer;</span>
+
+<span class="fc" id="L713">            this.version = version;</span>
+<span class="fc" id="L714">            this.fieldsSerializedSize = serializedSize(deletionTime, headerLength, columnIndexCount, this.version);</span>
+<span class="fc" id="L715">            this.offsetsOffset = indexedPartSize + fieldsSerializedSize - columnsIndexCount * TypeSizes.INT_SIZE;</span>
+<span class="fc" id="L716">        }</span>
+
+        /**
+         * Constructor for key-cache deserialization
+         */
+        private ShallowIndexedEntry(long dataFilePosition, DataInputPlus in, IndexInfo.Serializer idxInfoSerializer, Version version) throws IOException
+        {
+<span class="nc" id="L723">            super(dataFilePosition);</span>
+
+<span class="nc" id="L725">            this.indexFilePosition = in.readUnsignedVInt();</span>
+
+<span class="nc" id="L727">            this.headerLength = in.readUnsignedVInt();</span>
+<span class="nc" id="L728">            this.version = version;</span>
+
+<span class="nc" id="L730">            this.deletionTime = DeletionTime.getSerializer(version).deserialize(in);</span>
+<span class="nc" id="L731">            this.columnsIndexCount = in.readUnsignedVInt32();</span>
+
+<span class="nc" id="L733">            this.indexedPartSize = in.readUnsignedVInt32();</span>
+
+<span class="nc" id="L735">            this.idxInfoSerializer = idxInfoSerializer;</span>
+
+<span class="nc" id="L737">            this.fieldsSerializedSize = serializedSize(deletionTime, headerLength, columnsIndexCount, this.version);</span>
+<span class="nc" id="L738">            this.offsetsOffset = indexedPartSize + fieldsSerializedSize - columnsIndexCount * TypeSizes.INT_SIZE;</span>
+<span class="nc" id="L739">        }</span>
+
+        @Override
+        public int blockCount()
+        {
+<span class="fc" id="L744">            return columnsIndexCount;</span>
+        }
+
+        @Override
+        public DeletionTime deletionTime()
+        {
+<span class="fc" id="L750">            return deletionTime;</span>
+        }
+
+        @Override
+        public IndexInfoRetriever openWithIndex(FileHandle indexFile)
+        {
+<span class="fc" id="L756">            indexEntrySizeHistogram.update(indexedPartSize + fieldsSerializedSize);</span>
+<span class="fc" id="L757">            indexInfoCountHistogram.update(columnsIndexCount);</span>
+<span class="fc" id="L758">            return new ShallowInfoRetriever(indexFilePosition +</span>
+<span class="fc" id="L759">                                            VIntCoding.computeUnsignedVIntSize(position) +</span>
+<span class="fc" id="L760">                                            VIntCoding.computeUnsignedVIntSize(indexedPartSize + fieldsSerializedSize) +</span>
+                                            fieldsSerializedSize,
+                                            offsetsOffset - fieldsSerializedSize,
+<span class="fc" id="L763">                                            indexFile.createReader(), idxInfoSerializer);</span>
+        }
+
+        @Override
+        public long unsharedHeapSize()
+        {
+<span class="fc" id="L769">            return BASE_SIZE;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus out, ByteBuffer indexInfo) throws IOException
+        {
+<span class="fc" id="L775">            out.writeUnsignedVInt(position);</span>
+
+<span class="fc" id="L777">            out.writeUnsignedVInt32(fieldsSerializedSize + indexInfo.limit());</span>
+
+<span class="fc" id="L779">            out.writeUnsignedVInt(headerLength);</span>
+
+<span class="fc" id="L781">            DeletionTime.getSerializer(version).serialize(deletionTime, out);</span>
+<span class="fc" id="L782">            out.writeUnsignedVInt32(columnsIndexCount);</span>
+
+<span class="fc" id="L784">            out.write(indexInfo);</span>
+<span class="fc" id="L785">        }</span>
+
+        @Override
+        public void serializeForCache(DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L790">            out.writeUnsignedVInt(position);</span>
+<span class="nc" id="L791">            out.writeByte(CACHE_INDEXED_SHALLOW);</span>
+
+<span class="nc" id="L793">            out.writeUnsignedVInt(indexFilePosition);</span>
+
+<span class="nc" id="L795">            out.writeUnsignedVInt(headerLength);</span>
+
+<span class="nc" id="L797">            DeletionTime.getSerializer(version).serialize(deletionTime, out);</span>
+<span class="nc" id="L798">            out.writeUnsignedVInt32(columnsIndexCount);</span>
+<span class="nc" id="L799">            out.writeUnsignedVInt32(indexedPartSize);</span>
+<span class="nc" id="L800">        }</span>
+
+        static void skipForCache(DataInputPlus in, Version version) throws IOException
+        {
+<span class="nc" id="L804">            in.readUnsignedVInt();</span>
+
+<span class="nc" id="L806">            in.readUnsignedVInt();</span>
+<span class="nc" id="L807">            DeletionTime.getSerializer(version).skip(in);</span>
+<span class="nc" id="L808">            in.readUnsignedVInt();</span>
+
+<span class="nc" id="L810">            in.readUnsignedVInt();</span>
+<span class="nc" id="L811">        }</span>
+    }
+
+    private static final class ShallowInfoRetriever extends FileIndexInfoRetriever
+    {
+        private final int offsetsOffset;
+
+        private ShallowInfoRetriever(long indexInfoFilePosition, int offsetsOffset,
+                                     FileDataInput indexReader, ISerializer&lt;IndexInfo&gt; idxInfoSerializer)
+        {
+<span class="fc" id="L821">            super(indexInfoFilePosition, indexReader, idxInfoSerializer);</span>
+<span class="fc" id="L822">            this.offsetsOffset = offsetsOffset;</span>
+<span class="fc" id="L823">        }</span>
+
+        @Override
+        IndexInfo fetchIndex(int index) throws IOException
+        {
+            // seek to position in &quot;offsets to IndexInfo&quot; table
+<span class="fc" id="L829">            indexReader.seek(indexInfoFilePosition + offsetsOffset + index * TypeSizes.INT_SIZE);</span>
+
+            // read offset of IndexInfo
+<span class="fc" id="L832">            int indexInfoPos = indexReader.readInt();</span>
+
+            // seek to posision of IndexInfo
+<span class="fc" id="L835">            indexReader.seek(indexInfoFilePosition + indexInfoPos);</span>
+
+            // finally, deserialize IndexInfo
+<span class="fc" id="L838">            return idxInfoSerializer.deserialize(indexReader);</span>
+        }
+    }
+
+    /**
+     * Base class to access {@link IndexInfo} objects.
+     */
+    public interface IndexInfoRetriever extends AutoCloseable
+    {
+        IndexInfo columnsIndex(int index) throws IOException;
+
+        void close() throws IOException;
+    }
+
+    /**
+     * Base class to access {@link IndexInfo} objects on disk that keeps already
+     * read {@link IndexInfo} on heap.
+     */
+    private abstract static class FileIndexInfoRetriever implements IndexInfoRetriever
+    {
+        final long indexInfoFilePosition;
+        final ISerializer&lt;IndexInfo&gt; idxInfoSerializer;
+        final FileDataInput indexReader;
+        int retrievals;
+
+        /**
+         *
+         * @param indexInfoFilePosition offset of first serialized {@link IndexInfo} object
+         * @param indexReader file data input to access the index file, closed by this instance
+         * @param idxInfoSerializer the index serializer to deserialize {@link IndexInfo} objects
+         */
+        FileIndexInfoRetriever(long indexInfoFilePosition, FileDataInput indexReader, ISerializer&lt;IndexInfo&gt; idxInfoSerializer)
+<span class="fc" id="L870">        {</span>
+<span class="fc" id="L871">            this.indexInfoFilePosition = indexInfoFilePosition;</span>
+<span class="fc" id="L872">            this.idxInfoSerializer = idxInfoSerializer;</span>
+<span class="fc" id="L873">            this.indexReader = indexReader;</span>
+<span class="fc" id="L874">        }</span>
+
+        @Override
+        public final IndexInfo columnsIndex(int index) throws IOException
+        {
+<span class="fc" id="L879">            retrievals++;</span>
+<span class="fc" id="L880">            return fetchIndex(index);</span>
+        }
+
+        abstract IndexInfo fetchIndex(int index) throws IOException;
+
+        @Override
+        public void close() throws IOException
+        {
+<span class="fc" id="L888">            indexReader.close();</span>
+
+<span class="fc" id="L890">            indexInfoGetsHistogram.update(retrievals);</span>
+<span class="fc" id="L891">            indexInfoReadsHistogram.update(retrievals);</span>
+<span class="fc" id="L892">        }</span>
+    }
+
+    public static class RowIndexEntryReadSizeTooLargeException extends RejectException
+    {
+        public RowIndexEntryReadSizeTooLargeException(String message)
+        {
+<span class="nc" id="L899">            super(message);</span>
+<span class="nc" id="L900">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

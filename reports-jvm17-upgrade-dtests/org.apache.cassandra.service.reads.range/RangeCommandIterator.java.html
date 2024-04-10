@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeCommandIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads.range</a> &gt; <span class="el_source">RangeCommandIterator.java</span></div><h1>RangeCommandIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.reads.range;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.exceptions.ReadAbortException;
+import org.apache.cassandra.exceptions.ReadFailureException;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.locator.EndpointsForRange;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.metrics.ClientRangeRequestMetrics;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.reads.DataResolver;
+import org.apache.cassandra.service.reads.ReadCallback;
+import org.apache.cassandra.service.reads.repair.ReadRepair;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.CloseableIterator;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+@VisibleForTesting
+public class RangeCommandIterator extends AbstractIterator&lt;RowIterator&gt; implements PartitionIterator
+{
+<span class="fc" id="L61">    private static final Logger logger = LoggerFactory.getLogger(RangeCommandIterator.class);</span>
+
+<span class="fc" id="L63">    public static final ClientRangeRequestMetrics rangeMetrics = new ClientRangeRequestMetrics(&quot;RangeSlice&quot;);</span>
+
+    private final CloseableIterator&lt;ReplicaPlan.ForRangeRead&gt; replicaPlans;
+    private final int totalRangeCount;
+    private final PartitionRangeReadCommand command;
+    private final boolean enforceStrictLiveness;
+
+    private final long startTime;
+    private final long queryStartNanoTime;
+    private DataLimits.Counter counter;
+    private PartitionIterator sentQueryIterator;
+
+    private final int maxConcurrencyFactor;
+    private int concurrencyFactor;
+    // The two following &quot;metric&quot; are maintained to improve the concurrencyFactor
+    // when it was not good enough initially.
+    private int liveReturned;
+    private int rangesQueried;
+<span class="fc" id="L81">    private int batchesRequested = 0;</span>
+
+    RangeCommandIterator(CloseableIterator&lt;ReplicaPlan.ForRangeRead&gt; replicaPlans,
+                         PartitionRangeReadCommand command,
+                         int concurrencyFactor,
+                         int maxConcurrencyFactor,
+                         int totalRangeCount,
+                         long queryStartNanoTime)
+<span class="fc" id="L89">    {</span>
+<span class="fc" id="L90">        this.replicaPlans = replicaPlans;</span>
+<span class="fc" id="L91">        this.command = command;</span>
+<span class="fc" id="L92">        this.concurrencyFactor = concurrencyFactor;</span>
+<span class="fc" id="L93">        this.maxConcurrencyFactor = maxConcurrencyFactor;</span>
+<span class="fc" id="L94">        this.totalRangeCount = totalRangeCount;</span>
+<span class="fc" id="L95">        this.queryStartNanoTime = queryStartNanoTime;</span>
+
+<span class="fc" id="L97">        startTime = nanoTime();</span>
+<span class="fc" id="L98">        enforceStrictLiveness = command.metadata().enforceStrictLiveness();</span>
+<span class="fc" id="L99">    }</span>
+
+    @Override
+    protected RowIterator computeNext()
+    {
+        try
+        {
+<span class="fc bfc" id="L106" title="All 4 branches covered.">            while (sentQueryIterator == null || !sentQueryIterator.hasNext())</span>
+            {
+                // If we don't have more range to handle, we're done
+<span class="fc bfc" id="L109" title="All 2 branches covered.">                if (!replicaPlans.hasNext())</span>
+<span class="fc" id="L110">                    return endOfData();</span>
+
+                // else, sends the next batch of concurrent queries (after having close the previous iterator)
+<span class="fc bfc" id="L113" title="All 2 branches covered.">                if (sentQueryIterator != null)</span>
+                {
+<span class="fc" id="L115">                    liveReturned += counter.counted();</span>
+<span class="fc" id="L116">                    sentQueryIterator.close();</span>
+
+                    // It's not the first batch of queries and we're not done, so we we can use what has been
+                    // returned so far to improve our rows-per-range estimate and update the concurrency accordingly
+<span class="fc" id="L120">                    updateConcurrencyFactor();</span>
+                }
+<span class="fc" id="L122">                sentQueryIterator = sendNextRequests();</span>
+            }
+
+<span class="fc" id="L125">            return sentQueryIterator.next();</span>
+        }
+<span class="nc" id="L127">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L129">            rangeMetrics.unavailables.mark();</span>
+<span class="nc" id="L130">            StorageProxy.logRequestException(e, Collections.singleton(command));</span>
+<span class="nc" id="L131">            throw e;</span>
+        }
+<span class="fc" id="L133">        catch (ReadTimeoutException e)</span>
+        {
+<span class="fc" id="L135">            rangeMetrics.timeouts.mark();</span>
+<span class="fc" id="L136">            StorageProxy.logRequestException(e, Collections.singleton(command));</span>
+<span class="fc" id="L137">            throw e;</span>
+        }
+<span class="nc" id="L139">        catch (ReadAbortException e)</span>
+        {
+<span class="nc" id="L141">            rangeMetrics.markAbort(e);</span>
+<span class="nc" id="L142">            throw e;</span>
+        }
+<span class="nc" id="L144">        catch (ReadFailureException e)</span>
+        {
+<span class="nc" id="L146">            rangeMetrics.failures.mark();</span>
+<span class="nc" id="L147">            throw e;</span>
+        }
+    }
+
+    private void updateConcurrencyFactor()
+    {
+<span class="fc" id="L153">        liveReturned += counter.counted();</span>
+
+<span class="fc" id="L155">        concurrencyFactor = computeConcurrencyFactor(totalRangeCount, rangesQueried, maxConcurrencyFactor, command.limits().count(), liveReturned);</span>
+<span class="fc" id="L156">    }</span>
+
+    @VisibleForTesting
+    static int computeConcurrencyFactor(int totalRangeCount, int rangesQueried, int maxConcurrencyFactor, int limit, int liveReturned)
+    {
+<span class="fc" id="L161">        maxConcurrencyFactor = Math.max(1, Math.min(maxConcurrencyFactor, totalRangeCount - rangesQueried));</span>
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (liveReturned == 0)</span>
+        {
+            // we haven't actually gotten any results, so query up to the limit if not results so far
+<span class="fc" id="L165">            Tracing.trace(&quot;Didn't get any response rows; new concurrent requests: {}&quot;, maxConcurrencyFactor);</span>
+<span class="fc" id="L166">            return maxConcurrencyFactor;</span>
+        }
+
+        // Otherwise, compute how many rows per range we got on average and pick a concurrency factor
+        // that should allow us to fetch all remaining rows with the next batch of (concurrent) queries.
+<span class="nc" id="L171">        int remainingRows = limit - liveReturned;</span>
+<span class="nc" id="L172">        float rowsPerRange = (float) liveReturned / (float) rangesQueried;</span>
+<span class="nc" id="L173">        int concurrencyFactor = Math.max(1, Math.min(maxConcurrencyFactor, Math.round(remainingRows / rowsPerRange)));</span>
+<span class="nc" id="L174">        logger.trace(&quot;Didn't get enough response rows; actual rows per range: {}; remaining rows: {}, new concurrent requests: {}&quot;,</span>
+<span class="nc" id="L175">                     rowsPerRange, remainingRows, concurrencyFactor);</span>
+<span class="nc" id="L176">        return concurrencyFactor;</span>
+    }
+
+    /**
+     * Queries the provided sub-range.
+     *
+     * @param replicaPlan the subRange to query.
+     * @param isFirst in the case where multiple queries are sent in parallel, whether that's the first query on
+     * that batch or not. The reason it matters is that whe paging queries, the command (more specifically the
+     * {@code DataLimits}) may have &quot;state&quot; information and that state may only be valid for the first query (in
+     * that it's the query that &quot;continues&quot; whatever we're previously queried).
+     */
+    private SingleRangeResponse query(ReplicaPlan.ForRangeRead replicaPlan, boolean isFirst)
+    {
+<span class="fc" id="L190">        PartitionRangeReadCommand rangeCommand = command.forSubRange(replicaPlan.range(), isFirst);</span>
+        
+        // If enabled, request repaired data tracking info from full replicas, but
+        // only if there are multiple full replicas to compare results from.
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">        boolean trackRepairedStatus = DatabaseDescriptor.getRepairedDataTrackingForRangeReadsEnabled()</span>
+<span class="pc bnc" id="L195" title="All 2 branches missed.">                                      &amp;&amp; replicaPlan.contacts().filter(Replica::isFull).size() &gt; 1;</span>
+
+<span class="fc" id="L197">        ReplicaPlan.SharedForRangeRead sharedReplicaPlan = ReplicaPlan.shared(replicaPlan);</span>
+<span class="fc" id="L198">        ReadRepair&lt;EndpointsForRange, ReplicaPlan.ForRangeRead&gt; readRepair =</span>
+<span class="fc" id="L199">                ReadRepair.create(command, sharedReplicaPlan, queryStartNanoTime);</span>
+<span class="fc" id="L200">        DataResolver&lt;EndpointsForRange, ReplicaPlan.ForRangeRead&gt; resolver =</span>
+                new DataResolver&lt;&gt;(rangeCommand, sharedReplicaPlan, readRepair, queryStartNanoTime, trackRepairedStatus);
+<span class="fc" id="L202">        ReadCallback&lt;EndpointsForRange, ReplicaPlan.ForRangeRead&gt; handler =</span>
+                new ReadCallback&lt;&gt;(resolver, rangeCommand, sharedReplicaPlan, queryStartNanoTime);
+
+<span class="fc bfc" id="L205" title="All 4 branches covered.">        if (replicaPlan.contacts().size() == 1 &amp;&amp; replicaPlan.contacts().get(0).isSelf())</span>
+        {
+<span class="fc" id="L207">            Stage.READ.execute(new StorageProxy.LocalReadRunnable(rangeCommand, handler, trackRepairedStatus));</span>
+        }
+        else
+        {
+<span class="fc bfc" id="L211" title="All 2 branches covered.">            for (Replica replica : replicaPlan.contacts())</span>
+            {
+<span class="fc" id="L213">                Tracing.trace(&quot;Enqueuing request to {}&quot;, replica);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                ReadCommand command = replica.isFull() ? rangeCommand : rangeCommand.copyAsTransientQuery(replica);</span>
+<span class="pc bpc" id="L215" title="3 of 4 branches missed.">                Message&lt;ReadCommand&gt; message = command.createMessage(trackRepairedStatus &amp;&amp; replica.isFull());</span>
+<span class="fc" id="L216">                MessagingService.instance().sendWithCallback(message, replica.endpoint(), handler);</span>
+<span class="fc" id="L217">            }</span>
+        }
+
+<span class="fc" id="L220">        return new SingleRangeResponse(resolver, handler, readRepair);</span>
+    }
+
+    private PartitionIterator sendNextRequests()
+    {
+<span class="fc" id="L225">        List&lt;PartitionIterator&gt; concurrentQueries = new ArrayList&lt;&gt;(concurrencyFactor);</span>
+<span class="fc" id="L226">        List&lt;ReadRepair&lt;?, ?&gt;&gt; readRepairs = new ArrayList&lt;&gt;(concurrencyFactor);</span>
+
+        try
+        {
+<span class="pc bpc" id="L230" title="1 of 4 branches missed.">            for (int i = 0; i &lt; concurrencyFactor &amp;&amp; replicaPlans.hasNext(); )</span>
+            {
+<span class="fc" id="L232">                ReplicaPlan.ForRangeRead replicaPlan = replicaPlans.next();</span>
+
+                @SuppressWarnings(&quot;resource&quot;) // response will be closed by concatAndBlockOnRepair, or in the catch block below
+<span class="fc bfc" id="L235" title="All 2 branches covered.">                SingleRangeResponse response = query(replicaPlan, i == 0);</span>
+<span class="fc" id="L236">                concurrentQueries.add(response);</span>
+<span class="fc" id="L237">                readRepairs.add(response.getReadRepair());</span>
+                // due to RangeMerger, coordinator may fetch more ranges than required by concurrency factor.
+<span class="fc" id="L239">                rangesQueried += replicaPlan.vnodeCount();</span>
+<span class="fc" id="L240">                i += replicaPlan.vnodeCount();</span>
+<span class="fc" id="L241">            }</span>
+<span class="fc" id="L242">            batchesRequested++;</span>
+        }
+<span class="nc" id="L244">        catch (Throwable t)</span>
+        {
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            for (PartitionIterator response : concurrentQueries)</span>
+<span class="nc" id="L247">                response.close();</span>
+<span class="nc" id="L248">            throw t;</span>
+<span class="fc" id="L249">        }</span>
+
+<span class="fc" id="L251">        Tracing.trace(&quot;Submitted {} concurrent range requests&quot;, concurrentQueries.size());</span>
+        // We want to count the results for the sake of updating the concurrency factor (see updateConcurrencyFactor)
+        // but we don't want to enforce any particular limit at this point (this could break code than rely on
+        // postReconciliationProcessing), hence the DataLimits.NONE.
+<span class="fc" id="L255">        counter = DataLimits.NONE.newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);</span>
+<span class="fc" id="L256">        return counter.applyTo(StorageProxy.concatAndBlockOnRepair(concurrentQueries, readRepairs));</span>
+    }
+
+    @Override
+    public void close()
+    {
+        try
+        {
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">            if (sentQueryIterator != null)</span>
+<span class="fc" id="L265">                sentQueryIterator.close();</span>
+
+<span class="fc" id="L267">            replicaPlans.close();</span>
+        }
+        finally
+        {
+<span class="fc" id="L271">            long latency = nanoTime() - startTime;</span>
+<span class="fc" id="L272">            rangeMetrics.addNano(latency);</span>
+<span class="fc" id="L273">            rangeMetrics.roundTrips.update(batchesRequested);</span>
+<span class="fc" id="L274">            Keyspace.openAndGetStore(command.metadata()).metric.coordinatorScanLatency.update(latency, TimeUnit.NANOSECONDS);</span>
+        }
+<span class="fc" id="L276">    }</span>
+
+    @VisibleForTesting
+    int rangesQueried()
+    {
+<span class="nc" id="L281">        return rangesQueried;</span>
+    }
+
+    @VisibleForTesting
+    int batchesRequested()
+    {
+<span class="nc" id="L287">        return batchesRequested;</span>
+    }
+
+    @VisibleForTesting
+    int maxConcurrencyFactor()
+    {
+<span class="nc" id="L293">        return maxConcurrencyFactor;</span>
+    }
+
+    @VisibleForTesting
+    int concurrencyFactor()
+    {
+<span class="nc" id="L299">        return concurrencyFactor;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

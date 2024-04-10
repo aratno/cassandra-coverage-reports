@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MutualTlsInternodeAuthenticator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth</a> &gt; <span class="el_source">MutualTlsInternodeAuthenticator.java</span></div><h1>MutualTlsInternodeAuthenticator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.auth;
+
+import java.io.InputStream;
+import java.net.InetAddress;
+import java.nio.file.Files;
+import java.nio.file.Paths; // checkstyle: permit this import
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.config.ParameterizedClass;
+import org.apache.cassandra.exceptions.AuthenticationException;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+/*
+ * Performs mTLS authentication for internode connections by extracting identities from the certificates of incoming
+ * connection and verifying them against a list of authorized peers. Authorized peers can be configured in
+ * trusted_peer_identities in cassandra yaml, otherwise authenticator trusts connections from peers which has the same
+ * identity as the one that the node uses for making outbound connections.
+ *
+ * Optionally cassandra can validate the identity extracted from outbound keystore with node_identity that is configured
+ * in cassandra.yaml to avoid any configuration errors.
+ *
+ * Authenticator &amp; Certificate validator can be configured using cassandra.yaml, operators can write their own mTLS
+ * certificate validator and configure it in cassandra.yaml.Below is an example on how to configure validator.
+ * Note that this example uses SPIFFE based validator, it could be any other validator with any defined identifier format.
+ *
+ * internode_authenticator:
+ *   class_name : org.apache.cassandra.auth.AllowAllInternodeAuthenticator
+ *   parameters :
+ *     validator_class_name: org.apache.cassandra.auth.SpiffeCertificateValidator
+ *     trusted_peer_identities: &quot;spiffe1,spiffe2&quot;
+ *     node_identity: &quot;spiffe1&quot;
+ */
+public class MutualTlsInternodeAuthenticator implements IInternodeAuthenticator
+{
+    private static final String VALIDATOR_CLASS_NAME = &quot;validator_class_name&quot;;
+    private static final String TRUSTED_PEER_IDENTITIES = &quot;trusted_peer_identities&quot;;
+    private static final String NODE_IDENTITY = &quot;node_identity&quot;;
+<span class="nc" id="L74">    private final Logger logger = LoggerFactory.getLogger(this.getClass());</span>
+<span class="nc" id="L75">    private final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 30L, TimeUnit.SECONDS);</span>
+    private final MutualTlsCertificateValidator certificateValidator;
+    private final List&lt;String&gt; trustedIdentities;
+
+    public MutualTlsInternodeAuthenticator(Map&lt;String, String&gt; parameters)
+<span class="nc" id="L80">    {</span>
+<span class="nc" id="L81">        String certificateValidatorClassName = parameters.get(VALIDATOR_CLASS_NAME);</span>
+<span class="nc bnc" id="L82" title="All 2 branches missed.">        if (StringUtils.isEmpty(certificateValidatorClassName))</span>
+        {
+<span class="nc" id="L84">            String message = &quot;internode_authenticator.parameters.validator_class_name is not set&quot;;</span>
+<span class="nc" id="L85">            logger.error(message);</span>
+<span class="nc" id="L86">            throw new ConfigurationException(message);</span>
+        }
+
+<span class="nc" id="L89">        certificateValidator = ParameterizedClass.newInstance(new ParameterizedClass(certificateValidatorClassName),</span>
+<span class="nc" id="L90">                                                              Arrays.asList(&quot;&quot;, AuthConfig.class.getPackage().getName()));</span>
+<span class="nc" id="L91">        Config config = DatabaseDescriptor.getRawConfig();</span>
+<span class="nc" id="L92">        checkInternodeMtlsConfigurationIsValid(config);</span>
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (parameters.containsKey(TRUSTED_PEER_IDENTITIES))</span>
+        {
+            // If trusted_peer_identities identities is configured in cassandra.yaml trust only those identities
+<span class="nc" id="L97">            trustedIdentities = Arrays.stream(parameters.get(TRUSTED_PEER_IDENTITIES).split(&quot;,&quot;))</span>
+<span class="nc" id="L98">                                      .collect(Collectors.toList());</span>
+        }
+        else
+        {
+            // Otherwise, trust the identities extracted from outbound keystore which is the identity that the node uses
+            // for making outbound connections.
+<span class="nc" id="L104">            trustedIdentities = getIdentitiesFromKeyStore(config.server_encryption_options.outbound_keystore,</span>
+                                                          config.server_encryption_options.outbound_keystore_password,
+                                                          config.server_encryption_options.store_type);
+            // optionally, if node_identity is configured in the yaml, validate the identity extracted from outbound
+            // keystore to avoid any configuration errors
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            if(parameters.containsKey(NODE_IDENTITY))</span>
+            {
+<span class="nc" id="L111">                String nodeIdentity = parameters.get(NODE_IDENTITY);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">                if(!trustedIdentities.contains(nodeIdentity))</span>
+                {
+<span class="nc" id="L114">                    throw new ConfigurationException(&quot;Configured node identity is not matching identity extracted&quot; +</span>
+                                                     &quot;from the keystore&quot;);
+                }
+<span class="nc" id="L117">                trustedIdentities.retainAll(Collections.singleton(nodeIdentity));</span>
+            }
+        }
+
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (!trustedIdentities.isEmpty())</span>
+        {
+<span class="nc" id="L123">            logger.info(&quot;Initializing internode authenticator with identities {}&quot;, trustedIdentities);</span>
+        }
+        else
+        {
+<span class="nc" id="L127">            String message = String.format(&quot;No identity was extracted from the outbound keystore '%s'&quot;, config.server_encryption_options.outbound_keystore);</span>
+<span class="nc" id="L128">            logger.info(message);</span>
+<span class="nc" id="L129">            throw new ConfigurationException(message);</span>
+        }
+<span class="nc" id="L131">    }</span>
+
+    @Override
+    public boolean authenticate(InetAddress remoteAddress, int remotePort)
+    {
+<span class="nc" id="L136">        throw new UnsupportedOperationException(&quot;mTLS Authenticator only supports certificate based authenticate method&quot;);</span>
+    }
+
+    @Override
+    public boolean authenticate(InetAddress remoteAddress, int remotePort, Certificate[] certificates, InternodeConnectionDirection connectionType)
+    {
+<span class="nc" id="L142">        return authenticateInternodeWithMtls(remoteAddress, remotePort, certificates, connectionType);</span>
+    }
+
+
+    @Override
+    public void validateConfiguration() throws ConfigurationException
+    {
+
+<span class="nc" id="L150">    }</span>
+
+    protected boolean authenticateInternodeWithMtls(InetAddress remoteAddress, int remotePort, Certificate[] certificates,
+                                                    IInternodeAuthenticator.InternodeConnectionDirection connectionType)
+    {
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (connectionType == IInternodeAuthenticator.InternodeConnectionDirection.INBOUND)</span>
+        {
+<span class="nc" id="L157">            String identity = certificateValidator.identity(certificates);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">            if (!certificateValidator.isValidCertificate(certificates))</span>
+            {
+<span class="nc" id="L160">                noSpamLogger.error(&quot;Not a valid certificate from {}:{} with identity '{}'&quot;, remoteAddress, remotePort, identity);</span>
+<span class="nc" id="L161">                return false;</span>
+            }
+
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if(!trustedIdentities.contains(identity))</span>
+            {
+<span class="nc" id="L166">                noSpamLogger.error(&quot;Unable to authenticate user {}&quot;, identity);</span>
+<span class="nc" id="L167">                return false;</span>
+            }
+<span class="nc" id="L169">            return true;</span>
+        }
+        // Outbound connections don't need to be authenticated again in certificate based connections. SSL handshake
+        // makes sure that we are talking to valid server by checking root certificates of the server in the
+        // truststore of the client.
+<span class="nc" id="L174">        return true;</span>
+    }
+
+    @VisibleForTesting
+    List&lt;String&gt; getIdentitiesFromKeyStore(final String outboundKeyStorePath,
+                                           final String outboundKeyStorePassword,
+                                           final String storeType)
+    {
+<span class="nc" id="L182">        final List&lt;String&gt; allUsers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L183">        try (InputStream ksf = Files.newInputStream(Paths.get(outboundKeyStorePath)))</span>
+        {
+<span class="nc" id="L185">            final KeyStore ks = KeyStore.getInstance(storeType);</span>
+<span class="nc" id="L186">            ks.load(ksf, outboundKeyStorePassword.toCharArray());</span>
+<span class="nc" id="L187">            Enumeration&lt;String&gt; enumeration = ks.aliases();</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">            while (enumeration.hasMoreElements())</span>
+            {
+<span class="nc" id="L190">                String alias = enumeration.nextElement();</span>
+<span class="nc" id="L191">                Certificate[] chain = ks.getCertificateChain(alias);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if (chain == null)</span>
+                {
+<span class="nc" id="L194">                    logger.warn(&quot;Full chain/private key is not present in the keystore for certificate {}&quot;, alias);</span>
+<span class="nc" id="L195">                    continue;</span>
+                }
+                try
+                {
+<span class="nc" id="L199">                    allUsers.add(certificateValidator.identity(chain));</span>
+                }
+<span class="nc" id="L201">                catch (AuthenticationException e)</span>
+                {
+                    // When identity cannot be extracted, this exception is thrown
+                    // Ignore it, since only few certificates might contain identity
+<span class="nc" id="L205">                }</span>
+<span class="nc" id="L206">            }</span>
+        }
+<span class="nc" id="L208">        catch (Exception e)</span>
+        {
+<span class="nc" id="L210">            logger.error(&quot;Failed to get identities from outbound_keystore {}&quot;, outboundKeyStorePath, e);</span>
+<span class="nc" id="L211">        }</span>
+<span class="nc" id="L212">        return allUsers;</span>
+    }
+
+    private void checkInternodeMtlsConfigurationIsValid(Config config)
+    {
+<span class="nc bnc" id="L217" title="All 4 branches missed.">        if (config.server_encryption_options.internode_encryption == EncryptionOptions.ServerEncryptionOptions.InternodeEncryption.none</span>
+            || !config.server_encryption_options.require_client_auth)
+        {
+<span class="nc" id="L220">            String msg = &quot;MutualTlsInternodeAuthenticator requires server_encryption_options.internode_encryption to be enabled&quot; +</span>
+                         &quot; &amp; server_encryption_options.require_client_auth to be true&quot;;
+<span class="nc" id="L222">            logger.error(msg);</span>
+<span class="nc" id="L223">            throw new ConfigurationException(msg);</span>
+        }
+<span class="nc" id="L225">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

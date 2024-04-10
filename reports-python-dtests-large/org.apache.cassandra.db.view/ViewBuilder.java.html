@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ViewBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">ViewBuilder.java</span></div><h1>ViewBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.view;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.FutureCallback;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.locator.Replicas;
+import org.apache.cassandra.schema.SystemDistributedKeyspace;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.FutureCombiner;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+
+import static java.util.stream.Collectors.toList;
+
+/**
+ * Builds a materialized view for the local token ranges.
+ * &lt;p&gt;
+ * The build is split in at least {@link #NUM_TASKS} {@link ViewBuilderTask tasks}, suitable of being parallelized by
+ * the {@link CompactionManager} which will execute them.
+ */
+class ViewBuilder
+{
+<span class="fc" id="L62">    private static final Logger logger = LoggerFactory.getLogger(ViewBuilder.class);</span>
+
+<span class="fc" id="L64">    private static final int NUM_TASKS = Runtime.getRuntime().availableProcessors() * 4;</span>
+
+    private final ColumnFamilyStore baseCfs;
+    private final View view;
+    private final String ksName;
+<span class="fc" id="L69">    private final UUID localHostId = SystemKeyspace.getOrInitializeLocalHostId();</span>
+<span class="fc" id="L70">    private final Set&lt;Range&lt;Token&gt;&gt; builtRanges = Sets.newConcurrentHashSet();</span>
+<span class="fc" id="L71">    private final Map&lt;Range&lt;Token&gt;, Pair&lt;Token, Long&gt;&gt; pendingRanges = Maps.newConcurrentMap();</span>
+<span class="fc" id="L72">    private final Set&lt;ViewBuilderTask&gt; tasks = Sets.newConcurrentHashSet();</span>
+<span class="fc" id="L73">    private volatile long keysBuilt = 0;</span>
+<span class="fc" id="L74">    private volatile boolean isStopped = false;</span>
+<span class="fc" id="L75">    private volatile Future&lt;?&gt; future = ImmediateFuture.success(null);</span>
+
+    ViewBuilder(ColumnFamilyStore baseCfs, View view)
+<span class="fc" id="L78">    {</span>
+<span class="fc" id="L79">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L80">        this.view = view;</span>
+<span class="fc" id="L81">        ksName = baseCfs.metadata.keyspace;</span>
+<span class="fc" id="L82">    }</span>
+
+    public void start()
+    {
+<span class="fc bfc" id="L86" title="All 2 branches covered.">        if (SystemKeyspace.isViewBuilt(ksName, view.name))</span>
+        {
+<span class="fc" id="L88">            logger.debug(&quot;View already marked built for {}.{}&quot;, ksName, view.name);</span>
+<span class="fc bfc" id="L89" title="All 2 branches covered.">            if (!SystemKeyspace.isViewStatusReplicated(ksName, view.name))</span>
+<span class="fc" id="L90">                updateDistributed();</span>
+        }
+        else
+        {
+<span class="fc" id="L94">            SystemDistributedKeyspace.startViewBuild(ksName, view.name, localHostId);</span>
+
+<span class="fc" id="L96">            logger.debug(&quot;Starting build of view({}.{}). Flushing base table {}.{}&quot;,</span>
+                         ksName, view.name, ksName, baseCfs.name);
+<span class="fc" id="L98">            baseCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.VIEW_BUILD_STARTED);</span>
+
+<span class="fc" id="L100">            loadStatusAndBuild();</span>
+        }
+<span class="fc" id="L102">    }</span>
+
+    private void loadStatusAndBuild()
+    {
+<span class="fc" id="L106">        loadStatus();</span>
+<span class="fc" id="L107">        build();</span>
+<span class="fc" id="L108">    }</span>
+
+    private void loadStatus()
+    {
+<span class="fc" id="L112">        builtRanges.clear();</span>
+<span class="fc" id="L113">        pendingRanges.clear();</span>
+<span class="fc" id="L114">        SystemKeyspace.getViewBuildStatus(ksName, view.name)</span>
+<span class="fc" id="L115">                      .forEach((range, pair) -&gt;</span>
+                               {
+<span class="nc" id="L117">                                   Token lastToken = pair.left;</span>
+<span class="nc bnc" id="L118" title="All 4 branches missed.">                                   if (lastToken != null &amp;&amp; lastToken.equals(range.right))</span>
+                                   {
+<span class="nc" id="L120">                                       builtRanges.add(range);</span>
+<span class="nc" id="L121">                                       keysBuilt += pair.right;</span>
+                                   }
+                                   else
+                                   {
+<span class="nc" id="L125">                                       pendingRanges.put(range, pair);</span>
+                                   }
+<span class="nc" id="L127">                               });</span>
+<span class="fc" id="L128">    }</span>
+
+    private synchronized void build()
+    {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (isStopped)</span>
+        {
+<span class="nc" id="L134">            logger.debug(&quot;Stopped build for view({}.{}) after covering {} keys&quot;, ksName, view.name, keysBuilt);</span>
+<span class="nc" id="L135">            return;</span>
+        }
+
+        // Get the local ranges for which the view hasn't already been built nor it's building
+<span class="fc" id="L139">        RangesAtEndpoint replicatedRanges = StorageService.instance.getLocalReplicas(ksName);</span>
+<span class="fc" id="L140">        Replicas.temporaryAssertFull(replicatedRanges);</span>
+<span class="fc" id="L141">        Set&lt;Range&lt;Token&gt;&gt; newRanges = replicatedRanges.ranges()</span>
+<span class="fc" id="L142">                                                      .stream()</span>
+<span class="fc" id="L143">                                                      .map(r -&gt; r.subtractAll(builtRanges))</span>
+<span class="fc" id="L144">                                                      .flatMap(Set::stream)</span>
+<span class="fc" id="L145">                                                      .map(r -&gt; r.subtractAll(pendingRanges.keySet()))</span>
+<span class="fc" id="L146">                                                      .flatMap(Set::stream)</span>
+<span class="fc" id="L147">                                                      .collect(Collectors.toSet());</span>
+        // If there are no new nor pending ranges we should finish the build
+<span class="pc bpc" id="L149" title="1 of 4 branches missed.">        if (newRanges.isEmpty() &amp;&amp; pendingRanges.isEmpty())</span>
+        {
+<span class="fc" id="L151">            finish();</span>
+<span class="fc" id="L152">            return;</span>
+        }
+
+        // Split the new local ranges and add them to the pending set
+<span class="fc" id="L156">        DatabaseDescriptor.getPartitioner()</span>
+<span class="fc" id="L157">                          .splitter()</span>
+<span class="fc" id="L158">                          .map(s -&gt; s.split(newRanges, NUM_TASKS))</span>
+<span class="fc" id="L159">                          .orElse(newRanges)</span>
+<span class="fc" id="L160">                          .forEach(r -&gt; pendingRanges.put(r, Pair.&lt;Token, Long&gt;create(null, 0L)));</span>
+
+        // Submit a new view build task for each building range.
+        // We keep record of all the submitted tasks to be able of stopping them.
+<span class="fc" id="L164">        List&lt;Future&lt;Long&gt;&gt; futures = pendingRanges.entrySet()</span>
+<span class="fc" id="L165">                                                  .stream()</span>
+<span class="fc" id="L166">                                                  .map(e -&gt; new ViewBuilderTask(baseCfs,</span>
+                                                                                view,
+<span class="fc" id="L168">                                                                                e.getKey(),</span>
+<span class="fc" id="L169">                                                                                e.getValue().left,</span>
+<span class="fc" id="L170">                                                                                e.getValue().right))</span>
+<span class="fc" id="L171">                                                  .peek(tasks::add)</span>
+<span class="fc" id="L172">                                                  .map(CompactionManager.instance::submitViewBuilder)</span>
+<span class="fc" id="L173">                                                  .collect(toList());</span>
+
+        // Add a callback to process any eventual new local range and mark the view as built, doing a delayed retry if
+        // the tasks don't succeed
+<span class="fc" id="L177">        Future&lt;List&lt;Long&gt;&gt; future = FutureCombiner.allOf(futures);</span>
+<span class="fc" id="L178">        future.addCallback(new FutureCallback&lt;List&lt;Long&gt;&gt;()</span>
+<span class="fc" id="L179">        {</span>
+            public void onSuccess(List&lt;Long&gt; result)
+            {
+<span class="fc" id="L182">                keysBuilt += result.stream().mapToLong(x -&gt; x).sum();</span>
+<span class="fc" id="L183">                builtRanges.addAll(pendingRanges.keySet());</span>
+<span class="fc" id="L184">                pendingRanges.clear();</span>
+<span class="fc" id="L185">                build();</span>
+<span class="fc" id="L186">            }</span>
+
+            public void onFailure(Throwable t)
+            {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                if (t instanceof CompactionInterruptedException)</span>
+                {
+<span class="nc" id="L192">                    internalStop(true);</span>
+<span class="nc" id="L193">                    keysBuilt = tasks.stream().mapToLong(ViewBuilderTask::keysBuilt).sum();</span>
+<span class="nc" id="L194">                    logger.info(&quot;Interrupted build for view({}.{}) after covering {} keys&quot;, ksName, view.name, keysBuilt);</span>
+                }
+                else
+                {
+<span class="nc" id="L198">                    ScheduledExecutors.nonPeriodicTasks.schedule(() -&gt; loadStatusAndBuild(), 5, TimeUnit.MINUTES);</span>
+<span class="nc" id="L199">                    logger.warn(&quot;Materialized View failed to complete, sleeping 5 minutes before restarting&quot;, t);</span>
+                }
+<span class="nc" id="L201">            }</span>
+        });
+<span class="fc" id="L203">        this.future = future;</span>
+<span class="fc" id="L204">    }</span>
+
+    private void finish()
+    {
+<span class="fc" id="L208">        logger.debug(&quot;Marking view({}.{}) as built after covering {} keys &quot;, ksName, view.name, keysBuilt);</span>
+<span class="fc" id="L209">        SystemKeyspace.finishViewBuildStatus(ksName, view.name);</span>
+<span class="fc" id="L210">        updateDistributed();</span>
+<span class="fc" id="L211">    }</span>
+
+    private void updateDistributed()
+    {
+        try
+        {
+<span class="fc" id="L217">            SystemDistributedKeyspace.successfulViewBuild(ksName, view.name, localHostId);</span>
+<span class="fc" id="L218">            SystemKeyspace.setViewBuiltReplicated(ksName, view.name);</span>
+        }
+<span class="nc" id="L220">        catch (Exception e)</span>
+        {
+<span class="nc" id="L222">            ScheduledExecutors.nonPeriodicTasks.schedule(this::updateDistributed, 5, TimeUnit.MINUTES);</span>
+<span class="nc" id="L223">            logger.warn(&quot;Failed to update the distributed status of view, sleeping 5 minutes before retrying&quot;, e);</span>
+<span class="fc" id="L224">        }</span>
+<span class="fc" id="L225">    }</span>
+
+    /**
+     * Stops the view building.
+     */
+    void stop()
+    {
+        boolean wasStopped;
+<span class="fc" id="L233">        synchronized (this)</span>
+        {
+<span class="fc" id="L235">            wasStopped = isStopped;</span>
+<span class="fc" id="L236">            internalStop(false);</span>
+<span class="fc" id="L237">        }</span>
+        // TODO: very unclear what the goal is here. why do we wait only if we were the first to invoke stop?
+        // but we wait outside the synchronized block to avoid a deadlock with `build` in the future callback
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">        if (!wasStopped)</span>
+<span class="fc" id="L241">            FBUtilities.waitOnFuture(future);</span>
+<span class="fc" id="L242">    }</span>
+
+    private void internalStop(boolean isCompactionInterrupted)
+    {
+<span class="fc" id="L246">        isStopped = true;</span>
+<span class="fc" id="L247">        tasks.forEach(task -&gt; task.stop(isCompactionInterrupted));</span>
+<span class="fc" id="L248">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,315 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraValidationIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.repair</a> &gt; <span class="el_source">CassandraValidationIterator.java</span></div><h1>CassandraValidationIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.repair;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.LongPredicate;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Collections2;
+import com.google.common.collect.Maps;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
+import org.apache.cassandra.db.compaction.ActiveCompactionsTracker;
+import org.apache.cassandra.db.compaction.CompactionController;
+import org.apache.cassandra.db.compaction.CompactionIterator;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.metrics.TopPartitionTracker;
+import org.apache.cassandra.repair.SharedContext;
+import org.apache.cassandra.repair.ValidationPartitionIterator;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.repair.NoSuchRepairSessionException;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+public class CassandraValidationIterator extends ValidationPartitionIterator
+{
+<span class="fc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(CassandraValidationIterator.class);</span>
+
+    /*
+     * Controller for validation compaction that always purges.
+     * Note that we should not call cfs.getOverlappingSSTables on the provided
+     * sstables because those sstables are not guaranteed to be active sstables
+     * (since we can run repair on a snapshot).
+     */
+    private static class ValidationCompactionController extends CompactionController
+    {
+        public ValidationCompactionController(ColumnFamilyStore cfs, long gcBefore)
+        {
+<span class="fc" id="L79">            super(cfs, gcBefore);</span>
+<span class="fc" id="L80">        }</span>
+
+        @Override
+        public LongPredicate getPurgeEvaluator(DecoratedKey key)
+        {
+            /*
+             * The main reason we always purge is that including gcable tombstone would mean that the
+             * repair digest will depends on the scheduling of compaction on the different nodes. This
+             * is still not perfect because gcbefore is currently dependend on the current time at which
+             * the validation compaction start, which while not too bad for normal repair is broken for
+             * repair on snapshots. A better solution would be to agree on a gcbefore that all node would
+             * use, and we'll do that with CASSANDRA-4932.
+             * Note validation compaction includes all sstables, so we don't have the problem of purging
+             * a tombstone that could shadow a column in another sstable, but this is doubly not a concern
+             * since validation compaction is read-only.
+             */
+<span class="nc" id="L96">            return time -&gt; true;</span>
+        }
+    }
+
+    public static long getDefaultGcBefore(ColumnFamilyStore cfs, long nowInSec)
+    {
+        // 2ndary indexes have ExpiringColumns too, so we need to purge tombstones deleted before now. We do not need to
+        // add any GcGrace however since 2ndary indexes are local to a node.
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        return cfs.isIndex() ? nowInSec : cfs.gcBefore(nowInSec);</span>
+    }
+
+    private static class ValidationCompactionIterator extends CompactionIterator
+    {
+        public ValidationCompactionIterator(List&lt;ISSTableScanner&gt; scanners, ValidationCompactionController controller, long nowInSec, ActiveCompactionsTracker activeCompactions, TopPartitionTracker.Collector topPartitionCollector)
+        {
+<span class="fc" id="L111">            super(OperationType.VALIDATION, scanners, controller, nowInSec, nextTimeUUID(), activeCompactions, topPartitionCollector);</span>
+<span class="fc" id="L112">        }</span>
+    }
+
+    @VisibleForTesting
+    public static synchronized Refs&lt;SSTableReader&gt; getSSTablesToValidate(ColumnFamilyStore cfs, SharedContext ctx, Collection&lt;Range&lt;Token&gt;&gt; ranges, TimeUUID parentId, boolean isIncremental) throws NoSuchRepairSessionException
+    {
+        Refs&lt;SSTableReader&gt; sstables;
+
+<span class="fc" id="L120">        ActiveRepairService.ParentRepairSession prs = ctx.repair().getParentRepairSession(parentId);</span>
+
+<span class="fc" id="L122">        Set&lt;SSTableReader&gt; sstablesToValidate = new HashSet&lt;&gt;();</span>
+
+        com.google.common.base.Predicate&lt;SSTableReader&gt; predicate;
+<span class="fc bfc" id="L125" title="All 2 branches covered.">        if (prs.isPreview())</span>
+        {
+<span class="fc" id="L127">            predicate = prs.previewKind.predicate();</span>
+        }
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        else if (isIncremental)</span>
+        {
+<span class="fc" id="L131">            predicate = s -&gt; parentId.equals(s.getSSTableMetadata().pendingRepair);</span>
+        }
+        else
+        {
+            // note that we always grab all existing sstables for this - if we were to just grab the ones that
+            // were marked as repairing, we would miss any ranges that were compacted away and this would cause us to overstream
+<span class="fc bfc" id="L137" title="All 4 branches covered.">            predicate = (s) -&gt; !prs.isIncremental || !s.isRepaired();</span>
+        }
+
+<span class="fc" id="L140">        try (ColumnFamilyStore.RefViewFragment sstableCandidates = cfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL)))</span>
+        {
+<span class="fc bfc" id="L142" title="All 2 branches covered.">            for (SSTableReader sstable : sstableCandidates.sstables)</span>
+            {
+<span class="pc bpc" id="L144" title="1 of 4 branches missed.">                if (new Bounds&lt;&gt;(sstable.getFirst().getToken(), sstable.getLast().getToken()).intersects(ranges) &amp;&amp; predicate.apply(sstable))</span>
+                {
+<span class="fc" id="L146">                    sstablesToValidate.add(sstable);</span>
+                }
+<span class="fc" id="L148">            }</span>
+
+<span class="fc" id="L150">            sstables = Refs.tryRef(sstablesToValidate);</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">            if (sstables == null)</span>
+            {
+<span class="nc" id="L153">                logger.error(&quot;Could not reference sstables for {}&quot;, parentId);</span>
+<span class="nc" id="L154">                throw new RuntimeException(&quot;Could not reference sstables&quot;);</span>
+            }
+        }
+
+<span class="fc" id="L158">        return sstables;</span>
+    }
+
+    private final ColumnFamilyStore cfs;
+    private final SharedContext ctx;
+    private final Refs&lt;SSTableReader&gt; sstables;
+    private final String snapshotName;
+    private final boolean isGlobalSnapshotValidation;
+
+    private final boolean isSnapshotValidation;
+    private final AbstractCompactionStrategy.ScannerList scanners;
+    private final ValidationCompactionController controller;
+
+    private final CompactionIterator ci;
+
+    private final long estimatedBytes;
+    private final long estimatedPartitions;
+    private final Map&lt;Range&lt;Token&gt;, Long&gt; rangePartitionCounts;
+
+    public CassandraValidationIterator(ColumnFamilyStore cfs, SharedContext ctx, Collection&lt;Range&lt;Token&gt;&gt; ranges, TimeUUID parentId, TimeUUID sessionID, boolean isIncremental, long nowInSec, TopPartitionTracker.Collector topPartitionCollector) throws IOException, NoSuchRepairSessionException
+<span class="fc" id="L178">    {</span>
+<span class="fc" id="L179">        this.cfs = cfs;</span>
+<span class="fc" id="L180">        this.ctx = ctx;</span>
+
+<span class="fc" id="L182">        isGlobalSnapshotValidation = cfs.snapshotExists(parentId.toString());</span>
+<span class="fc bfc" id="L183" title="All 2 branches covered.">        if (isGlobalSnapshotValidation)</span>
+<span class="fc" id="L184">            snapshotName = parentId.toString();</span>
+        else
+<span class="fc" id="L186">            snapshotName = sessionID.toString();</span>
+<span class="fc" id="L187">        isSnapshotValidation = cfs.snapshotExists(snapshotName);</span>
+
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        if (isSnapshotValidation)</span>
+        {
+            // If there is a snapshot created for the session then read from there.
+            // note that we populate the parent repair session when creating the snapshot, meaning the sstables in the snapshot are the ones we
+            // are supposed to validate.
+<span class="fc" id="L194">            sstables = cfs.getSnapshotSSTableReaders(snapshotName);</span>
+        }
+        else
+        {
+<span class="fc bfc" id="L198" title="All 2 branches covered.">            if (!isIncremental)</span>
+            {
+                // flush first so everyone is validating data that is as similar as possible
+<span class="fc" id="L201">                cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.VALIDATION);</span>
+                // Note: we also flush for incremental repair during the anti-compaction process.
+            }
+<span class="fc" id="L204">            sstables = getSSTablesToValidate(cfs, ctx, ranges, parentId, isIncremental);</span>
+        }
+
+        // Persistent memtables will not flush or snapshot to sstables, make an sstable with their data.
+<span class="fc" id="L208">        cfs.writeAndAddMemtableRanges(parentId,</span>
+<span class="nc" id="L209">                                      () -&gt; Collections2.transform(Range.normalize(ranges), Range::makeRowRange),</span>
+                                      sstables);
+
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">        Preconditions.checkArgument(sstables != null);</span>
+
+<span class="fc" id="L214">        ActiveRepairService.ParentRepairSession prs = ctx.repair().getParentRepairSession(parentId);</span>
+<span class="fc" id="L215">        logger.info(&quot;{}, parentSessionId={}: Performing validation compaction on {} sstables in {}.{}&quot;,</span>
+<span class="fc" id="L216">                    prs.previewKind.logPrefix(sessionID),</span>
+                    parentId,
+<span class="fc" id="L218">                    sstables.size(),</span>
+<span class="fc" id="L219">                    cfs.getKeyspaceName(),</span>
+<span class="fc" id="L220">                    cfs.getTableName());</span>
+
+<span class="fc" id="L222">        controller = new ValidationCompactionController(cfs, getDefaultGcBefore(cfs, nowInSec));</span>
+<span class="fc" id="L223">        scanners = cfs.getCompactionStrategyManager().getScanners(sstables, ranges);</span>
+<span class="fc" id="L224">        ci = new ValidationCompactionIterator(scanners.scanners, controller, nowInSec, CompactionManager.instance.active, topPartitionCollector);</span>
+
+<span class="fc" id="L226">        long allPartitions = 0;</span>
+<span class="fc" id="L227">        rangePartitionCounts = Maps.newHashMapWithExpectedSize(ranges.size());</span>
+<span class="fc bfc" id="L228" title="All 2 branches covered.">        for (Range&lt;Token&gt; range : ranges)</span>
+        {
+<span class="fc" id="L230">            long numPartitions = 0;</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">            for (SSTableReader sstable : sstables)</span>
+<span class="fc" id="L232">                numPartitions += sstable.estimatedKeysForRanges(Collections.singleton(range));</span>
+<span class="fc" id="L233">            rangePartitionCounts.put(range, numPartitions);</span>
+<span class="fc" id="L234">            allPartitions += numPartitions;</span>
+<span class="fc" id="L235">        }</span>
+<span class="fc" id="L236">        estimatedPartitions = allPartitions;</span>
+
+<span class="fc" id="L238">        long estimatedTotalBytes = 0;</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            for (SSTableReader.PartitionPositionBounds positionsForRanges : sstable.getPositionsForRanges(ranges))</span>
+<span class="fc" id="L242">                estimatedTotalBytes += positionsForRanges.upperPosition - positionsForRanges.lowerPosition;</span>
+<span class="fc" id="L243">        }</span>
+<span class="fc" id="L244">        estimatedBytes = estimatedTotalBytes;</span>
+<span class="fc" id="L245">    }</span>
+
+    @Override
+    public long getBytesRead()
+    {
+<span class="fc" id="L250">        return ci.getBytesRead();</span>
+    }
+
+    @Override
+    public void close()
+    {
+        // TODO: can any of this fail and leave stuff unreleased?
+<span class="fc" id="L257">        super.close();</span>
+
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">        if (ci != null)</span>
+<span class="fc" id="L260">            ci.close();</span>
+
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">        if (scanners != null)</span>
+<span class="fc" id="L263">            scanners.close();</span>
+
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">        if (controller != null)</span>
+<span class="fc" id="L266">            controller.close();</span>
+
+<span class="pc bpc" id="L268" title="1 of 4 branches missed.">        if (isSnapshotValidation &amp;&amp; !isGlobalSnapshotValidation)</span>
+        {
+            // we can only clear the snapshot if we are not doing a global snapshot validation (we then clear it once anticompaction
+            // is done).
+<span class="nc" id="L272">            cfs.clearSnapshot(snapshotName);</span>
+        }
+
+<span class="pc bpc" id="L275" title="1 of 2 branches missed.">        if (sstables != null)</span>
+<span class="fc" id="L276">            sstables.release();</span>
+<span class="fc" id="L277">    }</span>
+
+    @Override
+    public TableMetadata metadata()
+    {
+<span class="nc" id="L282">        return cfs.metadata.get();</span>
+    }
+
+    @Override
+    public boolean hasNext()
+    {
+<span class="fc" id="L288">        return ci.hasNext();</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator next()
+    {
+<span class="fc" id="L294">        return ci.next();</span>
+    }
+
+    @Override
+    public long getEstimatedBytes()
+    {
+<span class="fc" id="L300">        return estimatedBytes;</span>
+    }
+
+    @Override
+    public long estimatedPartitions()
+    {
+<span class="fc" id="L306">        return estimatedPartitions;</span>
+    }
+
+    @Override
+    public Map&lt;Range&lt;Token&gt;, Long&gt; getRangePartitionCounts()
+    {
+<span class="fc" id="L312">        return rangePartitionCounts;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,824 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SimpleClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">SimpleClient.java</span></div><h1>SimpleClient.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.transport;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Ints;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
+import org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import io.netty.handler.codec.MessageToMessageEncoder;
+import io.netty.handler.ssl.SslContext;
+import io.netty.util.concurrent.Promise; // checkstyle: permit this import
+import io.netty.util.concurrent.PromiseCombiner;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.security.ISslContextFactory;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.transport.messages.*;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.net.SocketFactory.newSslHandler;
+import static org.apache.cassandra.transport.CQLMessageHandler.envelopeSize;
+import static org.apache.cassandra.transport.Flusher.MAX_FRAMED_PAYLOAD_SIZE;
+import static org.apache.cassandra.transport.PipelineConfigurator.SSL_FACTORY_CONTEXT_DESCRIPTION;
+import static org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter.NO_OP_LIMITER;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
+
+public class SimpleClient implements Closeable
+{
+
+    public static final int TIMEOUT_SECONDS = 10;
+
+    static
+    {
+<span class="nc" id="L71">        InternalLoggerFactory.setDefaultFactory(new Slf4JLoggerFactory());</span>
+    }
+
+<span class="nc" id="L74">    private static final Logger logger = LoggerFactory.getLogger(SimpleClient.class);</span>
+
+    public final String host;
+    public final int port;
+    private final EncryptionOptions encryptionOptions;
+    private final int largeMessageThreshold;
+
+<span class="nc" id="L81">    protected final ResponseHandler responseHandler = new ResponseHandler();</span>
+<span class="nc" id="L82">    protected final Connection.Tracker tracker = new ConnectionTracker();</span>
+    protected final ProtocolVersion version;
+    // We don't track connection really, so we don't need one Connection per channel
+    protected Connection connection;
+    protected Bootstrap bootstrap;
+    protected Channel channel;
+    protected ChannelFuture lastWriteFuture;
+
+    protected String compression;
+
+    public static class Builder
+    {
+        private final String host;
+        private final int port;
+<span class="nc" id="L96">        private EncryptionOptions encryptionOptions = new EncryptionOptions();</span>
+<span class="nc" id="L97">        private ProtocolVersion version = ProtocolVersion.CURRENT;</span>
+<span class="nc" id="L98">        private boolean useBeta = false;</span>
+<span class="nc" id="L99">        private int largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE;</span>
+
+        private Builder(String host, int port)
+<span class="nc" id="L102">        {</span>
+<span class="nc" id="L103">            this.host = host;</span>
+<span class="nc" id="L104">            this.port = port;</span>
+<span class="nc" id="L105">        }</span>
+
+        public Builder encryption(EncryptionOptions options)
+        {
+<span class="nc" id="L109">            this.encryptionOptions = options;</span>
+<span class="nc" id="L110">            return this;</span>
+        }
+
+        public Builder useBeta()
+        {
+<span class="nc" id="L115">            this.useBeta = true;</span>
+<span class="nc" id="L116">            return this;</span>
+        }
+
+        public Builder protocolVersion(ProtocolVersion version)
+        {
+<span class="nc" id="L121">            this.version = version;</span>
+<span class="nc" id="L122">            return this;</span>
+        }
+
+        public Builder largeMessageThreshold(int bytes)
+        {
+<span class="nc" id="L127">            largeMessageThreshold = bytes;</span>
+<span class="nc" id="L128">            return this;</span>
+        }
+
+        public SimpleClient build()
+        {
+<span class="nc bnc" id="L133" title="All 4 branches missed.">            if (version.isBeta() &amp;&amp; !useBeta)</span>
+<span class="nc" id="L134">                throw new IllegalArgumentException(String.format(&quot;Beta version of server used (%s), but USE_BETA flag is not set&quot;, version));</span>
+<span class="nc" id="L135">            return new SimpleClient(this);</span>
+        }
+    }
+
+    public static Builder builder(String host, int port)
+    {
+<span class="nc" id="L141">        return new Builder(host, port);</span>
+    }
+
+    private SimpleClient(Builder builder)
+<span class="nc" id="L145">    {</span>
+<span class="nc" id="L146">        this.host = builder.host;</span>
+<span class="nc" id="L147">        this.port = builder.port;</span>
+<span class="nc" id="L148">        this.version = builder.version;</span>
+<span class="nc" id="L149">        this.encryptionOptions = builder.encryptionOptions.applyConfig();</span>
+<span class="nc" id="L150">        this.largeMessageThreshold = builder.largeMessageThreshold;</span>
+<span class="nc" id="L151">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version, EncryptionOptions encryptionOptions)
+    {
+<span class="nc" id="L155">        this(host, port, version, false, encryptionOptions);</span>
+<span class="nc" id="L156">    }</span>
+
+    public SimpleClient(String host, int port, EncryptionOptions encryptionOptions)
+    {
+<span class="nc" id="L160">        this(host, port, ProtocolVersion.CURRENT, encryptionOptions);</span>
+<span class="nc" id="L161">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version)
+    {
+<span class="nc" id="L165">        this(host, port, version, new EncryptionOptions());</span>
+<span class="nc" id="L166">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version, boolean useBeta, EncryptionOptions encryptionOptions)
+<span class="nc" id="L169">    {</span>
+<span class="nc" id="L170">        this.host = host;</span>
+<span class="nc" id="L171">        this.port = port;</span>
+<span class="nc bnc" id="L172" title="All 4 branches missed.">        if (version.isBeta() &amp;&amp; !useBeta)</span>
+<span class="nc" id="L173">            throw new IllegalArgumentException(String.format(&quot;Beta version of server used (%s), but USE_BETA flag is not set&quot;, version));</span>
+
+<span class="nc" id="L175">        this.version = version;</span>
+<span class="nc" id="L176">        this.encryptionOptions = new EncryptionOptions(encryptionOptions).applyConfig();</span>
+<span class="nc" id="L177">        this.largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE -</span>
+<span class="nc" id="L178">                                        Math.max(FrameEncoderCrc.HEADER_AND_TRAILER_LENGTH,</span>
+                                                 FrameEncoderLZ4.HEADER_AND_TRAILER_LENGTH);
+<span class="nc" id="L180">    }</span>
+
+    public SimpleClient(String host, int port)
+    {
+<span class="nc" id="L184">        this(host, port, new EncryptionOptions());</span>
+<span class="nc" id="L185">    }</span>
+
+    public SimpleClient connect(boolean useCompression) throws IOException
+    {
+<span class="nc" id="L189">        return connect(useCompression, false);</span>
+    }
+
+    public SimpleClient connect(boolean useCompression, boolean throwOnOverload) throws IOException
+    {
+<span class="nc" id="L194">        establishConnection();</span>
+
+<span class="nc" id="L196">        Map&lt;String, String&gt; options = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L197">        options.put(StartupMessage.CQL_VERSION, &quot;3.0.0&quot;);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (throwOnOverload)</span>
+<span class="nc" id="L199">            options.put(StartupMessage.THROW_ON_OVERLOAD, &quot;1&quot;);</span>
+<span class="nc" id="L200">        connection.setThrowOnOverload(throwOnOverload);</span>
+
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (useCompression)</span>
+        {
+<span class="nc" id="L204">            options.put(StartupMessage.COMPRESSION, &quot;LZ4&quot;);</span>
+<span class="nc" id="L205">            connection.setCompressor(Compressor.LZ4Compressor.instance);</span>
+        }
+<span class="nc" id="L207">        execute(new StartupMessage(options));</span>
+
+<span class="nc" id="L209">        return this;</span>
+    }
+
+    public void setEventHandler(EventHandler eventHandler)
+    {
+<span class="nc" id="L214">        responseHandler.eventHandler = eventHandler;</span>
+<span class="nc" id="L215">    }</span>
+
+    @VisibleForTesting
+    void establishConnection() throws IOException
+    {
+        // Configure the client.
+<span class="nc" id="L221">        bootstrap = new Bootstrap()</span>
+<span class="nc" id="L222">                    .group(new NioEventLoopGroup(new NamedThreadFactory(&quot;SimpleClient-nioEventLoopGroup&quot;)))</span>
+<span class="nc" id="L223">                    .channel(io.netty.channel.socket.nio.NioSocketChannel.class)</span>
+<span class="nc" id="L224">                    .option(ChannelOption.TCP_NODELAY, true);</span>
+
+        // Configure the pipeline factory.
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        if(encryptionOptions.getEnabled())</span>
+        {
+<span class="nc" id="L229">            bootstrap.handler(new SecureInitializer(largeMessageThreshold));</span>
+        }
+        else
+        {
+<span class="nc" id="L233">            bootstrap.handler(new Initializer(largeMessageThreshold));</span>
+        }
+<span class="nc" id="L235">        ChannelFuture future = bootstrap.connect(new InetSocketAddress(host, port));</span>
+
+        // Wait until the connection attempt succeeds or fails.
+<span class="nc" id="L238">        channel = future.awaitUninterruptibly().channel();</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (!future.isSuccess())</span>
+        {
+<span class="nc" id="L241">            bootstrap.group().shutdownGracefully();</span>
+<span class="nc" id="L242">            throw new IOException(&quot;Connection Error&quot;, future.cause());</span>
+        }
+<span class="nc" id="L244">    }</span>
+
+    public ResultMessage execute(String query, ConsistencyLevel consistency)
+    {
+<span class="nc" id="L248">        return execute(query, Collections.&lt;ByteBuffer&gt;emptyList(), consistency);</span>
+    }
+
+    public ResultMessage execute(String query, List&lt;ByteBuffer&gt; values, ConsistencyLevel consistencyLevel)
+    {
+<span class="nc" id="L253">        Message.Response msg = execute(new QueryMessage(query, QueryOptions.forInternalCalls(consistencyLevel, values)));</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        assert msg instanceof ResultMessage;</span>
+<span class="nc" id="L255">        return (ResultMessage)msg;</span>
+    }
+
+    public ResultMessage.Prepared prepare(String query)
+    {
+<span class="nc" id="L260">        Message.Response msg = execute(new PrepareMessage(query, null));</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        assert msg instanceof ResultMessage.Prepared;</span>
+<span class="nc" id="L262">        return (ResultMessage.Prepared)msg;</span>
+    }
+
+    public ResultMessage executePrepared(ResultMessage.Prepared prepared, List&lt;ByteBuffer&gt; values, ConsistencyLevel consistency)
+    {
+<span class="nc" id="L267">        Message.Response msg = execute(new ExecuteMessage(prepared.statementId, prepared.resultMetadataId, QueryOptions.forInternalCalls(consistency, values)));</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        assert msg instanceof ResultMessage;</span>
+<span class="nc" id="L269">        return (ResultMessage)msg;</span>
+    }
+
+    public void close()
+    {
+        // Wait until all messages are flushed before closing the channel.
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (lastWriteFuture != null)</span>
+<span class="nc" id="L276">            lastWriteFuture.awaitUninterruptibly();</span>
+
+        // Close the connection.  Make sure the close operation ends because
+        // all I/O operations are asynchronous in Netty.
+<span class="nc" id="L280">        channel.close().awaitUninterruptibly();</span>
+
+        // Shut down all thread pools to exit.
+<span class="nc" id="L283">        bootstrap.group().shutdownGracefully();</span>
+<span class="nc" id="L284">    }</span>
+
+    public Message.Response execute(Message.Request request)
+    {
+<span class="nc" id="L288">        return execute(request, true);</span>
+    }
+
+    public Message.Response execute(Message.Request request, boolean throwOnErrorResponse)
+    {
+        try
+        {
+<span class="nc" id="L295">            request.attach(connection);</span>
+<span class="nc" id="L296">            lastWriteFuture = channel.writeAndFlush(Collections.singletonList(request));</span>
+<span class="nc" id="L297">            Message.Response msg = responseHandler.responses.poll(TIMEOUT_SECONDS, TimeUnit.SECONDS);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if (msg == null)</span>
+<span class="nc" id="L299">                throw new RuntimeException(&quot;timeout&quot;);</span>
+<span class="nc bnc" id="L300" title="All 4 branches missed.">            if (throwOnErrorResponse &amp;&amp; msg instanceof ErrorMessage)</span>
+<span class="nc" id="L301">                throw new RuntimeException((Throwable)((ErrorMessage)msg).error);</span>
+<span class="nc" id="L302">            return msg;</span>
+        }
+<span class="nc" id="L304">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L306">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    public Map&lt;Message.Request, Message.Response&gt; execute(List&lt;Message.Request&gt; requests)
+    {
+        try
+        {
+<span class="nc" id="L314">            Map&lt;Message.Request, Message.Response&gt; rrMap = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))</span>
+            {
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                for (int i = 0; i &lt; requests.size(); i++)</span>
+                {
+<span class="nc" id="L320">                    Message.Request message = requests.get(i);</span>
+<span class="nc" id="L321">                    message.setStreamId(i);</span>
+<span class="nc" id="L322">                    message.attach(connection);</span>
+                }
+<span class="nc" id="L324">                lastWriteFuture = channel.writeAndFlush(requests);</span>
+
+<span class="nc" id="L326">                long deadline = currentTimeMillis() + TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                for (int i = 0; i &lt; requests.size(); i++)</span>
+                {
+<span class="nc" id="L329">                    Message.Response msg = responseHandler.responses.poll(deadline - currentTimeMillis(), TimeUnit.MILLISECONDS);</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    if (msg == null)</span>
+<span class="nc" id="L331">                        throw new RuntimeException(&quot;timeout&quot;);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                    if (msg instanceof ErrorMessage)</span>
+<span class="nc" id="L333">                        throw new RuntimeException((Throwable) ((ErrorMessage) msg).error);</span>
+<span class="nc" id="L334">                    rrMap.put(requests.get(msg.getStreamId()), msg);</span>
+                }
+<span class="nc" id="L336">            }</span>
+            else
+            {
+                // V4 doesn't support batching
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                for (Message.Request request : requests)</span>
+<span class="nc" id="L341">                    rrMap.put(request, execute(request));</span>
+            }
+
+<span class="nc" id="L344">            return rrMap;</span>
+        }
+<span class="nc" id="L346">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L348">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    public interface EventHandler
+    {
+        void onEvent(Event event);
+    }
+
+<span class="nc" id="L357">    public static class SimpleEventHandler implements EventHandler</span>
+    {
+<span class="nc" id="L359">        public final BlockingQueue&lt;Event&gt; queue = newBlockingQueue();</span>
+
+        public void onEvent(Event event)
+        {
+<span class="nc" id="L363">            queue.add(event);</span>
+<span class="nc" id="L364">        }</span>
+    }
+
+    private static class ConnectionTracker implements Connection.Tracker
+    {
+<span class="nc" id="L369">        public void addConnection(Channel ch, Connection connection) {}</span>
+    }
+
+    private static class HandlerNames
+    {
+        private static final String ENVELOPE_DECODER        = &quot;envelopeDecoder&quot;;
+        private static final String ENVELOPE_ENCODER        = &quot;envelopeEncoder&quot;;
+        private static final String COMPRESSOR              = &quot;compressor&quot;;
+        private static final String DECOMPRESSOR            = &quot;decompressor&quot;;
+        private static final String MESSAGE_DECODER         = &quot;messageDecoder&quot;;
+        private static final String MESSAGE_ENCODER         = &quot;messageEncoder&quot;;
+
+        private static final String INITIAL_HANDLER         = &quot;intitialHandler&quot;;
+        private static final String RESPONSE_HANDLER        = &quot;responseHandler&quot;;
+
+        private static final String FRAME_DECODER           = &quot;frameDecoder&quot;;
+        private static final String FRAME_ENCODER           = &quot;frameEncoder&quot;;
+        private static final String PROCESSOR               = &quot;processor&quot;;
+    }
+
+    private static class InitialHandler extends MessageToMessageDecoder&lt;Envelope&gt;
+    {
+        final ProtocolVersion version;
+        final ResponseHandler responseHandler;
+        final int largeMessageThreshold;
+        InitialHandler(ProtocolVersion version, ResponseHandler responseHandler, int largeMessageThreshold)
+<span class="nc" id="L395">        {</span>
+<span class="nc" id="L396">            this.version = version;</span>
+<span class="nc" id="L397">            this.responseHandler = responseHandler;</span>
+<span class="nc" id="L398">            this.largeMessageThreshold = largeMessageThreshold;</span>
+<span class="nc" id="L399">        }</span>
+
+        protected void decode(ChannelHandlerContext ctx, Envelope response, List&lt;Object&gt; results)
+        {
+<span class="nc bnc" id="L403" title="All 3 branches missed.">            switch(response.header.type)</span>
+            {
+                case READY:
+                case AUTHENTICATE:
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                    if (response.header.version.isGreaterOrEqualTo(ProtocolVersion.V5))</span>
+                    {
+<span class="nc" id="L409">                        configureModernPipeline(ctx, response, largeMessageThreshold);</span>
+                        // consuming the message is done when setting up the pipeline
+                    }
+                    else
+                    {
+<span class="nc" id="L414">                        configureLegacyPipeline(ctx);</span>
+                        // really just removes self from the pipeline, so pass this message on
+<span class="nc" id="L416">                        ctx.pipeline().context(Envelope.Decoder.class).fireChannelRead(response);</span>
+                    }
+<span class="nc" id="L418">                    break;</span>
+                case SUPPORTED:
+                    // just pass through
+<span class="nc" id="L421">                    results.add(response);</span>
+<span class="nc" id="L422">                    break;</span>
+                default:
+<span class="nc" id="L424">                    throw new ProtocolException(String.format(&quot;Unexpected %s response expecting &quot; +</span>
+                                                              &quot;READY, AUTHENTICATE or SUPPORTED&quot;,
+                                                              response.header.type));
+            }
+<span class="nc" id="L428">        }</span>
+
+        private void configureModernPipeline(ChannelHandlerContext ctx, Envelope response, int largeMessageThreshold)
+        {
+<span class="nc" id="L432">            logger.info(&quot;Configuring modern pipeline&quot;);</span>
+<span class="nc" id="L433">            ChannelPipeline pipeline = ctx.pipeline();</span>
+<span class="nc" id="L434">            pipeline.remove(HandlerNames.ENVELOPE_DECODER);</span>
+<span class="nc" id="L435">            pipeline.remove(HandlerNames.MESSAGE_DECODER);</span>
+<span class="nc" id="L436">            pipeline.remove(HandlerNames.MESSAGE_ENCODER);</span>
+<span class="nc" id="L437">            pipeline.remove(HandlerNames.RESPONSE_HANDLER);</span>
+
+<span class="nc" id="L439">            BufferPoolAllocator allocator = GlobalBufferPoolAllocator.instance;</span>
+<span class="nc" id="L440">            Channel channel = ctx.channel();</span>
+<span class="nc" id="L441">            channel.config().setOption(ChannelOption.ALLOCATOR, allocator);</span>
+<span class="nc" id="L442">            int queueCapacity = 1 &lt;&lt; 20;  // 1MiB</span>
+
+<span class="nc" id="L444">            Envelope.Decoder envelopeDecoder = new Envelope.Decoder();</span>
+<span class="nc" id="L445">            Message.Decoder&lt;Message.Response&gt; messageDecoder = Message.responseDecoder();</span>
+<span class="nc" id="L446">            FrameDecoder frameDecoder = frameDecoder(ctx, allocator);</span>
+<span class="nc" id="L447">            FrameEncoder frameEncoder = frameEncoder(ctx);</span>
+<span class="nc" id="L448">            FrameEncoder.PayloadAllocator payloadAllocator = frameEncoder.allocator();</span>
+
+<span class="nc" id="L450">            CQLMessageHandler.MessageConsumer&lt;Message.Response&gt; responseConsumer = (c, message, converter, backpressured) -&gt; {</span>
+<span class="nc" id="L451">                responseHandler.handleResponse(c, message);</span>
+<span class="nc" id="L452">            };</span>
+
+<span class="nc" id="L454">            CQLMessageHandler.ErrorHandler errorHandler = (error) -&gt; {</span>
+<span class="nc" id="L455">                throw new RuntimeException(&quot;Unexpected error&quot;, error);</span>
+            };
+
+<span class="nc" id="L458">            ClientResourceLimits.ResourceProvider resources = new ClientResourceLimits.ResourceProvider()</span>
+<span class="nc" id="L459">            {</span>
+<span class="nc" id="L460">                final ResourceLimits.Limit endpointReserve = new ResourceLimits.Basic(1024 * 1024 * 64);</span>
+<span class="nc" id="L461">                final AbstractMessageHandler.WaitQueue endpointQueue = AbstractMessageHandler.WaitQueue.endpoint(endpointReserve);</span>
+
+<span class="nc" id="L463">                final ResourceLimits.Limit globalReserve = new ResourceLimits.Basic(1024 * 1024 * 64);</span>
+<span class="nc" id="L464">                final AbstractMessageHandler.WaitQueue globalQueue = AbstractMessageHandler.WaitQueue.global(endpointReserve);</span>
+
+                public ResourceLimits.Limit globalLimit()
+                {
+<span class="nc" id="L468">                    return globalReserve;</span>
+                }
+
+                public AbstractMessageHandler.WaitQueue globalWaitQueue()
+                {
+<span class="nc" id="L473">                    return globalQueue;</span>
+                }
+
+                public ResourceLimits.Limit endpointLimit()
+                {
+<span class="nc" id="L478">                    return endpointReserve;</span>
+                }
+
+                public AbstractMessageHandler.WaitQueue endpointWaitQueue()
+                {
+<span class="nc" id="L483">                    return endpointQueue;</span>
+                }
+
+                @Override
+                public NonBlockingRateLimiter requestRateLimiter()
+                {
+<span class="nc" id="L489">                    return NO_OP_LIMITER;</span>
+                }
+
+                public void release()
+                {
+<span class="nc" id="L494">                }</span>
+            };
+
+<span class="nc" id="L497">            CQLMessageHandler&lt;Message.Response&gt; processor =</span>
+<span class="nc" id="L498">                new CQLMessageHandler&lt;Message.Response&gt;(ctx.channel(),</span>
+                                        version,
+                                        frameDecoder,
+                                        envelopeDecoder,
+                                        messageDecoder,
+                                        responseConsumer,
+                                        payloadAllocator,
+                                        queueCapacity,
+                                        resources,
+<span class="nc" id="L507">                                        handler -&gt; {},</span>
+                                        errorHandler,
+<span class="nc" id="L509">                                        ctx.channel().attr(Connection.attributeKey).get().isThrowOnOverload())</span>
+<span class="nc" id="L510">                {</span>
+                    protected boolean processRequest(Envelope request)
+                    {
+<span class="nc" id="L513">                        boolean continueProcessing = super.processRequest(request);</span>
+<span class="nc" id="L514">                        releaseCapacity(Ints.checkedCast(request.header.bodySizeInBytes));</span>
+<span class="nc" id="L515">                        return continueProcessing;</span>
+                    }
+                };
+
+<span class="nc" id="L519">            pipeline.addLast(HandlerNames.FRAME_DECODER, frameDecoder);</span>
+<span class="nc" id="L520">            pipeline.addLast(HandlerNames.FRAME_ENCODER, frameEncoder);</span>
+<span class="nc" id="L521">            pipeline.addLast(HandlerNames.PROCESSOR, processor);</span>
+<span class="nc" id="L522">            pipeline.addLast(HandlerNames.MESSAGE_ENCODER, new ChannelOutboundHandlerAdapter() {</span>
+
+                public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception
+                {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                    if (!(msg instanceof List))</span>
+                    {
+<span class="nc" id="L528">                        ctx.write(msg, promise);</span>
+<span class="nc" id="L529">                        return;</span>
+                    }
+<span class="nc" id="L531">                    Connection connection = ctx.channel().attr(Connection.attributeKey).get();</span>
+                    // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
+<span class="nc bnc" id="L533" title="All 2 branches missed.">                    ProtocolVersion version = connection == null ? ProtocolVersion.CURRENT : connection.getVersion();</span>
+<span class="nc" id="L534">                    SimpleFlusher flusher = new SimpleFlusher(frameEncoder, largeMessageThreshold);</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">                    for (Message message : (List&lt;Message&gt;) msg)</span>
+<span class="nc" id="L536">                        flusher.enqueue(message.encode(version));</span>
+
+<span class="nc" id="L538">                    flusher.maybeWrite(ctx, promise);</span>
+<span class="nc" id="L539">                }</span>
+            });
+<span class="nc" id="L541">            pipeline.remove(this);</span>
+
+<span class="nc" id="L543">            Message.Response message = messageDecoder.decode(ctx.channel(), response);</span>
+<span class="nc" id="L544">            responseConsumer.accept(channel, message, (ch, req, resp) -&gt; null, Overload.NONE);</span>
+<span class="nc" id="L545">        }</span>
+
+        private FrameDecoder frameDecoder(ChannelHandlerContext ctx, BufferPoolAllocator allocator)
+        {
+<span class="nc" id="L549">            Connection conn = ctx.channel().attr(Connection.attributeKey).get();</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            if (conn.getCompressor() == null)</span>
+<span class="nc" id="L551">                return FrameDecoderCrc.create(allocator);</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            if (conn.getCompressor() instanceof Compressor.LZ4Compressor)</span>
+<span class="nc" id="L553">                return FrameDecoderLZ4.fast(allocator);</span>
+<span class="nc" id="L554">            throw new ProtocolException(&quot;Unsupported compressor: &quot; + conn.getCompressor().getClass().getCanonicalName());</span>
+        }
+
+        private FrameEncoder frameEncoder(ChannelHandlerContext ctx)
+        {
+<span class="nc" id="L559">            Connection conn = ctx.channel().attr(Connection.attributeKey).get();</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (conn.getCompressor() == null)</span>
+<span class="nc" id="L561">                return FrameEncoderCrc.instance;</span>
+<span class="nc bnc" id="L562" title="All 2 branches missed.">            if (conn.getCompressor() instanceof Compressor.LZ4Compressor)</span>
+<span class="nc" id="L563">                return FrameEncoderLZ4.fastInstance;</span>
+<span class="nc" id="L564">            throw new ProtocolException(&quot;Unsupported compressor: &quot; + conn.getCompressor().getClass().getCanonicalName());</span>
+        }
+
+        private void configureLegacyPipeline(ChannelHandlerContext ctx)
+        {
+<span class="nc" id="L569">            logger.info(&quot;Configuring legacy pipeline&quot;);</span>
+<span class="nc" id="L570">            ChannelPipeline pipeline = ctx.pipeline();</span>
+<span class="nc" id="L571">            pipeline.remove(this);</span>
+<span class="nc" id="L572">            pipeline.addAfter(HandlerNames.ENVELOPE_ENCODER, HandlerNames.DECOMPRESSOR, Envelope.Decompressor.instance);</span>
+<span class="nc" id="L573">            pipeline.addAfter(HandlerNames.DECOMPRESSOR, HandlerNames.COMPRESSOR, Envelope.Compressor.instance);</span>
+<span class="nc" id="L574">        }</span>
+    }
+
+    @ChannelHandler.Sharable
+     static class MessageBatchEncoder extends MessageToMessageEncoder&lt;List&lt;Message&gt;&gt;
+    {
+<span class="nc" id="L580">        public static final MessageBatchEncoder instance = new MessageBatchEncoder();</span>
+        private MessageBatchEncoder(){}
+
+        public void encode(ChannelHandlerContext ctx, List&lt;Message&gt; messages, List&lt;Object&gt; results)
+        {
+<span class="nc" id="L585">            Connection connection = ctx.channel().attr(Connection.attributeKey).get();</span>
+            // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            ProtocolVersion version = connection == null ? ProtocolVersion.CURRENT : connection.getVersion();</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">            assert messages.size() == 1;</span>
+<span class="nc" id="L589">            results.add(messages.get(0).encode(version));</span>
+<span class="nc" id="L590">        }</span>
+    }
+
+    private class Initializer extends ChannelInitializer&lt;Channel&gt;
+    {
+        private int largeMessageThreshold;
+        Initializer(int largeMessageThreshold)
+<span class="nc" id="L597">        {</span>
+<span class="nc" id="L598">            this.largeMessageThreshold = largeMessageThreshold;</span>
+<span class="nc" id="L599">        }</span>
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+<span class="nc" id="L603">            connection = new Connection(channel, version, tracker);</span>
+<span class="nc" id="L604">            channel.attr(Connection.attributeKey).set(connection);</span>
+
+<span class="nc" id="L606">            ChannelPipeline pipeline = channel.pipeline();</span>
+//            pipeline.addLast(&quot;debug&quot;, new LoggingHandler(LogLevel.INFO));
+<span class="nc" id="L608">            pipeline.addLast(HandlerNames.ENVELOPE_DECODER, new Envelope.Decoder());</span>
+<span class="nc" id="L609">            pipeline.addLast(HandlerNames.ENVELOPE_ENCODER, Envelope.Encoder.instance);</span>
+<span class="nc" id="L610">            pipeline.addLast(HandlerNames.INITIAL_HANDLER, new InitialHandler(version, responseHandler, largeMessageThreshold));</span>
+<span class="nc" id="L611">            pipeline.addLast(HandlerNames.MESSAGE_DECODER, PreV5Handlers.ProtocolDecoder.instance);</span>
+<span class="nc" id="L612">            pipeline.addLast(HandlerNames.MESSAGE_ENCODER, MessageBatchEncoder.instance);</span>
+<span class="nc" id="L613">            pipeline.addLast(HandlerNames.RESPONSE_HANDLER,  responseHandler);</span>
+<span class="nc" id="L614">        }</span>
+    }
+
+    private class SecureInitializer extends Initializer
+    {
+        SecureInitializer(int largeMessageThreshold)
+<span class="nc" id="L620">        {</span>
+<span class="nc" id="L621">            super(largeMessageThreshold);</span>
+<span class="nc" id="L622">        }</span>
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+<span class="nc" id="L626">            super.initChannel(channel);</span>
+<span class="nc" id="L627">            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.require_client_auth,</span>
+                                                                     ISslContextFactory.SocketType.CLIENT, SSL_FACTORY_CONTEXT_DESCRIPTION);
+<span class="nc bnc" id="L629" title="All 2 branches missed.">            InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? new InetSocketAddress(host, port) : null;</span>
+<span class="nc" id="L630">            channel.pipeline().addFirst(&quot;ssl&quot;, newSslHandler(channel, sslContext, peer));</span>
+<span class="nc" id="L631">        }</span>
+    }
+
+    @ChannelHandler.Sharable
+<span class="nc" id="L635">    static class ResponseHandler extends SimpleChannelInboundHandler&lt;Message.Response&gt;</span>
+    {
+<span class="nc" id="L637">        public final BlockingQueue&lt;Message.Response&gt; responses = new SynchronousQueue&lt;&gt;(true);</span>
+        public EventHandler eventHandler;
+
+        @Override
+        public void channelRead0(ChannelHandlerContext ctx, Message.Response r)
+        {
+<span class="nc" id="L643">            handleResponse(ctx.channel(), r);</span>
+<span class="nc" id="L644">        }</span>
+
+        public void handleResponse(Channel channel, Message.Response r)
+        {
+            try
+            {
+<span class="nc" id="L650">                Envelope cloned = r.getSource().clone();</span>
+<span class="nc" id="L651">                r.getSource().release();</span>
+<span class="nc" id="L652">                r.setSource(cloned);</span>
+
+<span class="nc bnc" id="L654" title="All 2 branches missed.">                if (r instanceof EventMessage)</span>
+                {
+<span class="nc bnc" id="L656" title="All 2 branches missed.">                    if (eventHandler != null)</span>
+<span class="nc" id="L657">                        eventHandler.onEvent(((EventMessage) r).event);</span>
+                }
+                else
+<span class="nc" id="L660">                    responses.put(r);</span>
+            }
+<span class="nc" id="L662">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L664">                throw new UncheckedInterruptedException(e);</span>
+<span class="nc" id="L665">            }</span>
+<span class="nc" id="L666">        }</span>
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
+        {
+<span class="nc bnc" id="L671" title="All 2 branches missed.">            if (this == ctx.pipeline().last())</span>
+            {
+<span class="nc" id="L673">                logger.error(&quot;Exception in response&quot;, cause);</span>
+            }
+            else
+            {
+<span class="nc" id="L677">                ctx.fireExceptionCaught(cause);</span>
+            }
+<span class="nc" id="L679">        }</span>
+    }
+
+    // Simple stand-in for Flusher for use in test code. Writers push CQL messages onto a queue and
+    // this collates them into frames and flushes them to the channel.
+    // Can be either scheduled to run on an EventExecutor or fired manually. If calling maybeWrite manually,
+    // as SimpleClient itself does, the call must be made on the event loop.
+    public static class SimpleFlusher
+    {
+<span class="nc" id="L688">        private static final ChannelFuture[] EMPTY_FUTURES_ARRAY = new ChannelFuture[0];</span>
+<span class="nc" id="L689">        final Queue&lt;Envelope&gt; outbound = new ConcurrentLinkedQueue&lt;&gt;();</span>
+        final FrameEncoder frameEncoder;
+<span class="nc" id="L691">        private final AtomicBoolean scheduled = new AtomicBoolean(false);</span>
+        private final int largeMessageThreshold;
+
+        SimpleFlusher(FrameEncoder frameEncoder, int largeMessageThreshold)
+<span class="nc" id="L695">        {</span>
+<span class="nc" id="L696">            this.frameEncoder = frameEncoder;</span>
+<span class="nc" id="L697">            this.largeMessageThreshold = largeMessageThreshold;</span>
+<span class="nc" id="L698">        }</span>
+
+        SimpleFlusher(FrameEncoder frameEncoder)
+        {
+<span class="nc" id="L702">            this(frameEncoder, MAX_FRAMED_PAYLOAD_SIZE);</span>
+<span class="nc" id="L703">        }</span>
+
+        public void enqueue(Envelope message)
+        {
+<span class="nc" id="L707">            outbound.offer(message);</span>
+<span class="nc" id="L708">        }</span>
+
+        public void releaseAll()
+        {
+            Envelope e;
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            while ((e = outbound.poll()) != null)</span>
+<span class="nc" id="L714">                e.release();</span>
+<span class="nc" id="L715">        }</span>
+
+        public void schedule(ChannelHandlerContext ctx)
+        {
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (scheduled.compareAndSet(false, true))</span>
+<span class="nc" id="L720">                ctx.executor().scheduleAtFixedRate(() -&gt; maybeWrite(ctx, ctx.voidPromise()),</span>
+                                                   10, 10, TimeUnit.MILLISECONDS);
+<span class="nc" id="L722">        }</span>
+
+        public void maybeWrite(ChannelHandlerContext ctx, Promise&lt;Void&gt; promise)
+        {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (outbound.isEmpty())</span>
+            {
+<span class="nc" id="L728">                promise.setSuccess(null);</span>
+<span class="nc" id="L729">                return;</span>
+            }
+
+<span class="nc" id="L732">            PromiseCombiner combiner = new PromiseCombiner(ctx.executor());</span>
+<span class="nc" id="L733">            List&lt;Envelope&gt; buffer = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L734">            long bufferSize = 0L;</span>
+<span class="nc" id="L735">            boolean pending = false;</span>
+            Envelope f;
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            while ((f = outbound.poll()) != null)</span>
+            {
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                if (f.header.bodySizeInBytes &gt; largeMessageThreshold)</span>
+                {
+<span class="nc" id="L741">                    combiner.addAll(writeLargeMessage(ctx, f));</span>
+                }
+                else
+                {
+<span class="nc" id="L745">                    int messageSize = envelopeSize(f.header);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                    if (bufferSize + messageSize &gt;= largeMessageThreshold)</span>
+                    {
+<span class="nc" id="L748">                        combiner.add(flushBuffer(ctx, buffer, bufferSize));</span>
+<span class="nc" id="L749">                        buffer = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L750">                        bufferSize = 0;</span>
+                    }
+<span class="nc" id="L752">                    buffer.add(f);</span>
+<span class="nc" id="L753">                    bufferSize += messageSize;</span>
+<span class="nc" id="L754">                    pending = true;</span>
+<span class="nc" id="L755">                }</span>
+            }
+
+<span class="nc bnc" id="L758" title="All 2 branches missed.">            if (pending)</span>
+<span class="nc" id="L759">                combiner.add(flushBuffer(ctx, buffer, bufferSize));</span>
+<span class="nc" id="L760">            combiner.finish(promise);</span>
+<span class="nc" id="L761">        }</span>
+
+        private ChannelFuture flushBuffer(ChannelHandlerContext ctx, List&lt;Envelope&gt; messages, long bufferSize)
+        {
+<span class="nc" id="L765">            FrameEncoder.Payload payload = allocate(Ints.checkedCast(bufferSize), true);</span>
+
+<span class="nc bnc" id="L767" title="All 2 branches missed.">            for (Envelope e : messages)</span>
+<span class="nc" id="L768">                e.encodeInto(payload.buffer);</span>
+
+<span class="nc" id="L770">            payload.finish();</span>
+<span class="nc" id="L771">            ChannelPromise release = AsyncChannelPromise.withListener(ctx, future -&gt; {</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">                for (Envelope e : messages)</span>
+<span class="nc" id="L773">                    e.release();</span>
+<span class="nc" id="L774">            });</span>
+<span class="nc" id="L775">            return ctx.writeAndFlush(payload, release);</span>
+        }
+
+        private FrameEncoder.Payload allocate(int size, boolean selfContained)
+        {
+<span class="nc" id="L780">            FrameEncoder.Payload payload = frameEncoder.allocator()</span>
+<span class="nc" id="L781">                                                       .allocate(selfContained, Math.min(size, largeMessageThreshold));</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            if (size &gt;= largeMessageThreshold)</span>
+<span class="nc" id="L783">                payload.buffer.limit(largeMessageThreshold);</span>
+
+<span class="nc" id="L785">            return payload;</span>
+        }
+
+        private ChannelFuture[] writeLargeMessage(ChannelHandlerContext ctx, Envelope f)
+        {
+<span class="nc" id="L790">            List&lt;ChannelFuture&gt; futures = new ArrayList&lt;&gt;();</span>
+            FrameEncoder.Payload payload;
+            ByteBuffer buf;
+<span class="nc" id="L793">            boolean firstFrame = true;</span>
+<span class="nc bnc" id="L794" title="All 4 branches missed.">            while (f.body.readableBytes() &gt; 0 || firstFrame)</span>
+            {
+<span class="nc" id="L796">                int payloadSize = Math.min(f.body.readableBytes(), largeMessageThreshold);</span>
+<span class="nc" id="L797">                payload = allocate(f.body.readableBytes(), false);</span>
+
+<span class="nc" id="L799">                buf = payload.buffer;</span>
+                // BufferPool may give us a buffer larger than we asked for.
+                // FrameEncoder may object if buffer.remaining is &gt;= MAX_SIZE.
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                if (payloadSize &gt;= largeMessageThreshold)</span>
+<span class="nc" id="L803">                    buf.limit(largeMessageThreshold);</span>
+
+<span class="nc bnc" id="L805" title="All 2 branches missed.">                if (firstFrame)</span>
+                {
+<span class="nc" id="L807">                    f.encodeHeaderInto(buf);</span>
+<span class="nc" id="L808">                    firstFrame = false;</span>
+                }
+
+<span class="nc" id="L811">                int remaining = Math.min(buf.remaining(), f.body.readableBytes());</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">                if (remaining &gt; 0)</span>
+<span class="nc" id="L813">                    buf.put(f.body.slice(f.body.readerIndex(), remaining).nioBuffer());</span>
+
+<span class="nc" id="L815">                f.body.readerIndex(f.body.readerIndex() + remaining);</span>
+<span class="nc" id="L816">                payload.finish();</span>
+<span class="nc" id="L817">                futures.add(ctx.writeAndFlush(payload, ctx.newPromise()));</span>
+<span class="nc" id="L818">            }</span>
+<span class="nc" id="L819">            f.release();</span>
+<span class="nc" id="L820">            return futures.toArray(EMPTY_FUTURES_ARRAY);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,545 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeFetchMapCalculator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.dht</a> &gt; <span class="el_source">RangeFetchMapCalculator.java</span></div><h1>RangeFetchMapCalculator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.dht;
+
+import java.math.BigInteger;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+
+import org.apache.cassandra.locator.EndpointsByRange;
+import org.apache.cassandra.locator.EndpointsForRange;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.locator.Replicas;
+import org.psjava.algo.graph.flownetwork.FordFulkersonAlgorithm;
+import org.psjava.algo.graph.flownetwork.MaximumFlowAlgorithm;
+import org.psjava.algo.graph.flownetwork.MaximumFlowAlgorithmResult;
+import org.psjava.algo.graph.pathfinder.DFSPathFinder;
+import org.psjava.ds.graph.CapacityEdge;
+import org.psjava.ds.graph.MutableCapacityGraph;
+import org.psjava.ds.numbersystrem.IntegerNumberSystem;
+import org.psjava.ds.math.Function;
+
+/**
+ * We model the graph like this:
+ * * Each range we are about to stream is a vertex in the graph
+ * * Each node that can provide a range is a vertex in the graph
+ * * We add an edge from each range to the node that can provide the range
+ * * Then, to be able to solve the maximum flow problem using Ford-Fulkerson we add a super source with edges to all range vertices
+ *   and a super sink with incoming edges from all the node vertices.
+ * * The capacity on the edges between the super source and the range-vertices is 1
+ * * The capacity on the edges between the range-vertices and the node vertices is infinite
+ * * The capacity on the edges between the nodes-vertices and the super sink is ceil(#range-vertices/#node-vertices)
+ *   - if we have more machines than ranges to stream the capacity will be 1 (each machine will stream at most 1 range)
+ * * Since the sum of the capacity on the edges from the super source to the range-vertices is less or equal to the sum
+ *   of the capacities between the node-vertices and super sink we know that to get maximum flow we will use all the
+ *   range-vertices. (Say we have x ranges, y machines to provide them, total supersource -&gt; range-vertice capacity will be x,
+ *   total node-vertice -&gt; supersink capacity will be (y * ceil(x / y)) which worst case is x if x==y). The capacity between
+ *   the range-vertices and node-vertices is infinite.
+ * * Then we try to solve the max-flow problem using psjava
+ * * If we can't find a solution where the total flow is = number of range-vertices, we bump the capacity between the node-vertices
+ *   and the super source and try again.
+ *
+ *
+ */
+public class RangeFetchMapCalculator
+{
+<span class="nc" id="L76">    private static final Logger logger = LoggerFactory.getLogger(RangeFetchMapCalculator.class);</span>
+    private static final long TRIVIAL_RANGE_LIMIT = 1000;
+    private final EndpointsByRange rangesWithSources;
+    private final Predicate&lt;Replica&gt; sourceFilters;
+    private final String keyspace;
+    //We need two Vertices to act as source and destination in the algorithm
+<span class="nc" id="L82">    private final Vertex sourceVertex = OuterVertex.getSourceVertex();</span>
+<span class="nc" id="L83">    private final Vertex destinationVertex = OuterVertex.getDestinationVertex();</span>
+    private final Set&lt;Range&lt;Token&gt;&gt; trivialRanges;
+
+    public RangeFetchMapCalculator(EndpointsByRange rangesWithSources,
+                                   Collection&lt;RangeStreamer.SourceFilter&gt; sourceFilters,
+                                   String keyspace)
+<span class="nc" id="L89">    {</span>
+<span class="nc" id="L90">        this.rangesWithSources = rangesWithSources;</span>
+<span class="nc" id="L91">        this.sourceFilters = Predicates.and(sourceFilters);</span>
+<span class="nc" id="L92">        this.keyspace = keyspace;</span>
+<span class="nc" id="L93">        this.trivialRanges = rangesWithSources.keySet()</span>
+<span class="nc" id="L94">                                              .stream()</span>
+<span class="nc" id="L95">                                              .filter(RangeFetchMapCalculator::isTrivial)</span>
+<span class="nc" id="L96">                                              .collect(Collectors.toSet());</span>
+<span class="nc" id="L97">    }</span>
+
+    static boolean isTrivial(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L101">        IPartitioner partitioner = DatabaseDescriptor.getPartitioner();</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        if (partitioner.splitter().isPresent())</span>
+        {
+<span class="nc" id="L104">            BigInteger l = partitioner.splitter().get().valueForToken(range.left);</span>
+<span class="nc" id="L105">            BigInteger r = partitioner.splitter().get().valueForToken(range.right);</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">            if (r.compareTo(l) &lt;= 0)</span>
+<span class="nc" id="L107">                return false;</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (r.subtract(l).compareTo(BigInteger.valueOf(TRIVIAL_RANGE_LIMIT)) &lt; 0)</span>
+<span class="nc" id="L109">                return true;</span>
+        }
+<span class="nc" id="L111">        return false;</span>
+    }
+
+    public Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; getRangeFetchMap()
+    {
+<span class="nc" id="L116">        Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; fetchMap = HashMultimap.create();</span>
+<span class="nc" id="L117">        fetchMap.putAll(getRangeFetchMapForNonTrivialRanges());</span>
+<span class="nc" id="L118">        fetchMap.putAll(getRangeFetchMapForTrivialRanges(fetchMap));</span>
+<span class="nc" id="L119">        return fetchMap;</span>
+    }
+
+    @VisibleForTesting
+    Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; getRangeFetchMapForNonTrivialRanges()
+    {
+        //Get the graph with edges between ranges and their source endpoints
+<span class="nc" id="L126">        MutableCapacityGraph&lt;Vertex, Integer&gt; graph = getGraph();</span>
+        //Add source and destination vertex and edges
+<span class="nc" id="L128">        addSourceAndDestination(graph, getDestinationLinkCapacity(graph));</span>
+
+<span class="nc" id="L130">        int flow = 0;</span>
+<span class="nc" id="L131">        MaximumFlowAlgorithmResult&lt;Integer, CapacityEdge&lt;Vertex, Integer&gt;&gt; result = null;</span>
+
+        //We might not be working on all ranges
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        while (flow &lt; getTotalRangeVertices(graph))</span>
+        {
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            if (flow &gt; 0)</span>
+            {
+                //We could not find a path with previous graph. Bump the capacity b/w endpoint vertices and destination by 1
+<span class="nc" id="L139">                incrementCapacity(graph, 1);</span>
+            }
+
+<span class="nc" id="L142">            MaximumFlowAlgorithm fordFulkerson = FordFulkersonAlgorithm.getInstance(DFSPathFinder.getInstance());</span>
+<span class="nc" id="L143">            result = fordFulkerson.calc(graph, sourceVertex, destinationVertex, IntegerNumberSystem.getInstance());</span>
+
+<span class="nc" id="L145">            int newFlow = result.calcTotalFlow();</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            assert newFlow &gt; flow;   //We are not making progress which should not happen</span>
+<span class="nc" id="L147">            flow = newFlow;</span>
+<span class="nc" id="L148">        }</span>
+
+<span class="nc" id="L150">        return getRangeFetchMapFromGraphResult(graph, result);</span>
+    }
+
+    @VisibleForTesting
+    Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; getRangeFetchMapForTrivialRanges(Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; optimisedMap)
+    {
+<span class="nc" id="L156">        Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; fetchMap = HashMultimap.create();</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        for (Range&lt;Token&gt; trivialRange : trivialRanges)</span>
+        {
+<span class="nc" id="L159">            boolean added = false;</span>
+<span class="nc" id="L160">            boolean localDCCheck = true;</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            while (!added)</span>
+            {
+                // sort with the endpoint having the least number of streams first:
+<span class="nc" id="L164">                EndpointsForRange replicas = rangesWithSources.get(trivialRange)</span>
+<span class="nc" id="L165">                        .sorted(Comparator.comparingInt(o -&gt; optimisedMap.get(o.endpoint()).size()));</span>
+<span class="nc" id="L166">                Replicas.temporaryAssertFull(replicas);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                for (Replica replica : replicas)</span>
+                {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                    if (passFilters(replica, localDCCheck))</span>
+                    {
+<span class="nc" id="L171">                        added = true;</span>
+                        // if we pass filters, it means that we don't filter away localhost and we can count it as a source,
+                        // see RangeFetchMapCalculator#addEndpoints  and RangeStreamer#getRangeFetchMap
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                        if (replica.isSelf())</span>
+<span class="nc" id="L175">                            continue; // but don't add localhost to avoid streaming locally</span>
+<span class="nc" id="L176">                        fetchMap.put(replica.endpoint(), trivialRange);</span>
+<span class="nc" id="L177">                        break;</span>
+                    }
+<span class="nc" id="L179">                }</span>
+<span class="nc bnc" id="L180" title="All 4 branches missed.">                if (!added &amp;&amp; !localDCCheck)</span>
+<span class="nc" id="L181">                    throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + trivialRange + &quot; in keyspace &quot; + keyspace);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                if (!added)</span>
+<span class="nc" id="L183">                    logger.info(&quot;Using other DC endpoints for streaming for range: {} and keyspace {}&quot;, trivialRange, keyspace);</span>
+<span class="nc" id="L184">                localDCCheck = false;</span>
+<span class="nc" id="L185">            }</span>
+<span class="nc" id="L186">        }</span>
+<span class="nc" id="L187">        return fetchMap;</span>
+    }
+    /*
+        Return the total number of range vertices in the graph
+     */
+    private int getTotalRangeVertices(MutableCapacityGraph&lt;Vertex, Integer&gt; graph)
+    {
+<span class="nc" id="L194">        int count = 0;</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        for (Vertex vertex : graph.getVertices())</span>
+        {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (vertex.isRangeVertex())</span>
+            {
+<span class="nc" id="L199">                count++;</span>
+            }
+<span class="nc" id="L201">        }</span>
+
+<span class="nc" id="L203">        return count;</span>
+    }
+
+    /**
+     *  Convert the max flow graph to Multimap&lt;InetAddress, Range&lt;Token&gt;&gt;
+     *      We iterate over all range vertices and find an edge with flow of more than zero connecting to endpoint vertex.
+     * @param graph  The graph to convert
+     * @param result Flow algorithm result
+     * @return  Multi Map of Machine to Ranges
+     */
+    private Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; getRangeFetchMapFromGraphResult(MutableCapacityGraph&lt;Vertex, Integer&gt; graph, MaximumFlowAlgorithmResult&lt;Integer, CapacityEdge&lt;Vertex, Integer&gt;&gt; result)
+    {
+<span class="nc" id="L215">        final Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; rangeFetchMapMap = HashMultimap.create();</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if(result == null)</span>
+<span class="nc" id="L217">            return rangeFetchMapMap;</span>
+<span class="nc" id="L218">        final Function&lt;CapacityEdge&lt;Vertex, Integer&gt;, Integer&gt; flowFunction = result.calcFlowFunction();</span>
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (Vertex vertex : graph.getVertices())</span>
+        {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (vertex.isRangeVertex())</span>
+            {
+<span class="nc" id="L224">                boolean sourceFound = false;</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                for (CapacityEdge&lt;Vertex, Integer&gt; e : graph.getEdges(vertex))</span>
+                {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                    if(flowFunction.get(e) &gt; 0)</span>
+                    {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                        assert !sourceFound;</span>
+<span class="nc" id="L230">                        sourceFound = true;</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                        if(e.to().isEndpointVertex())</span>
+<span class="nc" id="L232">                            rangeFetchMapMap.put(((EndpointVertex)e.to()).getEndpoint(), ((RangeVertex)vertex).getRange());</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                        else if(e.from().isEndpointVertex())</span>
+<span class="nc" id="L234">                            rangeFetchMapMap.put(((EndpointVertex)e.from()).getEndpoint(), ((RangeVertex)vertex).getRange());</span>
+                    }
+<span class="nc" id="L236">                }</span>
+
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                assert sourceFound;</span>
+
+            }
+<span class="nc" id="L241">        }</span>
+
+<span class="nc" id="L243">        return rangeFetchMapMap;</span>
+    }
+
+    /**
+     * This will increase the capacity from endpoint vertices to destination by incrementalCapacity
+     * @param graph The graph to work on
+     * @param incrementalCapacity Amount by which to increment capacity
+     */
+    private void incrementCapacity(MutableCapacityGraph&lt;Vertex, Integer&gt; graph, int incrementalCapacity)
+    {
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        for (Vertex vertex : graph.getVertices())</span>
+        {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (vertex.isEndpointVertex())</span>
+            {
+<span class="nc" id="L257">                graph.addEdge(vertex, destinationVertex, incrementalCapacity);</span>
+            }
+<span class="nc" id="L259">        }</span>
+<span class="nc" id="L260">    }</span>
+
+    /**
+     * Add source and destination vertices. Add edges of capacity 1 b/w source and range vertices.
+     * Also add edges b/w endpoint vertices and destination vertex with capacity of 'destinationCapacity'
+     * @param graph Graph to work on
+     * @param destinationCapacity The capacity for edges b/w endpoint vertices and destination
+     */
+    private void addSourceAndDestination(MutableCapacityGraph&lt;Vertex, Integer&gt; graph, int destinationCapacity)
+    {
+<span class="nc" id="L270">        graph.insertVertex(sourceVertex);</span>
+<span class="nc" id="L271">        graph.insertVertex(destinationVertex);</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">        for (Vertex vertex : graph.getVertices())</span>
+        {
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            if (vertex.isRangeVertex())</span>
+            {
+<span class="nc" id="L276">                graph.addEdge(sourceVertex, vertex, 1);</span>
+            }
+<span class="nc bnc" id="L278" title="All 2 branches missed.">            else if (vertex.isEndpointVertex())</span>
+            {
+<span class="nc" id="L280">                graph.addEdge(vertex, destinationVertex, destinationCapacity);</span>
+            }
+<span class="nc" id="L282">        }</span>
+<span class="nc" id="L283">    }</span>
+
+    /**
+     * Find the initial capacity which we want to use b/w machine vertices and destination to keep things optimal
+     * @param graph Graph to work on
+     * @return  The initial capacity
+     */
+    private int getDestinationLinkCapacity(MutableCapacityGraph&lt;Vertex, Integer&gt; graph)
+    {
+        //Find total nodes which are endpoints and ranges
+<span class="nc" id="L293">        double endpointVertices = 0;</span>
+<span class="nc" id="L294">        double rangeVertices = 0;</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        for (Vertex vertex : graph.getVertices())</span>
+        {
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            if (vertex.isEndpointVertex())</span>
+            {
+<span class="nc" id="L299">                endpointVertices++;</span>
+            }
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            else if (vertex.isRangeVertex())</span>
+            {
+<span class="nc" id="L303">                rangeVertices++;</span>
+            }
+<span class="nc" id="L305">        }</span>
+
+<span class="nc" id="L307">        return (int) Math.ceil(rangeVertices / endpointVertices);</span>
+    }
+
+    /**
+     *  Generate a graph with all ranges and endpoints as vertices. It will create edges b/w a range and its filtered source endpoints
+     *  It will try to use sources from local DC if possible
+     * @return  The generated graph
+     */
+    private MutableCapacityGraph&lt;Vertex, Integer&gt; getGraph()
+    {
+<span class="nc" id="L317">        MutableCapacityGraph&lt;Vertex, Integer&gt; capacityGraph = MutableCapacityGraph.create();</span>
+
+        //Connect all ranges with all source endpoints
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : rangesWithSources.keySet())</span>
+        {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (trivialRanges.contains(range))</span>
+            {
+<span class="nc" id="L324">                logger.debug(&quot;Not optimising trivial range {} for keyspace {}&quot;, range, keyspace);</span>
+<span class="nc" id="L325">                continue;</span>
+            }
+
+<span class="nc" id="L328">            final RangeVertex rangeVertex = new RangeVertex(range);</span>
+
+            //Try to only add source endpoints from same DC
+<span class="nc" id="L331">            boolean sourceFound = addEndpoints(capacityGraph, rangeVertex, true);</span>
+
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (!sourceFound)</span>
+            {
+<span class="nc" id="L335">                logger.info(&quot;Using other DC endpoints for streaming for range: {} and keyspace {}&quot;, range, keyspace);</span>
+<span class="nc" id="L336">                sourceFound = addEndpoints(capacityGraph, rangeVertex, false);</span>
+            }
+
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (!sourceFound)</span>
+<span class="nc" id="L340">                throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + range + &quot; in keyspace &quot; + keyspace);</span>
+
+<span class="nc" id="L342">        }</span>
+
+<span class="nc" id="L344">        return capacityGraph;</span>
+    }
+
+    /**
+     * Create edges with infinite capacity b/w range vertex and all its source endpoints which clear the filters
+     * @param capacityGraph The Capacity graph on which changes are made
+     * @param rangeVertex The range for which we need to add all its source endpoints
+     * @param localDCCheck Should add source endpoints from local DC only
+     * @return If we were able to add atleast one source for this range after applying filters to endpoints
+     */
+    private boolean addEndpoints(MutableCapacityGraph&lt;Vertex, Integer&gt; capacityGraph, RangeVertex rangeVertex, boolean localDCCheck)
+    {
+<span class="nc" id="L356">        boolean sourceFound = false;</span>
+<span class="nc" id="L357">        Replicas.temporaryAssertFull(rangesWithSources.get(rangeVertex.getRange()));</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        for (Replica replica : rangesWithSources.get(rangeVertex.getRange()))</span>
+        {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            if (passFilters(replica, localDCCheck))</span>
+            {
+<span class="nc" id="L362">                sourceFound = true;</span>
+                // if we pass filters, it means that we don't filter away localhost and we can count it as a source:
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                if (replica.isSelf())</span>
+<span class="nc" id="L365">                    continue; // but don't add localhost to the graph to avoid streaming locally</span>
+<span class="nc" id="L366">                final Vertex endpointVertex = new EndpointVertex(replica.endpoint());</span>
+<span class="nc" id="L367">                capacityGraph.insertVertex(rangeVertex);</span>
+<span class="nc" id="L368">                capacityGraph.insertVertex(endpointVertex);</span>
+<span class="nc" id="L369">                capacityGraph.addEdge(rangeVertex, endpointVertex, Integer.MAX_VALUE);</span>
+            }
+<span class="nc" id="L371">        }</span>
+<span class="nc" id="L372">        return sourceFound;</span>
+    }
+
+    private boolean isInLocalDC(Replica replica)
+    {
+<span class="nc" id="L377">        return DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(replica));</span>
+    }
+
+    /**
+     *
+     * @param replica   Replica to check
+     * @param localDCCheck Allow endpoints with local DC
+     * @return   True if filters pass this endpoint
+     */
+    private boolean passFilters(final Replica replica, boolean localDCCheck)
+    {
+<span class="nc bnc" id="L388" title="All 6 branches missed.">        return sourceFilters.apply(replica) &amp;&amp; (!localDCCheck || isInLocalDC(replica));</span>
+    }
+
+    private static abstract class Vertex
+    {
+<span class="nc" id="L393">        public enum VERTEX_TYPE</span>
+        {
+<span class="nc" id="L395">            ENDPOINT, RANGE, SOURCE, DESTINATION</span>
+        }
+
+        public abstract VERTEX_TYPE getVertexType();
+
+        public boolean isEndpointVertex()
+        {
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            return getVertexType() == VERTEX_TYPE.ENDPOINT;</span>
+        }
+
+        public boolean isRangeVertex()
+        {
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            return getVertexType() == VERTEX_TYPE.RANGE;</span>
+        }
+    }
+
+    /*
+       This Vertex will contain the endpoints.
+     */
+<span class="nc" id="L414">    private static class EndpointVertex extends Vertex</span>
+    {
+        private final InetAddressAndPort endpoint;
+
+        public EndpointVertex(InetAddressAndPort endpoint)
+<span class="nc" id="L419">        {</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            assert endpoint != null;</span>
+<span class="nc" id="L421">            this.endpoint = endpoint;</span>
+<span class="nc" id="L422">        }</span>
+
+        public InetAddressAndPort getEndpoint()
+        {
+<span class="nc" id="L426">            return endpoint;</span>
+        }
+
+
+        @Override
+        public VERTEX_TYPE getVertexType()
+        {
+<span class="nc" id="L433">            return VERTEX_TYPE.ENDPOINT;</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L440" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L442">            EndpointVertex that = (EndpointVertex) o;</span>
+
+<span class="nc" id="L444">            return endpoint.equals(that.endpoint);</span>
+
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L451">            return endpoint.hashCode();</span>
+        }
+    }
+
+    /*
+       This Vertex will contain the Range
+     */
+<span class="nc" id="L458">    private static class RangeVertex extends Vertex</span>
+    {
+        private final Range&lt;Token&gt; range;
+
+        public RangeVertex(Range&lt;Token&gt; range)
+<span class="nc" id="L463">        {</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">            assert range != null;</span>
+<span class="nc" id="L465">            this.range = range;</span>
+<span class="nc" id="L466">        }</span>
+
+        public Range&lt;Token&gt; getRange()
+        {
+<span class="nc" id="L470">            return range;</span>
+        }
+
+        @Override
+        public VERTEX_TYPE getVertexType()
+        {
+<span class="nc" id="L476">            return VERTEX_TYPE.RANGE;</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L482" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L483" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L485">            RangeVertex that = (RangeVertex) o;</span>
+
+<span class="nc" id="L487">            return range.equals(that.range);</span>
+
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L494">            return range.hashCode();</span>
+        }
+    }
+
+    /*
+       This denotes the source and destination Vertex we need for the flow graph
+     */
+    private static class OuterVertex extends Vertex
+    {
+        private final boolean source;
+
+        private OuterVertex(boolean source)
+<span class="nc" id="L506">        {</span>
+<span class="nc" id="L507">            this.source = source;</span>
+<span class="nc" id="L508">        }</span>
+
+        public static Vertex getSourceVertex()
+        {
+<span class="nc" id="L512">            return new OuterVertex(true);</span>
+        }
+
+        public static Vertex getDestinationVertex()
+        {
+<span class="nc" id="L517">            return new OuterVertex(false);</span>
+        }
+
+        @Override
+        public VERTEX_TYPE getVertexType()
+        {
+<span class="nc bnc" id="L523" title="All 2 branches missed.">            return source? VERTEX_TYPE.SOURCE : VERTEX_TYPE.DESTINATION;</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L530" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L532">            OuterVertex that = (OuterVertex) o;</span>
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">            return source == that.source;</span>
+
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">            return (source ? 1 : 0);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

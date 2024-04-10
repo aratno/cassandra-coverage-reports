@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ValidationManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">ValidationManager.java</span></div><h1>ValidationManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.repair;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.metrics.TopPartitionTracker;
+import org.apache.cassandra.repair.state.ValidationState;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MerkleTree;
+import org.apache.cassandra.utils.MerkleTrees;
+
+public class ValidationManager implements IValidationManager
+{
+<span class="fc" id="L47">    private static final Logger logger = LoggerFactory.getLogger(ValidationManager.class);</span>
+
+<span class="fc" id="L49">    public static final ValidationManager instance = new ValidationManager();</span>
+
+    private ValidationManager() {}
+
+    private static MerkleTrees createMerkleTrees(ValidationPartitionIterator validationIterator, Collection&lt;Range&lt;Token&gt;&gt; ranges, ColumnFamilyStore cfs)
+    {
+<span class="fc" id="L55">        MerkleTrees trees = new MerkleTrees(cfs.getPartitioner());</span>
+<span class="fc" id="L56">        long allPartitions = validationIterator.estimatedPartitions();</span>
+<span class="fc" id="L57">        Map&lt;Range&lt;Token&gt;, Long&gt; rangePartitionCounts = validationIterator.getRangePartitionCounts();</span>
+
+        // The repair coordinator must hold RF trees in memory at once, so a given validation compaction can only
+        // use 1 / RF of the allowed space.
+<span class="fc" id="L61">        long availableBytes = (DatabaseDescriptor.getRepairSessionSpaceInMiB() * 1048576) /</span>
+<span class="fc" id="L62">                              cfs.keyspace.getReplicationStrategy().getReplicationFactor().allReplicas;</span>
+
+<span class="fc bfc" id="L64" title="All 2 branches covered.">        for (Range&lt;Token&gt; range : ranges)</span>
+        {
+<span class="fc" id="L66">            long numPartitions = rangePartitionCounts.get(range);</span>
+<span class="pc bpc" id="L67" title="1 of 2 branches missed.">            double rangeOwningRatio = allPartitions &gt; 0 ? (double)numPartitions / allPartitions : 0;</span>
+            // determine max tree depth proportional to range size to avoid blowing up memory with multiple tress,
+            // capping at a depth that does not exceed our memory budget (CASSANDRA-11390, CASSANDRA-14096)
+<span class="fc" id="L70">            int rangeAvailableBytes = Math.max(1, (int) (rangeOwningRatio * availableBytes));</span>
+            // Try to estimate max tree depth that fits the space budget assuming hashes of 256 bits = 32 bytes
+            // note that estimatedMaxDepthForBytes cannot return a number lower than 1
+<span class="fc" id="L73">            int estimatedMaxDepth = MerkleTree.estimatedMaxDepthForBytes(cfs.getPartitioner(), rangeAvailableBytes, 32);</span>
+<span class="pc bpc" id="L74" title="1 of 2 branches missed.">            int maxDepth = rangeOwningRatio &gt; 0</span>
+<span class="fc" id="L75">                           ? Math.min(estimatedMaxDepth, DatabaseDescriptor.getRepairSessionMaxTreeDepth())</span>
+<span class="pc" id="L76">                           : 0;</span>
+            // determine tree depth from number of partitions, capping at max tree depth (CASSANDRA-5263)
+<span class="pc bpc" id="L78" title="1 of 2 branches missed.">            int depth = numPartitions &gt; 0 ? (int) Math.min(Math.ceil(Math.log(numPartitions) / Math.log(2)), maxDepth) : 0;</span>
+<span class="fc" id="L79">            trees.addMerkleTree((int) Math.pow(2, depth), range);</span>
+<span class="fc" id="L80">        }</span>
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">        if (logger.isDebugEnabled())</span>
+        {
+            // MT serialize may take time
+<span class="fc" id="L84">            logger.debug(&quot;Created {} merkle trees with merkle trees size {}, {} partitions, {} bytes&quot;, trees.ranges().size(), trees.size(), allPartitions, MerkleTrees.serializer.serializedSize(trees, 0));</span>
+        }
+
+<span class="fc" id="L87">        return trees;</span>
+    }
+
+    private static ValidationPartitionIterator getValidationIterator(TableRepairManager repairManager, Validator validator, TopPartitionTracker.Collector topPartitionCollector) throws IOException, NoSuchRepairSessionException
+    {
+<span class="fc" id="L92">        RepairJobDesc desc = validator.desc;</span>
+<span class="fc" id="L93">        return repairManager.getValidationIterator(desc.ranges, desc.parentSessionId, desc.sessionId, validator.isIncremental, validator.nowInSec, topPartitionCollector);</span>
+    }
+
+    /**
+     * Performs a readonly &quot;compaction&quot; of all sstables in order to validate complete rows,
+     * but without writing the merge result
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public static void doValidation(ColumnFamilyStore cfs, Validator validator) throws IOException, NoSuchRepairSessionException
+    {
+<span class="fc" id="L103">        SharedContext ctx = validator.ctx;</span>
+<span class="fc" id="L104">        Clock clock = ctx.clock();</span>
+        // this isn't meant to be race-proof, because it's not -- it won't cause bugs for a CFS to be dropped
+        // mid-validation, or to attempt to validate a droped CFS.  this is just a best effort to avoid useless work,
+        // particularly in the scenario where a validation is submitted before the drop, and there are compactions
+        // started prior to the drop keeping some sstables alive.  Since validationCompaction can run
+        // concurrently with other compactions, it would otherwise go ahead and scan those again.
+<span class="fc" id="L110">        ValidationState state = validator.state;</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">        if (!cfs.isValid())</span>
+        {
+<span class="nc" id="L113">            state.phase.skip(String.format(&quot;Table %s is not valid&quot;, cfs));</span>
+<span class="nc" id="L114">            return;</span>
+        }
+
+<span class="fc" id="L117">        TopPartitionTracker.Collector topPartitionCollector = null;</span>
+<span class="pc bpc" id="L118" title="3 of 6 branches missed.">        if (cfs.topPartitions != null &amp;&amp; DatabaseDescriptor.topPartitionsEnabled() &amp;&amp; isTopPartitionSupported(validator))</span>
+<span class="fc" id="L119">            topPartitionCollector = new TopPartitionTracker.Collector(validator.desc.ranges);</span>
+
+        // Create Merkle trees suitable to hold estimated partitions for the given ranges.
+        // We blindly assume that a partition is evenly distributed on all sstables for now.
+<span class="fc" id="L123">        long start = clock.nanoTime();</span>
+<span class="fc" id="L124">        try (ValidationPartitionIterator vi = getValidationIterator(ctx.repairManager(cfs), validator, topPartitionCollector))</span>
+        {
+<span class="fc" id="L126">            state.phase.start(vi.estimatedPartitions(), vi.getEstimatedBytes());</span>
+<span class="fc" id="L127">            MerkleTrees trees = createMerkleTrees(vi, validator.desc.ranges, cfs);</span>
+            // validate the CF as we iterate over it
+<span class="fc" id="L129">            validator.prepare(cfs, trees, topPartitionCollector);</span>
+<span class="fc bfc" id="L130" title="All 2 branches covered.">            while (vi.hasNext())</span>
+            {
+<span class="fc" id="L132">                try (UnfilteredRowIterator partition = vi.next())</span>
+                {
+<span class="fc" id="L134">                    validator.add(partition);</span>
+<span class="fc" id="L135">                    state.partitionsProcessed++;</span>
+<span class="fc" id="L136">                    state.bytesRead = vi.getBytesRead();</span>
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">                    if (state.partitionsProcessed % 1024 == 0) // update every so often</span>
+<span class="nc" id="L138">                        state.updated();</span>
+                }
+            }
+<span class="fc" id="L141">            validator.complete();</span>
+        }
+        finally
+        {
+<span class="fc" id="L145">            cfs.metric.bytesValidated.update(state.estimatedTotalBytes);</span>
+<span class="fc" id="L146">            cfs.metric.partitionsValidated.update(state.partitionsProcessed);</span>
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">            if (topPartitionCollector != null)</span>
+<span class="fc" id="L148">                cfs.topPartitions.merge(topPartitionCollector);</span>
+        }
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        if (logger.isDebugEnabled())</span>
+        {
+<span class="fc" id="L152">            long duration = TimeUnit.NANOSECONDS.toMillis(clock.nanoTime() - start);</span>
+<span class="fc" id="L153">            logger.debug(&quot;Validation of {} partitions (~{}) finished in {} msec, for {}&quot;,</span>
+<span class="fc" id="L154">                         state.partitionsProcessed,</span>
+<span class="fc" id="L155">                         FBUtilities.prettyPrintMemory(state.estimatedTotalBytes),</span>
+<span class="fc" id="L156">                         duration,</span>
+                         validator.desc);
+        }
+<span class="fc" id="L159">    }</span>
+
+    private static boolean isTopPartitionSupported(Validator validator)
+    {
+        // supported: --validate, --full, --full --preview
+<span class="pc bpc" id="L164" title="3 of 4 branches missed.">        switch (validator.getPreviewKind())</span>
+        {
+            case NONE:
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">                return !validator.isIncremental;</span>
+            case ALL:
+            case REPAIRED:
+<span class="nc" id="L170">                return true;</span>
+            case UNREPAIRED:
+<span class="nc" id="L172">                return false;</span>
+            default:
+<span class="nc" id="L174">                throw new AssertionError(&quot;Unknown preview kind: &quot; + validator.getPreviewKind());</span>
+        }
+    }
+
+    /**
+     * Does not mutate data, so is not scheduled.
+     */
+    @Override
+    public Future&lt;?&gt; submitValidation(ColumnFamilyStore cfs, Validator validator)
+    {
+<span class="fc" id="L184">        Callable&lt;Object&gt; validation = new Callable&lt;Object&gt;()</span>
+<span class="fc" id="L185">        {</span>
+            public Object call() throws IOException
+            {
+<span class="fc" id="L188">                try (TableMetrics.TableTimer.Context c = cfs.metric.validationTime.time())</span>
+                {
+<span class="fc" id="L190">                    doValidation(cfs, validator);</span>
+                }
+<span class="nc" id="L192">                catch (PreviewRepairConflictWithIncrementalRepairException | NoSuchRepairSessionException | CompactionInterruptedException e)</span>
+                {
+<span class="nc" id="L194">                    validator.fail(e);</span>
+<span class="nc" id="L195">                    logger.warn(e.getMessage());</span>
+                }
+<span class="nc" id="L197">                catch (Throwable e)</span>
+                {
+                    // we need to inform the remote end of our failure, otherwise it will hang on repair forever
+<span class="nc" id="L200">                    validator.fail(e);</span>
+<span class="nc" id="L201">                    logger.error(&quot;Validation failed.&quot;, e);</span>
+<span class="nc" id="L202">                    throw e;</span>
+<span class="pc" id="L203">                }</span>
+<span class="fc" id="L204">                return this;</span>
+            }
+        };
+
+<span class="fc" id="L208">        return cfs.getRepairManager().submitValidation(validation);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

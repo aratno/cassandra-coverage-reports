@@ -1,0 +1,676 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StorageAttachedIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai</a> &gt; <span class="el_source">StorageAttachedIndex.java</span></div><h1>StorageAttachedIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.index.sai;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture; // checkstyle: permit this import
+import java.util.concurrent.Future;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Futures; // checkstyle: permit this import
+import com.google.common.util.concurrent.ListenableFuture; // checkstyle: permit this import
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
+import org.apache.cassandra.db.CassandraWriteContext;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.WriteContext;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.LocalPartitioner;
+import org.apache.cassandra.dht.OrderPreservingPartitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.index.TargetParser;
+import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
+import org.apache.cassandra.index.sai.disk.SSTableIndex;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.index.sai.view.View;
+import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.SSTableIdFactory;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+
+public class StorageAttachedIndex implements Index
+{
+    public static final String NAME = &quot;sai&quot;;
+
+    @VisibleForTesting
+    public static final String ANALYSIS_ON_KEY_COLUMNS_MESSAGE = &quot;Analysis options are not supported on primary key columns, but found &quot;;
+    
+<span class="fc" id="L104">    private static final Logger logger = LoggerFactory.getLogger(StorageAttachedIndex.class);</span>
+
+<span class="fc" id="L106">    private static class StorageAttachedIndexBuildingSupport implements IndexBuildingSupport</span>
+    {
+        @Override
+        public SecondaryIndexBuilder getIndexBuildTask(ColumnFamilyStore cfs,
+                                                       Set&lt;Index&gt; indexes,
+                                                       Collection&lt;SSTableReader&gt; sstablesToRebuild,
+                                                       boolean isFullRebuild)
+        {
+<span class="fc" id="L114">            NavigableMap&lt;SSTableReader, Set&lt;StorageAttachedIndex&gt;&gt; sstables = new TreeMap&lt;&gt;(Comparator.comparing(s -&gt; s.descriptor.id, SSTableIdFactory.COMPARATOR));</span>
+<span class="fc" id="L115">            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);</span>
+
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">            assert group != null : &quot;Index group does not exist for table &quot; + cfs.keyspace + '.' + cfs.name;</span>
+
+<span class="fc" id="L119">            indexes.stream()</span>
+<span class="fc" id="L120">                   .filter((i) -&gt; i instanceof StorageAttachedIndex)</span>
+<span class="fc" id="L121">                   .forEach((i) -&gt;</span>
+                            {
+<span class="fc" id="L123">                                StorageAttachedIndex sai = (StorageAttachedIndex) i;</span>
+<span class="fc" id="L124">                                IndexContext indexContext = ((StorageAttachedIndex) i).getIndexContext();</span>
+
+                                // If this is not a full manual index rebuild we can skip SSTables that already have an
+                                // attached index. Otherwise, we override any pre-existent index.
+<span class="fc" id="L128">                                Collection&lt;SSTableReader&gt; ss = sstablesToRebuild;</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">                                if (!isFullRebuild)</span>
+                                {
+<span class="fc" id="L131">                                    ss = sstablesToRebuild.stream()</span>
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">                                                          .filter(s -&gt; !IndexDescriptor.create(s).isPerColumnIndexBuildComplete(indexContext))</span>
+<span class="fc" id="L133">                                                          .collect(Collectors.toList());</span>
+                                }
+
+<span class="fc" id="L136">                                group.dropIndexSSTables(ss, sai);</span>
+
+<span class="fc" id="L138">                                ss.forEach(sstable -&gt; sstables.computeIfAbsent(sstable, ignore -&gt; new HashSet&lt;&gt;()).add(sai));</span>
+<span class="fc" id="L139">                            });</span>
+
+<span class="fc" id="L141">            return new StorageAttachedIndexBuilder(group, sstables, isFullRebuild, false);</span>
+        }
+    }
+
+    // Used to build indexes on newly added SSTables:
+<span class="fc" id="L146">    private static final StorageAttachedIndexBuildingSupport INDEX_BUILDER_SUPPORT = new StorageAttachedIndexBuildingSupport();</span>
+
+<span class="fc" id="L148">    private static final Set&lt;String&gt; VALID_OPTIONS = ImmutableSet.of(IndexTarget.TARGET_OPTION_NAME,</span>
+                                                                     IndexTarget.CUSTOM_INDEX_OPTION_NAME,
+                                                                     NonTokenizingOptions.CASE_SENSITIVE,
+                                                                     NonTokenizingOptions.NORMALIZE,
+                                                                     NonTokenizingOptions.ASCII);
+
+<span class="fc" id="L154">    public static final Set&lt;CQL3Type&gt; SUPPORTED_TYPES = ImmutableSet.of(CQL3Type.Native.ASCII, CQL3Type.Native.BIGINT, CQL3Type.Native.DATE,</span>
+                                                                        CQL3Type.Native.DOUBLE, CQL3Type.Native.FLOAT, CQL3Type.Native.INT,
+                                                                        CQL3Type.Native.SMALLINT, CQL3Type.Native.TEXT, CQL3Type.Native.TIME,
+                                                                        CQL3Type.Native.TIMESTAMP, CQL3Type.Native.TIMEUUID, CQL3Type.Native.TINYINT,
+                                                                        CQL3Type.Native.UUID, CQL3Type.Native.VARCHAR, CQL3Type.Native.INET,
+                                                                        CQL3Type.Native.VARINT, CQL3Type.Native.DECIMAL, CQL3Type.Native.BOOLEAN);
+
+<span class="fc" id="L161">    private static final Set&lt;Class&lt;? extends IPartitioner&gt;&gt; ILLEGAL_PARTITIONERS =</span>
+<span class="fc" id="L162">            ImmutableSet.of(OrderPreservingPartitioner.class, LocalPartitioner.class, ByteOrderedPartitioner.class, RandomPartitioner.class);</span>
+
+    private final ColumnFamilyStore baseCfs;
+    private final IndexContext indexContext;
+
+    // Tracks whether we've started the index build on initialization.
+<span class="fc" id="L168">    private volatile boolean initBuildStarted = false;</span>
+
+    // Tracks whether the index has been invalidated due to removal, a table drop, etc.
+<span class="fc" id="L171">    private volatile boolean valid = true;</span>
+
+    public StorageAttachedIndex(ColumnFamilyStore baseCfs, IndexMetadata config)
+<span class="fc" id="L174">    {</span>
+<span class="fc" id="L175">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L176">        TableMetadata tableMetadata = baseCfs.metadata();</span>
+<span class="fc" id="L177">        Pair&lt;ColumnMetadata, IndexTarget.Type&gt; target = TargetParser.parse(tableMetadata, config);</span>
+<span class="fc" id="L178">        this.indexContext = new IndexContext(tableMetadata.keyspace,</span>
+                                             tableMetadata.name,
+                                             tableMetadata.partitionKeyType,
+                                             tableMetadata.partitioner,
+                                             tableMetadata.comparator,
+                                             target.left,
+                                             target.right,
+                                             config);
+<span class="fc" id="L186">    }</span>
+
+    /**
+     * Used via reflection in {@link IndexMetadata}
+     */
+    @SuppressWarnings({ &quot;unused&quot; })
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options, TableMetadata metadata)
+    {
+<span class="fc" id="L194">        Map&lt;String, String&gt; unknown = new HashMap&lt;&gt;(2);</span>
+
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        for (Map.Entry&lt;String, String&gt; option : options.entrySet())</span>
+        {
+<span class="fc bfc" id="L198" title="All 2 branches covered.">            if (!VALID_OPTIONS.contains(option.getKey()))</span>
+            {
+<span class="fc" id="L200">                unknown.put(option.getKey(), option.getValue());</span>
+            }
+<span class="fc" id="L202">        }</span>
+
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        if (!unknown.isEmpty())</span>
+        {
+<span class="fc" id="L206">            return unknown;</span>
+        }
+
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">        if (ILLEGAL_PARTITIONERS.contains(metadata.partitioner.getClass()))</span>
+        {
+<span class="nc" id="L211">            throw new InvalidRequestException(&quot;Storage-attached index does not support the following IPartitioner implementations: &quot; + ILLEGAL_PARTITIONERS);</span>
+        }
+
+<span class="fc" id="L214">        String targetColumn = options.get(IndexTarget.TARGET_OPTION_NAME);</span>
+
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">        if (targetColumn == null)</span>
+        {
+<span class="nc" id="L218">            throw new InvalidRequestException(&quot;Missing target column&quot;);</span>
+        }
+
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        if (targetColumn.split(&quot;,&quot;).length &gt; 1)</span>
+        {
+<span class="fc" id="L223">            throw new InvalidRequestException(&quot;A storage-attached index cannot be created over multiple columns: &quot; + targetColumn);</span>
+        }
+
+<span class="fc" id="L226">        Pair&lt;ColumnMetadata, IndexTarget.Type&gt; target = TargetParser.parse(metadata, targetColumn);</span>
+
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">        if (target == null)</span>
+        {
+<span class="nc" id="L230">            throw new InvalidRequestException(&quot;Failed to retrieve target column for: &quot; + targetColumn);</span>
+        }
+
+        // In order to support different index targets on non-frozen map, ie. KEYS, VALUE, ENTRIES, we need to put index
+        // name as part of index file name instead of column name. We only need to check that the target is different
+        // between indexes. This will only allow indexes in the same column with a different IndexTarget.Type.
+        //
+        // Note that: &quot;metadata.indexes&quot; already includes current index
+<span class="fc" id="L238">        if (metadata.indexes.stream().filter(index -&gt; index.getIndexClassName().equals(StorageAttachedIndex.class.getName()))</span>
+<span class="fc" id="L239">                            .map(index -&gt; TargetParser.parse(metadata, index.options.get(IndexTarget.TARGET_OPTION_NAME)))</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">                            .filter(Objects::nonNull).filter(t -&gt; t.equals(target)).count() &gt; 1)</span>
+        {
+<span class="fc" id="L242">            throw new InvalidRequestException(&quot;Cannot create more than one storage-attached index on the same column: &quot; + target.left);</span>
+        }
+
+<span class="fc" id="L245">        AbstractType&lt;?&gt; type = TypeUtil.cellValueType(target.left, target.right);</span>
+
+        // If we are indexing map entries we need to validate the subtypes
+<span class="fc bfc" id="L248" title="All 2 branches covered.">        if (TypeUtil.isComposite(type))</span>
+        {
+<span class="fc bfc" id="L250" title="All 2 branches covered.">            for (AbstractType&lt;?&gt; subType : type.subTypes())</span>
+            {
+<span class="pc bpc" id="L252" title="1 of 4 branches missed.">                if (!SUPPORTED_TYPES.contains(subType.asCQL3Type()) &amp;&amp; !TypeUtil.isFrozen(subType))</span>
+<span class="nc" id="L253">                    throw new InvalidRequestException(&quot;Unsupported type: &quot; + subType.asCQL3Type());</span>
+<span class="fc" id="L254">            }</span>
+        }
+<span class="fc bfc" id="L256" title="All 4 branches covered.">        else if (!SUPPORTED_TYPES.contains(type.asCQL3Type()) &amp;&amp; !TypeUtil.isFrozen(type))</span>
+        {
+<span class="fc" id="L258">            throw new InvalidRequestException(&quot;Unsupported type: &quot; + type.asCQL3Type());</span>
+        }
+
+<span class="fc" id="L261">        Map&lt;String, String&gt; analysisOptions = AbstractAnalyzer.getAnalyzerOptions(options);</span>
+<span class="fc bfc" id="L262" title="All 4 branches covered.">        if (target.left.isPrimaryKeyColumn() &amp;&amp; !analysisOptions.isEmpty())</span>
+        {
+<span class="fc" id="L264">            throw new InvalidRequestException(ANALYSIS_ON_KEY_COLUMNS_MESSAGE + new CqlBuilder().append(analysisOptions));</span>
+        }
+<span class="fc" id="L266">        AbstractAnalyzer.fromOptions(type, analysisOptions);</span>
+
+<span class="fc" id="L268">        return Collections.emptyMap();</span>
+    }
+
+    @Override
+    public void register(IndexRegistry registry)
+    {
+        // index will be available for writes
+<span class="fc" id="L275">        registry.registerIndex(this, StorageAttachedIndexGroup.class, () -&gt; new StorageAttachedIndexGroup(baseCfs));</span>
+<span class="fc" id="L276">    }</span>
+
+    @Override
+    public IndexMetadata getIndexMetadata()
+    {
+<span class="fc" id="L281">        return indexContext.getIndexMetadata();</span>
+    }
+
+    @Override
+    public Callable&lt;?&gt; getInitializationTask()
+    {
+        // New storage-attached indexes will be available for queries after on disk index data are built.
+        // Memtable data will be indexed via flushing triggered by schema change
+        // We only want to validate the index files if we are starting up
+<span class="fc bfc" id="L290" title="All 2 branches covered.">        IndexValidation validation = StorageService.instance.isStarting() ? IndexValidation.HEADER_FOOTER : IndexValidation.NONE;</span>
+<span class="fc" id="L291">        return () -&gt; startInitialBuild(baseCfs, validation).get();</span>
+    }
+
+    private Future&lt;?&gt; startInitialBuild(ColumnFamilyStore baseCfs, IndexValidation validation)
+    {
+<span class="fc bfc" id="L296" title="All 2 branches covered.">        if (baseCfs.indexManager.isIndexQueryable(this))</span>
+        {
+<span class="fc" id="L298">            logger.debug(indexContext.logMessage(&quot;Skipping validation and building in initialization task, as pre-join has already made the storage-attached index queryable...&quot;));</span>
+<span class="fc" id="L299">            initBuildStarted = true;</span>
+<span class="fc" id="L300">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+        // stop in-progress compaction tasks to prevent compacted sstable not being indexed.
+<span class="fc" id="L304">        logger.debug(indexContext.logMessage(&quot;Stopping active compactions to make sure all sstables are indexed after initial build.&quot;));</span>
+<span class="fc" id="L305">        CompactionManager.instance.interruptCompactionFor(Collections.singleton(baseCfs.metadata()),</span>
+<span class="nc" id="L306">                                                          ssTableReader -&gt; true,</span>
+                                                          true);
+
+        // Force another flush to make sure on disk index is generated for memtable data before marking it queryable.
+        // In the case of offline scrub, there are no live memtables.
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">        if (!baseCfs.getTracker().getView().liveMemtables.isEmpty())</span>
+        {
+<span class="fc" id="L313">            baseCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_BUILD_STARTED);</span>
+        }
+
+        // It is now safe to flush indexes directly from flushing Memtables.
+<span class="fc" id="L317">        initBuildStarted = true;</span>
+
+<span class="fc" id="L319">        StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);</span>
+
+<span class="pc bpc" id="L321" title="1 of 2 branches missed.">        assert indexGroup != null : &quot;Index group does not exist for table &quot; + baseCfs.keyspace + '.' + baseCfs.name;</span>
+
+<span class="fc" id="L323">        List&lt;SSTableReader&gt; nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, validation);</span>
+
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        if (nonIndexed.isEmpty())</span>
+        {
+<span class="fc" id="L327">            return CompletableFuture.completedFuture(null);</span>
+        }
+
+        // split sorted sstables into groups with similar size and build each group in separate compaction thread
+<span class="fc" id="L331">        List&lt;List&lt;SSTableReader&gt;&gt; groups = groupBySize(nonIndexed, DatabaseDescriptor.getConcurrentIndexBuilders());</span>
+<span class="fc" id="L332">        List&lt;ListenableFuture&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L334" title="All 2 branches covered.">        for (List&lt;SSTableReader&gt; group : groups)</span>
+        {
+<span class="fc" id="L336">            SortedMap&lt;SSTableReader, Set&lt;StorageAttachedIndex&gt;&gt; current = new TreeMap&lt;&gt;(Comparator.comparing(s -&gt; s.descriptor.id, SSTableIdFactory.COMPARATOR));</span>
+<span class="fc" id="L337">            group.forEach(sstable -&gt; current.put(sstable, Collections.singleton(this)));</span>
+
+<span class="fc" id="L339">            futures.add(CompactionManager.instance.submitIndexBuild(new StorageAttachedIndexBuilder(indexGroup, current, false, true)));</span>
+<span class="fc" id="L340">        }</span>
+
+<span class="fc" id="L342">        logger.info(indexContext.logMessage(&quot;Submitting {} parallel initial index builds over {} total sstables...&quot;), futures.size(), nonIndexed.size());</span>
+<span class="fc" id="L343">        return Futures.allAsList(futures);</span>
+    }
+
+    /**
+     * Splits SSTables into groups of similar overall size.
+     *
+     * @param toRebuild a list of SSTables to split (Note that this list will be sorted in place!)
+     * @param parallelism an upper bound on the number of groups
+     *
+     * @return a {@link List} of SSTable groups, each represented as a {@link List} of {@link SSTableReader}
+     */
+    @VisibleForTesting
+    public static List&lt;List&lt;SSTableReader&gt;&gt; groupBySize(List&lt;SSTableReader&gt; toRebuild, int parallelism)
+    {
+<span class="fc" id="L357">        List&lt;List&lt;SSTableReader&gt;&gt; groups = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L359">        toRebuild.sort(Comparator.comparingLong(SSTableReader::onDiskLength).reversed());</span>
+<span class="fc" id="L360">        Iterator&lt;SSTableReader&gt; sortedSSTables = toRebuild.iterator();</span>
+<span class="fc" id="L361">        double dataPerCompactor = toRebuild.stream().mapToLong(SSTableReader::onDiskLength).sum() * 1.0 / parallelism;</span>
+
+<span class="fc bfc" id="L363" title="All 2 branches covered.">        while (sortedSSTables.hasNext())</span>
+        {
+<span class="fc" id="L365">            long sum = 0;</span>
+<span class="fc" id="L366">            List&lt;SSTableReader&gt; current = new ArrayList&lt;&gt;();</span>
+
+<span class="fc bfc" id="L368" title="All 4 branches covered.">            while (sortedSSTables.hasNext() &amp;&amp; sum &lt; dataPerCompactor)</span>
+            {
+<span class="fc" id="L370">                SSTableReader sstable = sortedSSTables.next();</span>
+<span class="fc" id="L371">                sum += sstable.onDiskLength();</span>
+<span class="fc" id="L372">                current.add(sstable);</span>
+<span class="fc" id="L373">            }</span>
+
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">            assert !current.isEmpty();</span>
+<span class="fc" id="L376">            groups.add(current);</span>
+<span class="fc" id="L377">        }</span>
+
+<span class="fc" id="L379">        return groups;</span>
+    }
+
+    @Override
+    public Callable&lt;?&gt; getMetadataReloadTask(IndexMetadata indexMetadata)
+    {
+<span class="fc" id="L385">        return null;</span>
+    }
+
+    @Override
+    public Callable&lt;?&gt; getBlockingFlushTask()
+    {
+<span class="fc" id="L391">        return null; // storage-attached indexes are flushed alongside memtable</span>
+    }
+
+    @Override
+    public Callable&lt;?&gt; getInvalidateTask()
+    {
+<span class="fc" id="L397">        return () -&gt;</span>
+        {
+            // mark index as invalid, in-progress SSTableIndexWriters will abort
+<span class="fc" id="L400">            valid = false;</span>
+
+            // in case of dropping table, SSTable indexes should already been removed by SSTableListChangedNotification.
+<span class="fc" id="L403">            Set&lt;Component&gt; toRemove = getComponents();</span>
+<span class="fc bfc" id="L404" title="All 2 branches covered.">            for (SSTableIndex sstableIndex : indexContext.getView().getIndexes())</span>
+<span class="fc" id="L405">                sstableIndex.getSSTable().unregisterComponents(toRemove, baseCfs.getTracker());</span>
+
+<span class="fc" id="L407">            indexContext.invalidate();</span>
+<span class="fc" id="L408">            return null;</span>
+        };
+    }
+
+    @Override
+    public Callable&lt;?&gt; getPreJoinTask(boolean hadBootstrap)
+    {
+        /*
+         * During bootstrap, streamed SSTable are already built for existing indexes via {@link StorageAttachedIndexBuildingSupport}
+         * from {@link org.apache.cassandra.streaming.StreamReceiveTask.OnCompletionRunnable}.
+         *
+         * For indexes created during bootstrapping, we don't have to block bootstrap for them.
+         */
+
+<span class="fc" id="L422">        return this::startPreJoinTask;</span>
+    }
+
+    public boolean isInitBuildStarted()
+    {
+<span class="fc" id="L427">        return initBuildStarted;</span>
+    }
+
+    public BooleanSupplier isIndexValid()
+    {
+<span class="fc" id="L432">        return () -&gt; valid;</span>
+    }
+
+    private Future&lt;?&gt; startPreJoinTask()
+    {
+        try
+        {
+<span class="fc bfc" id="L439" title="All 2 branches covered.">            if (baseCfs.indexManager.isIndexQueryable(this))</span>
+            {
+<span class="fc" id="L441">                logger.debug(indexContext.logMessage(&quot;Skipping validation in pre-join task, as the initialization task has already made the index queryable...&quot;));</span>
+<span class="fc" id="L442">                baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);</span>
+<span class="fc" id="L443">                return null;</span>
+            }
+
+<span class="fc" id="L446">            StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);</span>
+
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">            assert indexGroup != null : &quot;Index group does not exist for table&quot;;</span>
+
+<span class="fc" id="L450">            Collection&lt;SSTableReader&gt; nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, IndexValidation.HEADER_FOOTER);</span>
+
+<span class="fc bfc" id="L452" title="All 2 branches covered.">            if (nonIndexed.isEmpty())</span>
+            {
+                // If the index is complete, mark it queryable before the node starts accepting requests:
+<span class="fc" id="L455">                baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);</span>
+            }
+        }
+<span class="fc" id="L458">        catch (Throwable t)</span>
+        {
+<span class="fc" id="L460">            logger.error(indexContext.logMessage(&quot;Failed in pre-join task!&quot;), t);</span>
+<span class="fc" id="L461">        }</span>
+
+<span class="fc" id="L463">        return null;</span>
+    }
+
+    @Override
+    public Callable&lt;?&gt; getTruncateTask(long truncatedAt)
+    {
+        /*
+         * index files will be removed as part of base sstable lifecycle in
+         * {@link LogTransaction#delete(java.io.File)} asynchronously.
+         */
+<span class="fc" id="L473">        return null;</span>
+    }
+
+    @Override
+    public boolean shouldBuildBlocking()
+    {
+<span class="fc" id="L479">        return true;</span>
+    }
+
+    @Override
+    public boolean isSSTableAttached()
+    {
+<span class="fc" id="L485">        return true;</span>
+    }
+
+    @Override
+    public Optional&lt;ColumnFamilyStore&gt; getBackingTable()
+    {
+<span class="fc" id="L491">        return Optional.empty();</span>
+    }
+
+    @Override
+    public boolean dependsOn(ColumnMetadata column)
+    {
+<span class="fc bfc" id="L497" title="All 2 branches covered.">        return indexContext.getDefinition().compareTo(column) == 0;</span>
+    }
+
+    @Override
+    public boolean supportsExpression(ColumnMetadata column, Operator operator)
+    {
+<span class="fc bfc" id="L503" title="All 4 branches covered.">        return dependsOn(column) &amp;&amp; indexContext.supports(operator);</span>
+    }
+
+    @Override
+    public boolean filtersMultipleContains()
+    {
+<span class="fc" id="L509">        return false;</span>
+    }
+
+    @Override
+    public AbstractType&lt;?&gt; customExpressionValueType()
+    {
+<span class="fc" id="L515">        return null;</span>
+    }
+
+    @Override
+    public RowFilter getPostIndexQueryFilter(RowFilter filter)
+    {
+        // it should be executed from the SAI query plan, this is only used by the singleton index query plan
+<span class="nc" id="L522">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public long getEstimatedResultRows()
+    {
+<span class="nc" id="L528">        throw new UnsupportedOperationException(&quot;Use StorageAttachedIndexQueryPlan#getEstimatedResultRows() instead.&quot;);</span>
+    }
+
+    @Override
+    public boolean isQueryable(Status status)
+    {
+        // consider unknown status as queryable, because gossip may not be up-to-date for newly joining nodes.
+<span class="fc bfc" id="L535" title="All 4 branches covered.">        return status == Status.BUILD_SUCCEEDED || status == Status.UNKNOWN;</span>
+    }
+
+    @Override
+    public void validate(PartitionUpdate update) throws InvalidRequestException
+<span class="fc" id="L540">    {}</span>
+
+    /**
+     * This method is called by the startup tasks to find SSTables that don't have indexes. The method is
+     * synchronized so that the view is unchanged between validation and the selection of non-indexed SSTables.
+     *
+     * @return a list SSTables without attached indexes
+     */
+    private synchronized List&lt;SSTableReader&gt; findNonIndexedSSTables(ColumnFamilyStore baseCfs, StorageAttachedIndexGroup group, IndexValidation validation)
+    {
+<span class="fc" id="L550">        Set&lt;SSTableReader&gt; sstables = baseCfs.getLiveSSTables();</span>
+
+        // Initialize the SSTable indexes w/ valid existing components...
+<span class="pc bpc" id="L553" title="1 of 2 branches missed.">        assert group != null : &quot;Missing index group on &quot; + baseCfs.name;</span>
+<span class="fc" id="L554">        group.onSSTableChanged(Collections.emptyList(), sstables, Collections.singleton(this), validation);</span>
+
+        // ...then identify and rebuild the SSTable indexes that are missing.
+<span class="fc" id="L557">        List&lt;SSTableReader&gt; nonIndexed = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L558">        View view = indexContext.getView();</span>
+
+<span class="fc bfc" id="L560" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+            // An SSTable is considered not indexed if:
+            //   1. The current view does not contain the SSTable
+            //   2. The SSTable is not marked compacted
+            //   3. The column index does not have a completion marker
+<span class="pc bpc" id="L566" title="1 of 4 branches missed.">            if (!view.containsSSTable(sstable) &amp;&amp; !sstable.isMarkedCompacted() &amp;&amp;</span>
+<span class="fc bfc" id="L567" title="All 2 branches covered.">                !IndexDescriptor.create(sstable).isPerColumnIndexBuildComplete(indexContext))</span>
+            {
+<span class="fc" id="L569">                nonIndexed.add(sstable);</span>
+            }
+<span class="fc" id="L571">        }</span>
+
+<span class="fc" id="L573">        return nonIndexed;</span>
+    }
+
+    @Override
+    public Searcher searcherFor(ReadCommand command) throws InvalidRequestException
+    {
+        // searchers should be created from the query plan, this is only used by the singleton index query plan
+<span class="nc" id="L580">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public SSTableFlushObserver getFlushObserver(Descriptor descriptor, LifecycleNewTracker tracker)
+    {
+        // flush observers should be created from the index group, this is only used by the singleton index group
+<span class="nc" id="L587">        throw new UnsupportedOperationException(&quot;Storage-attached index flush observers should never be created directly.&quot;);</span>
+    }
+
+    @Override
+    public Set&lt;Component&gt; getComponents()
+    {
+<span class="fc" id="L593">        return Version.LATEST.onDiskFormat()</span>
+<span class="fc" id="L594">                             .perColumnIndexComponents(indexContext)</span>
+<span class="fc" id="L595">                             .stream()</span>
+<span class="fc" id="L596">                             .map(c -&gt; Version.LATEST.makePerIndexComponent(c, indexContext))</span>
+<span class="fc" id="L597">                             .collect(Collectors.toSet());</span>
+    }
+
+    @Override
+    public Indexer indexerFor(DecoratedKey key,
+                              RegularAndStaticColumns columns,
+                              long nowInSec,
+                              WriteContext writeContext,
+                              IndexTransaction.Type transactionType,
+                              Memtable memtable)
+    {
+<span class="pc bpc" id="L608" title="1 of 2 branches missed.">        if (transactionType == IndexTransaction.Type.UPDATE)</span>
+        {
+<span class="fc" id="L610">            return new UpdateIndexer(key, memtable, writeContext);</span>
+        }
+
+        // we are only interested in the data from Memtable
+        // everything else is going to be handled by SSTableWriter observers
+<span class="nc" id="L615">        return null;</span>
+    }
+
+    @Override
+    public IndexBuildingSupport getBuildTaskSupport()
+    {
+<span class="fc" id="L621">        return INDEX_BUILDER_SUPPORT;</span>
+    }
+
+    public IndexContext getIndexContext()
+    {
+<span class="fc" id="L626">        return indexContext;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="pc bpc" id="L632" title="1 of 2 branches missed.">        return String.format(&quot;%s.%s.%s&quot;, baseCfs.keyspace.getName(), baseCfs.name, getIndexMetadata() == null ? &quot;?&quot; : getIndexMetadata());</span>
+    }
+
+    /**
+     * Removes this index from the {@code SecondaryIndexManager}'s set of queryable indexes.
+     */
+    public void makeIndexNonQueryable()
+    {
+<span class="fc" id="L640">        baseCfs.indexManager.makeIndexNonQueryable(this, Status.BUILD_FAILED);</span>
+<span class="fc" id="L641">        logger.warn(indexContext.logMessage(&quot;Storage-attached index is no longer queryable. Please restart this node to repair it.&quot;));</span>
+<span class="fc" id="L642">    }</span>
+
+    private class UpdateIndexer implements Index.Indexer
+    {
+        private final DecoratedKey key;
+        private final Memtable memtable;
+        private final WriteContext writeContext;
+
+        UpdateIndexer(DecoratedKey key, Memtable memtable, WriteContext writeContext)
+<span class="fc" id="L651">        {</span>
+<span class="fc" id="L652">            this.key = key;</span>
+<span class="fc" id="L653">            this.memtable = memtable;</span>
+<span class="fc" id="L654">            this.writeContext = writeContext;</span>
+<span class="fc" id="L655">        }</span>
+
+        @Override
+        public void insertRow(Row row)
+        {
+<span class="fc" id="L660">            adjustMemtableSize(indexContext.getMemtableIndexManager().index(key, row, memtable),</span>
+<span class="fc" id="L661">                               CassandraWriteContext.fromContext(writeContext).getGroup());</span>
+<span class="fc" id="L662">        }</span>
+
+        @Override
+        public void updateRow(Row oldRow, Row newRow)
+        {
+<span class="fc" id="L667">            insertRow(newRow);</span>
+<span class="fc" id="L668">        }</span>
+
+        void adjustMemtableSize(long additionalSpace, OpOrder.Group opGroup)
+        {
+<span class="fc" id="L672">            memtable.markExtraOnHeapUsed(additionalSpace, opGroup);</span>
+<span class="fc" id="L673">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

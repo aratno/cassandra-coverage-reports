@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ExternalArchiver.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.binlog</a> &gt; <span class="el_source">ExternalArchiver.java</span></div><h1>ExternalArchiver.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils.binlog;
+
+import java.io.File; // checkstyle: permit this import
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Longs;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import net.openhft.chronicle.queue.impl.single.SingleChronicleQueue;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+/**
+ * Archives binary log files immediately when they are rolled using a configure archive command.
+ *
+ * The archive command should be &quot;/path/to/script.sh %path&quot; where %path will be replaced with the file to be archived
+ */
+public class ExternalArchiver implements BinLogArchiver
+{
+<span class="fc" id="L53">    private static final Logger logger = LoggerFactory.getLogger(ExternalArchiver.class);</span>
+    // used to replace %path with the actual file to archive when calling the archive command
+<span class="fc" id="L55">    private static final Pattern PATH = Pattern.compile(&quot;%path&quot;);</span>
+<span class="fc" id="L56">    private static final long DEFAULT_RETRY_DELAY_MS = TimeUnit.MILLISECONDS.convert(5, TimeUnit.MINUTES);</span>
+
+    /**
+     * use a DelayQueue to simplify retries - we want first tries to be executed immediately and retries should wait DEFAULT_RETRY_DELAY_MS
+     */
+<span class="fc" id="L61">    private final DelayQueue&lt;DelayFile&gt; archiveQueue = new DelayQueue&lt;&gt;();</span>
+    private final String archiveCommand;
+<span class="fc" id="L63">    private final ExecutorService executor = executorFactory().sequential(&quot;BinLogArchiver&quot;);</span>
+    private final Path path;
+    /**
+     * for testing, to be able to make sure that the command is executed
+     */
+    private final ExecCommand commandExecutor;
+<span class="fc" id="L69">    private volatile boolean shouldContinue = true;</span>
+
+    public ExternalArchiver(String archiveCommand, Path path, int maxArchiveRetries)
+    {
+<span class="fc" id="L73">        this(archiveCommand, path, DEFAULT_RETRY_DELAY_MS, maxArchiveRetries, ExternalArchiver::exec);</span>
+<span class="fc" id="L74">    }</span>
+
+    @VisibleForTesting
+    ExternalArchiver(String archiveCommand, Path path, long retryDelayMs, int maxRetries, ExecCommand command)
+<span class="fc" id="L78">    {</span>
+<span class="fc" id="L79">        this.archiveCommand = archiveCommand;</span>
+<span class="fc" id="L80">        this.commandExecutor = command;</span>
+        // if there are any .cq4 files in path, archive them on startup - this handles any leftover files from crashes etc
+<span class="fc" id="L82">        archiveExisting(path);</span>
+<span class="fc" id="L83">        this.path = path;</span>
+
+<span class="fc" id="L85">        executor.execute(() -&gt; {</span>
+<span class="fc bfc" id="L86" title="All 2 branches covered.">           while (shouldContinue)</span>
+           {
+<span class="fc" id="L88">               DelayFile toArchive = null;</span>
+               try
+               {
+<span class="fc" id="L91">                   toArchive = archiveQueue.poll(100, TimeUnit.MILLISECONDS);</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">                   if (toArchive != null)</span>
+<span class="fc" id="L93">                       archiveFile(toArchive.file);</span>
+               }
+<span class="fc" id="L95">               catch (Throwable t)</span>
+               {
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">                   if (toArchive != null)</span>
+                   {
+
+<span class="fc bfc" id="L100" title="All 2 branches covered.">                       if (toArchive.retries &lt; maxRetries)</span>
+                       {
+<span class="fc" id="L102">                           logger.error(&quot;Got error archiving {}, retrying in {} minutes&quot;, toArchive.file, TimeUnit.MINUTES.convert(retryDelayMs, TimeUnit.MILLISECONDS), t);</span>
+<span class="fc" id="L103">                           archiveQueue.add(new DelayFile(toArchive.file, retryDelayMs, TimeUnit.MILLISECONDS, toArchive.retries + 1));</span>
+                       }
+                       else
+                       {
+<span class="fc" id="L107">                           logger.error(&quot;Max retries {} reached for {}, leaving on disk&quot;, toArchive.retries, toArchive.file, t);</span>
+                       }
+                   }
+                   else
+<span class="nc" id="L111">                       logger.error(&quot;Got error waiting for files to archive&quot;, t);</span>
+<span class="fc" id="L112">               }</span>
+<span class="fc" id="L113">           }</span>
+<span class="fc" id="L114">           logger.debug(&quot;Exiting archiver thread&quot;);</span>
+<span class="fc" id="L115">        });</span>
+<span class="fc" id="L116">    }</span>
+
+    public void onReleased(int cycle, File file)
+    {
+<span class="fc" id="L120">        logger.debug(&quot;BinLog file released: {}&quot;, file);</span>
+<span class="fc" id="L121">        archiveQueue.add(new DelayFile(file, 0, TimeUnit.MILLISECONDS, 0));</span>
+<span class="fc" id="L122">    }</span>
+
+    /**
+     * Stops the archiver thread and tries to archive all existing files
+     *
+     * this handles the case where a user explicitly disables full/audit log and would expect all log files to be archived
+     * rolled or not
+     */
+    public void stop()
+    {
+<span class="fc" id="L132">        shouldContinue = false;</span>
+        try
+        {
+            // wait for the archiver thread to stop;
+<span class="fc" id="L136">            executor.submit(() -&gt; {}).get();</span>
+            // and try to archive all remaining files before exiting
+<span class="fc" id="L138">            archiveExisting(path);</span>
+        }
+<span class="nc" id="L140">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L142">            throw new UncheckedInterruptedException(e);</span>
+        }
+<span class="nc" id="L144">        catch (ExecutionException e)</span>
+        {
+<span class="nc" id="L146">            throw new RuntimeException(e);</span>
+<span class="fc" id="L147">        }</span>
+<span class="fc" id="L148">    }</span>
+
+    /**
+     * Iterates over all files in path, executing the archive command for each.
+     */
+    private void archiveExisting(Path path)
+    {
+<span class="fc bfc" id="L155" title="All 2 branches covered.">        if (path == null)</span>
+<span class="fc" id="L156">            return;</span>
+<span class="pc bpc" id="L157" title="1 of 6 branches missed.">        for (File f : path.toFile().listFiles((f) -&gt; f.isFile() &amp;&amp; f.getName().endsWith(SingleChronicleQueue.SUFFIX))) // checkstyle: permit this invocation</span>
+        {
+            try
+            {
+<span class="fc" id="L161">                logger.debug(&quot;Archiving existing file {}&quot;, f);</span>
+<span class="fc" id="L162">                archiveFile(f);</span>
+            }
+<span class="nc" id="L164">            catch (IOException e)</span>
+            {
+<span class="nc" id="L166">                logger.error(&quot;Got error archiving existing file {}&quot;, f, e);</span>
+<span class="fc" id="L167">            }</span>
+        }
+<span class="fc" id="L169">    }</span>
+
+    private void archiveFile(File f) throws IOException
+    {
+<span class="fc" id="L173">        String cmd = PATH.matcher(archiveCommand).replaceAll(Matcher.quoteReplacement(f.getAbsolutePath()));</span>
+<span class="fc" id="L174">        logger.debug(&quot;Executing archive command: {}&quot;, cmd);</span>
+<span class="fc" id="L175">        commandExecutor.exec(cmd);</span>
+<span class="fc" id="L176">    }</span>
+
+    static void exec(String command) throws IOException
+    {
+<span class="fc" id="L180">        ProcessBuilder pb = new ProcessBuilder(command.split(&quot; &quot;));</span>
+<span class="fc" id="L181">        pb.redirectErrorStream(true);</span>
+<span class="fc" id="L182">        FBUtilities.exec(pb);</span>
+<span class="fc" id="L183">    }</span>
+
+    private static class DelayFile implements Delayed
+    {
+        public final File file;
+        private final long delayTime;
+        private final int retries;
+
+        public DelayFile(File file, long delay, TimeUnit delayUnit, int retries)
+<span class="fc" id="L192">        {</span>
+<span class="fc" id="L193">            this.file = file;</span>
+<span class="fc" id="L194">            this.delayTime = currentTimeMillis() + MILLISECONDS.convert(delay, delayUnit);</span>
+<span class="fc" id="L195">            this.retries = retries;</span>
+<span class="fc" id="L196">        }</span>
+        public long getDelay(TimeUnit unit)
+        {
+<span class="fc" id="L199">            return unit.convert(delayTime - currentTimeMillis(), TimeUnit.MILLISECONDS);</span>
+        }
+
+        public int compareTo(Delayed o)
+        {
+<span class="fc" id="L204">            DelayFile other = (DelayFile)o;</span>
+<span class="fc" id="L205">            return Longs.compare(delayTime, other.delayTime);</span>
+        }
+    }
+
+    interface ExecCommand
+    {
+        public void exec(String command) throws IOException;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

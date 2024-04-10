@@ -1,0 +1,1433 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SchemaKeyspace.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.schema</a> &gt; <span class="el_source">SchemaKeyspace.java</span></div><h1>SchemaKeyspace.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.schema;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+import com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.antlr.runtime.RecognitionException;
+import org.apache.cassandra.config.*;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.*;
+import org.apache.cassandra.cql3.functions.masking.ColumnMask;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
+import org.apache.cassandra.schema.ColumnMetadata.ClusteringOrder;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Simulate;
+
+import static java.lang.String.format;
+
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toSet;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.IGNORE_CORRUPTED_SCHEMA_TABLES;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_FLUSH_LOCAL_SCHEMA_CHANGES;
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
+import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
+import static org.apache.cassandra.schema.SchemaKeyspaceTables.*;
+import static org.apache.cassandra.utils.Simulate.With.GLOBAL_CLOCK;
+
+/**
+ * system_schema.* tables and methods for manipulating them.
+ *
+ * Please notice this class is _not_ thread safe and all methods which reads or updates the data in schema keyspace
+ * should be accessed only from the implementation of {@link SchemaUpdateHandler} in synchronized blocks.
+ */
+@NotThreadSafe
+public final class SchemaKeyspace
+{
+    private SchemaKeyspace()
+    {
+    }
+
+<span class="fc" id="L79">    private static final Logger logger = LoggerFactory.getLogger(SchemaKeyspace.class);</span>
+
+<span class="fc" id="L81">    private static final boolean FLUSH_SCHEMA_TABLES = TEST_FLUSH_LOCAL_SCHEMA_CHANGES.getBoolean();</span>
+<span class="fc" id="L82">    private static final boolean IGNORE_CORRUPTED_SCHEMA_TABLES_PROPERTY_VALUE = IGNORE_CORRUPTED_SCHEMA_TABLES.getBoolean();</span>
+
+    /**
+     * The tables to which we added the cdc column. This is used in {@link #makeUpdateForSchema} below to make sure we skip that
+     * column is cdc is disabled as the columns breaks pre-cdc to post-cdc upgrades (typically, 3.0 -&gt; 3.X).
+     */
+<span class="fc" id="L88">    private static final Set&lt;String&gt; TABLES_WITH_CDC_ADDED = ImmutableSet.of(SchemaKeyspaceTables.TABLES, SchemaKeyspaceTables.VIEWS);</span>
+
+<span class="fc" id="L90">    private static final TableMetadata Keyspaces =</span>
+<span class="fc" id="L91">        parse(KEYSPACES,</span>
+              &quot;keyspace definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;durable_writes boolean,&quot;
+              + &quot;replication frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name)))&quot;);
+
+<span class="fc" id="L99">    private static final TableMetadata Tables =</span>
+<span class="fc" id="L100">        parse(TABLES,</span>
+              &quot;table definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;table_name text,&quot;
+              + &quot;allow_auto_snapshot boolean,&quot;
+              + &quot;bloom_filter_fp_chance double,&quot;
+              + &quot;caching frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;comment text,&quot;
+              + &quot;compaction frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;compression frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;memtable text,&quot;
+              + &quot;crc_check_chance double,&quot;
+              + &quot;dclocal_read_repair_chance double,&quot; // no longer used, left for drivers' sake
+              + &quot;default_time_to_live int,&quot;
+              + &quot;extensions frozen&lt;map&lt;text, blob&gt;&gt;,&quot;
+              + &quot;flags frozen&lt;set&lt;text&gt;&gt;,&quot; // SUPER, COUNTER, DENSE, COMPOUND
+              + &quot;gc_grace_seconds int,&quot;
+              + &quot;incremental_backups boolean,&quot;
+              + &quot;id uuid,&quot;
+              + &quot;max_index_interval int,&quot;
+              + &quot;memtable_flush_period_in_ms int,&quot;
+              + &quot;min_index_interval int,&quot;
+              + &quot;read_repair_chance double,&quot; // no longer used, left for drivers' sake
+              + &quot;speculative_retry text,&quot;
+              + &quot;additional_write_policy text,&quot;
+              + &quot;cdc boolean,&quot;
+              + &quot;read_repair text,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), table_name))&quot;);
+
+<span class="fc" id="L130">    private static final TableMetadata Columns =</span>
+<span class="fc" id="L131">        parse(COLUMNS,</span>
+              &quot;column definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;table_name text,&quot;
+              + &quot;column_name text,&quot;
+              + &quot;clustering_order text,&quot;
+              + &quot;column_name_bytes blob,&quot;
+              + &quot;kind text,&quot;
+              + &quot;position int,&quot;
+              + &quot;type text,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), table_name, column_name))&quot;);
+
+<span class="fc" id="L144">    private static final TableMetadata ColumnMasks =</span>
+<span class="fc" id="L145">    parse(COLUMN_MASKS,</span>
+          &quot;column dynamic data masks&quot;,
+          &quot;CREATE TABLE %s (&quot;
+          + &quot;keyspace_name text,&quot;
+          + &quot;table_name text,&quot;
+          + &quot;column_name text,&quot;
+          + &quot;function_keyspace text,&quot;
+          + &quot;function_name text,&quot;
+          + &quot;function_argument_types frozen&lt;list&lt;text&gt;&gt;,&quot;
+          + &quot;function_argument_values frozen&lt;list&lt;text&gt;&gt;,&quot;
+          + &quot;function_argument_nulls frozen&lt;list&lt;boolean&gt;&gt;,&quot; // arguments that are null
+          + &quot;PRIMARY KEY ((keyspace_name), table_name, column_name))&quot;);
+
+<span class="fc" id="L158">    private static final TableMetadata DroppedColumns =</span>
+<span class="fc" id="L159">        parse(DROPPED_COLUMNS,</span>
+              &quot;dropped column registry&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;table_name text,&quot;
+              + &quot;column_name text,&quot;
+              + &quot;dropped_time timestamp,&quot;
+              + &quot;kind text,&quot;
+              + &quot;type text,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), table_name, column_name))&quot;);
+
+<span class="fc" id="L170">    private static final TableMetadata Triggers =</span>
+<span class="fc" id="L171">        parse(TRIGGERS,</span>
+              &quot;trigger definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;table_name text,&quot;
+              + &quot;trigger_name text,&quot;
+              + &quot;options frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), table_name, trigger_name))&quot;);
+
+<span class="fc" id="L180">    private static final TableMetadata Views =</span>
+<span class="fc" id="L181">        parse(VIEWS,</span>
+              &quot;view definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;view_name text,&quot;
+              + &quot;base_table_id uuid,&quot;
+              + &quot;base_table_name text,&quot;
+              + &quot;where_clause text,&quot;
+              + &quot;allow_auto_snapshot boolean,&quot;
+              + &quot;bloom_filter_fp_chance double,&quot;
+              + &quot;caching frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;comment text,&quot;
+              + &quot;compaction frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;compression frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;memtable text,&quot;
+              + &quot;crc_check_chance double,&quot;
+              + &quot;dclocal_read_repair_chance double,&quot; // no longer used, left for drivers' sake
+              + &quot;default_time_to_live int,&quot;
+              + &quot;extensions frozen&lt;map&lt;text, blob&gt;&gt;,&quot;
+              + &quot;gc_grace_seconds int,&quot;
+              + &quot;incremental_backups boolean,&quot;
+              + &quot;id uuid,&quot;
+              + &quot;include_all_columns boolean,&quot;
+              + &quot;max_index_interval int,&quot;
+              + &quot;memtable_flush_period_in_ms int,&quot;
+              + &quot;min_index_interval int,&quot;
+              + &quot;read_repair_chance double,&quot; // no longer used, left for drivers' sake
+              + &quot;speculative_retry text,&quot;
+              + &quot;additional_write_policy text,&quot;
+              + &quot;cdc boolean,&quot;
+              + &quot;read_repair text,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), view_name))&quot;);
+
+<span class="fc" id="L214">    private static final TableMetadata Indexes =</span>
+<span class="fc" id="L215">        parse(INDEXES,</span>
+              &quot;secondary index definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;table_name text,&quot;
+              + &quot;index_name text,&quot;
+              + &quot;kind text,&quot;
+              + &quot;options frozen&lt;map&lt;text, text&gt;&gt;,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), table_name, index_name))&quot;);
+
+<span class="fc" id="L225">    private static final TableMetadata Types =</span>
+<span class="fc" id="L226">        parse(TYPES,</span>
+              &quot;user defined type definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;type_name text,&quot;
+              + &quot;field_names frozen&lt;list&lt;text&gt;&gt;,&quot;
+              + &quot;field_types frozen&lt;list&lt;text&gt;&gt;,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), type_name))&quot;);
+
+<span class="fc" id="L235">    private static final TableMetadata Functions =</span>
+<span class="fc" id="L236">        parse(FUNCTIONS,</span>
+              &quot;user defined function definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;function_name text,&quot;
+              + &quot;argument_types frozen&lt;list&lt;text&gt;&gt;,&quot;
+              + &quot;argument_names frozen&lt;list&lt;text&gt;&gt;,&quot;
+              + &quot;body text,&quot;
+              + &quot;language text,&quot;
+              + &quot;return_type text,&quot;
+              + &quot;called_on_null_input boolean,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), function_name, argument_types))&quot;);
+
+<span class="fc" id="L249">    private static final TableMetadata Aggregates =</span>
+<span class="fc" id="L250">        parse(AGGREGATES,</span>
+              &quot;user defined aggregate definitions&quot;,
+              &quot;CREATE TABLE %s (&quot;
+              + &quot;keyspace_name text,&quot;
+              + &quot;aggregate_name text,&quot;
+              + &quot;argument_types frozen&lt;list&lt;text&gt;&gt;,&quot;
+              + &quot;final_func text,&quot;
+              + &quot;initcond text,&quot;
+              + &quot;return_type text,&quot;
+              + &quot;state_func text,&quot;
+              + &quot;state_type text,&quot;
+              + &quot;PRIMARY KEY ((keyspace_name), aggregate_name, argument_types))&quot;);
+
+<span class="fc" id="L263">    private static final List&lt;TableMetadata&gt; ALL_TABLE_METADATA = ImmutableList.of(Keyspaces,</span>
+                                                                                   Tables,
+                                                                                   Columns,
+                                                                                   ColumnMasks,
+                                                                                   Triggers,
+                                                                                   DroppedColumns,
+                                                                                   Views,
+                                                                                   Types,
+                                                                                   Functions,
+                                                                                   Aggregates,
+                                                                                   Indexes);
+
+    private static TableMetadata parse(String name, String description, String cql)
+    {
+<span class="fc" id="L277">        return CreateTableStatement.parse(format(cql, name), SchemaConstants.SCHEMA_KEYSPACE_NAME)</span>
+<span class="fc" id="L278">                                   .id(TableId.forSystemTable(SchemaConstants.SCHEMA_KEYSPACE_NAME, name))</span>
+<span class="fc" id="L279">                                   .gcGraceSeconds((int) TimeUnit.DAYS.toSeconds(7))</span>
+<span class="fc" id="L280">                                   .memtableFlushPeriod((int) TimeUnit.HOURS.toMillis(1))</span>
+<span class="fc" id="L281">                                   .comment(description)</span>
+<span class="fc" id="L282">                                   .build();</span>
+    }
+
+    public static KeyspaceMetadata metadata()
+    {
+<span class="fc" id="L287">        return KeyspaceMetadata.create(SchemaConstants.SCHEMA_KEYSPACE_NAME, KeyspaceParams.local(), org.apache.cassandra.schema.Tables.of(ALL_TABLE_METADATA));</span>
+    }
+
+    static Collection&lt;Mutation&gt; convertSchemaDiffToMutations(KeyspacesDiff diff, long timestamp)
+    {
+<span class="fc" id="L292">        Map&lt;String, Mutation&gt; mutations = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L294">        diff.dropped.forEach(k -&gt; mutations.put(k.name, makeDropKeyspaceMutation(k, timestamp).build()));</span>
+<span class="fc" id="L295">        diff.created.forEach(k -&gt; mutations.put(k.name, makeCreateKeyspaceMutation(k, timestamp).build()));</span>
+<span class="fc" id="L296">        diff.altered.forEach(kd -&gt;</span>
+        {
+<span class="fc" id="L298">            KeyspaceMetadata ks = kd.after;</span>
+
+<span class="fc" id="L300">            Mutation.SimpleBuilder builder = makeCreateKeyspaceMutation(ks.name, ks.params, timestamp);</span>
+
+<span class="fc" id="L302">            kd.types.dropped.forEach(t -&gt; addDropTypeToSchemaMutation(t, builder));</span>
+<span class="fc" id="L303">            kd.types.created.forEach(t -&gt; addTypeToSchemaMutation(t, builder));</span>
+<span class="fc" id="L304">            kd.types.altered(Difference.SHALLOW).forEach(td -&gt; addTypeToSchemaMutation(td.after, builder));</span>
+
+<span class="fc" id="L306">            kd.tables.dropped.forEach(t -&gt; addDropTableToSchemaMutation(t, builder));</span>
+<span class="fc" id="L307">            kd.tables.created.forEach(t -&gt; addTableToSchemaMutation(t, true, builder));</span>
+<span class="fc" id="L308">            kd.tables.altered(Difference.SHALLOW).forEach(td -&gt; addAlterTableToSchemaMutation(td.before, td.after, builder));</span>
+
+<span class="fc" id="L310">            kd.views.dropped.forEach(v -&gt; addDropViewToSchemaMutation(v, builder));</span>
+<span class="fc" id="L311">            kd.views.created.forEach(v -&gt; addViewToSchemaMutation(v, true, builder));</span>
+<span class="fc" id="L312">            kd.views.altered(Difference.SHALLOW).forEach(vd -&gt; addAlterViewToSchemaMutation(vd.before, vd.after, builder));</span>
+
+<span class="fc" id="L314">            kd.udfs.dropped.forEach(f -&gt; addDropFunctionToSchemaMutation((UDFunction) f, builder));</span>
+<span class="fc" id="L315">            kd.udfs.created.forEach(f -&gt; addFunctionToSchemaMutation((UDFunction) f, builder));</span>
+<span class="fc" id="L316">            kd.udfs.altered(Difference.SHALLOW).forEach(fd -&gt; addFunctionToSchemaMutation(fd.after, builder));</span>
+
+<span class="fc" id="L318">            kd.udas.dropped.forEach(a -&gt; addDropAggregateToSchemaMutation((UDAggregate) a, builder));</span>
+<span class="fc" id="L319">            kd.udas.created.forEach(a -&gt; addAggregateToSchemaMutation((UDAggregate) a, builder));</span>
+<span class="pc" id="L320">            kd.udas.altered(Difference.SHALLOW).forEach(ad -&gt; addAggregateToSchemaMutation(ad.after, builder));</span>
+
+<span class="fc" id="L322">            mutations.put(ks.name, builder.build());</span>
+<span class="fc" id="L323">        });</span>
+
+<span class="fc" id="L325">        return mutations.values();</span>
+    }
+
+    /**
+     * Add entries to system_schema.* for the hardcoded system keyspaces
+     */
+    @Simulate(with = GLOBAL_CLOCK)
+    static void saveSystemKeyspacesSchema()
+    {
+<span class="fc" id="L334">        KeyspaceMetadata system = Schema.instance.getKeyspaceMetadata(SchemaConstants.SYSTEM_KEYSPACE_NAME);</span>
+<span class="fc" id="L335">        KeyspaceMetadata schema = Schema.instance.getKeyspaceMetadata(SchemaConstants.SCHEMA_KEYSPACE_NAME);</span>
+
+<span class="fc" id="L337">        long timestamp = FBUtilities.timestampMicros();</span>
+
+        // delete old, possibly obsolete entries in schema tables
+<span class="fc bfc" id="L340" title="All 2 branches covered.">        for (String schemaTable : ALL)</span>
+        {
+<span class="fc" id="L342">            String query = String.format(&quot;DELETE FROM %s.%s USING TIMESTAMP ? WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, schemaTable);</span>
+<span class="fc bfc" id="L343" title="All 2 branches covered.">            for (String systemKeyspace : SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES)</span>
+<span class="fc" id="L344">                executeOnceInternal(query, timestamp, systemKeyspace);</span>
+<span class="fc" id="L345">        }</span>
+
+        // (+1 to timestamp to make sure we don't get shadowed by the tombstones we just added)
+<span class="fc" id="L348">        makeCreateKeyspaceMutation(system, timestamp + 1).build().apply();</span>
+<span class="fc" id="L349">        makeCreateKeyspaceMutation(schema, timestamp + 1).build().apply();</span>
+<span class="fc" id="L350">    }</span>
+
+    static void truncate()
+    {
+<span class="nc" id="L354">        logger.debug(&quot;Truncating schema tables...&quot;);</span>
+<span class="nc" id="L355">        ALL.reverse().forEach(table -&gt; getSchemaCFS(table).truncateBlocking());</span>
+<span class="nc" id="L356">    }</span>
+
+    private static void flush()
+    {
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.isUnsafeSystem())</span>
+<span class="fc" id="L361">            ALL.forEach(table -&gt; FBUtilities.waitOnFuture(getSchemaCFS(table).forceFlush(ColumnFamilyStore.FlushReason.INTERNALLY_FORCED)));</span>
+<span class="fc" id="L362">    }</span>
+
+    /**
+     * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
+     * will be converted into UUID which would act as content-based version of the schema.
+     */
+    public static UUID calculateSchemaDigest()
+    {
+<span class="fc" id="L370">        Digest digest = Digest.forSchema();</span>
+<span class="fc bfc" id="L371" title="All 2 branches covered.">        for (String table : ALL)</span>
+        {
+<span class="fc" id="L373">            ReadCommand cmd = getReadCommandForTableSchema(table);</span>
+<span class="fc" id="L374">            try (ReadExecutionController executionController = cmd.executionController();</span>
+<span class="fc" id="L375">                 PartitionIterator schema = cmd.executeInternal(executionController))</span>
+            {
+<span class="fc bfc" id="L377" title="All 2 branches covered.">                while (schema.hasNext())</span>
+                {
+<span class="fc" id="L379">                    try (RowIterator partition = schema.next())</span>
+                    {
+<span class="fc bfc" id="L381" title="All 2 branches covered.">                        if (!isSystemKeyspaceSchemaPartition(partition.partitionKey()))</span>
+<span class="fc" id="L382">                            RowIterators.digest(partition, digest);</span>
+                    }
+                }
+            }
+<span class="fc" id="L386">        }</span>
+<span class="fc" id="L387">        return UUID.nameUUIDFromBytes(digest.digest());</span>
+    }
+
+    /**
+     * @param schemaTableName The name of the table responsible for part of the schema
+     * @return CFS responsible to hold low-level serialized schema
+     */
+    private static ColumnFamilyStore getSchemaCFS(String schemaTableName)
+    {
+<span class="fc" id="L396">        return Keyspace.open(SchemaConstants.SCHEMA_KEYSPACE_NAME).getColumnFamilyStore(schemaTableName);</span>
+    }
+
+    /**
+     * @param schemaTableName The name of the table responsible for part of the schema.
+     * @return low-level schema representation
+     */
+    private static ReadCommand getReadCommandForTableSchema(String schemaTableName)
+    {
+<span class="fc" id="L405">        ColumnFamilyStore cfs = getSchemaCFS(schemaTableName);</span>
+<span class="fc" id="L406">        return PartitionRangeReadCommand.allDataRead(cfs.metadata(), FBUtilities.nowInSeconds());</span>
+    }
+
+    static Collection&lt;Mutation&gt; convertSchemaToMutations()
+    {
+<span class="fc" id="L411">        Map&lt;DecoratedKey, Mutation.PartitionUpdateCollector&gt; mutationMap = new HashMap&lt;&gt;();</span>
+
+<span class="fc bfc" id="L413" title="All 2 branches covered.">        for (String table : ALL)</span>
+<span class="fc" id="L414">            convertSchemaToMutations(mutationMap, table);</span>
+
+<span class="fc" id="L416">        return mutationMap.values().stream().map(Mutation.PartitionUpdateCollector::build).collect(Collectors.toList());</span>
+    }
+
+    private static void convertSchemaToMutations(Map&lt;DecoratedKey, Mutation.PartitionUpdateCollector&gt; mutationMap, String schemaTableName)
+    {
+<span class="fc" id="L421">        ReadCommand cmd = getReadCommandForTableSchema(schemaTableName);</span>
+<span class="fc" id="L422">        try (ReadExecutionController executionController = cmd.executionController();</span>
+<span class="fc" id="L423">             UnfilteredPartitionIterator iter = cmd.executeLocally(executionController))</span>
+        {
+<span class="fc bfc" id="L425" title="All 2 branches covered.">            while (iter.hasNext())</span>
+            {
+<span class="fc" id="L427">                try (UnfilteredRowIterator partition = iter.next())</span>
+                {
+<span class="fc bfc" id="L429" title="All 2 branches covered.">                    if (isSystemKeyspaceSchemaPartition(partition.partitionKey()))</span>
+                        continue;
+
+<span class="fc" id="L432">                    DecoratedKey key = partition.partitionKey();</span>
+<span class="fc" id="L433">                    Mutation.PartitionUpdateCollector puCollector = mutationMap.computeIfAbsent(key, k -&gt; new Mutation.PartitionUpdateCollector(SchemaConstants.SCHEMA_KEYSPACE_NAME, key));</span>
+<span class="fc" id="L434">                    puCollector.add(makeUpdateForSchema(partition, cmd.columnFilter()).withOnlyPresentColumns());</span>
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">                }</span>
+            }
+        }
+<span class="fc" id="L438">    }</span>
+
+    /**
+     * Creates a PartitionUpdate from a partition containing some schema table content.
+     * This is mainly calling {@code PartitionUpdate.fromIterator} except for the fact that it deals with
+     * the problem described in #12236.
+     */
+    private static PartitionUpdate makeUpdateForSchema(UnfilteredRowIterator partition, ColumnFilter filter)
+    {
+        // This method is used during schema migration tasks, and if cdc is disabled, we want to force excluding the
+        // 'cdc' column from the TABLES/VIEWS schema table because it is problematic if received by older nodes (see #12236
+        // and #12697). Otherwise though, we just simply &quot;buffer&quot; the content of the partition into a PartitionUpdate.
+<span class="pc bpc" id="L450" title="1 of 4 branches missed.">        if (DatabaseDescriptor.isCDCEnabled() || !TABLES_WITH_CDC_ADDED.contains(partition.metadata().name))</span>
+<span class="fc" id="L451">            return PartitionUpdate.fromIterator(partition, filter);</span>
+
+        // We want to skip the 'cdc' column. A simple solution for that is based on the fact that
+        // 'PartitionUpdate.fromIterator()' will ignore any columns that are marked as 'fetched' but not 'queried'.
+<span class="fc" id="L455">        ColumnFilter.Builder builder = ColumnFilter.allRegularColumnsBuilder(partition.metadata(), false);</span>
+<span class="fc bfc" id="L456" title="All 2 branches covered.">        for (ColumnMetadata column : filter.fetchedColumns())</span>
+        {
+<span class="fc bfc" id="L458" title="All 2 branches covered.">            if (!column.name.toString().equals(&quot;cdc&quot;))</span>
+<span class="fc" id="L459">                builder.add(column);</span>
+<span class="fc" id="L460">        }</span>
+
+<span class="fc" id="L462">        return PartitionUpdate.fromIterator(partition, builder.build());</span>
+    }
+
+    private static boolean isSystemKeyspaceSchemaPartition(DecoratedKey partitionKey)
+    {
+<span class="fc" id="L467">        return SchemaConstants.isLocalSystemKeyspace(UTF8Type.instance.compose(partitionKey.getKey()));</span>
+    }
+
+    /*
+     * Schema entities to mutations
+     */
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private static DecoratedKey decorate(TableMetadata metadata, Object value)
+    {
+<span class="fc" id="L477">        return metadata.partitioner.decorateKey(metadata.partitionKeyType.decomposeUntyped(value));</span>
+    }
+
+    private static Mutation.SimpleBuilder makeCreateKeyspaceMutation(String name, KeyspaceParams params, long timestamp)
+    {
+<span class="fc" id="L482">        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(Keyspaces.keyspace, decorate(Keyspaces, name))</span>
+<span class="fc" id="L483">                                                 .timestamp(timestamp);</span>
+
+<span class="fc" id="L485">        builder.update(Keyspaces)</span>
+<span class="fc" id="L486">               .row()</span>
+<span class="fc" id="L487">               .add(KeyspaceParams.Option.DURABLE_WRITES.toString(), params.durableWrites)</span>
+<span class="fc" id="L488">               .add(KeyspaceParams.Option.REPLICATION.toString(), params.replication.asMap());</span>
+
+<span class="fc" id="L490">        return builder;</span>
+    }
+
+    @VisibleForTesting
+    static Mutation.SimpleBuilder makeCreateKeyspaceMutation(KeyspaceMetadata keyspace, long timestamp)
+    {
+<span class="fc" id="L496">        Mutation.SimpleBuilder builder = makeCreateKeyspaceMutation(keyspace.name, keyspace.params, timestamp);</span>
+
+<span class="fc" id="L498">        keyspace.tables.forEach(table -&gt; addTableToSchemaMutation(table, true, builder));</span>
+<span class="pc" id="L499">        keyspace.views.forEach(view -&gt; addViewToSchemaMutation(view, true, builder));</span>
+<span class="pc" id="L500">        keyspace.types.forEach(type -&gt; addTypeToSchemaMutation(type, builder));</span>
+<span class="pc" id="L501">        keyspace.userFunctions.udfs().forEach(udf -&gt; addFunctionToSchemaMutation(udf, builder));</span>
+<span class="pc" id="L502">        keyspace.userFunctions.udas().forEach(uda -&gt; addAggregateToSchemaMutation(uda, builder));</span>
+
+<span class="fc" id="L504">        return builder;</span>
+    }
+
+    private static Mutation.SimpleBuilder makeDropKeyspaceMutation(KeyspaceMetadata keyspace, long timestamp)
+    {
+<span class="fc" id="L509">        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(SchemaConstants.SCHEMA_KEYSPACE_NAME, decorate(Keyspaces, keyspace.name))</span>
+<span class="fc" id="L510">                                                 .timestamp(timestamp);</span>
+
+<span class="fc bfc" id="L512" title="All 2 branches covered.">        for (TableMetadata schemaTable : ALL_TABLE_METADATA)</span>
+<span class="fc" id="L513">            builder.update(schemaTable).delete();</span>
+
+<span class="fc" id="L515">        return builder;</span>
+    }
+
+    private static void addTypeToSchemaMutation(UserType type, Mutation.SimpleBuilder mutation)
+    {
+<span class="fc" id="L520">        mutation.update(Types)</span>
+<span class="fc" id="L521">                .row(type.getNameAsString())</span>
+<span class="fc" id="L522">                .add(&quot;field_names&quot;, type.fieldNames().stream().map(FieldIdentifier::toString).collect(toList()))</span>
+<span class="fc" id="L523">                .add(&quot;field_types&quot;, type.fieldTypes().stream().map(AbstractType::asCQL3Type).map(CQL3Type::toString).collect(toList()));</span>
+<span class="fc" id="L524">    }</span>
+
+    private static void addDropTypeToSchemaMutation(UserType type, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L528">        builder.update(Types).row(type.name).delete();</span>
+<span class="fc" id="L529">    }</span>
+
+    @VisibleForTesting
+    static Mutation.SimpleBuilder makeCreateTableMutation(KeyspaceMetadata keyspace, TableMetadata table, long timestamp)
+    {
+        // Include the serialized keyspace in case the target node missed a CREATE KEYSPACE migration (see CASSANDRA-5631).
+<span class="nc" id="L535">        Mutation.SimpleBuilder builder = makeCreateKeyspaceMutation(keyspace.name, keyspace.params, timestamp);</span>
+<span class="nc" id="L536">        addTableToSchemaMutation(table, true, builder);</span>
+<span class="nc" id="L537">        return builder;</span>
+    }
+
+    private static void addTableToSchemaMutation(TableMetadata table, boolean withColumnsAndTriggers, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L542">        Row.SimpleBuilder rowBuilder = builder.update(Tables)</span>
+<span class="fc" id="L543">                                              .row(table.name)</span>
+<span class="fc" id="L544">                                              .deletePrevious()</span>
+<span class="fc" id="L545">                                              .add(&quot;id&quot;, table.id.asUUID())</span>
+<span class="fc" id="L546">                                              .add(&quot;flags&quot;, TableMetadata.Flag.toStringSet(table.flags));</span>
+
+<span class="fc" id="L548">        addTableParamsToRowBuilder(table.params, rowBuilder);</span>
+
+<span class="fc bfc" id="L550" title="All 2 branches covered.">        if (withColumnsAndTriggers)</span>
+        {
+<span class="fc bfc" id="L552" title="All 2 branches covered.">            for (ColumnMetadata column : table.columns())</span>
+<span class="fc" id="L553">                addColumnToSchemaMutation(table, column, builder);</span>
+
+<span class="fc bfc" id="L555" title="All 2 branches covered.">            for (DroppedColumn column : table.droppedColumns.values())</span>
+<span class="fc" id="L556">                addDroppedColumnToSchemaMutation(table, column, builder);</span>
+
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">            for (TriggerMetadata trigger : table.triggers)</span>
+<span class="nc" id="L559">                addTriggerToSchemaMutation(table, trigger, builder);</span>
+
+<span class="fc bfc" id="L561" title="All 2 branches covered.">            for (IndexMetadata index : table.indexes)</span>
+<span class="fc" id="L562">                addIndexToSchemaMutation(table, index, builder);</span>
+        }
+<span class="fc" id="L564">    }</span>
+
+    private static void addTableParamsToRowBuilder(TableParams params, Row.SimpleBuilder builder)
+    {
+<span class="fc" id="L568">        builder.add(&quot;bloom_filter_fp_chance&quot;, params.bloomFilterFpChance)</span>
+<span class="fc" id="L569">               .add(&quot;comment&quot;, params.comment)</span>
+<span class="fc" id="L570">               .add(&quot;dclocal_read_repair_chance&quot;, 0.0) // no longer used, left for drivers' sake</span>
+<span class="fc" id="L571">               .add(&quot;default_time_to_live&quot;, params.defaultTimeToLive)</span>
+<span class="fc" id="L572">               .add(&quot;gc_grace_seconds&quot;, params.gcGraceSeconds)</span>
+<span class="fc" id="L573">               .add(&quot;max_index_interval&quot;, params.maxIndexInterval)</span>
+<span class="fc" id="L574">               .add(&quot;memtable_flush_period_in_ms&quot;, params.memtableFlushPeriodInMs)</span>
+<span class="fc" id="L575">               .add(&quot;min_index_interval&quot;, params.minIndexInterval)</span>
+<span class="fc" id="L576">               .add(&quot;read_repair_chance&quot;, 0.0) // no longer used, left for drivers' sake</span>
+<span class="fc" id="L577">               .add(&quot;speculative_retry&quot;, params.speculativeRetry.toString())</span>
+<span class="fc" id="L578">               .add(&quot;additional_write_policy&quot;, params.additionalWritePolicy.toString())</span>
+<span class="fc" id="L579">               .add(&quot;crc_check_chance&quot;, params.crcCheckChance)</span>
+<span class="fc" id="L580">               .add(&quot;caching&quot;, params.caching.asMap())</span>
+<span class="fc" id="L581">               .add(&quot;compaction&quot;, params.compaction.asMap())</span>
+<span class="fc" id="L582">               .add(&quot;compression&quot;, params.compression.asMap())</span>
+<span class="fc" id="L583">               .add(&quot;read_repair&quot;, params.readRepair.toString())</span>
+<span class="fc" id="L584">               .add(&quot;extensions&quot;, params.extensions);</span>
+
+        // Only add CDC-enabled flag to schema if it's enabled on the node. This is to work around RTE's post-8099 if a 3.8+
+        // node sends table schema to a &lt; 3.8 versioned node with an unknown column.
+<span class="fc bfc" id="L588" title="All 2 branches covered.">        if (DatabaseDescriptor.isCDCEnabled())</span>
+<span class="fc" id="L589">            builder.add(&quot;cdc&quot;, params.cdc);</span>
+
+        // As above, only add the memtable column if the table uses a non-default memtable configuration to avoid RTE
+        // in mixed operation with pre-4.1 versioned node during upgrades.
+<span class="pc bpc" id="L593" title="1 of 2 branches missed.">        if (params.memtable != MemtableParams.DEFAULT)</span>
+<span class="nc" id="L594">            builder.add(&quot;memtable&quot;, params.memtable.configurationKey());</span>
+
+        // As above, only add the allow_auto_snapshot column if the value is not default (true) and
+        // auto-snapshotting is enabled, to avoid RTE in pre-4.2 versioned node during upgrades
+<span class="pc bpc" id="L598" title="1 of 2 branches missed.">        if (!params.allowAutoSnapshot)</span>
+<span class="nc" id="L599">            builder.add(&quot;allow_auto_snapshot&quot;, false);</span>
+
+        // As above, only add the incremental_backups column if the value is not default (true) and
+        // incremental_backups is enabled, to avoid RTE in pre-4.2 versioned node during upgrades
+<span class="pc bpc" id="L603" title="1 of 2 branches missed.">        if (!params.incrementalBackups)</span>
+<span class="nc" id="L604">            builder.add(&quot;incremental_backups&quot;, false);</span>
+<span class="fc" id="L605">    }</span>
+
+    private static void addAlterTableToSchemaMutation(TableMetadata oldTable, TableMetadata newTable, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L609">        addTableToSchemaMutation(newTable, false, builder);</span>
+
+<span class="fc" id="L611">        MapDifference&lt;ByteBuffer, ColumnMetadata&gt; columnDiff = Maps.difference(oldTable.columns, newTable.columns);</span>
+
+        // columns that are no longer needed
+<span class="fc bfc" id="L614" title="All 2 branches covered.">        for (ColumnMetadata column : columnDiff.entriesOnlyOnLeft().values())</span>
+<span class="fc" id="L615">            dropColumnFromSchemaMutation(oldTable, column, builder);</span>
+
+        // newly added columns
+<span class="fc bfc" id="L618" title="All 2 branches covered.">        for (ColumnMetadata column : columnDiff.entriesOnlyOnRight().values())</span>
+<span class="fc" id="L619">            addColumnToSchemaMutation(newTable, column, builder);</span>
+
+        // old columns with updated attributes
+<span class="pc bpc" id="L622" title="1 of 2 branches missed.">        for (ByteBuffer name : columnDiff.entriesDiffering().keySet())</span>
+<span class="nc" id="L623">            addColumnToSchemaMutation(newTable, newTable.getColumn(name), builder);</span>
+
+        // dropped columns
+<span class="fc" id="L626">        MapDifference&lt;ByteBuffer, DroppedColumn&gt; droppedColumnDiff =</span>
+<span class="fc" id="L627">            Maps.difference(oldTable.droppedColumns, newTable.droppedColumns);</span>
+
+        // newly dropped columns
+<span class="fc bfc" id="L630" title="All 2 branches covered.">        for (DroppedColumn column : droppedColumnDiff.entriesOnlyOnRight().values())</span>
+<span class="fc" id="L631">            addDroppedColumnToSchemaMutation(newTable, column, builder);</span>
+
+        // columns added then dropped again
+<span class="pc bpc" id="L634" title="1 of 2 branches missed.">        for (ByteBuffer name : droppedColumnDiff.entriesDiffering().keySet())</span>
+<span class="nc" id="L635">            addDroppedColumnToSchemaMutation(newTable, newTable.droppedColumns.get(name), builder);</span>
+
+<span class="fc" id="L637">        MapDifference&lt;String, TriggerMetadata&gt; triggerDiff = triggersDiff(oldTable.triggers, newTable.triggers);</span>
+
+        // dropped triggers
+<span class="pc bpc" id="L640" title="1 of 2 branches missed.">        for (TriggerMetadata trigger : triggerDiff.entriesOnlyOnLeft().values())</span>
+<span class="nc" id="L641">            dropTriggerFromSchemaMutation(oldTable, trigger, builder);</span>
+
+        // newly created triggers
+<span class="pc bpc" id="L644" title="1 of 2 branches missed.">        for (TriggerMetadata trigger : triggerDiff.entriesOnlyOnRight().values())</span>
+<span class="nc" id="L645">            addTriggerToSchemaMutation(newTable, trigger, builder);</span>
+
+<span class="fc" id="L647">        MapDifference&lt;String, IndexMetadata&gt; indexesDiff = indexesDiff(oldTable.indexes, newTable.indexes);</span>
+
+        // dropped indexes
+<span class="fc bfc" id="L650" title="All 2 branches covered.">        for (IndexMetadata index : indexesDiff.entriesOnlyOnLeft().values())</span>
+<span class="fc" id="L651">            dropIndexFromSchemaMutation(oldTable, index, builder);</span>
+
+        // newly created indexes
+<span class="fc bfc" id="L654" title="All 2 branches covered.">        for (IndexMetadata index : indexesDiff.entriesOnlyOnRight().values())</span>
+<span class="fc" id="L655">            addIndexToSchemaMutation(newTable, index, builder);</span>
+
+        // updated indexes need to be updated
+<span class="pc bpc" id="L658" title="1 of 2 branches missed.">        for (MapDifference.ValueDifference&lt;IndexMetadata&gt; diff : indexesDiff.entriesDiffering().values())</span>
+<span class="nc" id="L659">            addUpdatedIndexToSchemaMutation(newTable, diff.rightValue(), builder);</span>
+<span class="fc" id="L660">    }</span>
+
+    @VisibleForTesting
+    static Mutation.SimpleBuilder makeUpdateTableMutation(KeyspaceMetadata keyspace,
+                                                          TableMetadata oldTable,
+                                                          TableMetadata newTable,
+                                                          long timestamp)
+    {
+<span class="nc" id="L668">        Mutation.SimpleBuilder builder = makeCreateKeyspaceMutation(keyspace.name, keyspace.params, timestamp);</span>
+<span class="nc" id="L669">        addAlterTableToSchemaMutation(oldTable, newTable, builder);</span>
+<span class="nc" id="L670">        return builder;</span>
+    }
+
+    private static MapDifference&lt;String, IndexMetadata&gt; indexesDiff(Indexes before, Indexes after)
+    {
+<span class="fc" id="L675">        Map&lt;String, IndexMetadata&gt; beforeMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L676">        before.forEach(i -&gt; beforeMap.put(i.name, i));</span>
+
+<span class="fc" id="L678">        Map&lt;String, IndexMetadata&gt; afterMap = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L679">        after.forEach(i -&gt; afterMap.put(i.name, i));</span>
+
+<span class="fc" id="L681">        return Maps.difference(beforeMap, afterMap);</span>
+    }
+
+    private static MapDifference&lt;String, TriggerMetadata&gt; triggersDiff(Triggers before, Triggers after)
+    {
+<span class="fc" id="L686">        Map&lt;String, TriggerMetadata&gt; beforeMap = new HashMap&lt;&gt;();</span>
+<span class="pc" id="L687">        before.forEach(t -&gt; beforeMap.put(t.name, t));</span>
+
+<span class="fc" id="L689">        Map&lt;String, TriggerMetadata&gt; afterMap = new HashMap&lt;&gt;();</span>
+<span class="pc" id="L690">        after.forEach(t -&gt; afterMap.put(t.name, t));</span>
+
+<span class="fc" id="L692">        return Maps.difference(beforeMap, afterMap);</span>
+    }
+
+    private static void addDropTableToSchemaMutation(TableMetadata table, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L697">        builder.update(Tables).row(table.name).delete();</span>
+
+<span class="fc bfc" id="L699" title="All 2 branches covered.">        for (ColumnMetadata column : table.columns())</span>
+<span class="fc" id="L700">            dropColumnFromSchemaMutation(table, column, builder);</span>
+
+<span class="pc bpc" id="L702" title="1 of 2 branches missed.">        for (TriggerMetadata trigger : table.triggers)</span>
+<span class="nc" id="L703">            dropTriggerFromSchemaMutation(table, trigger, builder);</span>
+
+<span class="fc bfc" id="L705" title="All 2 branches covered.">        for (DroppedColumn column : table.droppedColumns.values())</span>
+<span class="fc" id="L706">            dropDroppedColumnFromSchemaMutation(table, column, builder);</span>
+
+<span class="fc bfc" id="L708" title="All 2 branches covered.">        for (IndexMetadata index : table.indexes)</span>
+<span class="fc" id="L709">            dropIndexFromSchemaMutation(table, index, builder);</span>
+<span class="fc" id="L710">    }</span>
+
+    private static void addColumnToSchemaMutation(TableMetadata table, ColumnMetadata column, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L714">        AbstractType&lt;?&gt; type = column.type;</span>
+<span class="fc bfc" id="L715" title="All 2 branches covered.">        if (type instanceof ReversedType)</span>
+<span class="fc" id="L716">            type = ((ReversedType&lt;?&gt;) type).baseType;</span>
+
+<span class="fc" id="L718">        builder.update(Columns)</span>
+<span class="fc" id="L719">               .row(table.name, column.name.toString())</span>
+<span class="fc" id="L720">               .add(&quot;column_name_bytes&quot;, column.name.bytes)</span>
+<span class="fc" id="L721">               .add(&quot;kind&quot;, column.kind.toString().toLowerCase())</span>
+<span class="fc" id="L722">               .add(&quot;position&quot;, column.position())</span>
+<span class="fc" id="L723">               .add(&quot;clustering_order&quot;, column.clusteringOrder().toString().toLowerCase())</span>
+<span class="fc" id="L724">               .add(&quot;type&quot;, type.asCQL3Type().toString());</span>
+
+<span class="fc" id="L726">        ColumnMask mask = column.getMask();</span>
+<span class="fc bfc" id="L727" title="All 2 branches covered.">        if (SchemaConstants.isReplicatedSystemKeyspace(table.keyspace))</span>
+        {
+            // The propagation of system distributed keyspaces at startup can be problematic for old nodes without DDM,
+            // since those won't know what to do with the mask mutations. Thus, we don't support DDM on those keyspaces.
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">            assert mask == null : &quot;Dynamic data masking shouldn't be used on system distributed keyspaces&quot;;</span>
+        }
+        else
+        {
+<span class="fc" id="L735">            Row.SimpleBuilder maskBuilder = builder.update(ColumnMasks).row(table.name, column.name.toString());</span>
+
+<span class="pc bpc" id="L737" title="1 of 2 branches missed.">            if (mask == null)</span>
+            {
+<span class="fc" id="L739">                maskBuilder.delete();</span>
+            }
+            else
+            {
+<span class="nc" id="L743">                FunctionName maskFunctionName = mask.function.name();</span>
+
+                // Some arguments of the masking function can be null, but the CQL's list type that stores them doesn't
+                // accept nulls, so we use a parallel list of booleans to store what arguments are null.
+<span class="nc" id="L747">                List&lt;AbstractType&lt;?&gt;&gt; partialTypes = mask.partialArgumentTypes();</span>
+<span class="nc" id="L748">                List&lt;ByteBuffer&gt; partialValues = mask.partialArgumentValues();</span>
+<span class="nc" id="L749">                int numArgs = partialTypes.size();</span>
+<span class="nc" id="L750">                List&lt;String&gt; types = new ArrayList&lt;&gt;(numArgs);</span>
+<span class="nc" id="L751">                List&lt;String&gt; values = new ArrayList&lt;&gt;(numArgs);</span>
+<span class="nc" id="L752">                List&lt;Boolean&gt; nulls = new ArrayList&lt;&gt;(numArgs);</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">                for (int i = 0; i &lt; numArgs; i++)</span>
+                {
+<span class="nc" id="L755">                    AbstractType&lt;?&gt; argType = partialTypes.get(i);</span>
+<span class="nc" id="L756">                    types.add(argType.asCQL3Type().toString());</span>
+
+<span class="nc" id="L758">                    ByteBuffer argValue = partialValues.get(i);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">                    boolean isNull = argValue == null;</span>
+<span class="nc" id="L760">                    nulls.add(isNull);</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">                    values.add(isNull ? &quot;&quot; : argType.getString(argValue));</span>
+                }
+
+<span class="nc" id="L764">                maskBuilder.add(&quot;function_keyspace&quot;, maskFunctionName.keyspace)</span>
+<span class="nc" id="L765">                           .add(&quot;function_name&quot;, maskFunctionName.name)</span>
+<span class="nc" id="L766">                           .add(&quot;function_argument_types&quot;, types)</span>
+<span class="nc" id="L767">                           .add(&quot;function_argument_values&quot;, values)</span>
+<span class="nc" id="L768">                           .add(&quot;function_argument_nulls&quot;, nulls);</span>
+            }
+        }
+<span class="fc" id="L771">    }</span>
+
+    private static void dropColumnFromSchemaMutation(TableMetadata table, ColumnMetadata column, Mutation.SimpleBuilder builder)
+    {
+        // Note: we do want to use name.toString(), not name.bytes directly for backward compatibility (For CQL3, this won't make a difference).
+<span class="fc" id="L776">        builder.update(Columns).row(table.name, column.name.toString()).delete();</span>
+<span class="fc" id="L777">    }</span>
+
+    private static void addDroppedColumnToSchemaMutation(TableMetadata table, DroppedColumn column, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L781">        builder.update(DroppedColumns)</span>
+<span class="fc" id="L782">               .row(table.name, column.column.name.toString())</span>
+<span class="fc" id="L783">               .add(&quot;dropped_time&quot;, new Date(TimeUnit.MICROSECONDS.toMillis(column.droppedTime)))</span>
+<span class="fc" id="L784">               .add(&quot;type&quot;, column.column.type.asCQL3Type().toString())</span>
+<span class="fc" id="L785">               .add(&quot;kind&quot;, column.column.kind.toString().toLowerCase());</span>
+<span class="fc" id="L786">    }</span>
+
+    private static void dropDroppedColumnFromSchemaMutation(TableMetadata table, DroppedColumn column, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L790">        builder.update(DroppedColumns).row(table.name, column.column.name.toString()).delete();</span>
+<span class="fc" id="L791">    }</span>
+
+    private static void addTriggerToSchemaMutation(TableMetadata table, TriggerMetadata trigger, Mutation.SimpleBuilder builder)
+    {
+<span class="nc" id="L795">        builder.update(Triggers)</span>
+<span class="nc" id="L796">               .row(table.name, trigger.name)</span>
+<span class="nc" id="L797">               .add(&quot;options&quot;, Collections.singletonMap(&quot;class&quot;, trigger.classOption));</span>
+<span class="nc" id="L798">    }</span>
+
+    private static void dropTriggerFromSchemaMutation(TableMetadata table, TriggerMetadata trigger, Mutation.SimpleBuilder builder)
+    {
+<span class="nc" id="L802">        builder.update(Triggers).row(table.name, trigger.name).delete();</span>
+<span class="nc" id="L803">    }</span>
+
+    private static void addViewToSchemaMutation(ViewMetadata view, boolean includeColumns, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L807">        TableMetadata table = view.metadata;</span>
+<span class="fc" id="L808">        Row.SimpleBuilder rowBuilder = builder.update(Views)</span>
+<span class="fc" id="L809">                                              .row(view.name())</span>
+<span class="fc" id="L810">                                              .deletePrevious()</span>
+<span class="fc" id="L811">                                              .add(&quot;include_all_columns&quot;, view.includeAllColumns)</span>
+<span class="fc" id="L812">                                              .add(&quot;base_table_id&quot;, view.baseTableId.asUUID())</span>
+<span class="fc" id="L813">                                              .add(&quot;base_table_name&quot;, view.baseTableName)</span>
+<span class="fc" id="L814">                                              .add(&quot;where_clause&quot;, view.whereClause.toCQLString())</span>
+<span class="fc" id="L815">                                              .add(&quot;id&quot;, table.id.asUUID());</span>
+
+<span class="fc" id="L817">        addTableParamsToRowBuilder(table.params, rowBuilder);</span>
+
+<span class="fc bfc" id="L819" title="All 2 branches covered.">        if (includeColumns)</span>
+        {
+<span class="fc bfc" id="L821" title="All 2 branches covered.">            for (ColumnMetadata column : table.columns())</span>
+<span class="fc" id="L822">                addColumnToSchemaMutation(table, column, builder);</span>
+
+<span class="pc bpc" id="L824" title="1 of 2 branches missed.">            for (DroppedColumn column : table.droppedColumns.values())</span>
+<span class="nc" id="L825">                addDroppedColumnToSchemaMutation(table, column, builder);</span>
+        }
+<span class="fc" id="L827">    }</span>
+
+    private static void addDropViewToSchemaMutation(ViewMetadata view, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L831">        builder.update(Views).row(view.name()).delete();</span>
+
+<span class="fc" id="L833">        TableMetadata table = view.metadata;</span>
+<span class="fc bfc" id="L834" title="All 2 branches covered.">        for (ColumnMetadata column : table.columns())</span>
+<span class="fc" id="L835">            dropColumnFromSchemaMutation(table, column, builder);</span>
+<span class="fc" id="L836">    }</span>
+
+    private static void addAlterViewToSchemaMutation(ViewMetadata before, ViewMetadata after, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L840">        addViewToSchemaMutation(after, false, builder);</span>
+
+<span class="fc" id="L842">        MapDifference&lt;ByteBuffer, ColumnMetadata&gt; columnDiff = Maps.difference(before.metadata.columns, after.metadata.columns);</span>
+
+        // columns that are no longer needed
+<span class="fc bfc" id="L845" title="All 2 branches covered.">        for (ColumnMetadata column : columnDiff.entriesOnlyOnLeft().values())</span>
+<span class="fc" id="L846">            dropColumnFromSchemaMutation(before.metadata, column, builder);</span>
+
+        // newly added columns
+<span class="fc bfc" id="L849" title="All 2 branches covered.">        for (ColumnMetadata column : columnDiff.entriesOnlyOnRight().values())</span>
+<span class="fc" id="L850">            addColumnToSchemaMutation(after.metadata, column, builder);</span>
+
+        // old columns with updated attributes
+<span class="pc bpc" id="L853" title="1 of 2 branches missed.">        for (ByteBuffer name : columnDiff.entriesDiffering().keySet())</span>
+<span class="nc" id="L854">            addColumnToSchemaMutation(after.metadata, after.metadata.getColumn(name), builder);</span>
+<span class="fc" id="L855">    }</span>
+
+    private static void addIndexToSchemaMutation(TableMetadata table, IndexMetadata index, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L859">        builder.update(Indexes)</span>
+<span class="fc" id="L860">               .row(table.name, index.name)</span>
+<span class="fc" id="L861">               .add(&quot;kind&quot;, index.kind.toString())</span>
+<span class="fc" id="L862">               .add(&quot;options&quot;, index.options);</span>
+<span class="fc" id="L863">    }</span>
+
+    private static void dropIndexFromSchemaMutation(TableMetadata table, IndexMetadata index, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L867">        builder.update(Indexes).row(table.name, index.name).delete();</span>
+<span class="fc" id="L868">    }</span>
+
+    private static void addUpdatedIndexToSchemaMutation(TableMetadata table,
+                                                        IndexMetadata index,
+                                                        Mutation.SimpleBuilder builder)
+    {
+<span class="nc" id="L874">        addIndexToSchemaMutation(table, index, builder);</span>
+<span class="nc" id="L875">    }</span>
+
+    private static void addFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L879">        builder.update(Functions)</span>
+<span class="fc" id="L880">               .row(function.name().name, function.argumentsList())</span>
+<span class="fc" id="L881">               .add(&quot;body&quot;, function.body())</span>
+<span class="fc" id="L882">               .add(&quot;language&quot;, function.language())</span>
+<span class="fc" id="L883">               .add(&quot;return_type&quot;, function.returnType().asCQL3Type().toString())</span>
+<span class="fc" id="L884">               .add(&quot;called_on_null_input&quot;, function.isCalledOnNullInput())</span>
+<span class="fc" id="L885">               .add(&quot;argument_names&quot;, function.argNames().stream().map((c) -&gt; bbToString(c.bytes)).collect(toList()));</span>
+<span class="fc" id="L886">    }</span>
+
+    private static String bbToString(ByteBuffer bb)
+    {
+        try
+        {
+<span class="fc" id="L892">            return ByteBufferUtil.string(bb);</span>
+        }
+<span class="nc" id="L894">        catch (CharacterCodingException e)</span>
+        {
+<span class="nc" id="L896">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    private static void addDropFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L902">        builder.update(Functions).row(function.name().name, function.argumentsList()).delete();</span>
+<span class="fc" id="L903">    }</span>
+
+    private static void addAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L907">        builder.update(Aggregates)</span>
+<span class="fc" id="L908">               .row(aggregate.name().name, aggregate.argumentsList())</span>
+<span class="fc" id="L909">               .add(&quot;return_type&quot;, aggregate.returnType().asCQL3Type().toString())</span>
+<span class="fc" id="L910">               .add(&quot;state_func&quot;, aggregate.stateFunction().name().name)</span>
+<span class="fc" id="L911">               .add(&quot;state_type&quot;, aggregate.stateType().asCQL3Type().toString())</span>
+<span class="fc bfc" id="L912" title="All 2 branches covered.">               .add(&quot;final_func&quot;, aggregate.finalFunction() != null ? aggregate.finalFunction().name().name : null)</span>
+<span class="fc bfc" id="L913" title="All 2 branches covered.">               .add(&quot;initcond&quot;, aggregate.initialCondition() != null</span>
+                                // must use the frozen state type here, as 'null' for unfrozen collections may mean 'empty'
+<span class="fc" id="L915">                                ? aggregate.stateType().freeze().asCQL3Type().toCQLLiteral(aggregate.initialCondition())</span>
+<span class="fc" id="L916">                                : null);</span>
+<span class="fc" id="L917">    }</span>
+
+    private static void addDropAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
+    {
+<span class="fc" id="L921">        builder.update(Aggregates).row(aggregate.name().name, aggregate.argumentsList()).delete();</span>
+<span class="fc" id="L922">    }</span>
+
+    /*
+     * Fetching schema
+     */
+    public static Keyspaces fetchNonSystemKeyspaces()
+    {
+<span class="fc" id="L929">        return fetchKeyspacesWithout(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES);</span>
+    }
+
+    private static Keyspaces fetchKeyspacesWithout(Set&lt;String&gt; excludedKeyspaceNames)
+    {
+<span class="fc" id="L934">        String query = format(&quot;SELECT keyspace_name FROM %s.%s&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, KEYSPACES);</span>
+
+<span class="fc" id="L936">        Keyspaces.Builder keyspaces = org.apache.cassandra.schema.Keyspaces.builder();</span>
+<span class="fc bfc" id="L937" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query))</span>
+        {
+<span class="fc" id="L939">            String keyspaceName = row.getString(&quot;keyspace_name&quot;);</span>
+<span class="fc bfc" id="L940" title="All 2 branches covered.">            if (!excludedKeyspaceNames.contains(keyspaceName))</span>
+<span class="fc" id="L941">                keyspaces.add(fetchKeyspace(keyspaceName));</span>
+<span class="fc" id="L942">        }</span>
+<span class="fc" id="L943">        return keyspaces.build();</span>
+    }
+
+    private static KeyspaceMetadata fetchKeyspace(String keyspaceName)
+    {
+<span class="fc" id="L948">        KeyspaceParams params = fetchKeyspaceParams(keyspaceName);</span>
+<span class="fc" id="L949">        Types types = fetchTypes(keyspaceName);</span>
+<span class="fc" id="L950">        UserFunctions functions = fetchFunctions(keyspaceName, types);</span>
+<span class="fc" id="L951">        Tables tables = fetchTables(keyspaceName, types, functions);</span>
+<span class="fc" id="L952">        Views views = fetchViews(keyspaceName, types, functions);</span>
+<span class="fc" id="L953">        return KeyspaceMetadata.create(keyspaceName, params, tables, views, types, functions);</span>
+    }
+
+    private static KeyspaceParams fetchKeyspaceParams(String keyspaceName)
+    {
+<span class="fc" id="L958">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, KEYSPACES);</span>
+
+<span class="fc" id="L960">        UntypedResultSet.Row row = query(query, keyspaceName).one();</span>
+<span class="fc" id="L961">        boolean durableWrites = row.getBoolean(KeyspaceParams.Option.DURABLE_WRITES.toString());</span>
+<span class="fc" id="L962">        Map&lt;String, String&gt; replication = row.getFrozenTextMap(KeyspaceParams.Option.REPLICATION.toString());</span>
+<span class="fc" id="L963">        return KeyspaceParams.create(durableWrites, replication);</span>
+    }
+
+    private static Types fetchTypes(String keyspaceName)
+    {
+<span class="fc" id="L968">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, TYPES);</span>
+
+<span class="fc" id="L970">        Types.RawBuilder types = org.apache.cassandra.schema.Types.rawBuilder(keyspaceName);</span>
+<span class="fc bfc" id="L971" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, keyspaceName))</span>
+        {
+<span class="fc" id="L973">            String name = row.getString(&quot;type_name&quot;);</span>
+<span class="fc" id="L974">            List&lt;String&gt; fieldNames = row.getFrozenList(&quot;field_names&quot;, UTF8Type.instance);</span>
+<span class="fc" id="L975">            List&lt;String&gt; fieldTypes = row.getFrozenList(&quot;field_types&quot;, UTF8Type.instance);</span>
+<span class="fc" id="L976">            types.add(name, fieldNames, fieldTypes);</span>
+<span class="fc" id="L977">        }</span>
+<span class="fc" id="L978">        return types.build();</span>
+    }
+
+    private static Tables fetchTables(String keyspaceName, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L983">        String query = format(&quot;SELECT table_name FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, TABLES);</span>
+
+<span class="fc" id="L985">        Tables.Builder tables = org.apache.cassandra.schema.Tables.builder();</span>
+<span class="fc bfc" id="L986" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, keyspaceName))</span>
+        {
+<span class="fc" id="L988">            String tableName = row.getString(&quot;table_name&quot;);</span>
+            try
+            {
+<span class="fc" id="L991">                tables.add(fetchTable(keyspaceName, tableName, types, functions));</span>
+            }
+<span class="nc" id="L993">            catch (MissingColumns exc)</span>
+            {
+<span class="nc" id="L995">                String errorMsg = String.format(&quot;No partition columns found for table %s.%s in %s.%s.  This may be due to &quot; +</span>
+                                                &quot;corruption or concurrent dropping and altering of a table. If this table is supposed &quot; +
+                                                &quot;to be dropped, {}run the following query to cleanup: &quot; +
+                                                &quot;\&quot;DELETE FROM %s.%s WHERE keyspace_name = '%s' AND table_name = '%s'; &quot; +
+                                                &quot;DELETE FROM %s.%s WHERE keyspace_name = '%s' AND table_name = '%s';\&quot; &quot; +
+                                                &quot;If the table is not supposed to be dropped, restore %s.%s sstables from backups.&quot;,
+                                                keyspaceName, tableName, SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, TABLES, keyspaceName, tableName,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS, keyspaceName, tableName,
+                                                SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS);
+
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">                if (IGNORE_CORRUPTED_SCHEMA_TABLES_PROPERTY_VALUE)</span>
+                {
+<span class="nc" id="L1008">                    logger.error(errorMsg, &quot;&quot;, exc);</span>
+                }
+                else
+                {
+<span class="nc" id="L1012">                    logger.error(errorMsg, &quot;restart cassandra with -D{}=true and &quot;, IGNORE_CORRUPTED_SCHEMA_TABLES.getKey());</span>
+<span class="nc" id="L1013">                    throw exc;</span>
+                }
+<span class="fc" id="L1015">            }</span>
+<span class="fc" id="L1016">        }</span>
+<span class="fc" id="L1017">        return tables.build();</span>
+    }
+
+    private static TableMetadata fetchTable(String keyspaceName, String tableName, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L1022">        String query = String.format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, TABLES);</span>
+<span class="fc" id="L1023">        UntypedResultSet rows = query(query, keyspaceName, tableName);</span>
+<span class="pc bpc" id="L1024" title="1 of 2 branches missed.">        if (rows.isEmpty())</span>
+<span class="nc" id="L1025">            throw new RuntimeException(String.format(&quot;%s:%s not found in the schema definitions keyspace.&quot;, keyspaceName, tableName));</span>
+<span class="fc" id="L1026">        UntypedResultSet.Row row = rows.one();</span>
+
+<span class="fc" id="L1028">        Set&lt;TableMetadata.Flag&gt; flags = TableMetadata.Flag.fromStringSet(row.getFrozenSet(&quot;flags&quot;, UTF8Type.instance));</span>
+<span class="fc" id="L1029">        return TableMetadata.builder(keyspaceName, tableName, TableId.fromUUID(row.getUUID(&quot;id&quot;)))</span>
+<span class="fc" id="L1030">                            .flags(flags)</span>
+<span class="fc" id="L1031">                            .params(createTableParamsFromRow(row))</span>
+<span class="fc" id="L1032">                            .addColumns(fetchColumns(keyspaceName, tableName, types, functions))</span>
+<span class="fc" id="L1033">                            .droppedColumns(fetchDroppedColumns(keyspaceName, tableName))</span>
+<span class="fc" id="L1034">                            .indexes(fetchIndexes(keyspaceName, tableName))</span>
+<span class="fc" id="L1035">                            .triggers(fetchTriggers(keyspaceName, tableName))</span>
+<span class="fc" id="L1036">                            .build();</span>
+    }
+
+    @VisibleForTesting
+    static TableParams createTableParamsFromRow(UntypedResultSet.Row row)
+    {
+<span class="fc" id="L1042">        TableParams.Builder builder = TableParams.builder()</span>
+<span class="fc" id="L1043">                                                 .bloomFilterFpChance(row.getDouble(&quot;bloom_filter_fp_chance&quot;))</span>
+<span class="fc" id="L1044">                                                 .caching(CachingParams.fromMap(row.getFrozenTextMap(&quot;caching&quot;)))</span>
+<span class="fc" id="L1045">                                                 .comment(row.getString(&quot;comment&quot;))</span>
+<span class="fc" id="L1046">                                                 .compaction(CompactionParams.fromMap(row.getFrozenTextMap(&quot;compaction&quot;)))</span>
+<span class="fc" id="L1047">                                                 .compression(CompressionParams.fromMap(row.getFrozenTextMap(&quot;compression&quot;)))</span>
+<span class="pc bpc" id="L1048" title="1 of 2 branches missed.">                                                 .memtable(MemtableParams.getWithFallback(row.has(&quot;memtable&quot;)</span>
+<span class="nc" id="L1049">                                                                                          ? row.getString(&quot;memtable&quot;)</span>
+<span class="fc" id="L1050">                                                                                          : null)) // memtable column was introduced in 4.1</span>
+<span class="fc" id="L1051">                                                 .defaultTimeToLive(row.getInt(&quot;default_time_to_live&quot;))</span>
+<span class="fc" id="L1052">                                                 .extensions(row.getFrozenMap(&quot;extensions&quot;, UTF8Type.instance, BytesType.instance))</span>
+<span class="fc" id="L1053">                                                 .gcGraceSeconds(row.getInt(&quot;gc_grace_seconds&quot;))</span>
+<span class="fc" id="L1054">                                                 .maxIndexInterval(row.getInt(&quot;max_index_interval&quot;))</span>
+<span class="fc" id="L1055">                                                 .memtableFlushPeriodInMs(row.getInt(&quot;memtable_flush_period_in_ms&quot;))</span>
+<span class="fc" id="L1056">                                                 .minIndexInterval(row.getInt(&quot;min_index_interval&quot;))</span>
+<span class="fc" id="L1057">                                                 .crcCheckChance(row.getDouble(&quot;crc_check_chance&quot;))</span>
+<span class="fc" id="L1058">                                                 .speculativeRetry(SpeculativeRetryPolicy.fromString(row.getString(&quot;speculative_retry&quot;)))</span>
+<span class="pc bpc" id="L1059" title="1 of 2 branches missed.">                                                 .additionalWritePolicy(row.has(&quot;additional_write_policy&quot;) ?</span>
+<span class="fc" id="L1060">                                                                        SpeculativeRetryPolicy.fromString(row.getString(&quot;additional_write_policy&quot;)) :</span>
+<span class="nc" id="L1061">                                                                        SpeculativeRetryPolicy.fromString(&quot;99PERCENTILE&quot;))</span>
+<span class="fc bfc" id="L1062" title="All 4 branches covered.">                                                 .cdc(row.has(&quot;cdc&quot;) &amp;&amp; row.getBoolean(&quot;cdc&quot;))</span>
+<span class="fc" id="L1063">                                                 .readRepair(getReadRepairStrategy(row));</span>
+
+        // allow_auto_snapshot column was introduced in 4.2
+<span class="pc bpc" id="L1066" title="1 of 2 branches missed.">        if (row.has(&quot;allow_auto_snapshot&quot;))</span>
+<span class="nc" id="L1067">            builder.allowAutoSnapshot(row.getBoolean(&quot;allow_auto_snapshot&quot;));</span>
+
+        // incremental_backups column was introduced in 4.2
+<span class="pc bpc" id="L1070" title="1 of 2 branches missed.">        if (row.has(&quot;incremental_backups&quot;))</span>
+<span class="nc" id="L1071">            builder.incrementalBackups(row.getBoolean(&quot;incremental_backups&quot;));</span>
+
+<span class="fc" id="L1073">        return builder.build();</span>
+    }
+
+    private static List&lt;ColumnMetadata&gt; fetchColumns(String keyspace, String table, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L1078">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMNS);</span>
+<span class="fc" id="L1079">        UntypedResultSet columnRows = query(query, keyspace, table);</span>
+<span class="pc bpc" id="L1080" title="1 of 2 branches missed.">        if (columnRows.isEmpty())</span>
+<span class="nc" id="L1081">            throw new MissingColumns(&quot;Columns not found in schema table for &quot; + keyspace + '.' + table);</span>
+
+<span class="fc" id="L1083">        List&lt;ColumnMetadata&gt; columns = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L1084">        columnRows.forEach(row -&gt; columns.add(createColumnFromRow(row, types, functions)));</span>
+
+<span class="pc bpc" id="L1086" title="1 of 2 branches missed.">        if (columns.stream().noneMatch(ColumnMetadata::isPartitionKey))</span>
+<span class="nc" id="L1087">            throw new MissingColumns(&quot;No partition key columns found in schema table for &quot; + keyspace + &quot;.&quot; + table);</span>
+
+<span class="fc" id="L1089">        return columns;</span>
+    }
+
+    @VisibleForTesting
+    public static ColumnMetadata createColumnFromRow(UntypedResultSet.Row row, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L1095">        String keyspace = row.getString(&quot;keyspace_name&quot;);</span>
+<span class="fc" id="L1096">        String table = row.getString(&quot;table_name&quot;);</span>
+
+<span class="fc" id="L1098">        ColumnMetadata.Kind kind = ColumnMetadata.Kind.valueOf(row.getString(&quot;kind&quot;).toUpperCase());</span>
+
+<span class="fc" id="L1100">        int position = row.getInt(&quot;position&quot;);</span>
+<span class="fc" id="L1101">        ClusteringOrder order = ClusteringOrder.valueOf(row.getString(&quot;clustering_order&quot;).toUpperCase());</span>
+
+<span class="fc" id="L1103">        AbstractType&lt;?&gt; type = CQLTypeParser.parse(keyspace, row.getString(&quot;type&quot;), types);</span>
+<span class="fc bfc" id="L1104" title="All 2 branches covered.">        if (order == ClusteringOrder.DESC)</span>
+<span class="fc" id="L1105">            type = ReversedType.getInstance(type);</span>
+
+<span class="fc" id="L1107">        ColumnIdentifier name = new ColumnIdentifier(row.getBytes(&quot;column_name_bytes&quot;), row.getString(&quot;column_name&quot;));</span>
+
+<span class="fc" id="L1109">        ColumnMask mask = null;</span>
+<span class="fc" id="L1110">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ? AND column_name = ?&quot;,</span>
+                              SchemaConstants.SCHEMA_KEYSPACE_NAME, COLUMN_MASKS);
+<span class="fc" id="L1112">        UntypedResultSet columnMasks = query(query, keyspace, table, name.toString());</span>
+<span class="pc bpc" id="L1113" title="1 of 2 branches missed.">        if (!columnMasks.isEmpty())</span>
+        {
+<span class="nc" id="L1115">            UntypedResultSet.Row maskRow = columnMasks.one();</span>
+<span class="nc" id="L1116">            FunctionName functionName = new FunctionName(maskRow.getString(&quot;function_keyspace&quot;), maskRow.getString(&quot;function_name&quot;));</span>
+
+<span class="nc" id="L1118">            List&lt;String&gt; partialArgumentTypes = maskRow.getFrozenList(&quot;function_argument_types&quot;, UTF8Type.instance);</span>
+<span class="nc" id="L1119">            List&lt;AbstractType&lt;?&gt;&gt; argumentTypes = new ArrayList&lt;&gt;(1 + partialArgumentTypes.size());</span>
+<span class="nc" id="L1120">            argumentTypes.add(type);</span>
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">            for (String argumentType : partialArgumentTypes)</span>
+            {
+<span class="nc" id="L1123">                argumentTypes.add(CQLTypeParser.parse(keyspace, argumentType, types));</span>
+<span class="nc" id="L1124">            }</span>
+
+<span class="nc" id="L1126">            Function function = FunctionResolver.get(keyspace, functionName, argumentTypes, null, null, null, functions);</span>
+<span class="nc bnc" id="L1127" title="All 2 branches missed.">            if (function == null)</span>
+            {
+<span class="nc" id="L1129">                throw new AssertionError(format(&quot;Unable to find masking function %s(%s) for column %s.%s.%s&quot;,</span>
+                                                functionName, argumentTypes, keyspace, table, name));
+            }
+<span class="nc bnc" id="L1132" title="All 2 branches missed.">            else if (!(function instanceof ScalarFunction))</span>
+            {
+<span class="nc" id="L1134">                throw new AssertionError(format(&quot;Column %s.%s.%s is unexpectedly masked with function %s &quot; +</span>
+                                                &quot;which is not a scalar masking function&quot;,
+                                                keyspace, table, name, function));
+            }
+
+            // Some arguments of the masking function can be null, but the CQL's list type that stores them doesn't
+            // accept nulls, so we use a parallel list of booleans to store what arguments are null.
+<span class="nc" id="L1141">            List&lt;Boolean&gt; nulls = maskRow.getFrozenList(&quot;function_argument_nulls&quot;, BooleanType.instance);</span>
+<span class="nc" id="L1142">            List&lt;String&gt; valuesAsCQL = maskRow.getFrozenList(&quot;function_argument_values&quot;, UTF8Type.instance);</span>
+<span class="nc" id="L1143">            ByteBuffer[] values = new ByteBuffer[valuesAsCQL.size()];</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">            for (int i = 0; i &lt; valuesAsCQL.size(); i++)</span>
+            {
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">                if (nulls.get(i))</span>
+<span class="nc" id="L1147">                    values[i] = null;</span>
+                else
+<span class="nc" id="L1149">                    values[i] = argumentTypes.get(i + 1).fromString(valuesAsCQL.get(i));</span>
+            }
+
+<span class="nc" id="L1152">            mask = new ColumnMask((ScalarFunction) function, values);</span>
+        }
+
+<span class="fc" id="L1155">        return new ColumnMetadata(keyspace, table, name, type, position, kind, mask);</span>
+    }
+
+    private static Map&lt;ByteBuffer, DroppedColumn&gt; fetchDroppedColumns(String keyspace, String table)
+    {
+<span class="fc" id="L1160">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, DROPPED_COLUMNS);</span>
+<span class="fc" id="L1161">        Map&lt;ByteBuffer, DroppedColumn&gt; columns = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1162" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, keyspace, table))</span>
+        {
+<span class="fc" id="L1164">            DroppedColumn column = createDroppedColumnFromRow(row);</span>
+<span class="fc" id="L1165">            columns.put(column.column.name.bytes, column);</span>
+<span class="fc" id="L1166">        }</span>
+<span class="fc" id="L1167">        return columns;</span>
+    }
+
+    private static DroppedColumn createDroppedColumnFromRow(UntypedResultSet.Row row)
+    {
+<span class="fc" id="L1172">        String keyspace = row.getString(&quot;keyspace_name&quot;);</span>
+<span class="fc" id="L1173">        String table = row.getString(&quot;table_name&quot;);</span>
+<span class="fc" id="L1174">        String name = row.getString(&quot;column_name&quot;);</span>
+        /*
+         * we never store actual UDT names in dropped column types (so that we can safely drop types if nothing refers to
+         * them anymore), so before storing dropped columns in schema we expand UDTs to tuples. See expandUserTypes method.
+         * Because of that, we can safely pass Types.none() to parse()
+         */
+<span class="fc" id="L1180">        AbstractType&lt;?&gt; type = CQLTypeParser.parse(keyspace, row.getString(&quot;type&quot;), org.apache.cassandra.schema.Types.none());</span>
+<span class="pc bpc" id="L1181" title="1 of 2 branches missed.">        ColumnMetadata.Kind kind = row.has(&quot;kind&quot;)</span>
+<span class="fc" id="L1182">                                 ? ColumnMetadata.Kind.valueOf(row.getString(&quot;kind&quot;).toUpperCase())</span>
+<span class="pc" id="L1183">                                 : ColumnMetadata.Kind.REGULAR;</span>
+<span class="pc bpc" id="L1184" title="1 of 4 branches missed.">        assert kind == ColumnMetadata.Kind.REGULAR || kind == ColumnMetadata.Kind.STATIC</span>
+            : &quot;Unexpected dropped column kind: &quot; + kind;
+
+<span class="fc" id="L1187">        ColumnMetadata column = new ColumnMetadata(keyspace, table, ColumnIdentifier.getInterned(name, true), type, ColumnMetadata.NO_POSITION, kind, null);</span>
+<span class="fc" id="L1188">        long droppedTime = TimeUnit.MILLISECONDS.toMicros(row.getLong(&quot;dropped_time&quot;));</span>
+<span class="fc" id="L1189">        return new DroppedColumn(column, droppedTime);</span>
+    }
+
+    private static Indexes fetchIndexes(String keyspace, String table)
+    {
+<span class="fc" id="L1194">        String query = String.format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, INDEXES);</span>
+<span class="fc" id="L1195">        Indexes.Builder indexes = org.apache.cassandra.schema.Indexes.builder();</span>
+<span class="fc" id="L1196">        query(query, keyspace, table).forEach(row -&gt; indexes.add(createIndexMetadataFromRow(row)));</span>
+<span class="fc" id="L1197">        return indexes.build();</span>
+    }
+
+    private static IndexMetadata createIndexMetadataFromRow(UntypedResultSet.Row row)
+    {
+<span class="fc" id="L1202">        String name = row.getString(&quot;index_name&quot;);</span>
+<span class="fc" id="L1203">        IndexMetadata.Kind type = IndexMetadata.Kind.valueOf(row.getString(&quot;kind&quot;));</span>
+<span class="fc" id="L1204">        Map&lt;String, String&gt; options = row.getFrozenTextMap(&quot;options&quot;);</span>
+<span class="fc" id="L1205">        return IndexMetadata.fromSchemaMetadata(name, type, options);</span>
+    }
+
+    private static Triggers fetchTriggers(String keyspace, String table)
+    {
+<span class="fc" id="L1210">        String query = String.format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND table_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, TRIGGERS);</span>
+<span class="fc" id="L1211">        Triggers.Builder triggers = org.apache.cassandra.schema.Triggers.builder();</span>
+<span class="pc" id="L1212">        query(query, keyspace, table).forEach(row -&gt; triggers.add(createTriggerFromRow(row)));</span>
+<span class="fc" id="L1213">        return triggers.build();</span>
+    }
+
+    private static TriggerMetadata createTriggerFromRow(UntypedResultSet.Row row)
+    {
+<span class="nc" id="L1218">        String name = row.getString(&quot;trigger_name&quot;);</span>
+<span class="nc" id="L1219">        String classOption = row.getFrozenTextMap(&quot;options&quot;).get(&quot;class&quot;);</span>
+<span class="nc" id="L1220">        return new TriggerMetadata(name, classOption);</span>
+    }
+
+    private static Views fetchViews(String keyspaceName, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L1225">        String query = format(&quot;SELECT view_name FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, VIEWS);</span>
+
+<span class="fc" id="L1227">        Views.Builder views = org.apache.cassandra.schema.Views.builder();</span>
+<span class="fc bfc" id="L1228" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, keyspaceName))</span>
+<span class="fc" id="L1229">            views.put(fetchView(keyspaceName, row.getString(&quot;view_name&quot;), types, functions));</span>
+<span class="fc" id="L1230">        return views.build();</span>
+    }
+
+    private static ViewMetadata fetchView(String keyspaceName, String viewName, Types types, UserFunctions functions)
+    {
+<span class="fc" id="L1235">        String query = String.format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ? AND view_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, VIEWS);</span>
+<span class="fc" id="L1236">        UntypedResultSet rows = query(query, keyspaceName, viewName);</span>
+<span class="pc bpc" id="L1237" title="1 of 2 branches missed.">        if (rows.isEmpty())</span>
+<span class="nc" id="L1238">            throw new RuntimeException(String.format(&quot;%s:%s not found in the schema definitions keyspace.&quot;, keyspaceName, viewName));</span>
+<span class="fc" id="L1239">        UntypedResultSet.Row row = rows.one();</span>
+
+<span class="fc" id="L1241">        TableId baseTableId = TableId.fromUUID(row.getUUID(&quot;base_table_id&quot;));</span>
+<span class="fc" id="L1242">        String baseTableName = row.getString(&quot;base_table_name&quot;);</span>
+<span class="fc" id="L1243">        boolean includeAll = row.getBoolean(&quot;include_all_columns&quot;);</span>
+<span class="fc" id="L1244">        String whereClauseString = row.getString(&quot;where_clause&quot;);</span>
+
+<span class="fc" id="L1246">        List&lt;ColumnMetadata&gt; columns = fetchColumns(keyspaceName, viewName, types, functions);</span>
+
+<span class="fc" id="L1248">        TableMetadata metadata =</span>
+<span class="fc" id="L1249">            TableMetadata.builder(keyspaceName, viewName, TableId.fromUUID(row.getUUID(&quot;id&quot;)))</span>
+<span class="fc" id="L1250">                         .kind(TableMetadata.Kind.VIEW)</span>
+<span class="fc" id="L1251">                         .addColumns(columns)</span>
+<span class="fc" id="L1252">                         .droppedColumns(fetchDroppedColumns(keyspaceName, viewName))</span>
+<span class="fc" id="L1253">                         .params(createTableParamsFromRow(row))</span>
+<span class="fc" id="L1254">                         .build();</span>
+
+        WhereClause whereClause;
+
+        try
+        {
+<span class="fc" id="L1260">            whereClause = WhereClause.parse(whereClauseString);</span>
+        }
+<span class="nc" id="L1262">        catch (RecognitionException e)</span>
+        {
+<span class="nc" id="L1264">            throw new RuntimeException(format(&quot;Unexpected error while parsing materialized view's where clause for '%s' (got %s)&quot;, viewName, whereClauseString));</span>
+<span class="fc" id="L1265">        }</span>
+
+<span class="fc" id="L1267">        return new ViewMetadata(baseTableId, baseTableName, includeAll, whereClause, metadata);</span>
+    }
+
+    private static UserFunctions fetchFunctions(String keyspaceName, Types types)
+    {
+<span class="fc" id="L1272">        Collection&lt;UDFunction&gt; udfs = fetchUDFs(keyspaceName, types);</span>
+<span class="fc" id="L1273">        Collection&lt;UDAggregate&gt; udas = fetchUDAs(keyspaceName, udfs, types);</span>
+
+<span class="fc" id="L1275">        return UserFunctions.builder().add(udfs).add(udas).build();</span>
+    }
+
+    private static Collection&lt;UDFunction&gt; fetchUDFs(String keyspaceName, Types types)
+    {
+<span class="fc" id="L1280">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, FUNCTIONS);</span>
+
+<span class="fc" id="L1282">        Collection&lt;UDFunction&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1283" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, keyspaceName))</span>
+<span class="fc" id="L1284">            functions.add(createUDFFromRow(row, types));</span>
+<span class="fc" id="L1285">        return functions;</span>
+    }
+
+    private static UDFunction createUDFFromRow(UntypedResultSet.Row row, Types types)
+    {
+<span class="fc" id="L1290">        String ksName = row.getString(&quot;keyspace_name&quot;);</span>
+<span class="fc" id="L1291">        String functionName = row.getString(&quot;function_name&quot;);</span>
+<span class="fc" id="L1292">        FunctionName name = new FunctionName(ksName, functionName);</span>
+
+<span class="fc" id="L1294">        List&lt;ColumnIdentifier&gt; argNames = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1295" title="All 2 branches covered.">        for (String arg : row.getFrozenList(&quot;argument_names&quot;, UTF8Type.instance))</span>
+<span class="fc" id="L1296">            argNames.add(new ColumnIdentifier(arg, true));</span>
+
+<span class="fc" id="L1298">        List&lt;AbstractType&lt;?&gt;&gt; argTypes = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L1299" title="All 2 branches covered.">        for (String type : row.getFrozenList(&quot;argument_types&quot;, UTF8Type.instance))</span>
+<span class="fc" id="L1300">            argTypes.add(CQLTypeParser.parse(ksName, type, types).udfType());</span>
+
+<span class="fc" id="L1302">        AbstractType&lt;?&gt; returnType = CQLTypeParser.parse(ksName, row.getString(&quot;return_type&quot;), types).udfType();</span>
+
+<span class="fc" id="L1304">        String language = row.getString(&quot;language&quot;);</span>
+<span class="fc" id="L1305">        String body = row.getString(&quot;body&quot;);</span>
+<span class="fc" id="L1306">        boolean calledOnNullInput = row.getBoolean(&quot;called_on_null_input&quot;);</span>
+
+        /*
+         * TODO: find a way to get rid of Schema.instance dependency; evaluate if the opimisation below makes a difference
+         * in the first place. Remove if it isn't.
+         */
+<span class="fc" id="L1312">        UserFunction existing = Schema.instance.findUserFunction(name, argTypes).orElse(null);</span>
+<span class="fc bfc" id="L1313" title="All 2 branches covered.">        if (existing instanceof UDFunction)</span>
+        {
+            // This check prevents duplicate compilation of effectively the same UDF.
+            // Duplicate compilation attempts can occur on the coordinator node handling the CREATE FUNCTION
+            // statement, since CreateFunctionStatement needs to execute UDFunction.create but schema migration
+            // also needs that (since it needs to handle its own change).
+<span class="fc" id="L1319">            UDFunction udf = (UDFunction) existing;</span>
+<span class="pc bpc" id="L1320" title="1 of 2 branches missed.">            if (udf.argNames().equals(argNames) &amp;&amp;</span>
+<span class="pc bpc" id="L1321" title="1 of 2 branches missed.">                udf.argTypes().equals(argTypes) &amp;&amp;</span>
+<span class="pc bpc" id="L1322" title="1 of 2 branches missed.">                udf.returnType().equals(returnType) &amp;&amp;</span>
+<span class="pc bpc" id="L1323" title="1 of 2 branches missed.">                !udf.isAggregate() &amp;&amp;</span>
+<span class="pc bpc" id="L1324" title="1 of 2 branches missed.">                udf.language().equals(language) &amp;&amp;</span>
+<span class="pc bpc" id="L1325" title="1 of 2 branches missed.">                udf.body().equals(body) &amp;&amp;</span>
+<span class="pc bpc" id="L1326" title="1 of 2 branches missed.">                udf.isCalledOnNullInput() == calledOnNullInput)</span>
+            {
+<span class="fc" id="L1328">                logger.trace(&quot;Skipping duplicate compilation of already existing UDF {}&quot;, name);</span>
+<span class="fc" id="L1329">                return udf;</span>
+            }
+        }
+
+        try
+        {
+<span class="fc" id="L1335">            return UDFunction.create(name, argNames, argTypes, returnType, calledOnNullInput, language, body);</span>
+        }
+<span class="nc" id="L1337">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L1339">            logger.error(String.format(&quot;Cannot load function '%s' from schema: this function won't be available (on this node)&quot;, name), e);</span>
+<span class="nc" id="L1340">            return UDFunction.createBrokenFunction(name, argNames, argTypes, returnType, calledOnNullInput, language, body, e);</span>
+        }
+    }
+
+    private static Collection&lt;UDAggregate&gt; fetchUDAs(String keyspaceName, Collection&lt;UDFunction&gt; udfs, Types types)
+    {
+<span class="fc" id="L1346">        String query = format(&quot;SELECT * FROM %s.%s WHERE keyspace_name = ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, AGGREGATES);</span>
+
+<span class="fc" id="L1348">        Collection&lt;UDAggregate&gt; aggregates = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L1349">        query(query, keyspaceName).forEach(row -&gt; aggregates.add(createUDAFromRow(row, udfs, types)));</span>
+<span class="fc" id="L1350">        return aggregates;</span>
+    }
+
+    private static UDAggregate createUDAFromRow(UntypedResultSet.Row row, Collection&lt;UDFunction&gt; functions, Types types)
+    {
+<span class="nc" id="L1355">        String ksName = row.getString(&quot;keyspace_name&quot;);</span>
+<span class="nc" id="L1356">        String functionName = row.getString(&quot;aggregate_name&quot;);</span>
+<span class="nc" id="L1357">        FunctionName name = new FunctionName(ksName, functionName);</span>
+
+<span class="nc" id="L1359">        List&lt;AbstractType&lt;?&gt;&gt; argTypes =</span>
+<span class="nc" id="L1360">            row.getFrozenList(&quot;argument_types&quot;, UTF8Type.instance)</span>
+<span class="nc" id="L1361">               .stream()</span>
+<span class="nc" id="L1362">               .map(t -&gt; CQLTypeParser.parse(ksName, t, types).udfType())</span>
+<span class="nc" id="L1363">               .collect(toList());</span>
+
+<span class="nc" id="L1365">        AbstractType&lt;?&gt; returnType = CQLTypeParser.parse(ksName, row.getString(&quot;return_type&quot;), types).udfType();</span>
+
+<span class="nc" id="L1367">        FunctionName stateFunc = new FunctionName(ksName, (row.getString(&quot;state_func&quot;)));</span>
+
+<span class="nc bnc" id="L1369" title="All 2 branches missed.">        FunctionName finalFunc = row.has(&quot;final_func&quot;) ? new FunctionName(ksName, row.getString(&quot;final_func&quot;)) : null;</span>
+<span class="nc bnc" id="L1370" title="All 2 branches missed.">        AbstractType&lt;?&gt; stateType = row.has(&quot;state_type&quot;) ? CQLTypeParser.parse(ksName, row.getString(&quot;state_type&quot;), types) : null;</span>
+<span class="nc bnc" id="L1371" title="All 2 branches missed.">        ByteBuffer initcond = row.has(&quot;initcond&quot;) ? Terms.asBytes(ksName, row.getString(&quot;initcond&quot;), stateType) : null;</span>
+
+<span class="nc" id="L1373">        return UDAggregate.create(functions, name, argTypes, returnType, stateFunc, finalFunc, stateType, initcond);</span>
+    }
+
+    private static UntypedResultSet query(String query, Object... variables)
+    {
+<span class="fc" id="L1378">        return executeInternal(query, variables);</span>
+    }
+
+    /*
+     * Merging schema
+     */
+
+    /**
+     * Computes the set of names of keyspaces affected by the provided schema mutations.
+     */
+    static Set&lt;String&gt; affectedKeyspaces(Collection&lt;Mutation&gt; mutations)
+    {
+        // only compare the keyspaces affected by this set of schema mutations
+<span class="fc" id="L1391">        return mutations.stream()</span>
+<span class="fc" id="L1392">                        .map(m -&gt; UTF8Type.instance.compose(m.key().getKey()))</span>
+<span class="fc" id="L1393">                        .collect(toSet());</span>
+    }
+
+    static void applyChanges(Collection&lt;Mutation&gt; mutations)
+    {
+<span class="fc" id="L1398">        mutations.forEach(Mutation::apply);</span>
+<span class="pc bpc" id="L1399" title="1 of 2 branches missed.">        if (SchemaKeyspace.FLUSH_SCHEMA_TABLES)</span>
+<span class="fc" id="L1400">            SchemaKeyspace.flush();</span>
+<span class="fc" id="L1401">    }</span>
+
+    static Keyspaces fetchKeyspaces(Set&lt;String&gt; toFetch)
+    {
+        /*
+         * We know the keyspace names we are going to query, but we still want to run the SELECT IN
+         * query, to filter out the keyspaces that had been dropped by the applied mutation set.
+         */
+<span class="fc" id="L1409">        String query = format(&quot;SELECT keyspace_name FROM %s.%s WHERE keyspace_name IN ?&quot;, SchemaConstants.SCHEMA_KEYSPACE_NAME, KEYSPACES);</span>
+
+<span class="fc" id="L1411">        Keyspaces.Builder keyspaces = org.apache.cassandra.schema.Keyspaces.builder();</span>
+<span class="fc bfc" id="L1412" title="All 2 branches covered.">        for (UntypedResultSet.Row row : query(query, new ArrayList&lt;&gt;(toFetch)))</span>
+<span class="fc" id="L1413">            keyspaces.add(fetchKeyspace(row.getString(&quot;keyspace_name&quot;)));</span>
+<span class="fc" id="L1414">        return keyspaces.build();</span>
+    }
+
+    @VisibleForTesting
+    static class MissingColumns extends RuntimeException
+    {
+        MissingColumns(String message)
+        {
+<span class="nc" id="L1422">            super(message);</span>
+<span class="nc" id="L1423">        }</span>
+    }
+
+    private static ReadRepairStrategy getReadRepairStrategy(UntypedResultSet.Row row)
+    {
+<span class="pc bpc" id="L1428" title="1 of 2 branches missed.">        return row.has(&quot;read_repair&quot;)</span>
+<span class="fc" id="L1429">               ? ReadRepairStrategy.fromString(row.getString(&quot;read_repair&quot;))</span>
+<span class="nc" id="L1430">               : ReadRepairStrategy.BLOCKING;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

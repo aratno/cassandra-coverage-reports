@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Flushing.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.memtable</a> &gt; <span class="el_source">Flushing.java</span></div><h1>Flushing.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.memtable;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+
+import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.DiskBoundaries;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.commitlog.IntervalSet;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.FBUtilities;
+
+public class Flushing
+{
+<span class="fc" id="L51">    private static final Logger logger = LoggerFactory.getLogger(Flushing.class);</span>
+
+    private Flushing() // prevent instantiation
+    {
+    }
+
+    public static List&lt;FlushRunnable&gt; flushRunnables(ColumnFamilyStore cfs,
+                                                     Memtable memtable,
+                                                     LifecycleTransaction txn)
+    {
+<span class="fc" id="L61">        LifecycleTransaction ongoingFlushTransaction = memtable.setFlushTransaction(txn);</span>
+<span class="pc bpc" id="L62" title="1 of 2 branches missed.">        Preconditions.checkState(ongoingFlushTransaction == null,</span>
+                                 &quot;Attempted to flush Memtable more than once on %s.%s&quot;,
+<span class="fc" id="L64">                                 cfs.keyspace.getName(),</span>
+                                 cfs.name);
+
+<span class="fc" id="L67">        DiskBoundaries diskBoundaries = cfs.getDiskBoundaries();</span>
+<span class="fc" id="L68">        List&lt;PartitionPosition&gt; boundaries = diskBoundaries.positions;</span>
+<span class="fc" id="L69">        List&lt;Directories.DataDirectory&gt; locations = diskBoundaries.directories;</span>
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">        if (boundaries == null)</span>
+        {
+<span class="fc" id="L72">            FlushRunnable runnable = flushRunnable(cfs, memtable, null, null, txn, null);</span>
+<span class="fc" id="L73">            return Collections.singletonList(runnable);</span>
+        }
+
+<span class="nc" id="L76">        List&lt;FlushRunnable&gt; runnables = new ArrayList&lt;&gt;(boundaries.size());</span>
+<span class="nc" id="L77">        PartitionPosition rangeStart = boundaries.get(0).getPartitioner().getMinimumToken().minKeyBound();</span>
+        try
+        {
+<span class="nc bnc" id="L80" title="All 2 branches missed.">            for (int i = 0; i &lt; boundaries.size(); i++)</span>
+            {
+<span class="nc" id="L82">                PartitionPosition t = boundaries.get(i);</span>
+<span class="nc" id="L83">                FlushRunnable runnable = flushRunnable(cfs, memtable, rangeStart, t, txn, locations.get(i));</span>
+
+<span class="nc" id="L85">                runnables.add(runnable);</span>
+<span class="nc" id="L86">                rangeStart = t;</span>
+            }
+<span class="nc" id="L88">            return runnables;</span>
+        }
+<span class="nc" id="L90">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L92">            Throwable t = abortRunnables(runnables, e);</span>
+<span class="nc" id="L93">            Throwables.throwIfUnchecked(t);</span>
+<span class="nc" id="L94">            throw new RuntimeException(t);</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)   // writer owned by runnable, to be closed or aborted by its caller
+    static FlushRunnable flushRunnable(ColumnFamilyStore cfs,
+                                       Memtable memtable,
+                                       PartitionPosition from,
+                                       PartitionPosition to,
+                                       LifecycleTransaction txn,
+                                       Directories.DataDirectory flushLocation)
+    {
+<span class="fc" id="L106">        Memtable.FlushablePartitionSet&lt;?&gt; flushSet = memtable.getFlushSet(from, to);</span>
+<span class="fc" id="L107">        SSTableFormat&lt;?, ?&gt; format = DatabaseDescriptor.getSelectedSSTableFormat();</span>
+<span class="fc" id="L108">        long estimatedSize = format.getWriterFactory().estimateSize(flushSet);</span>
+
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">        Descriptor descriptor = flushLocation == null</span>
+<span class="fc" id="L111">                                ? cfs.newSSTableDescriptor(cfs.getDirectories().getWriteableLocationAsFile(estimatedSize), format)</span>
+<span class="pc" id="L112">                                : cfs.newSSTableDescriptor(cfs.getDirectories().getLocationForDisk(flushLocation), format);</span>
+
+<span class="fc" id="L114">        SSTableMultiWriter writer = createFlushWriter(cfs,</span>
+                                                      flushSet,
+                                                      txn,
+                                                      descriptor,
+<span class="fc" id="L118">                                                      flushSet.partitionCount());</span>
+
+<span class="fc" id="L120">        return new FlushRunnable(flushSet, writer, cfs.metric, true);</span>
+    }
+
+    public static Throwable abortRunnables(List&lt;FlushRunnable&gt; runnables, Throwable t)
+    {
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (runnables != null)</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">            for (FlushRunnable runnable : runnables)</span>
+<span class="nc" id="L127">                t = runnable.writer.abort(t);</span>
+<span class="nc" id="L128">        return t;</span>
+    }
+
+    public static class FlushRunnable implements Callable&lt;SSTableMultiWriter&gt;
+    {
+        private final Memtable.FlushablePartitionSet&lt;?&gt; toFlush;
+
+        private final SSTableMultiWriter writer;
+        private final TableMetrics metrics;
+        private final boolean isBatchLogTable;
+        private final boolean logCompletion;
+
+        public FlushRunnable(Memtable.FlushablePartitionSet&lt;?&gt; flushSet,
+                             SSTableMultiWriter writer,
+                             TableMetrics metrics,
+                             boolean logCompletion)
+<span class="fc" id="L144">        {</span>
+<span class="fc" id="L145">            this.toFlush = flushSet;</span>
+<span class="fc" id="L146">            this.writer = writer;</span>
+<span class="fc" id="L147">            this.metrics = metrics;</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">            this.isBatchLogTable = toFlush.metadata() == SystemKeyspace.Batches;</span>
+<span class="fc" id="L149">            this.logCompletion = logCompletion;</span>
+<span class="fc" id="L150">        }</span>
+
+        private void writeSortedContents()
+        {
+<span class="fc" id="L154">            logger.info(&quot;Writing {}, flushed range = [{}, {})&quot;, toFlush.memtable(), toFlush.from(), toFlush.to());</span>
+
+            // (we can't clear out the map as-we-go to free up memory,
+            //  since the memtable is being used for queries in the &quot;pending flush&quot; category)
+<span class="fc bfc" id="L158" title="All 2 branches covered.">            for (Partition partition : toFlush)</span>
+            {
+                // Each batchlog partition is a separate entry in the log. And for an entry, we only do 2
+                // operations: 1) we insert the entry and 2) we delete it. Further, BL data is strictly local,
+                // we don't need to preserve tombstones for repair. So if both operation are in this
+                // memtable (which will almost always be the case if there is no ongoing failure), we can
+                // just skip the entry (CASSANDRA-4667).
+<span class="pc bpc" id="L165" title="5 of 6 branches missed.">                if (isBatchLogTable &amp;&amp; !partition.partitionLevelDeletion().isLive() &amp;&amp; partition.hasRows())</span>
+<span class="nc" id="L166">                    continue;</span>
+
+<span class="pc bpc" id="L168" title="1 of 2 branches missed.">                if (!partition.isEmpty())</span>
+                {
+<span class="fc" id="L170">                    try (UnfilteredRowIterator iter = partition.unfilteredIterator())</span>
+                    {
+<span class="fc" id="L172">                        writer.append(iter);</span>
+                    }
+                }
+<span class="fc" id="L175">            }</span>
+
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">            if (logCompletion)</span>
+            {
+<span class="fc" id="L179">                long bytesFlushed = writer.getBytesWritten();</span>
+<span class="fc" id="L180">                logger.info(&quot;Completed flushing {} ({}) for commitlog position {}&quot;,</span>
+<span class="fc" id="L181">                            writer.getFilename(),</span>
+<span class="fc" id="L182">                            FBUtilities.prettyPrintMemory(bytesFlushed),</span>
+<span class="fc" id="L183">                            toFlush.memtable().getFinalCommitLogUpperBound());</span>
+                // Update the metrics
+<span class="fc" id="L185">                metrics.bytesFlushed.inc(bytesFlushed);</span>
+            }
+<span class="fc" id="L187">        }</span>
+
+        @Override
+        public SSTableMultiWriter call()
+        {
+<span class="fc" id="L192">            writeSortedContents();</span>
+<span class="fc" id="L193">            return writer;</span>
+            // We don't close the writer on error as the caller aborts all runnables if one happens.
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L200">            return &quot;Flush &quot; + toFlush.metadata().keyspace + '.' + toFlush.metadata().name;</span>
+        }
+    }
+
+    public static SSTableMultiWriter createFlushWriter(ColumnFamilyStore cfs,
+                                                       Memtable.FlushablePartitionSet&lt;?&gt; flushSet,
+                                                       LifecycleTransaction txn,
+                                                       Descriptor descriptor,
+                                                       long partitionCount)
+    {
+<span class="fc" id="L210">        return cfs.createSSTableMultiWriter(descriptor,</span>
+                                            partitionCount,
+                                            ActiveRepairService.UNREPAIRED_SSTABLE,
+                                            ActiveRepairService.NO_PENDING_REPAIR,
+                                            false,
+<span class="fc" id="L215">                                            new IntervalSet&lt;&gt;(flushSet.commitLogLowerBound(),</span>
+<span class="fc" id="L216">                                                              flushSet.commitLogUpperBound()),</span>
+                                            new SerializationHeader(true,
+<span class="fc" id="L218">                                                                    flushSet.metadata(),</span>
+<span class="fc" id="L219">                                                                    flushSet.columns(),</span>
+<span class="fc" id="L220">                                                                    flushSet.encodingStats()),</span>
+                                            txn);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

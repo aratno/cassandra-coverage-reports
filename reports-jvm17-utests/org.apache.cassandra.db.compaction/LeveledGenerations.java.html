@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LeveledGenerations.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">LeveledGenerations.java</span></div><h1>LeveledGenerations.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.io.sstable.SSTableIdFactory;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_STRICT_LCS_CHECKS;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+/**
+ * Handles the leveled manifest generations
+ *
+ * Not thread safe, all access should be synchronized in LeveledManifest
+ */
+class LeveledGenerations
+{
+<span class="fc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(LeveledGenerations.class);</span>
+<span class="fc" id="L55">    private final boolean strictLCSChecksTest = TEST_STRICT_LCS_CHECKS.getBoolean();</span>
+    // It includes L0, i.e. we support [L0 - L8] levels
+    static final int MAX_LEVEL_COUNT = 9;
+
+    /**
+     * This map is used to track the original NORMAL instances of sstables
+     *
+     * When aborting a compaction we can get notified that a MOVED_STARTS sstable is replaced with a NORMAL instance
+     * of the same sstable but since we use sorted sets (on the first token) in L1+ we won't find it and won't remove it.
+     * Then, when we add the NORMAL instance we have to replace the *instance* of the sstable to be able to later mark
+     * it compacting again.
+     *
+     * In this map we rely on the fact that hashCode and equals do not care about first token, so when we
+     * do allSSTables.get(instance_with_moved_starts) we will get the NORMAL sstable back, which we can then remove
+     * from the TreeSet.
+     */
+<span class="fc" id="L71">    private final Map&lt;SSTableReader, SSTableReader&gt; allSSTables = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L72">    private final Set&lt;SSTableReader&gt; l0 = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L73">    private static long lastOverlapCheck = nanoTime();</span>
+    // note that since l0 is broken out, levels[0] represents L1:
+<span class="fc" id="L75">    private final TreeSet&lt;SSTableReader&gt; [] levels = new TreeSet[MAX_LEVEL_COUNT - 1];</span>
+
+<span class="fc" id="L77">    private static final Comparator&lt;SSTableReader&gt; nonL0Comparator = (o1, o2) -&gt; {</span>
+<span class="fc" id="L78">        int cmp = SSTableReader.firstKeyComparator.compare(o1, o2);</span>
+<span class="fc bfc" id="L79" title="All 2 branches covered.">        if (cmp == 0)</span>
+<span class="fc" id="L80">            cmp = SSTableIdFactory.COMPARATOR.compare(o1.descriptor.id, o2.descriptor.id);</span>
+<span class="fc" id="L81">        return cmp;</span>
+    };
+
+    LeveledGenerations()
+<span class="fc" id="L85">    {</span>
+<span class="fc bfc" id="L86" title="All 2 branches covered.">        for (int i = 0; i &lt; MAX_LEVEL_COUNT - 1; i++)</span>
+<span class="fc" id="L87">            levels[i] = new TreeSet&lt;&gt;(nonL0Comparator);</span>
+<span class="fc" id="L88">    }</span>
+
+    Set&lt;SSTableReader&gt; get(int level)
+    {
+<span class="fc bfc" id="L92" title="All 4 branches covered.">        if (level &gt; levelCount() - 1 || level &lt; 0)</span>
+<span class="fc" id="L93">            throw new ArrayIndexOutOfBoundsException(&quot;Invalid generation &quot; + level + &quot; - maximum is &quot; + (levelCount() - 1));</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">        if (level == 0)</span>
+<span class="fc" id="L95">            return l0;</span>
+<span class="fc" id="L96">        return levels[level - 1];</span>
+    }
+
+    int levelCount()
+    {
+<span class="fc" id="L101">        return levels.length + 1;</span>
+    }
+
+    /**
+     * Adds readers to the correct level
+     *
+     * If adding an sstable would cause an overlap in the level (if level &gt; 1) we send it to L0. This can happen
+     * for example when moving sstables from unrepaired to repaired.
+     *
+     * If the sstable is already in the manifest we replace the instance.
+     *
+     * If the sstable exists in the manifest but has the wrong level, it is removed from the wrong level and added to the correct one
+     *
+     * todo: group sstables per level, add all if level is currently empty, improve startup speed
+     */
+    void addAll(Iterable&lt;SSTableReader&gt; readers)
+    {
+<span class="fc" id="L118">        logDistribution();</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        for (SSTableReader sstable : readers)</span>
+        {
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">            assert sstable.getSSTableLevel() &lt; levelCount() : &quot;Invalid level &quot; + sstable.getSSTableLevel() + &quot; out of &quot; + (levelCount() - 1);</span>
+<span class="fc" id="L122">            int existingLevel = getLevelIfExists(sstable);</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            if (existingLevel != -1)</span>
+            {
+<span class="nc bnc" id="L125" title="All 2 branches missed.">                if (sstable.getSSTableLevel() != existingLevel)</span>
+                {
+<span class="nc" id="L127">                    logger.error(&quot;SSTable {} on the wrong level in the manifest - {} instead of {} as recorded in the sstable metadata, removing from level {}&quot;, sstable, existingLevel, sstable.getSSTableLevel(), existingLevel);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                    if (strictLCSChecksTest)</span>
+<span class="nc" id="L129">                        throw new AssertionError(&quot;SSTable not in matching level in manifest: &quot;+sstable + &quot;: &quot;+existingLevel+&quot; != &quot; + sstable.getSSTableLevel());</span>
+                }
+                else
+                {
+<span class="nc" id="L133">                    logger.info(&quot;Manifest already contains {} in level {} - replacing instance&quot;, sstable, existingLevel);</span>
+                }
+<span class="nc" id="L135">                get(existingLevel).remove(sstable);</span>
+<span class="nc" id="L136">                allSSTables.remove(sstable);</span>
+            }
+
+<span class="fc" id="L139">            allSSTables.put(sstable, sstable);</span>
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (sstable.getSSTableLevel() == 0)</span>
+            {
+<span class="fc" id="L142">                l0.add(sstable);</span>
+<span class="fc" id="L143">                continue;</span>
+            }
+
+<span class="fc" id="L146">            TreeSet&lt;SSTableReader&gt; level = levels[sstable.getSSTableLevel() - 1];</span>
+            /*
+            current level: |-----||----||----|        |---||---|
+              new sstable:                      |--|
+                                          ^ before
+                                                        ^ after
+                overlap if before.last &gt;= newsstable.first or after.first &lt;= newsstable.last
+             */
+<span class="fc" id="L154">            SSTableReader after = level.ceiling(sstable);</span>
+<span class="fc" id="L155">            SSTableReader before = level.floor(sstable);</span>
+
+<span class="fc bfc" id="L157" title="All 6 branches covered.">            if (before != null &amp;&amp; before.getLast().compareTo(sstable.getFirst()) &gt;= 0 ||</span>
+<span class="fc bfc" id="L158" title="All 2 branches covered.">                after != null &amp;&amp; after.getFirst().compareTo(sstable.getLast()) &lt;= 0)</span>
+            {
+<span class="fc" id="L160">                sendToL0(sstable);</span>
+            }
+            else
+            {
+<span class="fc" id="L164">                level.add(sstable);</span>
+            }
+<span class="fc" id="L166">        }</span>
+<span class="fc" id="L167">        maybeVerifyLevels();</span>
+<span class="fc" id="L168">    }</span>
+
+    /**
+     * Sends sstable to L0 by mutating its level in the sstable metadata.
+     *
+     * SSTable should not exist in the manifest
+     */
+    private void sendToL0(SSTableReader sstable)
+    {
+        try
+        {
+<span class="fc" id="L179">            sstable.mutateLevelAndReload(0);</span>
+        }
+<span class="nc" id="L181">        catch (IOException e)</span>
+        {
+            // Adding it to L0 and marking suspect is probably the best we can do here - it won't create overlap
+            // and we won't pick it for later compactions.
+<span class="nc" id="L185">            logger.error(&quot;Failed mutating sstable metadata for {} - adding it to L0 to avoid overlap. Marking suspect&quot;, sstable, e);</span>
+<span class="nc" id="L186">            sstable.markSuspect();</span>
+<span class="fc" id="L187">        }</span>
+<span class="fc" id="L188">        l0.add(sstable);</span>
+<span class="fc" id="L189">    }</span>
+
+    /**
+     * Tries to find the sstable in the levels without using the sstable-recorded level
+     *
+     * Used to make sure we don't try to re-add an existing sstable
+     */
+    private int getLevelIfExists(SSTableReader sstable)
+    {
+<span class="fc bfc" id="L198" title="All 2 branches covered.">        for (int i = 0; i &lt; levelCount(); i++)</span>
+        {
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">            if (get(i).contains(sstable))</span>
+<span class="nc" id="L201">                return i;</span>
+        }
+<span class="fc" id="L203">        return -1;</span>
+    }
+
+    int remove(Collection&lt;SSTableReader&gt; readers)
+    {
+<span class="fc" id="L208">        int minLevel = Integer.MAX_VALUE;</span>
+<span class="fc bfc" id="L209" title="All 2 branches covered.">        for (SSTableReader sstable : readers)</span>
+        {
+<span class="fc" id="L211">            int level = sstable.getSSTableLevel();</span>
+<span class="fc" id="L212">            minLevel = Math.min(minLevel, level);</span>
+<span class="fc" id="L213">            SSTableReader versionInManifest = allSSTables.get(sstable);</span>
+<span class="fc bfc" id="L214" title="All 2 branches covered.">            if (versionInManifest != null)</span>
+            {
+<span class="fc" id="L216">                get(level).remove(versionInManifest);</span>
+<span class="fc" id="L217">                allSSTables.remove(versionInManifest);</span>
+            }
+<span class="fc" id="L219">        }</span>
+<span class="fc" id="L220">        return minLevel;</span>
+    }
+
+    int[] getAllLevelSize()
+    {
+<span class="fc" id="L225">        int[] counts = new int[levelCount()];</span>
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        for (int i = 0; i &lt; levelCount(); i++)</span>
+<span class="fc" id="L227">            counts[i] = get(i).size();</span>
+<span class="fc" id="L228">        return counts;</span>
+    }
+
+    long[] getAllLevelSizeBytes()
+    {
+<span class="fc" id="L233">        long[] sums = new long[levelCount()];</span>
+<span class="fc bfc" id="L234" title="All 2 branches covered.">        for (int i = 0; i &lt; sums.length; i++)</span>
+<span class="fc" id="L235">            sums[i] = get(i).stream().map(SSTableReader::onDiskLength).reduce(0L, Long::sum);</span>
+<span class="fc" id="L236">        return sums;</span>
+    }
+
+    Set&lt;SSTableReader&gt; allSSTables()
+    {
+<span class="fc" id="L241">        ImmutableSet.Builder&lt;SSTableReader&gt; builder = ImmutableSet.builder();</span>
+<span class="fc" id="L242">        builder.addAll(l0);</span>
+<span class="fc bfc" id="L243" title="All 2 branches covered.">        for (Set&lt;SSTableReader&gt; sstables : levels)</span>
+<span class="fc" id="L244">            builder.addAll(sstables);</span>
+<span class="fc" id="L245">        return builder.build();</span>
+    }
+
+    /**
+     * given a level with sstables with first tokens [0, 10, 20, 30] and a lastCompactedSSTable with last = 15, we will
+     * return an Iterator over [20, 30, 0, 10].
+     */
+    Iterator&lt;SSTableReader&gt; wrappingIterator(int lvl, SSTableReader lastCompactedSSTable)
+    {
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">        assert lvl &gt; 0; // only makes sense in L1+</span>
+<span class="fc" id="L255">        TreeSet&lt;SSTableReader&gt; level = levels[lvl - 1];</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">        if (level.isEmpty())</span>
+<span class="fc" id="L257">            return Collections.emptyIterator();</span>
+<span class="fc bfc" id="L258" title="All 2 branches covered.">        if (lastCompactedSSTable == null)</span>
+<span class="fc" id="L259">            return level.iterator();</span>
+
+<span class="fc" id="L261">        PeekingIterator&lt;SSTableReader&gt; tail = Iterators.peekingIterator(level.tailSet(lastCompactedSSTable).iterator());</span>
+<span class="fc" id="L262">        SSTableReader pivot = null;</span>
+        // then we need to make sure that the first token of the pivot is greater than the last token of the lastCompactedSSTable
+<span class="fc bfc" id="L264" title="All 2 branches covered.">        while (tail.hasNext())</span>
+        {
+<span class="fc" id="L266">            SSTableReader potentialPivot = tail.peek();</span>
+<span class="fc bfc" id="L267" title="All 2 branches covered.">            if (potentialPivot.getFirst().compareTo(lastCompactedSSTable.getLast()) &gt; 0)</span>
+            {
+<span class="fc" id="L269">                pivot = potentialPivot;</span>
+<span class="fc" id="L270">                break;</span>
+            }
+<span class="fc" id="L272">            tail.next();</span>
+<span class="fc" id="L273">        }</span>
+
+<span class="fc bfc" id="L275" title="All 2 branches covered.">        if (pivot == null)</span>
+<span class="fc" id="L276">            return level.iterator();</span>
+
+<span class="fc" id="L278">        return Iterators.concat(tail, level.headSet(pivot, false).iterator());</span>
+    }
+
+    void logDistribution()
+    {
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            for (int i = 0; i &lt; levelCount(); i++)</span>
+            {
+<span class="nc" id="L287">                Set&lt;SSTableReader&gt; level = get(i);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if (!level.isEmpty())</span>
+                {
+<span class="nc" id="L290">                    logger.trace(&quot;L{} contains {} SSTables ({}) in {}&quot;,</span>
+<span class="nc" id="L291">                                 i,</span>
+<span class="nc" id="L292">                                 level.size(),</span>
+<span class="nc" id="L293">                                 FBUtilities.prettyPrintMemory(SSTableReader.getTotalBytes(level)),</span>
+                                 this);
+                }
+            }
+        }
+<span class="fc" id="L298">    }</span>
+
+    Set&lt;SSTableReader&gt;[] snapshot()
+    {
+<span class="fc" id="L302">        Set&lt;SSTableReader&gt; [] levelsCopy = new Set[levelCount()];</span>
+<span class="fc bfc" id="L303" title="All 2 branches covered.">        for (int i = 0; i &lt; levelCount(); i++)</span>
+<span class="fc" id="L304">            levelsCopy[i] = ImmutableSet.copyOf(get(i));</span>
+<span class="fc" id="L305">        return levelsCopy;</span>
+    }
+
+    /**
+     * do extra verification of the sstables in the generations
+     *
+     * only used during tests
+     */
+    private void maybeVerifyLevels()
+    {
+<span class="pc bpc" id="L315" title="3 of 4 branches missed.">        if (!strictLCSChecksTest || nanoTime() - lastOverlapCheck &lt;= TimeUnit.NANOSECONDS.convert(5, TimeUnit.SECONDS))</span>
+<span class="fc" id="L316">            return;</span>
+<span class="nc" id="L317">        logger.info(&quot;LCS verifying levels&quot;);</span>
+<span class="nc" id="L318">        lastOverlapCheck = nanoTime();</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        for (int i = 1; i &lt; levelCount(); i++)</span>
+        {
+<span class="nc" id="L321">            SSTableReader prev = null;</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            for (SSTableReader sstable : get(i))</span>
+            {
+                // no overlap:
+<span class="nc bnc" id="L325" title="All 4 branches missed.">                assert prev == null || prev.getLast().compareTo(sstable.getFirst()) &lt; 0;</span>
+<span class="nc" id="L326">                prev = sstable;</span>
+                // make sure it does not exist in any other level:
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                for (int j = 0; j &lt; levelCount(); j++)</span>
+                {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    if (i == j)</span>
+<span class="nc" id="L331">                        continue;</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                    assert !get(j).contains(sstable);</span>
+                }
+<span class="nc" id="L334">            }</span>
+        }
+<span class="nc" id="L336">    }</span>
+
+    void newLevel(SSTableReader sstable, int oldLevel)
+    {
+<span class="fc" id="L340">        SSTableReader versionInManifest = allSSTables.remove(sstable);</span>
+<span class="fc" id="L341">        boolean removed = false;</span>
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        if (versionInManifest != null)</span>
+<span class="fc" id="L343">            removed = get(oldLevel).remove(versionInManifest);</span>
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">        if (!removed)</span>
+<span class="nc" id="L345">            logger.warn(&quot;Could not remove &quot;+sstable+&quot; from &quot;+oldLevel);</span>
+<span class="fc" id="L346">        addAll(Collections.singleton(sstable));</span>
+<span class="fc" id="L347">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

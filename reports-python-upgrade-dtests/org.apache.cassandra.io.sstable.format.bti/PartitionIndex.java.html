@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PartitionIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format.bti</a> &gt; <span class="el_source">PartitionIndex.java</span></div><h1>PartitionIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.format.bti;
+
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.ByteBuffer;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.tries.SerializationNode;
+import org.apache.cassandra.io.tries.TrieNode;
+import org.apache.cassandra.io.tries.TrieSerializer;
+import org.apache.cassandra.io.tries.ValueIterator;
+import org.apache.cassandra.io.tries.Walker;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.PageAware;
+import org.apache.cassandra.io.util.Rebufferer;
+import org.apache.cassandra.io.util.SizedInts;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.SharedCloseable;
+
+/**
+ * This class holds the partition index as an on-disk trie mapping unique prefixes of decorated keys to:
+ * &lt;ul&gt;
+ *     &lt;li&gt;data file position if the partition is small enough to not need an index
+ *     &lt;li&gt;row index file position if the partition has a row index
+ * &lt;/ul&gt;plus&lt;ul&gt;
+ *     &lt;li&gt;the last 8 bits of the key's filter hash which is used to filter out mismatched keys without reading the key
+ * &lt;/ul&gt;
+ * To avoid having to create an object to carry the result, the two are distinguished by sign. Direct-to-dfile entries
+ * are recorded as ~position (~ instead of - to differentiate 0 in ifile from 0 in dfile).
+ * &lt;p&gt;
+ * In either case the contents of the file at this position start with a serialization of the key which can be used
+ * to verify the correct key is found.
+ * &lt;p&gt;
+ * The indexes are created by {@link PartitionIndexBuilder}. To read the index one must obtain a thread-unsafe
+ * {@link Reader} or {@link IndexPosIterator}.
+ */
+@VisibleForTesting
+public class PartitionIndex implements SharedCloseable
+{
+<span class="nc" id="L69">    private static final Logger logger = LoggerFactory.getLogger(PartitionIndex.class);</span>
+
+    private final FileHandle fh;
+    private final long keyCount;
+    private final DecoratedKey first;
+    private final DecoratedKey last;
+    private final long root;
+
+    public static final long NOT_FOUND = Long.MIN_VALUE;
+    public static final int FOOTER_LENGTH = 3 * 8;
+    private static final int FLAG_HAS_HASH_BYTE = 8;
+
+    @VisibleForTesting
+    public PartitionIndex(FileHandle fh, long trieRoot, long keyCount, DecoratedKey first, DecoratedKey last)
+<span class="nc" id="L83">    {</span>
+<span class="nc" id="L84">        this.keyCount = keyCount;</span>
+<span class="nc" id="L85">        this.fh = fh.sharedCopy();</span>
+<span class="nc" id="L86">        this.first = first;</span>
+<span class="nc" id="L87">        this.last = last;</span>
+<span class="nc" id="L88">        this.root = trieRoot;</span>
+<span class="nc" id="L89">    }</span>
+
+    private PartitionIndex(PartitionIndex src)
+    {
+<span class="nc" id="L93">        this(src.fh, src.root, src.keyCount, src.first, src.last);</span>
+<span class="nc" id="L94">    }</span>
+
+<span class="nc" id="L96">    static class Payload</span>
+    {
+        final long position;
+        final short hashBits;
+
+        public Payload(long position, short hashBits)
+<span class="nc" id="L102">        {</span>
+<span class="nc" id="L103">            this.position = position;</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            assert this.position != NOT_FOUND : &quot;Partition position &quot; + NOT_FOUND + &quot; is not valid.&quot;;</span>
+<span class="nc" id="L105">            this.hashBits = hashBits;</span>
+<span class="nc" id="L106">        }</span>
+    }
+
+<span class="nc" id="L109">    static final PartitionIndexSerializer TRIE_SERIALIZER = new PartitionIndexSerializer();</span>
+
+    private static class PartitionIndexSerializer implements TrieSerializer&lt;Payload, DataOutputPlus&gt;
+    {
+        public int sizeofNode(SerializationNode&lt;Payload&gt; node, long nodePosition)
+        {
+<span class="nc" id="L115">            return TrieNode.typeFor(node, nodePosition).sizeofNode(node) +</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">                   (node.payload() != null ? 1 + SizedInts.nonZeroSize(node.payload().position) : 0);</span>
+        }
+
+        @Override
+        public void write(DataOutputPlus dest, SerializationNode&lt;Payload&gt; node, long nodePosition) throws IOException
+        {
+<span class="nc" id="L122">            write(dest, TrieNode.typeFor(node, nodePosition), node, nodePosition);</span>
+<span class="nc" id="L123">        }</span>
+
+        private void write(DataOutputPlus dest, TrieNode type, SerializationNode&lt;Payload&gt; node, long nodePosition) throws IOException
+        {
+<span class="nc" id="L127">            Payload payload = node.payload();</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (payload != null)</span>
+            {
+<span class="nc" id="L130">                int size = SizedInts.nonZeroSize(payload.position);</span>
+                // The reader supports payloads both with (payloadBits between 8 and 15) and without (payloadBits
+                // between 1 and 7) hash. To not introduce undue configuration complexity, we always write a hash.
+<span class="nc" id="L133">                int payloadBits = FLAG_HAS_HASH_BYTE + (size - 1);</span>
+<span class="nc" id="L134">                type.serialize(dest, node, payloadBits, nodePosition);</span>
+<span class="nc" id="L135">                dest.writeByte(payload.hashBits);</span>
+<span class="nc" id="L136">                SizedInts.write(dest, payload.position, size);</span>
+<span class="nc" id="L137">            }</span>
+            else
+<span class="nc" id="L139">                type.serialize(dest, node, 0, nodePosition);</span>
+<span class="nc" id="L140">        }</span>
+    }
+
+    public long size()
+    {
+<span class="nc" id="L145">        return keyCount;</span>
+    }
+
+    public DecoratedKey firstKey()
+    {
+<span class="nc" id="L150">        return first;</span>
+    }
+
+    public DecoratedKey lastKey()
+    {
+<span class="nc" id="L155">        return last;</span>
+    }
+
+    @Override
+    public PartitionIndex sharedCopy()
+    {
+<span class="nc" id="L161">        return new PartitionIndex(this);</span>
+    }
+
+    @Override
+    public void addTo(Ref.IdentityCollection identities)
+    {
+<span class="nc" id="L167">        fh.addTo(identities);</span>
+<span class="nc" id="L168">    }</span>
+
+    public static PartitionIndex load(FileHandle.Builder fhBuilder,
+                                      IPartitioner partitioner,
+                                      boolean preload) throws IOException
+    {
+<span class="nc" id="L174">        try (FileHandle fh = fhBuilder.complete())</span>
+        {
+<span class="nc" id="L176">            return load(fh, partitioner, preload);</span>
+        }
+    }
+
+    public static Pair&lt;DecoratedKey, DecoratedKey&gt; readFirstAndLastKey(File file, IPartitioner partitioner) throws IOException
+    {
+<span class="nc" id="L182">        try (PartitionIndex index = load(new FileHandle.Builder(file), partitioner, false))</span>
+        {
+<span class="nc" id="L184">            return Pair.create(index.firstKey(), index.lastKey());</span>
+        }
+    }
+
+    public static PartitionIndex load(FileHandle fh, IPartitioner partitioner, boolean preload) throws IOException
+    {
+<span class="nc" id="L190">        try (FileDataInput rdr = fh.createReader(fh.dataLength() - FOOTER_LENGTH))</span>
+        {
+<span class="nc" id="L192">            long firstPos = rdr.readLong();</span>
+<span class="nc" id="L193">            long keyCount = rdr.readLong();</span>
+<span class="nc" id="L194">            long root = rdr.readLong();</span>
+<span class="nc" id="L195">            rdr.seek(firstPos);</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            DecoratedKey first = partitioner != null ? partitioner.decorateKey(ByteBufferUtil.readWithShortLength(rdr)) : null;</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            DecoratedKey last = partitioner != null ? partitioner.decorateKey(ByteBufferUtil.readWithShortLength(rdr)) : null;</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            if (preload)</span>
+            {
+<span class="nc" id="L200">                int csum = 0;</span>
+                // force a read of all the pages of the index
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                for (long pos = 0; pos &lt; fh.dataLength(); pos += PageAware.PAGE_SIZE)</span>
+                {
+<span class="nc" id="L204">                    rdr.seek(pos);</span>
+<span class="nc" id="L205">                    csum += rdr.readByte();</span>
+                }
+<span class="nc" id="L207">                logger.trace(&quot;Checksum {}&quot;, csum);      // Note: trace is required so that reads aren't optimized away.</span>
+            }
+
+<span class="nc" id="L210">            return new PartitionIndex(fh, root, keyCount, first, last);</span>
+        }
+    }
+
+    @Override
+    public void close()
+    {
+<span class="nc" id="L217">        fh.close();</span>
+<span class="nc" id="L218">    }</span>
+
+    @Override
+    public Throwable close(Throwable accumulate)
+    {
+<span class="nc" id="L223">        return fh.close(accumulate);</span>
+    }
+
+    public Reader openReader()
+    {
+<span class="nc" id="L228">        return new Reader(this);</span>
+    }
+
+    protected IndexPosIterator allKeysIterator()
+    {
+<span class="nc" id="L233">        return new IndexPosIterator(this);</span>
+    }
+
+    protected Rebufferer instantiateRebufferer()
+    {
+<span class="nc" id="L238">        return fh.instantiateRebufferer(null);</span>
+    }
+
+
+    /**
+     * @return the file handle to the file on disk. This is needed for locking the index in RAM.
+     */
+    FileHandle getFileHandle()
+    {
+<span class="nc" id="L247">        return fh;</span>
+    }
+
+    private static long getIndexPos(ByteBuffer contents, int payloadPos, int bytes)
+    {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (bytes &gt;= FLAG_HAS_HASH_BYTE)</span>
+        {
+<span class="nc" id="L254">            ++payloadPos;</span>
+<span class="nc" id="L255">            bytes -= FLAG_HAS_HASH_BYTE - 1;</span>
+        }
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        if (bytes == 0)</span>
+<span class="nc" id="L258">            return NOT_FOUND;</span>
+<span class="nc" id="L259">        return SizedInts.read(contents, payloadPos, bytes);</span>
+    }
+
+    public interface Acceptor&lt;ArgType, ResultType&gt;
+    {
+        ResultType accept(long position, boolean assumeNoMatch, ArgType v) throws IOException;
+    }
+
+    /**
+     * Provides methods to read the partition index trie.
+     * Thread-unsafe, uses class members to store lookup state.
+     */
+    public static class Reader extends Walker&lt;Reader&gt;
+    {
+        protected Reader(PartitionIndex index)
+        {
+<span class="nc" id="L275">            super(index.instantiateRebufferer(), index.root);</span>
+<span class="nc" id="L276">        }</span>
+
+        /**
+         * Finds a candidate for an exact key search. Returns an ifile (if positive) or dfile (if negative, using ~)
+         * position. The position returned has a low chance of being a different entry, but only if the sought key
+         * is not present in the file.
+         */
+        public long exactCandidate(DecoratedKey key)
+        {
+            // A hit must be a prefix of the byte-comparable representation of the key.
+<span class="nc" id="L286">            int b = follow(key);</span>
+            // If the prefix ended in a node with children it is only acceptable if it is a full match.
+<span class="nc bnc" id="L288" title="All 4 branches missed.">            if (b != ByteSource.END_OF_STREAM &amp;&amp; hasChildren())</span>
+<span class="nc" id="L289">                return NOT_FOUND;</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            if (!checkHashBits(key.filterHashLowerBits()))</span>
+<span class="nc" id="L291">                return NOT_FOUND;</span>
+<span class="nc" id="L292">            return getCurrentIndexPos();</span>
+        }
+
+        final boolean checkHashBits(short hashBits)
+        {
+<span class="nc" id="L297">            int bytes = payloadFlags();</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if (bytes &lt; FLAG_HAS_HASH_BYTE)</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                return bytes &gt; 0;</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            return (buf.get(payloadPosition()) == (byte) hashBits);</span>
+        }
+
+        public &lt;ResultType&gt; ResultType ceiling(PartitionPosition key, Acceptor&lt;PartitionPosition, ResultType&gt; acceptor) throws IOException
+        {
+            // Look for a prefix of the key. If there is one, the key it stands for could be less, equal, or greater
+            // than the required value so try that first.
+<span class="nc" id="L307">            int b = followWithGreater(key);</span>
+            // If the prefix ended in a node with children it is only acceptable if it is a full match.
+<span class="nc bnc" id="L309" title="All 4 branches missed.">            if (!hasChildren() || b == ByteSource.END_OF_STREAM)</span>
+            {
+<span class="nc" id="L311">                long indexPos = getCurrentIndexPos();</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                if (indexPos != NOT_FOUND)</span>
+                {
+<span class="nc" id="L314">                    ResultType res = acceptor.accept(indexPos, false, key);</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                    if (res != null)</span>
+<span class="nc" id="L316">                        return res;</span>
+                }
+            }
+            // If that was not found, the closest greater value can be used instead, and we know that
+            // it stands for a key greater than the argument.
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (greaterBranch == NONE)</span>
+<span class="nc" id="L322">                return null;</span>
+<span class="nc" id="L323">            goMin(greaterBranch);</span>
+<span class="nc" id="L324">            long indexPos = getCurrentIndexPos();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (indexPos == NOT_FOUND)</span>
+<span class="nc" id="L326">                return null;</span>
+
+<span class="nc" id="L328">            return acceptor.accept(indexPos, true, key);</span>
+        }
+
+
+        public &lt;ResultType&gt; ResultType floor(PartitionPosition key, Acceptor&lt;PartitionPosition, ResultType&gt; acceptor) throws IOException
+        {
+            // Check for a prefix and find closest smaller branch.
+<span class="nc" id="L335">            Long indexPos = prefixAndNeighbours(key, Reader::getSpecificIndexPos);</span>
+
+<span class="nc bnc" id="L337" title="All 4 branches missed.">            if (indexPos != null &amp;&amp; indexPos != NOT_FOUND)</span>
+            {
+<span class="nc" id="L339">                ResultType res = acceptor.accept(indexPos, false, key);</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                if (res != null)</span>
+<span class="nc" id="L341">                    return res;</span>
+            }
+
+            // Otherwise return the IndexInfo for the closest entry of the smaller branch (which is the max of lesserBranch).
+            // Note (see prefixAndNeighbours): since we accept prefix matches above, at this point there cannot be another
+            // prefix match that is closer than max(lesserBranch).
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (lesserBranch == NONE)</span>
+<span class="nc" id="L348">                return null;</span>
+<span class="nc" id="L349">            goMax(lesserBranch);</span>
+<span class="nc" id="L350">            indexPos = getCurrentIndexPos();</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            if (indexPos == NOT_FOUND)</span>
+<span class="nc" id="L352">                return null;</span>
+
+<span class="nc" id="L354">            return acceptor.accept(indexPos, true, key);</span>
+        }
+
+
+        public Long getSpecificIndexPos(int pos, int bits)
+        {
+<span class="nc" id="L360">            return getIndexPos(buf, pos, bits);</span>
+        }
+
+        public long getCurrentIndexPos()
+        {
+<span class="nc" id="L365">            return getIndexPos(buf, payloadPosition(), payloadFlags());</span>
+        }
+
+        public long getLastIndexPosition()
+        {
+<span class="nc" id="L370">            goMax(root);</span>
+<span class="nc" id="L371">            return getCurrentIndexPos();</span>
+        }
+
+        /**
+         * To be used only in analysis.
+         */
+        @SuppressWarnings(&quot;unused&quot;)
+        protected int payloadSize()
+        {
+<span class="nc" id="L380">            int bytes = payloadFlags();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">            return bytes &gt; 7 ? bytes - 6 : bytes;</span>
+        }
+    }
+
+    /**
+     * Iterator of index positions covered between two keys. Since we store prefixes only, the first and last returned
+     * values can be outside the span (and inclusiveness is not given as we cannot verify it).
+     */
+    public static class IndexPosIterator extends ValueIterator&lt;IndexPosIterator&gt;
+    {
+        static final long INVALID = -1;
+<span class="nc" id="L392">        long pos = INVALID;</span>
+
+        /**
+         * @param index PartitionIndex to use for the iteration.
+         * &lt;p&gt;
+         * Note: For performance reasons this class does not keep a reference of the index. Caller must ensure a
+         * reference is held for the lifetime of this object.
+         */
+        public IndexPosIterator(PartitionIndex index)
+        {
+<span class="nc" id="L402">            super(index.instantiateRebufferer(), index.root);</span>
+<span class="nc" id="L403">        }</span>
+
+        IndexPosIterator(PartitionIndex index, PartitionPosition start, PartitionPosition end)
+        {
+<span class="nc" id="L407">            super(index.instantiateRebufferer(), index.root, start, end, true);</span>
+<span class="nc" id="L408">        }</span>
+
+        /**
+         * Returns the position in the row index or data file.
+         */
+        protected long nextIndexPos()
+        {
+            // without missing positions, we save and reuse the unreturned position.
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (pos == INVALID)</span>
+            {
+<span class="nc" id="L418">                pos = nextPayloadedNode();</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                if (pos == INVALID)</span>
+<span class="nc" id="L420">                    return NOT_FOUND;</span>
+            }
+
+<span class="nc" id="L423">            go(pos);</span>
+
+<span class="nc" id="L425">            pos = INVALID; // make sure next time we call nextPayloadedNode() again</span>
+<span class="nc" id="L426">            return getIndexPos(buf, payloadPosition(), payloadFlags()); // this should not throw</span>
+        }
+    }
+
+    /**
+     * debug/test code
+     */
+    @VisibleForTesting
+    public void dumpTrie(String fileName)
+    {
+<span class="nc" id="L436">        try(PrintStream ps = new PrintStream(fileName))</span>
+        {
+<span class="nc" id="L438">            dumpTrie(ps);</span>
+        }
+<span class="nc" id="L440">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L442">            logger.warn(&quot;Failed to dump trie to {} due to exception {}&quot;, fileName, t);</span>
+<span class="nc" id="L443">        }</span>
+<span class="nc" id="L444">    }</span>
+
+    private void dumpTrie(PrintStream out) throws IOException
+    {
+<span class="nc" id="L448">        try (Reader rdr = openReader())</span>
+        {
+<span class="nc" id="L450">            rdr.dumpTrie(out, (buf, ppos, pbits, version) -&gt; Long.toString(getIndexPos(buf, ppos, pbits)), null);</span>
+        }
+<span class="nc" id="L452">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

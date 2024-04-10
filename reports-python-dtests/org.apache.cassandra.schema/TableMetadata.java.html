@@ -1,0 +1,1722 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TableMetadata.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.schema</a> &gt; <span class="el_source">TableMetadata.java</span></div><h1>TableMetadata.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.schema;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import javax.annotation.Nullable;
+
+import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableCollection;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.DataResource;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.cql3.SchemaElement;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.functions.masking.ColumnMask;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
+import org.apache.cassandra.db.Columns;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.EmptyType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.github.jamm.Unmetered;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
+import static java.lang.String.format;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toSet;
+import static org.apache.cassandra.schema.IndexMetadata.isNameValid;
+
+@Unmetered
+public class TableMetadata implements SchemaElement
+{
+<span class="fc" id="L81">    private static final Logger logger = LoggerFactory.getLogger(TableMetadata.class);</span>
+
+    // Please note that currently the only one truly useful flag is COUNTER, as the rest of the flags were about
+    // differencing between CQL tables and the various types of COMPACT STORAGE tables (pre-4.0). As those &quot;compact&quot;
+    // tables are not supported anymore, no tables should be either SUPER or DENSE, and they should all be COMPOUND.
+<span class="fc" id="L86">    public enum Flag</span>
+    {
+        // As mentioned above, all tables on 4.0+ will have the COMPOUND flag, making the flag of little value. However,
+        // on upgrade from pre-4.0, we want to detect if a tables does _not_ have this flag, in which case this would
+        // be a compact table on which DROP COMPACT STORAGE has _not_ be used and fail startup. This is also why we
+        // still write this flag for all tables. Once we drop support for upgrading from pre-4.0 versions (and so are
+        // sure all tables do have the flag), we can stop writing this flag and ignore it when present (deprecate it).
+        // Later, we'll be able to drop the flag from this enum completely.
+<span class="fc" id="L94">        COMPOUND,</span>
+<span class="fc" id="L95">        DENSE,</span>
+<span class="fc" id="L96">        COUNTER,</span>
+        // The only reason we still have those is that on the first startup after an upgrade from pre-4.0, we cannot
+        // guarantee some tables won't have those flags (users having forgotten to use DROP COMPACT STORAGE before
+        // upgrading). So we still &quot;deserialize&quot; those flags correctly, but otherwise prevent startup if any table
+        // have them. Once we drop support for upgrading from pre-4.0, we can remove those values.
+<span class="fc" id="L101">        @Deprecated SUPER;</span>
+
+        /*
+         *  We call dense a CF for which each component of the comparator is a clustering column, i.e. no
+         * component is used to store a regular column names. In other words, non-composite static &quot;thrift&quot;
+         * and CQL3 CF are *not* dense.
+         */
+        public static boolean isDense(Set&lt;TableMetadata.Flag&gt; flags)
+        {
+<span class="fc" id="L110">            return flags.contains(TableMetadata.Flag.DENSE);</span>
+        }
+
+        public static boolean isCompound(Set&lt;TableMetadata.Flag&gt; flags)
+        {
+<span class="fc" id="L115">            return flags.contains(TableMetadata.Flag.COMPOUND);</span>
+        }
+
+
+        public static boolean isSuper(Set&lt;TableMetadata.Flag&gt; flags)
+        {
+<span class="fc" id="L121">            return flags.contains(TableMetadata.Flag.SUPER);</span>
+        }
+
+        public static boolean isCQLTable(Set&lt;TableMetadata.Flag&gt; flags)
+        {
+<span class="pc bpc" id="L126" title="3 of 6 branches missed.">            return !isSuper(flags) &amp;&amp; !isDense(flags) &amp;&amp; isCompound(flags);</span>
+        }
+
+        public static boolean isStaticCompactTable(Set&lt;TableMetadata.Flag&gt; flags)
+        {
+<span class="nc bnc" id="L131" title="All 6 branches missed.">            return !Flag.isSuper(flags) &amp;&amp; !Flag.isDense(flags) &amp;&amp; !Flag.isCompound(flags);</span>
+        }
+
+        public static Set&lt;Flag&gt; fromStringSet(Set&lt;String&gt; strings)
+        {
+<span class="fc" id="L136">            return strings.stream().map(String::toUpperCase).map(Flag::valueOf).collect(toSet());</span>
+        }
+
+        public static Set&lt;String&gt; toStringSet(Set&lt;Flag&gt; flags)
+        {
+<span class="fc" id="L141">            return flags.stream().map(Flag::toString).map(String::toLowerCase).collect(toSet());</span>
+        }
+    }
+
+<span class="fc" id="L145">    public enum Kind</span>
+    {
+<span class="fc" id="L147">        REGULAR, INDEX, VIEW, VIRTUAL</span>
+    }
+
+    public final String keyspace;
+    public final String name;
+    public final TableId id;
+
+    public final IPartitioner partitioner;
+    public final Kind kind;
+    public final TableParams params;
+    public final ImmutableSet&lt;Flag&gt; flags;
+
+    @Nullable
+    private final String indexName; // derived from table name
+
+    /*
+     * All CQL3 columns definition are stored in the columns map.
+     * On top of that, we keep separated collection of each kind of definition, to
+     * 1) allow easy access to each kind and
+     * 2) for the partition key and clustering key ones, those list are ordered by the &quot;component index&quot; of the elements.
+     */
+    public final ImmutableMap&lt;ByteBuffer, DroppedColumn&gt; droppedColumns;
+    final ImmutableMap&lt;ByteBuffer, ColumnMetadata&gt; columns;
+
+    protected final ImmutableList&lt;ColumnMetadata&gt; partitionKeyColumns;
+    protected final ImmutableList&lt;ColumnMetadata&gt; clusteringColumns;
+    protected final RegularAndStaticColumns regularAndStaticColumns;
+
+    public final Indexes indexes;
+    public final Triggers triggers;
+
+    // derived automatically from flags and columns
+    public final AbstractType&lt;?&gt; partitionKeyType;
+    public final ClusteringComparator comparator;
+
+    // performance hacks; TODO see if all are really necessary
+    public final DataResource resource;
+
+    protected TableMetadata(Builder builder)
+<span class="fc" id="L186">    {</span>
+<span class="fc" id="L187">        flags = Sets.immutableEnumSet(builder.flags);</span>
+<span class="fc" id="L188">        keyspace = builder.keyspace;</span>
+<span class="fc" id="L189">        name = builder.name;</span>
+<span class="fc" id="L190">        id = builder.id;</span>
+
+<span class="fc" id="L192">        partitioner = builder.partitioner;</span>
+<span class="fc" id="L193">        kind = builder.kind;</span>
+<span class="fc" id="L194">        params = builder.params.build();</span>
+
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        indexName = kind == Kind.INDEX ? name.substring(name.indexOf('.') + 1) : null;</span>
+
+<span class="fc" id="L198">        droppedColumns = ImmutableMap.copyOf(builder.droppedColumns);</span>
+<span class="fc" id="L199">        Collections.sort(builder.partitionKeyColumns);</span>
+<span class="fc" id="L200">        partitionKeyColumns = ImmutableList.copyOf(builder.partitionKeyColumns);</span>
+<span class="fc" id="L201">        Collections.sort(builder.clusteringColumns);</span>
+<span class="fc" id="L202">        clusteringColumns = ImmutableList.copyOf(builder.clusteringColumns);</span>
+<span class="fc" id="L203">        regularAndStaticColumns = RegularAndStaticColumns.builder().addAll(builder.regularAndStaticColumns).build();</span>
+<span class="fc" id="L204">        columns = ImmutableMap.copyOf(builder.columns);</span>
+
+<span class="fc" id="L206">        indexes = builder.indexes;</span>
+<span class="fc" id="L207">        triggers = builder.triggers;</span>
+
+<span class="fc bfc" id="L209" title="All 2 branches covered.">        partitionKeyType = partitionKeyColumns.size() == 1</span>
+<span class="fc" id="L210">                         ? partitionKeyColumns.get(0).type</span>
+<span class="fc" id="L211">                         : CompositeType.getInstance(transform(partitionKeyColumns, t -&gt; t.type));</span>
+
+<span class="fc" id="L213">        comparator = new ClusteringComparator(transform(clusteringColumns, c -&gt; c.type));</span>
+
+<span class="fc" id="L215">        resource = DataResource.table(keyspace, name);</span>
+<span class="fc" id="L216">    }</span>
+
+    public static Builder builder(String keyspace, String table)
+    {
+<span class="fc" id="L220">        return new Builder(keyspace, table);</span>
+    }
+
+    public static Builder builder(String keyspace, String table, TableId id)
+    {
+<span class="fc" id="L225">        return new Builder(keyspace, table, id);</span>
+    }
+
+    public Builder unbuild()
+    {
+<span class="fc" id="L230">        return builder(keyspace, name, id)</span>
+<span class="fc" id="L231">               .partitioner(partitioner)</span>
+<span class="fc" id="L232">               .kind(kind)</span>
+<span class="fc" id="L233">               .params(params)</span>
+<span class="fc" id="L234">               .flags(flags)</span>
+<span class="fc" id="L235">               .addColumns(columns())</span>
+<span class="fc" id="L236">               .droppedColumns(droppedColumns)</span>
+<span class="fc" id="L237">               .indexes(indexes)</span>
+<span class="fc" id="L238">               .triggers(triggers);</span>
+    }
+
+    public boolean isIndex()
+    {
+<span class="fc bfc" id="L243" title="All 2 branches covered.">        return kind == Kind.INDEX;</span>
+    }
+
+    public TableMetadata withSwapped(TableParams params)
+    {
+<span class="fc" id="L248">        return unbuild().params(params).build();</span>
+    }
+
+    public TableMetadata withSwapped(Set&lt;Flag&gt; flags)
+    {
+<span class="nc" id="L253">        return unbuild().flags(flags).build();</span>
+    }
+
+    public TableMetadata withSwapped(Triggers triggers)
+    {
+<span class="nc" id="L258">        return unbuild().triggers(triggers).build();</span>
+    }
+
+    public TableMetadata withSwapped(Indexes indexes)
+    {
+<span class="fc" id="L263">        return unbuild().indexes(indexes).build();</span>
+    }
+
+    public boolean isView()
+    {
+<span class="fc bfc" id="L268" title="All 2 branches covered.">        return kind == Kind.VIEW;</span>
+    }
+
+    public boolean isVirtual()
+    {
+<span class="fc bfc" id="L273" title="All 2 branches covered.">        return kind == Kind.VIRTUAL;</span>
+    }
+
+    public Optional&lt;String&gt; indexName()
+    {
+<span class="fc" id="L278">        return Optional.ofNullable(indexName);</span>
+    }
+
+    public boolean isCounter()
+    {
+<span class="fc" id="L283">        return flags.contains(Flag.COUNTER);</span>
+    }
+
+    public boolean isCompactTable()
+    {
+<span class="fc" id="L288">        return false;</span>
+    }
+    
+    public boolean isIncrementalBackupsEnabled()
+    {
+<span class="nc" id="L293">        return params.incrementalBackups;</span>
+    }
+
+    public boolean isStaticCompactTable()
+    {
+<span class="fc" id="L298">        return false;</span>
+    }
+
+    public ImmutableCollection&lt;ColumnMetadata&gt; columns()
+    {
+<span class="fc" id="L303">        return columns.values();</span>
+    }
+
+    public Iterable&lt;ColumnMetadata&gt; primaryKeyColumns()
+    {
+<span class="fc" id="L308">        return Iterables.concat(partitionKeyColumns, clusteringColumns);</span>
+    }
+
+    public ImmutableList&lt;ColumnMetadata&gt; partitionKeyColumns()
+    {
+<span class="fc" id="L313">        return partitionKeyColumns;</span>
+    }
+
+    public ImmutableList&lt;ColumnMetadata&gt; clusteringColumns()
+    {
+<span class="fc" id="L318">        return clusteringColumns;</span>
+    }
+
+    public RegularAndStaticColumns regularAndStaticColumns()
+    {
+<span class="fc" id="L323">        return regularAndStaticColumns;</span>
+    }
+
+    public Columns regularColumns()
+    {
+<span class="fc" id="L328">        return regularAndStaticColumns.regulars;</span>
+    }
+
+    public Columns staticColumns()
+    {
+<span class="fc" id="L333">        return regularAndStaticColumns.statics;</span>
+    }
+
+    /*
+     * An iterator over all column definitions but that respect the order of a SELECT *.
+     */
+    public Iterator&lt;ColumnMetadata&gt; allColumnsInSelectOrder()
+    {
+<span class="fc" id="L341">        Iterator&lt;ColumnMetadata&gt; partitionKeyIter = partitionKeyColumns.iterator();</span>
+<span class="fc" id="L342">        Iterator&lt;ColumnMetadata&gt; clusteringIter = clusteringColumns.iterator();</span>
+<span class="fc" id="L343">        Iterator&lt;ColumnMetadata&gt; otherColumns = regularAndStaticColumns.selectOrderIterator();</span>
+
+<span class="fc" id="L345">        return columnsIterator(partitionKeyIter, clusteringIter, otherColumns);</span>
+    }
+
+    /**
+     * Returns an iterator over all column definitions that respect the order of the CREATE statement.
+     */
+    public Iterator&lt;ColumnMetadata&gt; allColumnsInCreateOrder()
+    {
+<span class="fc" id="L353">        Iterator&lt;ColumnMetadata&gt; partitionKeyIter = partitionKeyColumns.iterator();</span>
+<span class="fc" id="L354">        Iterator&lt;ColumnMetadata&gt; clusteringIter = clusteringColumns.iterator();</span>
+<span class="fc" id="L355">        Iterator&lt;ColumnMetadata&gt; otherColumns = regularAndStaticColumns.iterator();</span>
+
+<span class="fc" id="L357">        return columnsIterator(partitionKeyIter, clusteringIter, otherColumns);</span>
+    }
+
+    private static Iterator&lt;ColumnMetadata&gt; columnsIterator(Iterator&lt;ColumnMetadata&gt; partitionKeys,
+                                                            Iterator&lt;ColumnMetadata&gt; clusteringColumns,
+                                                            Iterator&lt;ColumnMetadata&gt; otherColumns)
+    {
+<span class="fc" id="L364">        return new AbstractIterator&lt;ColumnMetadata&gt;()</span>
+<span class="fc" id="L365">        {</span>
+            protected ColumnMetadata computeNext()
+            {
+<span class="fc bfc" id="L368" title="All 2 branches covered.">                if (partitionKeys.hasNext())</span>
+<span class="fc" id="L369">                    return partitionKeys.next();</span>
+
+<span class="fc bfc" id="L371" title="All 2 branches covered.">                if (clusteringColumns.hasNext())</span>
+<span class="fc" id="L372">                    return clusteringColumns.next();</span>
+
+<span class="fc bfc" id="L374" title="All 2 branches covered.">                return otherColumns.hasNext() ? otherColumns.next() : endOfData();</span>
+            }
+        };
+    }
+
+    /**
+     * Returns the ColumnMetadata for {@code name}.
+     */
+    public ColumnMetadata getColumn(ColumnIdentifier name)
+    {
+<span class="fc" id="L384">        return columns.get(name.bytes);</span>
+    }
+    /**
+     * Returns the column of the provided name if it exists, but throws a user-visible exception if that column doesn't
+     * exist.
+     *
+     * &lt;p&gt;This method is for finding columns from a name provided by the user, and as such it does _not_ returne hidden
+     * columns (throwing that the column is unknown instead).
+     *
+     * @param name the name of an existing non-hidden column of this table.
+     * @return the column metadata corresponding to {@code name}.
+     *
+     * @throws InvalidRequestException if there is no non-hidden column named {@code name} in this table.
+     */
+    public ColumnMetadata getExistingColumn(ColumnIdentifier name)
+    {
+<span class="fc" id="L400">        ColumnMetadata def = getColumn(name);</span>
+<span class="fc bfc" id="L401" title="All 2 branches covered.">        if (def == null)</span>
+<span class="fc" id="L402">            throw new InvalidRequestException(format(&quot;Undefined column name %s in table %s&quot;, name.toCQLString(), this));</span>
+<span class="fc" id="L403">        return def;</span>
+    }
+    /*
+     * In general it is preferable to work with ColumnIdentifier to make it
+     * clear that we are talking about a CQL column, not a cell name, but there
+     * is a few cases where all we have is a ByteBuffer (when dealing with IndexExpression
+     * for instance) so...
+     */
+    public ColumnMetadata getColumn(ByteBuffer name)
+    {
+<span class="fc" id="L413">        return columns.get(name);</span>
+    }
+
+    public ColumnMetadata getDroppedColumn(ByteBuffer name)
+    {
+<span class="fc" id="L418">        DroppedColumn dropped = droppedColumns.get(name);</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">        return dropped == null ? null : dropped.column;</span>
+    }
+
+    /**
+     * Returns a &quot;fake&quot; ColumnMetadata corresponding to the dropped column {@code name}
+     * of {@code null} if there is no such dropped column.
+     *
+     * @param name - the column name
+     * @param isStatic - whether the column was a static column, if known
+     */
+    public ColumnMetadata getDroppedColumn(ByteBuffer name, boolean isStatic)
+    {
+<span class="fc" id="L431">        DroppedColumn dropped = droppedColumns.get(name);</span>
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">        if (dropped == null)</span>
+<span class="nc" id="L433">            return null;</span>
+
+<span class="pc bpc" id="L435" title="1 of 4 branches missed.">        if (isStatic &amp;&amp; !dropped.column.isStatic())</span>
+<span class="nc" id="L436">            return ColumnMetadata.staticColumn(this, name, dropped.column.type);</span>
+
+<span class="fc" id="L438">        return dropped.column;</span>
+    }
+
+    public boolean hasStaticColumns()
+    {
+<span class="fc bfc" id="L443" title="All 2 branches covered.">        return !staticColumns().isEmpty();</span>
+    }
+
+    /**
+     * @return {@code true} if the table has any masked column, {@code false} otherwise.
+     */
+    public boolean hasMaskedColumns()
+    {
+<span class="fc bfc" id="L451" title="All 2 branches covered.">        for (ColumnMetadata column : columns.values())</span>
+        {
+<span class="pc bpc" id="L453" title="1 of 2 branches missed.">            if (column.isMasked())</span>
+<span class="nc" id="L454">                return true;</span>
+<span class="fc" id="L455">        }</span>
+<span class="fc" id="L456">        return false;</span>
+    }
+
+    /**
+     * @param function a user function
+     * @return {@code true} if the table has any masked column depending on the specified user function,
+     * {@code false} otherwise.
+     */
+    public boolean dependsOn(Function function)
+    {
+<span class="fc bfc" id="L466" title="All 2 branches covered.">        for (ColumnMetadata column : columns.values())</span>
+        {
+<span class="fc" id="L468">            ColumnMask mask = column.getMask();</span>
+<span class="pc bpc" id="L469" title="3 of 4 branches missed.">            if (mask != null &amp;&amp; mask.function.name().equals(function.name()))</span>
+<span class="nc" id="L470">                return true;</span>
+<span class="fc" id="L471">        }</span>
+<span class="fc" id="L472">        return false;</span>
+    }
+
+    public void validate()
+    {
+<span class="pc bpc" id="L477" title="1 of 2 branches missed.">        if (!isNameValid(keyspace))</span>
+<span class="nc" id="L478">            except(&quot;Keyspace name must not be empty, more than %s characters long, or contain non-alphanumeric-underscore characters (got \&quot;%s\&quot;)&quot;, SchemaConstants.NAME_LENGTH, keyspace);</span>
+
+<span class="pc bpc" id="L480" title="1 of 2 branches missed.">        if (!isNameValid(name))</span>
+<span class="nc" id="L481">            except(&quot;Table name must not be empty, more than %s characters long, or contain non-alphanumeric-underscore characters (got \&quot;%s\&quot;)&quot;, SchemaConstants.NAME_LENGTH, name);</span>
+
+<span class="fc" id="L483">        params.validate();</span>
+
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">        if (partitionKeyColumns.stream().anyMatch(c -&gt; c.type.isCounter()))</span>
+<span class="nc" id="L486">            except(&quot;PRIMARY KEY columns cannot contain counters&quot;);</span>
+
+        // Mixing counter with non counter columns is not supported (#2614)
+<span class="fc bfc" id="L489" title="All 2 branches covered.">        if (isCounter())</span>
+        {
+<span class="fc bfc" id="L491" title="All 2 branches covered.">            for (ColumnMetadata column : regularAndStaticColumns)</span>
+<span class="pc bpc" id="L492" title="3 of 4 branches missed.">                if (!(column.type.isCounter()) &amp;&amp; !isSuperColumnMapColumnName(column.name))</span>
+<span class="nc" id="L493">                    except(&quot;Cannot have a non counter column (\&quot;%s\&quot;) in a counter table&quot;, column.name);</span>
+        }
+        else
+        {
+<span class="fc bfc" id="L497" title="All 2 branches covered.">            for (ColumnMetadata column : regularAndStaticColumns)</span>
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">                if (column.type.isCounter())</span>
+<span class="nc" id="L499">                    except(&quot;Cannot have a counter column (\&quot;%s\&quot;) in a non counter table&quot;, column.name);</span>
+        }
+
+        // All tables should have a partition key
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">        if (partitionKeyColumns.isEmpty())</span>
+<span class="nc" id="L504">            except(&quot;Missing partition keys for table %s&quot;, toString());</span>
+
+<span class="fc" id="L506">        indexes.validate(this);</span>
+<span class="fc" id="L507">    }</span>
+
+    /**
+     * To support backward compatibility with thrift super columns in the C* 3.0+ storage engine, we encode said super
+     * columns as a CQL {@code map&lt;blob, blob&gt;}. To ensure the name of this map did not conflict with any other user
+     * defined columns, we used the empty name (which is otherwise not allowed for user created columns).
+     * &lt;p&gt;
+     * While all thrift-based tables must have been converted to &quot;CQL&quot; ones with &quot;DROP COMPACT STORAGE&quot; (before
+     * upgrading to C* 4.0, which stop supporting non-CQL tables completely), a converted super-column table will still
+     * have this map with an empty name. And the reason we need to recognize it still, is that for backward
+     * compatibility we need to support counters in values of this map while it's not supported in any other map.
+     *
+     * TODO: it's probably worth lifting the limitation of not allowing counters as map values. It works fully
+     *   internally (since we had to support it for this special map) and doesn't feel particularly dangerous to
+     *   support. Doing so would remove this special case, but would also let user that do have an upgraded super-column
+     *   table with counters to rename that weirdly name map to something more meaningful (it's not possible today
+     *   as after renaming the validation in {@link #validate)} would trigger).
+     */
+    private static boolean isSuperColumnMapColumnName(ColumnIdentifier columnName)
+    {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        return !columnName.bytes.hasRemaining();</span>
+    }
+
+    public void validateCompatibility(TableMetadata previous)
+    {
+<span class="fc bfc" id="L532" title="All 2 branches covered.">        if (isIndex())</span>
+<span class="fc" id="L533">            return;</span>
+
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">        if (!previous.keyspace.equals(keyspace))</span>
+<span class="nc" id="L536">            except(&quot;Keyspace mismatch (found %s; expected %s)&quot;, keyspace, previous.keyspace);</span>
+
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">        if (!previous.name.equals(name))</span>
+<span class="nc" id="L539">            except(&quot;Table mismatch (found %s; expected %s)&quot;, name, previous.name);</span>
+
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">        if (!previous.id.equals(id))</span>
+<span class="nc" id="L542">            except(&quot;Table ID mismatch (found %s; expected %s)&quot;, id, previous.id);</span>
+
+<span class="pc bpc" id="L544" title="5 of 6 branches missed.">        if (!previous.flags.equals(flags) &amp;&amp; (!Flag.isCQLTable(flags) || Flag.isCQLTable(previous.flags)))</span>
+<span class="nc" id="L545">            except(&quot;Table type mismatch (found %s; expected %s)&quot;, flags, previous.flags);</span>
+
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">        if (previous.partitionKeyColumns.size() != partitionKeyColumns.size())</span>
+        {
+<span class="nc" id="L549">            except(&quot;Partition keys of different length (found %s; expected %s)&quot;,</span>
+<span class="nc" id="L550">                   partitionKeyColumns.size(),</span>
+<span class="nc" id="L551">                   previous.partitionKeyColumns.size());</span>
+        }
+
+<span class="fc bfc" id="L554" title="All 2 branches covered.">        for (int i = 0; i &lt; partitionKeyColumns.size(); i++)</span>
+        {
+<span class="pc bpc" id="L556" title="1 of 2 branches missed.">            if (!partitionKeyColumns.get(i).type.isCompatibleWith(previous.partitionKeyColumns.get(i).type))</span>
+            {
+<span class="nc" id="L558">                except(&quot;Partition key column mismatch (found %s; expected %s)&quot;,</span>
+<span class="nc" id="L559">                       partitionKeyColumns.get(i).type,</span>
+<span class="nc" id="L560">                       previous.partitionKeyColumns.get(i).type);</span>
+            }
+        }
+
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">        if (previous.clusteringColumns.size() != clusteringColumns.size())</span>
+        {
+<span class="nc" id="L566">            except(&quot;Clustering columns of different length (found %s; expected %s)&quot;,</span>
+<span class="nc" id="L567">                   clusteringColumns.size(),</span>
+<span class="nc" id="L568">                   previous.clusteringColumns.size());</span>
+        }
+
+<span class="fc bfc" id="L571" title="All 2 branches covered.">        for (int i = 0; i &lt; clusteringColumns.size(); i++)</span>
+        {
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">            if (!clusteringColumns.get(i).type.isCompatibleWith(previous.clusteringColumns.get(i).type))</span>
+            {
+<span class="nc" id="L575">                except(&quot;Clustering column mismatch (found %s; expected %s)&quot;,</span>
+<span class="nc" id="L576">                       clusteringColumns.get(i).type,</span>
+<span class="nc" id="L577">                       previous.clusteringColumns.get(i).type);</span>
+            }
+        }
+
+<span class="fc bfc" id="L581" title="All 2 branches covered.">        for (ColumnMetadata previousColumn : previous.regularAndStaticColumns)</span>
+        {
+<span class="fc" id="L583">            ColumnMetadata column = getColumn(previousColumn.name);</span>
+<span class="pc bpc" id="L584" title="1 of 4 branches missed.">            if (column != null &amp;&amp; !column.type.isCompatibleWith(previousColumn.type))</span>
+<span class="nc" id="L585">                except(&quot;Column mismatch (found %s; expected %s)&quot;, column, previousColumn);</span>
+<span class="fc" id="L586">        }</span>
+<span class="fc" id="L587">    }</span>
+
+    public ClusteringComparator partitionKeyAsClusteringComparator()
+    {
+<span class="fc" id="L591">        return new ClusteringComparator(partitionKeyColumns.stream().map(c -&gt; c.type).collect(toList()));</span>
+    }
+
+    /**
+     * Generate a table name for an index corresponding to the given column.
+     * This is NOT the same as the index's name! This is only used in sstable filenames and is not exposed to users.
+     *
+     * @param info A definition of the column with index
+     *
+     * @return name of the index table
+     */
+    public String indexTableName(IndexMetadata info)
+    {
+        // TODO simplify this when info.index_name is guaranteed to be set
+<span class="fc" id="L605">        return name + Directories.SECONDARY_INDEX_NAME_SEPARATOR + info.name;</span>
+    }
+
+    /**
+     * @return true if the change as made impacts queries/updates on the table,
+     *         e.g. any columns or indexes were added, removed, or altered; otherwise, false is returned.
+     *         Used to determine whether prepared statements against this table need to be re-prepared.
+     */
+    boolean changeAffectsPreparedStatements(TableMetadata updated)
+    {
+<span class="fc bfc" id="L615" title="All 2 branches covered.">        return !partitionKeyColumns.equals(updated.partitionKeyColumns)</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">            || !clusteringColumns.equals(updated.clusteringColumns)</span>
+<span class="fc bfc" id="L617" title="All 2 branches covered.">            || !regularAndStaticColumns.equals(updated.regularAndStaticColumns)</span>
+<span class="fc bfc" id="L618" title="All 6 branches covered.">            || !indexes.equals(updated.indexes)</span>
+            || params.defaultTimeToLive != updated.params.defaultTimeToLive
+            || params.gcGraceSeconds != updated.params.gcGraceSeconds
+<span class="pc bpc" id="L621" title="3 of 4 branches missed.">            || ( !Flag.isCQLTable(flags) &amp;&amp; Flag.isCQLTable(updated.flags) );</span>
+    }
+
+    /**
+     * There is a couple of places in the code where we need a TableMetadata object and don't have one readily available
+     * and know that only the keyspace and name matter. This creates such &quot;fake&quot; metadata. Use only if you know what
+     * you're doing.
+     */
+    public static TableMetadata minimal(String keyspace, String name)
+    {
+<span class="fc" id="L631">        return TableMetadata.builder(keyspace, name)</span>
+<span class="fc" id="L632">                            .addPartitionKeyColumn(&quot;key&quot;, BytesType.instance)</span>
+<span class="fc" id="L633">                            .build();</span>
+    }
+
+    public TableMetadata updateIndexTableMetadata(TableParams baseTableParams)
+    {
+<span class="fc" id="L638">        TableParams.Builder builder = baseTableParams.unbuild().gcGraceSeconds(0);</span>
+
+        // Depends on parent's cache setting, turn on its index table's cache.
+        // Row caching is never enabled; see CASSANDRA-5732
+<span class="pc bpc" id="L642" title="1 of 2 branches missed.">        builder.caching(baseTableParams.caching.cacheKeys() ? CachingParams.CACHE_KEYS : CachingParams.CACHE_NOTHING);</span>
+
+<span class="fc" id="L644">        return unbuild().params(builder.build()).build();</span>
+    }
+
+    boolean referencesUserType(ByteBuffer name)
+    {
+<span class="fc" id="L649">        return any(columns(), c -&gt; c.type.referencesUserType(name));</span>
+    }
+
+    public TableMetadata withUpdatedUserType(UserType udt)
+    {
+<span class="pc bpc" id="L654" title="1 of 2 branches missed.">        if (!referencesUserType(udt.name))</span>
+<span class="nc" id="L655">            return this;</span>
+
+<span class="fc" id="L657">        Builder builder = unbuild();</span>
+<span class="fc" id="L658">        columns().forEach(c -&gt; builder.alterColumnType(c.name, c.type.withUpdatedUserType(udt)));</span>
+
+<span class="fc" id="L660">        return builder.build();</span>
+    }
+
+    protected void except(String format, Object... args)
+    {
+<span class="nc" id="L665">        throw new ConfigurationException(keyspace + &quot;.&quot; + name + &quot;: &quot; + format(format, args));</span>
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="fc bfc" id="L671" title="All 2 branches covered.">        if (this == o)</span>
+<span class="fc" id="L672">            return true;</span>
+
+<span class="pc bpc" id="L674" title="1 of 2 branches missed.">        if (!(o instanceof TableMetadata))</span>
+<span class="nc" id="L675">            return false;</span>
+
+<span class="fc" id="L677">        TableMetadata tm = (TableMetadata) o;</span>
+
+<span class="pc bpc" id="L679" title="1 of 4 branches missed.">        return equalsWithoutColumns(tm) &amp;&amp; columns.equals(tm.columns);</span>
+    }
+
+    private boolean equalsWithoutColumns(TableMetadata tm)
+    {
+<span class="fc bfc" id="L684" title="All 2 branches covered.">        return keyspace.equals(tm.keyspace)</span>
+<span class="fc bfc" id="L685" title="All 2 branches covered.">            &amp;&amp; name.equals(tm.name)</span>
+<span class="pc bpc" id="L686" title="1 of 2 branches missed.">            &amp;&amp; id.equals(tm.id)</span>
+<span class="pc bpc" id="L687" title="1 of 4 branches missed.">            &amp;&amp; partitioner.equals(tm.partitioner)</span>
+            &amp;&amp; kind == tm.kind
+<span class="fc bfc" id="L689" title="All 2 branches covered.">            &amp;&amp; params.equals(tm.params)</span>
+<span class="pc bpc" id="L690" title="1 of 2 branches missed.">            &amp;&amp; flags.equals(tm.flags)</span>
+<span class="fc bfc" id="L691" title="All 2 branches covered.">            &amp;&amp; droppedColumns.equals(tm.droppedColumns)</span>
+<span class="fc bfc" id="L692" title="All 2 branches covered.">            &amp;&amp; indexes.equals(tm.indexes)</span>
+<span class="pc bpc" id="L693" title="1 of 2 branches missed.">            &amp;&amp; triggers.equals(tm.triggers);</span>
+    }
+
+    Optional&lt;Difference&gt; compare(TableMetadata other)
+    {
+<span class="fc bfc" id="L698" title="All 2 branches covered.">        return equalsWithoutColumns(other)</span>
+<span class="fc" id="L699">             ? compareColumns(other.columns)</span>
+<span class="fc" id="L700">             : Optional.of(Difference.SHALLOW);</span>
+    }
+
+    private Optional&lt;Difference&gt; compareColumns(Map&lt;ByteBuffer, ColumnMetadata&gt; other)
+    {
+<span class="fc bfc" id="L705" title="All 2 branches covered.">        if (!columns.keySet().equals(other.keySet()))</span>
+<span class="fc" id="L706">            return Optional.of(Difference.SHALLOW);</span>
+
+<span class="fc" id="L708">        boolean differsDeeply = false;</span>
+
+<span class="fc bfc" id="L710" title="All 2 branches covered.">        for (Map.Entry&lt;ByteBuffer, ColumnMetadata&gt; entry : columns.entrySet())</span>
+        {
+<span class="fc" id="L712">            ColumnMetadata thisColumn = entry.getValue();</span>
+<span class="fc" id="L713">            ColumnMetadata thatColumn = other.get(entry.getKey());</span>
+
+<span class="fc" id="L715">            Optional&lt;Difference&gt; difference = thisColumn.compare(thatColumn);</span>
+<span class="fc bfc" id="L716" title="All 2 branches covered.">            if (difference.isPresent())</span>
+            {
+<span class="pc bpc" id="L718" title="2 of 3 branches missed.">                switch (difference.get())</span>
+                {
+                    case SHALLOW:
+<span class="nc" id="L721">                        return difference;</span>
+                    case DEEP:
+<span class="fc" id="L723">                        differsDeeply = true;</span>
+                }
+            }
+<span class="fc" id="L726">        }</span>
+
+<span class="fc bfc" id="L728" title="All 2 branches covered.">        return differsDeeply ? Optional.of(Difference.DEEP) : Optional.empty();</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="fc" id="L734">        return Objects.hash(keyspace, name, id, partitioner, kind, params, flags, columns, droppedColumns, indexes, triggers);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L740">        return format(&quot;%s.%s&quot;, ColumnIdentifier.maybeQuote(keyspace), ColumnIdentifier.maybeQuote(name));</span>
+    }
+
+    public String toDebugString()
+    {
+<span class="nc" id="L745">        return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L746">                          .add(&quot;keyspace&quot;, keyspace)</span>
+<span class="nc" id="L747">                          .add(&quot;table&quot;, name)</span>
+<span class="nc" id="L748">                          .add(&quot;id&quot;, id)</span>
+<span class="nc" id="L749">                          .add(&quot;partitioner&quot;, partitioner)</span>
+<span class="nc" id="L750">                          .add(&quot;kind&quot;, kind)</span>
+<span class="nc" id="L751">                          .add(&quot;params&quot;, params)</span>
+<span class="nc" id="L752">                          .add(&quot;flags&quot;, flags)</span>
+<span class="nc" id="L753">                          .add(&quot;columns&quot;, columns())</span>
+<span class="nc" id="L754">                          .add(&quot;droppedColumns&quot;, droppedColumns.values())</span>
+<span class="nc" id="L755">                          .add(&quot;indexes&quot;, indexes)</span>
+<span class="nc" id="L756">                          .add(&quot;triggers&quot;, triggers)</span>
+<span class="nc" id="L757">                          .toString();</span>
+    }
+
+<span class="fc" id="L760">    public static final class Builder</span>
+    {
+        final String keyspace;
+        final String name;
+
+        private TableId id;
+
+        private IPartitioner partitioner;
+<span class="fc" id="L768">        private Kind kind = Kind.REGULAR;</span>
+<span class="fc" id="L769">        private TableParams.Builder params = TableParams.builder();</span>
+
+        // See the comment on Flag.COMPOUND definition for why we (still) inconditionally add this flag.
+<span class="fc" id="L772">        private Set&lt;Flag&gt; flags = EnumSet.of(Flag.COMPOUND);</span>
+<span class="fc" id="L773">        private Triggers triggers = Triggers.none();</span>
+<span class="fc" id="L774">        private Indexes indexes = Indexes.none();</span>
+
+<span class="fc" id="L776">        private final Map&lt;ByteBuffer, DroppedColumn&gt; droppedColumns = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L777">        private final Map&lt;ByteBuffer, ColumnMetadata&gt; columns = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L778">        private final List&lt;ColumnMetadata&gt; partitionKeyColumns = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L779">        private final List&lt;ColumnMetadata&gt; clusteringColumns = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L780">        private final List&lt;ColumnMetadata&gt; regularAndStaticColumns = new ArrayList&lt;&gt;();</span>
+
+        private Builder(String keyspace, String name, TableId id)
+<span class="fc" id="L783">        {</span>
+<span class="fc" id="L784">            this.keyspace = keyspace;</span>
+<span class="fc" id="L785">            this.name = name;</span>
+<span class="fc" id="L786">            this.id = id;</span>
+<span class="fc" id="L787">        }</span>
+
+        private Builder(String keyspace, String name)
+<span class="fc" id="L790">        {</span>
+<span class="fc" id="L791">            this.keyspace = keyspace;</span>
+<span class="fc" id="L792">            this.name = name;</span>
+<span class="fc" id="L793">        }</span>
+
+        public TableMetadata build()
+        {
+<span class="fc bfc" id="L797" title="All 2 branches covered.">            if (partitioner == null)</span>
+<span class="fc" id="L798">                partitioner = DatabaseDescriptor.getPartitioner();</span>
+
+<span class="fc bfc" id="L800" title="All 2 branches covered.">            if (id == null)</span>
+            {
+                // make sure vtables use determiniestic ids so they can be referenced in calls cross-nodes
+                // see CASSANDRA-17295
+<span class="pc bpc" id="L804" title="1 of 4 branches missed.">                if (DatabaseDescriptor.useDeterministicTableID() || kind == Kind.VIRTUAL) id = TableId.unsafeDeterministic(keyspace, name);</span>
+<span class="fc" id="L805">                else id = TableId.generate();</span>
+            }
+
+<span class="pc bpc" id="L808" title="1 of 2 branches missed.">            if (Flag.isCQLTable(flags))</span>
+<span class="fc" id="L809">                return new TableMetadata(this);</span>
+            else
+<span class="nc" id="L811">                return new CompactTableMetadata(this);</span>
+        }
+
+        public Builder id(TableId val)
+        {
+<span class="fc" id="L816">            id = val;</span>
+<span class="fc" id="L817">            return this;</span>
+        }
+
+        public Builder partitioner(IPartitioner val)
+        {
+<span class="fc" id="L822">            partitioner = val;</span>
+<span class="fc" id="L823">            return this;</span>
+        }
+
+        public Builder kind(Kind val)
+        {
+<span class="fc" id="L828">            kind = val;</span>
+<span class="fc" id="L829">            return this;</span>
+        }
+
+        public Builder params(TableParams val)
+        {
+<span class="fc" id="L834">            params = val.unbuild();</span>
+<span class="fc" id="L835">            return this;</span>
+        }
+
+        public Builder allowAutoSnapshot(boolean val)
+        {
+<span class="nc" id="L840">            params.allowAutoSnapshot(val);</span>
+<span class="nc" id="L841">            return this;</span>
+        }
+
+        public Builder bloomFilterFpChance(double val)
+        {
+<span class="nc" id="L846">            params.bloomFilterFpChance(val);</span>
+<span class="nc" id="L847">            return this;</span>
+        }
+
+        public Builder caching(CachingParams val)
+        {
+<span class="nc" id="L852">            params.caching(val);</span>
+<span class="nc" id="L853">            return this;</span>
+        }
+
+        public Builder comment(String val)
+        {
+<span class="fc" id="L858">            params.comment(val);</span>
+<span class="fc" id="L859">            return this;</span>
+        }
+
+        public Builder compaction(CompactionParams val)
+        {
+<span class="fc" id="L864">            params.compaction(val);</span>
+<span class="fc" id="L865">            return this;</span>
+        }
+
+        public Builder compression(CompressionParams val)
+        {
+<span class="nc" id="L870">            params.compression(val);</span>
+<span class="nc" id="L871">            return this;</span>
+        }
+
+        public Builder defaultTimeToLive(int val)
+        {
+<span class="fc" id="L876">            params.defaultTimeToLive(val);</span>
+<span class="fc" id="L877">            return this;</span>
+        }
+
+        public Builder gcGraceSeconds(int val)
+        {
+<span class="fc" id="L882">            params.gcGraceSeconds(val);</span>
+<span class="fc" id="L883">            return this;</span>
+        }
+
+        public Builder maxIndexInterval(int val)
+        {
+<span class="nc" id="L888">            params.maxIndexInterval(val);</span>
+<span class="nc" id="L889">            return this;</span>
+        }
+
+        public Builder memtableFlushPeriod(int val)
+        {
+<span class="fc" id="L894">            params.memtableFlushPeriodInMs(val);</span>
+<span class="fc" id="L895">            return this;</span>
+        }
+
+        public Builder minIndexInterval(int val)
+        {
+<span class="nc" id="L900">            params.minIndexInterval(val);</span>
+<span class="nc" id="L901">            return this;</span>
+        }
+
+        public Builder crcCheckChance(double val)
+        {
+<span class="nc" id="L906">            params.crcCheckChance(val);</span>
+<span class="nc" id="L907">            return this;</span>
+        }
+
+        public Builder speculativeRetry(SpeculativeRetryPolicy val)
+        {
+<span class="nc" id="L912">            params.speculativeRetry(val);</span>
+<span class="nc" id="L913">            return this;</span>
+        }
+
+        public Builder additionalWritePolicy(SpeculativeRetryPolicy val)
+        {
+<span class="nc" id="L918">            params.additionalWritePolicy(val);</span>
+<span class="nc" id="L919">            return this;</span>
+        }
+
+        public Builder extensions(Map&lt;String, ByteBuffer&gt; val)
+        {
+<span class="nc" id="L924">            params.extensions(val);</span>
+<span class="nc" id="L925">            return this;</span>
+        }
+
+        public Builder flags(Set&lt;Flag&gt; val)
+        {
+<span class="fc" id="L930">            flags = val;</span>
+<span class="fc" id="L931">            return this;</span>
+        }
+
+        public Builder memtable(MemtableParams val)
+        {
+<span class="nc" id="L936">            params.memtable(val);</span>
+<span class="nc" id="L937">            return this;</span>
+        }
+
+
+        public Builder isCounter(boolean val)
+        {
+<span class="fc" id="L943">            return flag(Flag.COUNTER, val);</span>
+        }
+
+        private Builder flag(Flag flag, boolean set)
+        {
+<span class="fc bfc" id="L948" title="All 2 branches covered.">            if (set) flags.add(flag); else flags.remove(flag);</span>
+<span class="fc" id="L949">            return this;</span>
+        }
+
+        public Builder triggers(Triggers val)
+        {
+<span class="fc" id="L954">            triggers = val;</span>
+<span class="fc" id="L955">            return this;</span>
+        }
+
+        public Builder indexes(Indexes val)
+        {
+<span class="fc" id="L960">            indexes = val;</span>
+<span class="fc" id="L961">            return this;</span>
+        }
+
+        public Builder addPartitionKeyColumn(String name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L966">            return addPartitionKeyColumn(name, type, null);</span>
+        }
+
+        public Builder addPartitionKeyColumn(String name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L971">            return addPartitionKeyColumn(ColumnIdentifier.getInterned(name, false), type, mask);</span>
+        }
+
+        public Builder addPartitionKeyColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L976">            return addPartitionKeyColumn(name, type, null);</span>
+        }
+
+        public Builder addPartitionKeyColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L981">            return addColumn(new ColumnMetadata(keyspace, this.name, name, type, partitionKeyColumns.size(), ColumnMetadata.Kind.PARTITION_KEY, mask));</span>
+        }
+
+        public Builder addClusteringColumn(String name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L986">            return addClusteringColumn(name, type, null);</span>
+        }
+
+        public Builder addClusteringColumn(String name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L991">            return addClusteringColumn(ColumnIdentifier.getInterned(name, false), type, mask);</span>
+        }
+
+        public Builder addClusteringColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L996">            return addClusteringColumn(name, type, null);</span>
+        }
+
+        public Builder addClusteringColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L1001">            return addColumn(new ColumnMetadata(keyspace, this.name, name, type, clusteringColumns.size(), ColumnMetadata.Kind.CLUSTERING, mask));</span>
+        }
+
+        public Builder addRegularColumn(String name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L1006">            return addRegularColumn(name, type, null);</span>
+        }
+
+        public Builder addRegularColumn(String name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L1011">            return addRegularColumn(ColumnIdentifier.getInterned(name, false), type, mask);</span>
+        }
+
+        public Builder addRegularColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L1016">            return addRegularColumn(name, type, null);</span>
+        }
+
+        public Builder addRegularColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L1021">            return addColumn(new ColumnMetadata(keyspace, this.name, name, type, ColumnMetadata.NO_POSITION, ColumnMetadata.Kind.REGULAR, mask));</span>
+        }
+
+        public Builder addStaticColumn(String name, AbstractType&lt;?&gt; type)
+        {
+<span class="nc" id="L1026">            return addStaticColumn(name, type, null);</span>
+        }
+
+        public Builder addStaticColumn(String name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="nc" id="L1031">            return addStaticColumn(ColumnIdentifier.getInterned(name, false), type, mask);</span>
+        }
+
+        public Builder addStaticColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type)
+        {
+<span class="nc" id="L1036">            return addStaticColumn(name, type, null);</span>
+        }
+
+        public Builder addStaticColumn(ColumnIdentifier name, AbstractType&lt;?&gt; type, @Nullable ColumnMask mask)
+        {
+<span class="fc" id="L1041">            return addColumn(new ColumnMetadata(keyspace, this.name, name, type, ColumnMetadata.NO_POSITION, ColumnMetadata.Kind.STATIC, mask));</span>
+        }
+
+        public Builder addColumn(ColumnMetadata column)
+        {
+<span class="pc bpc" id="L1046" title="1 of 2 branches missed.">            if (columns.containsKey(column.name.bytes))</span>
+<span class="nc" id="L1047">                throw new IllegalArgumentException();</span>
+
+<span class="fc bfc" id="L1049" title="All 3 branches covered.">            switch (column.kind)</span>
+            {
+                case PARTITION_KEY:
+<span class="fc" id="L1052">                    partitionKeyColumns.add(column);</span>
+<span class="fc" id="L1053">                    Collections.sort(partitionKeyColumns);</span>
+<span class="fc" id="L1054">                    break;</span>
+                case CLUSTERING:
+<span class="fc" id="L1056">                    column.type.checkComparable();</span>
+<span class="fc" id="L1057">                    clusteringColumns.add(column);</span>
+<span class="fc" id="L1058">                    Collections.sort(clusteringColumns);</span>
+<span class="fc" id="L1059">                    break;</span>
+                default:
+<span class="fc" id="L1061">                    regularAndStaticColumns.add(column);</span>
+            }
+
+<span class="fc" id="L1064">            columns.put(column.name.bytes, column);</span>
+
+<span class="fc" id="L1066">            return this;</span>
+        }
+
+        public Builder addColumns(Iterable&lt;ColumnMetadata&gt; columns)
+        {
+<span class="fc" id="L1071">            columns.forEach(this::addColumn);</span>
+<span class="fc" id="L1072">            return this;</span>
+        }
+
+        public Builder droppedColumns(Map&lt;ByteBuffer, DroppedColumn&gt; droppedColumns)
+        {
+<span class="fc" id="L1077">            this.droppedColumns.clear();</span>
+<span class="fc" id="L1078">            this.droppedColumns.putAll(droppedColumns);</span>
+<span class="fc" id="L1079">            return this;</span>
+        }
+
+        /**
+         * Records a deprecated column for a system table.
+         */
+        public Builder recordDeprecatedSystemColumn(String name, AbstractType&lt;?&gt; type)
+        {
+            // As we play fast and loose with the removal timestamp, make sure this is misued for a non system table.
+<span class="pc bpc" id="L1088" title="1 of 2 branches missed.">            assert SchemaConstants.isLocalSystemKeyspace(keyspace);</span>
+<span class="fc" id="L1089">            recordColumnDrop(ColumnMetadata.regularColumn(keyspace, this.name, name, type), Long.MAX_VALUE);</span>
+<span class="fc" id="L1090">            return this;</span>
+        }
+
+        public Builder recordColumnDrop(ColumnMetadata column, long timeMicros)
+        {
+<span class="fc" id="L1095">            droppedColumns.put(column.name.bytes, new DroppedColumn(column.withNewType(column.type.expandUserTypes()), timeMicros));</span>
+<span class="fc" id="L1096">            return this;</span>
+        }
+
+        public Iterable&lt;ColumnMetadata&gt; columns()
+        {
+<span class="nc" id="L1101">            return columns.values();</span>
+        }
+
+        public int numColumns()
+        {
+<span class="fc" id="L1106">            return columns.size();</span>
+        }
+
+        public Set&lt;String&gt; columnNames()
+        {
+<span class="nc" id="L1111">            return columns.values().stream().map(c -&gt; c.name.toString()).collect(toSet());</span>
+        }
+
+        public ColumnMetadata getColumn(ColumnIdentifier identifier)
+        {
+<span class="fc" id="L1116">            return columns.get(identifier.bytes);</span>
+        }
+
+        public ColumnMetadata getColumn(ByteBuffer name)
+        {
+<span class="nc" id="L1121">            return columns.get(name);</span>
+        }
+
+        public boolean hasRegularColumns()
+        {
+<span class="nc" id="L1126">            return regularAndStaticColumns.stream().anyMatch(ColumnMetadata::isRegular);</span>
+        }
+
+        /*
+         * The following methods all assume a Builder with valid set of partition key, clustering, regular and static columns.
+         */
+
+        public Builder removeRegularOrStaticColumn(ColumnIdentifier identifier)
+        {
+<span class="fc" id="L1135">            ColumnMetadata column = columns.get(identifier.bytes);</span>
+<span class="pc bpc" id="L1136" title="2 of 4 branches missed.">            if (column == null || column.isPrimaryKeyColumn())</span>
+<span class="nc" id="L1137">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L1139">            columns.remove(identifier.bytes);</span>
+<span class="fc" id="L1140">            regularAndStaticColumns.remove(column);</span>
+
+<span class="fc" id="L1142">            return this;</span>
+        }
+
+        public Builder renamePrimaryKeyColumn(ColumnIdentifier from, ColumnIdentifier to)
+        {
+<span class="pc bpc" id="L1147" title="1 of 2 branches missed.">            if (columns.containsKey(to.bytes))</span>
+<span class="nc" id="L1148">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L1150">            ColumnMetadata column = columns.get(from.bytes);</span>
+<span class="pc bpc" id="L1151" title="2 of 4 branches missed.">            if (column == null || !column.isPrimaryKeyColumn())</span>
+<span class="nc" id="L1152">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L1154">            ColumnMetadata newColumn = column.withNewName(to);</span>
+<span class="fc bfc" id="L1155" title="All 2 branches covered.">            if (column.isPartitionKey())</span>
+<span class="fc" id="L1156">                partitionKeyColumns.set(column.position(), newColumn);</span>
+            else
+<span class="fc" id="L1158">                clusteringColumns.set(column.position(), newColumn);</span>
+
+<span class="fc" id="L1160">            columns.remove(from.bytes);</span>
+<span class="fc" id="L1161">            columns.put(to.bytes, newColumn);</span>
+
+<span class="fc" id="L1163">            return this;</span>
+        }
+
+        public Builder alterColumnMask(ColumnIdentifier name, @Nullable ColumnMask mask)
+        {
+<span class="nc" id="L1168">            ColumnMetadata column = columns.get(name.bytes);</span>
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">            if (column == null)</span>
+<span class="nc" id="L1170">                throw new IllegalArgumentException();</span>
+
+<span class="nc" id="L1172">            ColumnMetadata newColumn = column.withNewMask(mask);</span>
+
+<span class="nc" id="L1174">            updateColumn(column, newColumn);</span>
+
+<span class="nc" id="L1176">            return this;</span>
+        }
+
+        Builder alterColumnType(ColumnIdentifier name, AbstractType&lt;?&gt; type)
+        {
+<span class="fc" id="L1181">            ColumnMetadata column = columns.get(name.bytes);</span>
+<span class="pc bpc" id="L1182" title="1 of 2 branches missed.">            if (column == null)</span>
+<span class="nc" id="L1183">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L1185">            ColumnMetadata newColumn = column.withNewType(type);</span>
+
+<span class="fc" id="L1187">            updateColumn(column, newColumn);</span>
+
+<span class="fc" id="L1189">            return this;</span>
+        }
+
+        private void updateColumn(ColumnMetadata column, ColumnMetadata newColumn)
+        {
+<span class="pc bpc" id="L1194" title="2 of 4 branches missed.">            switch (column.kind)</span>
+            {
+                case PARTITION_KEY:
+<span class="fc" id="L1197">                    partitionKeyColumns.set(column.position(), newColumn);</span>
+<span class="fc" id="L1198">                    break;</span>
+                case CLUSTERING:
+<span class="nc" id="L1200">                    clusteringColumns.set(column.position(), newColumn);</span>
+<span class="nc" id="L1201">                    break;</span>
+                case REGULAR:
+                case STATIC:
+<span class="fc" id="L1204">                    regularAndStaticColumns.remove(column);</span>
+<span class="fc" id="L1205">                    regularAndStaticColumns.add(newColumn);</span>
+                    break;
+            }
+
+<span class="fc" id="L1209">            columns.put(column.name.bytes, newColumn);</span>
+<span class="fc" id="L1210">        }</span>
+    }
+    
+    /**
+     * A table with strict liveness filters/ignores rows without PK liveness info,
+     * effectively tying the row liveness to its primary key liveness.
+     *
+     * Currently this is only used by views with normal base column as PK column
+     * so updates to other columns do not make the row live when the base column
+     * is not live. See CASSANDRA-11500.
+     *
+     * TODO: does not belong here, should be gone
+     */
+    public boolean enforceStrictLiveness()
+    {
+<span class="fc bfc" id="L1225" title="All 4 branches covered.">        return isView() &amp;&amp; Keyspace.open(keyspace).viewManager.getByName(name).enforceStrictLiveness();</span>
+    }
+
+    /**
+     * Returns the names of all the user types referenced by this table.
+     *
+     * @return the names of all the user types referenced by this table.
+     */
+    public Set&lt;ByteBuffer&gt; getReferencedUserTypes()
+    {
+<span class="fc" id="L1235">        Set&lt;ByteBuffer&gt; types = new LinkedHashSet&lt;&gt;();</span>
+<span class="fc" id="L1236">        columns().forEach(c -&gt; addUserTypes(c.type, types));</span>
+<span class="fc" id="L1237">        return types;</span>
+    }
+
+    /**
+     * Find all user types used by the specified type and add them to the set.
+     *
+     * @param type the type to check for user types.
+     * @param types the set of UDT names to which to add new user types found in {@code type}. Note that the
+     * insertion ordering is important and ensures that if a user type A uses another user type B, then B will appear
+     * before A in iteration order.
+     */
+    private static void addUserTypes(AbstractType&lt;?&gt; type, Set&lt;ByteBuffer&gt; types)
+    {
+        // Reach into subtypes first, so that if the type is a UDT, it's dependencies are recreated first.
+<span class="fc" id="L1251">        type.subTypes().forEach(t -&gt; addUserTypes(t, types));</span>
+
+<span class="fc bfc" id="L1253" title="All 2 branches covered.">        if (type.isUDT())</span>
+<span class="fc" id="L1254">            types.add(((UserType)type).name);</span>
+<span class="fc" id="L1255">    }</span>
+
+    @Override
+    public SchemaElementType elementType()
+    {
+<span class="fc" id="L1260">        return SchemaElementType.TABLE;</span>
+    }
+
+    @Override
+    public String elementKeyspace()
+    {
+<span class="fc" id="L1266">        return keyspace;</span>
+    }
+
+    @Override
+    public String elementName()
+    {
+<span class="fc" id="L1272">        return name;</span>
+    }
+
+    @Override
+    public String toCqlString(boolean withInternals, boolean ifNotExists)
+    {
+<span class="fc" id="L1278">        CqlBuilder builder = new CqlBuilder(2048);</span>
+<span class="fc" id="L1279">        appendCqlTo(builder, withInternals, withInternals, ifNotExists);</span>
+<span class="fc" id="L1280">        return builder.toString();</span>
+    }
+
+    public String toCqlString(boolean includeDroppedColumns,
+                              boolean withInternals,
+                              boolean ifNotExists)
+    {
+<span class="fc" id="L1287">        CqlBuilder builder = new CqlBuilder(2048);</span>
+<span class="fc" id="L1288">        appendCqlTo(builder, includeDroppedColumns, withInternals, ifNotExists);</span>
+<span class="fc" id="L1289">        return builder.toString();</span>
+    }
+
+    public void appendCqlTo(CqlBuilder builder,
+                            boolean includeDroppedColumns,
+                            boolean withInternals,
+                            boolean ifNotExists)
+    {
+<span class="pc bpc" id="L1297" title="1 of 2 branches missed.">        assert !isView();</span>
+
+<span class="fc" id="L1299">        String createKeyword = &quot;CREATE&quot;;</span>
+<span class="pc bpc" id="L1300" title="1 of 2 branches missed.">        if (isVirtual())</span>
+        {
+<span class="nc" id="L1302">            builder.append(String.format(&quot;/*\n&quot; +</span>
+                    &quot;Warning: Table %s is a virtual table and cannot be recreated with CQL.\n&quot; +
+                    &quot;Structure, for reference:\n&quot;,
+<span class="nc" id="L1305">                                         toString()));</span>
+<span class="nc" id="L1306">            createKeyword = &quot;VIRTUAL&quot;;</span>
+        }
+
+<span class="fc" id="L1309">        builder.append(createKeyword)</span>
+<span class="fc" id="L1310">               .append(&quot; TABLE &quot;);</span>
+
+<span class="fc bfc" id="L1312" title="All 2 branches covered.">        if (ifNotExists)</span>
+<span class="fc" id="L1313">            builder.append(&quot;IF NOT EXISTS &quot;);</span>
+
+<span class="fc" id="L1315">        builder.append(toString())</span>
+<span class="fc" id="L1316">               .append(&quot; (&quot;)</span>
+<span class="fc" id="L1317">               .newLine()</span>
+<span class="fc" id="L1318">               .increaseIndent();</span>
+
+<span class="pc bpc" id="L1320" title="1 of 4 branches missed.">        boolean hasSingleColumnPrimaryKey = partitionKeyColumns.size() == 1 &amp;&amp; clusteringColumns.isEmpty();</span>
+
+<span class="fc" id="L1322">        appendColumnDefinitions(builder, includeDroppedColumns, hasSingleColumnPrimaryKey);</span>
+
+<span class="fc bfc" id="L1324" title="All 2 branches covered.">        if (!hasSingleColumnPrimaryKey)</span>
+<span class="fc" id="L1325">            appendPrimaryKey(builder);</span>
+
+<span class="fc" id="L1327">        builder.decreaseIndent()</span>
+<span class="fc" id="L1328">               .append(')');</span>
+
+<span class="fc" id="L1330">        builder.append(&quot; WITH &quot;)</span>
+<span class="fc" id="L1331">               .increaseIndent();</span>
+
+<span class="fc" id="L1333">        appendTableOptions(builder, withInternals);</span>
+
+<span class="fc" id="L1335">        builder.decreaseIndent();</span>
+
+<span class="pc bpc" id="L1337" title="1 of 2 branches missed.">        if (isVirtual())</span>
+        {
+<span class="nc" id="L1339">            builder.newLine()</span>
+<span class="nc" id="L1340">                   .append(&quot;*/&quot;);</span>
+        }
+
+<span class="fc bfc" id="L1343" title="All 2 branches covered.">        if (includeDroppedColumns)</span>
+<span class="fc" id="L1344">            appendDropColumns(builder);</span>
+<span class="fc" id="L1345">    }</span>
+
+    private void appendColumnDefinitions(CqlBuilder builder,
+                                         boolean includeDroppedColumns,
+                                         boolean hasSingleColumnPrimaryKey)
+    {
+<span class="fc" id="L1351">        Iterator&lt;ColumnMetadata&gt; iter = allColumnsInCreateOrder();</span>
+<span class="fc bfc" id="L1352" title="All 2 branches covered.">        while (iter.hasNext())</span>
+        {
+<span class="fc" id="L1354">            ColumnMetadata column = iter.next();</span>
+            // If the column has been re-added after a drop, we don't include it right away. Instead, we'll add the
+            // dropped one first below, then we'll issue the DROP and then the actual ADD for this column, thus
+            // simulating the proper sequence of events.
+<span class="pc bpc" id="L1358" title="1 of 4 branches missed.">            if (includeDroppedColumns &amp;&amp; droppedColumns.containsKey(column.name.bytes))</span>
+<span class="nc" id="L1359">                continue;</span>
+
+<span class="fc" id="L1361">            column.appendCqlTo(builder);</span>
+
+<span class="fc bfc" id="L1363" title="All 4 branches covered.">            if (hasSingleColumnPrimaryKey &amp;&amp; column.isPartitionKey())</span>
+<span class="fc" id="L1364">                builder.append(&quot; PRIMARY KEY&quot;);</span>
+
+<span class="fc bfc" id="L1366" title="All 8 branches covered.">            if (!hasSingleColumnPrimaryKey || (includeDroppedColumns &amp;&amp; !droppedColumns.isEmpty()) || iter.hasNext())</span>
+<span class="fc" id="L1367">                builder.append(',');</span>
+
+<span class="fc" id="L1369">            builder.newLine();</span>
+<span class="fc" id="L1370">        }</span>
+
+<span class="fc bfc" id="L1372" title="All 2 branches covered.">        if (includeDroppedColumns)</span>
+        {
+<span class="fc" id="L1374">            Iterator&lt;DroppedColumn&gt; iterDropped = droppedColumns.values().iterator();</span>
+<span class="fc bfc" id="L1375" title="All 2 branches covered.">            while (iterDropped.hasNext())</span>
+            {
+<span class="fc" id="L1377">                DroppedColumn dropped = iterDropped.next();</span>
+<span class="fc" id="L1378">                dropped.column.appendCqlTo(builder);</span>
+
+<span class="pc bpc" id="L1380" title="2 of 4 branches missed.">                if (!hasSingleColumnPrimaryKey || iter.hasNext())</span>
+<span class="nc" id="L1381">                    builder.append(',');</span>
+
+<span class="fc" id="L1383">                builder.newLine();</span>
+<span class="fc" id="L1384">            }</span>
+        }
+<span class="fc" id="L1386">    }</span>
+
+    void appendPrimaryKey(CqlBuilder builder)
+    {
+<span class="fc" id="L1390">        List&lt;ColumnMetadata&gt; partitionKeyColumns = partitionKeyColumns();</span>
+<span class="fc" id="L1391">        List&lt;ColumnMetadata&gt; clusteringColumns = clusteringColumns();</span>
+
+<span class="pc bpc" id="L1393" title="1 of 2 branches missed.">        if (isStaticCompactTable())</span>
+<span class="nc" id="L1394">            clusteringColumns = Collections.emptyList();</span>
+
+<span class="fc" id="L1396">        builder.append(&quot;PRIMARY KEY (&quot;);</span>
+<span class="fc bfc" id="L1397" title="All 2 branches covered.">        if (partitionKeyColumns.size() &gt; 1)</span>
+        {
+<span class="fc" id="L1399">            builder.append('(')</span>
+<span class="fc" id="L1400">                   .appendWithSeparators(partitionKeyColumns, (b, c) -&gt; b.append(c.name), &quot;, &quot;)</span>
+<span class="fc" id="L1401">                   .append(')');</span>
+        }
+        else
+        {
+<span class="fc" id="L1405">            builder.append(partitionKeyColumns.get(0).name);</span>
+        }
+
+<span class="pc bpc" id="L1408" title="1 of 2 branches missed.">        if (!clusteringColumns.isEmpty())</span>
+<span class="fc" id="L1409">            builder.append(&quot;, &quot;)</span>
+<span class="fc" id="L1410">                   .appendWithSeparators(clusteringColumns, (b, c) -&gt; b.append(c.name), &quot;, &quot;);</span>
+
+<span class="fc" id="L1412">        builder.append(')')</span>
+<span class="fc" id="L1413">               .newLine();</span>
+<span class="fc" id="L1414">    }</span>
+
+    void appendTableOptions(CqlBuilder builder, boolean withInternals)
+    {
+<span class="fc bfc" id="L1418" title="All 2 branches covered.">        if (withInternals)</span>
+<span class="fc" id="L1419">            builder.append(&quot;ID = &quot;)</span>
+<span class="fc" id="L1420">                   .append(id.toString())</span>
+<span class="fc" id="L1421">                   .newLine()</span>
+<span class="fc" id="L1422">                   .append(&quot;AND &quot;);</span>
+
+<span class="fc" id="L1424">        List&lt;ColumnMetadata&gt; clusteringColumns = clusteringColumns();</span>
+<span class="fc bfc" id="L1425" title="All 2 branches covered.">        if (!clusteringColumns.isEmpty())</span>
+        {
+<span class="fc" id="L1427">            builder.append(&quot;CLUSTERING ORDER BY (&quot;)</span>
+<span class="fc" id="L1428">                   .appendWithSeparators(clusteringColumns, (b, c) -&gt; c.appendNameAndOrderTo(b), &quot;, &quot;)</span>
+<span class="fc" id="L1429">                   .append(')')</span>
+<span class="fc" id="L1430">                   .newLine()</span>
+<span class="fc" id="L1431">                   .append(&quot;AND &quot;);</span>
+        }
+
+<span class="pc bpc" id="L1434" title="1 of 2 branches missed.">        if (isVirtual())</span>
+        {
+<span class="nc" id="L1436">            builder.append(&quot;comment = &quot;).appendWithSingleQuotes(params.comment);</span>
+        }
+        else
+        {
+<span class="fc" id="L1440">            params.appendCqlTo(builder, isView());</span>
+        }
+<span class="fc" id="L1442">        builder.append(&quot;;&quot;);</span>
+<span class="fc" id="L1443">    }</span>
+
+    private void appendDropColumns(CqlBuilder builder)
+    {
+<span class="fc bfc" id="L1447" title="All 2 branches covered.">        for (Entry&lt;ByteBuffer, DroppedColumn&gt; entry : droppedColumns.entrySet())</span>
+        {
+<span class="fc" id="L1449">            DroppedColumn dropped = entry.getValue();</span>
+
+<span class="fc" id="L1451">            builder.newLine()</span>
+<span class="fc" id="L1452">                   .append(&quot;ALTER TABLE &quot;)</span>
+<span class="fc" id="L1453">                   .append(toString())</span>
+<span class="fc" id="L1454">                   .append(&quot; DROP &quot;)</span>
+<span class="fc" id="L1455">                   .append(dropped.column.name)</span>
+<span class="fc" id="L1456">                   .append(&quot; USING TIMESTAMP &quot;)</span>
+<span class="fc" id="L1457">                   .append(dropped.droppedTime)</span>
+<span class="fc" id="L1458">                   .append(';');</span>
+
+<span class="fc" id="L1460">            ColumnMetadata column = getColumn(entry.getKey());</span>
+<span class="pc bpc" id="L1461" title="1 of 2 branches missed.">            if (column != null)</span>
+            {
+<span class="nc" id="L1463">                builder.newLine()</span>
+<span class="nc" id="L1464">                       .append(&quot;ALTER TABLE &quot;)</span>
+<span class="nc" id="L1465">                       .append(toString())</span>
+<span class="nc" id="L1466">                       .append(&quot; ADD &quot;);</span>
+
+<span class="nc" id="L1468">                column.appendCqlTo(builder);</span>
+
+<span class="nc" id="L1470">                builder.append(';');</span>
+            }
+<span class="fc" id="L1472">        }</span>
+<span class="fc" id="L1473">    }</span>
+
+    /**
+     * Returns a string representation of a partition in a CQL-friendly format.
+     *
+     * For non-composite types it returns the result of {@link org.apache.cassandra.cql3.CQL3Type#toCQLLiteral}
+     * applied to the partition key.
+     * For composite types it applies {@link org.apache.cassandra.cql3.CQL3Type#toCQLLiteral} to each subkey and
+     * combines the results into a tuple.
+     *
+     * @param partitionKey a partition key
+     * @return CQL-like string representation of a partition key
+     */
+    public String partitionKeyAsCQLLiteral(ByteBuffer partitionKey)
+    {
+<span class="nc" id="L1488">        return primaryKeyAsCQLLiteral(partitionKey, Clustering.EMPTY);</span>
+    }
+
+    /**
+     * Returns a string representation of a primary key in a CQL-friendly format.
+     *
+     * @param partitionKey the partition key part of the primary key
+     * @param clustering the clustering key part of the primary key
+     * @return a CQL-like string representation of the specified primary key
+     */
+    public String primaryKeyAsCQLLiteral(ByteBuffer partitionKey, Clustering&lt;?&gt; clustering)
+    {
+<span class="nc" id="L1500">        int clusteringSize = clustering.size();</span>
+
+        String[] literals;
+<span class="nc" id="L1503">        int i = 0;</span>
+
+<span class="nc bnc" id="L1505" title="All 2 branches missed.">        if (partitionKeyType instanceof CompositeType)</span>
+        {
+<span class="nc" id="L1507">            List&lt;AbstractType&lt;?&gt;&gt; components = partitionKeyType.getComponents();</span>
+<span class="nc" id="L1508">            int size = components.size();</span>
+<span class="nc" id="L1509">            literals = new String[size + clusteringSize];</span>
+<span class="nc" id="L1510">            ByteBuffer[] values = ((CompositeType) partitionKeyType).split(partitionKey);</span>
+<span class="nc bnc" id="L1511" title="All 2 branches missed.">            for (i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L1513">                literals[i] = asCQLLiteral(components.get(i), values[i]);</span>
+            }
+<span class="nc" id="L1515">        }</span>
+        else
+        {
+<span class="nc" id="L1518">            literals = new String[1 + clusteringSize];</span>
+<span class="nc" id="L1519">            literals[i++] = asCQLLiteral(partitionKeyType, partitionKey);</span>
+        }
+
+<span class="nc bnc" id="L1522" title="All 2 branches missed.">        for (int j = 0; j &lt; clusteringSize; j++)</span>
+        {
+<span class="nc" id="L1524">            literals[i++] = asCQLLiteral(clusteringColumns().get(j).type, clustering.bufferAt(j));</span>
+        }
+
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">        return i == 1 ? literals[0] : &quot;(&quot; + String.join(&quot;, &quot;, literals) + &quot;)&quot;;</span>
+    }
+
+    private static String asCQLLiteral(AbstractType&lt;?&gt; type, ByteBuffer value)
+    {
+<span class="nc" id="L1532">        return type.asCQL3Type().toCQLLiteral(value);</span>
+    }
+
+<span class="nc" id="L1535">    public static class CompactTableMetadata extends TableMetadata</span>
+    {
+
+        /*
+         * For dense tables, this alias the single non-PK column the table contains (since it can only have one). We keep
+         * that as convenience to access that column more easily (but we could replace calls by regularAndStaticColumns().iterator().next()
+         * for those tables in practice).
+         */
+        public final ColumnMetadata compactValueColumn;
+
+        private final Set&lt;ColumnMetadata&gt; hiddenColumns;
+        protected CompactTableMetadata(Builder builder)
+        {
+<span class="nc" id="L1548">            super(builder);</span>
+
+<span class="nc" id="L1550">            compactValueColumn = getCompactValueColumn(regularAndStaticColumns);</span>
+
+<span class="nc bnc" id="L1552" title="All 6 branches missed.">            if (isCompactTable() &amp;&amp; Flag.isDense(this.flags) &amp;&amp; hasEmptyCompactValue())</span>
+            {
+<span class="nc" id="L1554">                hiddenColumns = Collections.singleton(compactValueColumn);</span>
+            }
+<span class="nc bnc" id="L1556" title="All 4 branches missed.">            else if (isCompactTable() &amp;&amp; !Flag.isDense(this.flags))</span>
+            {
+<span class="nc" id="L1558">                hiddenColumns = Sets.newHashSetWithExpectedSize(clusteringColumns.size() + 1);</span>
+<span class="nc" id="L1559">                hiddenColumns.add(compactValueColumn);</span>
+<span class="nc" id="L1560">                hiddenColumns.addAll(clusteringColumns);</span>
+
+            }
+            else
+            {
+<span class="nc" id="L1565">                hiddenColumns = Collections.emptySet();</span>
+            }
+<span class="nc" id="L1567">        }</span>
+
+        @Override
+        public boolean isCompactTable()
+        {
+<span class="nc" id="L1572">            return true;</span>
+        }
+
+        public ColumnMetadata getExistingColumn(ColumnIdentifier name)
+        {
+<span class="nc" id="L1577">            ColumnMetadata def = getColumn(name);</span>
+<span class="nc bnc" id="L1578" title="All 4 branches missed.">            if (def == null || isHiddenColumn(def))</span>
+<span class="nc" id="L1579">                throw new InvalidRequestException(format(&quot;Undefined column name %s in table %s&quot;, name.toCQLString(), this));</span>
+<span class="nc" id="L1580">            return def;</span>
+        }
+
+        public boolean isHiddenColumn(ColumnMetadata def)
+        {
+<span class="nc" id="L1585">            return hiddenColumns.contains(def);</span>
+        }
+
+        @Override
+        public Iterator&lt;ColumnMetadata&gt; allColumnsInSelectOrder()
+        {
+<span class="nc" id="L1591">            boolean isStaticCompactTable = isStaticCompactTable();</span>
+<span class="nc" id="L1592">            boolean noNonPkColumns = hasEmptyCompactValue();</span>
+
+<span class="nc" id="L1594">            Iterator&lt;ColumnMetadata&gt; partitionKeyIter = partitionKeyColumns.iterator();</span>
+            Iterator&lt;ColumnMetadata&gt; clusteringIter =
+<span class="nc bnc" id="L1596" title="All 2 branches missed.">            isStaticCompactTable ? Collections.emptyIterator() : clusteringColumns.iterator();</span>
+<span class="nc bnc" id="L1597" title="All 2 branches missed.">            Iterator&lt;ColumnMetadata&gt; otherColumns = noNonPkColumns ? Collections.emptyIterator()</span>
+<span class="nc bnc" id="L1598" title="All 2 branches missed.">                                                                   : (isStaticCompactTable ? staticColumns().selectOrderIterator()</span>
+<span class="nc" id="L1599">                                                                                           : regularAndStaticColumns.selectOrderIterator());</span>
+
+<span class="nc" id="L1601">            return columnsIterator(partitionKeyIter, clusteringIter, otherColumns);</span>
+        }
+
+        public ImmutableList&lt;ColumnMetadata&gt; createStatementClusteringColumns()
+        {
+<span class="nc bnc" id="L1606" title="All 2 branches missed.">            return isStaticCompactTable() ? ImmutableList.of() : clusteringColumns;</span>
+        }
+
+        public Iterator&lt;ColumnMetadata&gt; allColumnsInCreateOrder()
+        {
+<span class="nc" id="L1611">            boolean isStaticCompactTable = isStaticCompactTable();</span>
+<span class="nc bnc" id="L1612" title="All 4 branches missed.">            boolean noNonPkColumns = !Flag.isCQLTable(flags) &amp;&amp; hasEmptyCompactValue();</span>
+
+<span class="nc" id="L1614">            Iterator&lt;ColumnMetadata&gt; partitionKeyIter = partitionKeyColumns.iterator();</span>
+            Iterator&lt;ColumnMetadata&gt; clusteringIter;
+
+<span class="nc bnc" id="L1617" title="All 2 branches missed.">            if (isStaticCompactTable())</span>
+<span class="nc" id="L1618">                clusteringIter = Collections.EMPTY_LIST.iterator();</span>
+            else
+<span class="nc" id="L1620">                clusteringIter = createStatementClusteringColumns().iterator();</span>
+
+            Iterator&lt;ColumnMetadata&gt; otherColumns;
+
+<span class="nc bnc" id="L1624" title="All 2 branches missed.">            if (noNonPkColumns)</span>
+            {
+<span class="nc" id="L1626">                otherColumns = Collections.emptyIterator();</span>
+            }
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">            else if (isStaticCompactTable)</span>
+            {
+<span class="nc" id="L1630">                List&lt;ColumnMetadata&gt; columns = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">                for (ColumnMetadata c : regularAndStaticColumns)</span>
+                {
+<span class="nc bnc" id="L1633" title="All 2 branches missed.">                    if (c.isStatic())</span>
+<span class="nc" id="L1634">                        columns.add(new ColumnMetadata(c.ksName, c.cfName, c.name, c.type, -1, ColumnMetadata.Kind.REGULAR, c.getMask()));</span>
+<span class="nc" id="L1635">                }</span>
+<span class="nc" id="L1636">                otherColumns = columns.iterator();</span>
+<span class="nc" id="L1637">            }</span>
+            else
+            {
+<span class="nc" id="L1640">                otherColumns = regularAndStaticColumns.iterator();</span>
+            }
+
+<span class="nc" id="L1643">            return columnsIterator(partitionKeyIter, clusteringIter, otherColumns);</span>
+        }
+
+        public boolean hasEmptyCompactValue()
+        {
+<span class="nc" id="L1648">            return compactValueColumn.type instanceof EmptyType;</span>
+        }
+
+        public void validate()
+        {
+<span class="nc" id="L1653">            super.validate();</span>
+
+            // A compact table should always have a clustering
+<span class="nc bnc" id="L1656" title="All 4 branches missed.">            if (!Flag.isCQLTable(flags) &amp;&amp; clusteringColumns.isEmpty())</span>
+<span class="nc" id="L1657">                except(&quot;For table %s, isDense=%b, isCompound=%b, clustering=%s&quot;, toString(),</span>
+<span class="nc" id="L1658">                       Flag.isDense(flags), Flag.isCompound(flags), clusteringColumns);</span>
+<span class="nc" id="L1659">        }</span>
+
+        AbstractType&lt;?&gt; staticCompactOrSuperTableColumnNameType()
+        {
+<span class="nc bnc" id="L1663" title="All 2 branches missed.">            assert isStaticCompactTable();</span>
+<span class="nc" id="L1664">            return clusteringColumns.get(0).type;</span>
+        }
+
+        public AbstractType&lt;?&gt; columnDefinitionNameComparator(ColumnMetadata.Kind kind)
+        {
+<span class="nc bnc" id="L1669" title="All 4 branches missed.">            return (Flag.isSuper(this.flags) &amp;&amp; kind == ColumnMetadata.Kind.REGULAR) ||</span>
+<span class="nc bnc" id="L1670" title="All 4 branches missed.">                   (isStaticCompactTable() &amp;&amp; kind == ColumnMetadata.Kind.STATIC)</span>
+<span class="nc" id="L1671">                   ? staticCompactOrSuperTableColumnNameType()</span>
+<span class="nc" id="L1672">                   : UTF8Type.instance;</span>
+        }
+
+        @Override
+        public boolean isStaticCompactTable()
+        {
+<span class="nc bnc" id="L1678" title="All 6 branches missed.">            return !Flag.isSuper(flags) &amp;&amp; !Flag.isDense(flags) &amp;&amp; !Flag.isCompound(flags);</span>
+        }
+
+        public void appendCqlTo(CqlBuilder builder,
+                                boolean includeDroppedColumns,
+                                boolean internals,
+                                boolean ifNotExists)
+        {
+<span class="nc" id="L1686">            builder.append(&quot;/*&quot;)</span>
+<span class="nc" id="L1687">                   .newLine()</span>
+<span class="nc" id="L1688">                   .append(&quot;Warning: Table &quot;)</span>
+<span class="nc" id="L1689">                   .append(toString())</span>
+<span class="nc" id="L1690">                   .append(&quot; omitted because it has constructs not compatible with CQL (was created via legacy API).&quot;)</span>
+<span class="nc" id="L1691">                   .newLine()</span>
+<span class="nc" id="L1692">                   .append(&quot;Approximate structure, for reference:&quot;)</span>
+<span class="nc" id="L1693">                   .newLine()</span>
+<span class="nc" id="L1694">                   .append(&quot;(this should not be used to reproduce this schema)&quot;)</span>
+<span class="nc" id="L1695">                   .newLine()</span>
+<span class="nc" id="L1696">                   .newLine();</span>
+
+<span class="nc" id="L1698">            super.appendCqlTo(builder, includeDroppedColumns, internals, ifNotExists);</span>
+
+<span class="nc" id="L1700">            builder.newLine()</span>
+<span class="nc" id="L1701">                   .append(&quot;*/&quot;);</span>
+<span class="nc" id="L1702">        }</span>
+
+        void appendTableOptions(CqlBuilder builder, boolean internals)
+        {
+<span class="nc" id="L1706">            builder.append(&quot;COMPACT STORAGE&quot;)</span>
+<span class="nc" id="L1707">                   .newLine()</span>
+<span class="nc" id="L1708">                   .append(&quot;AND &quot;);</span>
+
+<span class="nc" id="L1710">            super.appendTableOptions(builder, internals);</span>
+<span class="nc" id="L1711">        }</span>
+
+        public static ColumnMetadata getCompactValueColumn(RegularAndStaticColumns columns)
+        {
+<span class="nc bnc" id="L1715" title="All 4 branches missed.">            assert columns.regulars.simpleColumnCount() == 1 &amp;&amp; columns.regulars.complexColumnCount() == 0;</span>
+<span class="nc" id="L1716">            return columns.regulars.getSimple(0);</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

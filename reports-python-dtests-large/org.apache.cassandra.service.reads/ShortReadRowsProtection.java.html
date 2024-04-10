@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShortReadRowsProtection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads</a> &gt; <span class="el_source">ShortReadRowsProtection.java</span></div><h1>ShortReadRowsProtection.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.reads;
+
+import java.util.function.Function;
+
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.MoreRows;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.tracing.Tracing;
+
+<span class="fc" id="L40">class ShortReadRowsProtection extends Transformation implements MoreRows&lt;UnfilteredRowIterator&gt;</span>
+{
+    private final ReadCommand command;
+    private final Replica source;
+    private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
+    private final DataLimits.Counter mergedResultCounter; // merged end-result counter
+    private final Function&lt;ReadCommand, UnfilteredPartitionIterator&gt; commandExecutor;
+    private final TableMetadata metadata;
+    private final DecoratedKey partitionKey;
+
+    private Clustering&lt;?&gt; lastClustering; // clustering of the last observed row
+
+<span class="fc" id="L52">    private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows</span>
+<span class="fc" id="L53">    private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)</span>
+<span class="fc" id="L54">    private int lastQueried = 0; // # extra rows requested from the replica last time</span>
+
+    ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
+                            Function&lt;ReadCommand, UnfilteredPartitionIterator&gt; commandExecutor,
+                            DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter)
+<span class="fc" id="L59">    {</span>
+<span class="fc" id="L60">        this.command = command;</span>
+<span class="fc" id="L61">        this.source = source;</span>
+<span class="fc" id="L62">        this.commandExecutor = commandExecutor;</span>
+<span class="fc" id="L63">        this.singleResultCounter = singleResultCounter;</span>
+<span class="fc" id="L64">        this.mergedResultCounter = mergedResultCounter;</span>
+<span class="fc" id="L65">        this.metadata = command.metadata();</span>
+<span class="fc" id="L66">        this.partitionKey = partitionKey;</span>
+<span class="fc" id="L67">    }</span>
+
+    @Override
+    public Row applyToRow(Row row)
+    {
+<span class="fc" id="L72">        lastClustering = row.clustering();</span>
+<span class="fc" id="L73">        return row;</span>
+    }
+
+    /*
+     * We only get here once all the rows in this iterator have been iterated over, and so if the node
+     * had returned the requested number of rows but we still get here, then some results were skipped
+     * during reconciliation.
+     */
+    public UnfilteredRowIterator moreContents()
+    {
+        // never try to request additional rows from replicas if our reconciled partition is already filled to the limit
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">        assert !mergedResultCounter.isDoneForPartition();</span>
+
+        // we do not apply short read protection when we have no limits at all
+<span class="pc bpc" id="L87" title="1 of 2 branches missed.">        assert !command.limits().isUnlimited();</span>
+
+        /*
+         * If the returned partition doesn't have enough rows to satisfy even the original limit, don't ask for more.
+         *
+         * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
+         * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
+         */
+<span class="pc bpc" id="L95" title="2 of 4 branches missed.">        if (command.limits().isExhausted(singleResultCounter) &amp;&amp; command.limits().perPartitionCount() == DataLimits.NO_LIMIT)</span>
+<span class="fc" id="L96">            return null;</span>
+
+        /*
+         * If the replica has no live rows in the partition, don't try to fetch more.
+         *
+         * Note that the previous branch [if (!singleResultCounter.isDoneForPartition()) return null] doesn't
+         * always cover this scenario:
+         * isDoneForPartition() is defined as [isDone() || rowInCurrentPartition &gt;= perPartitionLimit],
+         * and will return true if isDone() returns true, even if there are 0 rows counted in the current partition.
+         *
+         * This can happen with a range read if after 1+ rounds of short read protection requests we managed to fetch
+         * enough extra rows for other partitions to satisfy the singleResultCounter's total row limit, but only
+         * have tombstones in the current partition.
+         *
+         * One other way we can hit this condition is when the partition only has a live static row and no regular
+         * rows. In that scenario the counter will remain at 0 until the partition is closed - which happens after
+         * the moreContents() call.
+         */
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (singleResultCounter.rowsCountedInCurrentPartition() == 0)</span>
+<span class="nc" id="L115">            return null;</span>
+
+        /*
+         * This is a table with no clustering columns, and has at most one row per partition - with EMPTY clustering.
+         * We already have the row, so there is no point in asking for more from the partition.
+         */
+<span class="nc bnc" id="L121" title="All 4 branches missed.">        if (lastClustering != null &amp;&amp; lastClustering.isEmpty())</span>
+<span class="nc" id="L122">            return null;</span>
+
+<span class="nc" id="L124">        lastFetched = singleResultCounter.rowsCountedInCurrentPartition() - lastCounted;</span>
+<span class="nc" id="L125">        lastCounted = singleResultCounter.rowsCountedInCurrentPartition();</span>
+
+        // getting back fewer rows than we asked for means the partition on the replica has been fully consumed
+<span class="nc bnc" id="L128" title="All 4 branches missed.">        if (lastQueried &gt; 0 &amp;&amp; lastFetched &lt; lastQueried)</span>
+<span class="nc" id="L129">            return null;</span>
+
+        /*
+         * At this point we know that:
+         *     1. the replica returned [repeatedly?] as many rows as we asked for and potentially has more
+         *        rows in the partition
+         *     2. at least one of those returned rows was shadowed by a tombstone returned from another
+         *        replica
+         *     3. we haven't satisfied the client's limits yet, and should attempt to query for more rows to
+         *        avoid a short read
+         *
+         * In the ideal scenario, we would get exactly min(a, b) or fewer rows from the next request, where a and b
+         * are defined as follows:
+         *     [a] limits.count() - mergedResultCounter.counted()
+         *     [b] limits.perPartitionCount() - mergedResultCounter.countedInCurrentPartition()
+         *
+         * It would be naive to query for exactly that many rows, as it's possible and not unlikely
+         * that some of the returned rows would also be shadowed by tombstones from other hosts.
+         *
+         * Note: we don't know, nor do we care, how many rows from the replica made it into the reconciled result;
+         * we can only tell how many in total we queried for, and that [0, mrc.countedInCurrentPartition()) made it.
+         *
+         * In general, our goal should be to minimise the number of extra requests - *not* to minimise the number
+         * of rows fetched: there is a high transactional cost for every individual request, but a relatively low
+         * marginal cost for each extra row requested.
+         *
+         * As such it's better to overfetch than to underfetch extra rows from a host; but at the same
+         * time we want to respect paging limits and not blow up spectacularly.
+         *
+         * Note: it's ok to retrieve more rows that necessary since singleResultCounter is not stopping and only
+         * counts.
+         *
+         * With that in mind, we'll just request the minimum of (count(), perPartitionCount()) limits.
+         *
+         * See CASSANDRA-13794 for more details.
+         */
+<span class="nc" id="L165">        lastQueried = Math.min(command.limits().count(), command.limits().perPartitionCount());</span>
+
+<span class="nc" id="L167">        ColumnFamilyStore.metricsFor(metadata.id).shortReadProtectionRequests.mark();</span>
+<span class="nc" id="L168">        Tracing.trace(&quot;Requesting {} extra rows from {} for short read protection&quot;, lastQueried, source);</span>
+
+<span class="nc" id="L170">        SinglePartitionReadCommand cmd = makeFetchAdditionalRowsReadCommand(lastQueried);</span>
+<span class="nc" id="L171">        return UnfilteredPartitionIterators.getOnlyElement(commandExecutor.apply(cmd), cmd);</span>
+    }
+
+    private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)
+    {
+<span class="nc" id="L176">        ClusteringIndexFilter filter = command.clusteringIndexFilter(partitionKey);</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (null != lastClustering)</span>
+<span class="nc" id="L178">            filter = filter.forPaging(metadata.comparator, lastClustering, false);</span>
+
+<span class="nc" id="L180">        return SinglePartitionReadCommand.create(command.metadata(),</span>
+<span class="nc" id="L181">                                                 command.nowInSec(),</span>
+<span class="nc" id="L182">                                                 command.columnFilter(),</span>
+<span class="nc" id="L183">                                                 command.rowFilter(),</span>
+<span class="nc" id="L184">                                                 command.limits().forShortReadRetry(toQuery),</span>
+                                                 partitionKey,
+                                                 filter,
+<span class="nc" id="L187">                                                 command.indexQueryPlan());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

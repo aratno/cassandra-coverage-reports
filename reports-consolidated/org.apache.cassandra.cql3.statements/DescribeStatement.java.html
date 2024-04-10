@@ -1,0 +1,751 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DescribeStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">DescribeStatement.java</span></div><h1>DescribeStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.collect.ImmutableList;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.db.KeyspaceNotDefinedException;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDGen;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotEmpty;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+
+/**
+ * The differents &lt;code&gt;DESCRIBE&lt;/code&gt; statements parsed from a CQL statement.
+ */
+<span class="fc" id="L64">public abstract class DescribeStatement&lt;T&gt; extends CQLStatement.Raw implements CQLStatement</span>
+{
+    private static final String KS = &quot;system&quot;;
+    private static final String CF = &quot;describe&quot;;
+
+    /**
+     * The columns returned by the describe queries that only list elements names (e.g. DESCRIBE KEYSPACES, DESCRIBE TABLES...)
+     */
+<span class="fc" id="L72">    private static final List&lt;ColumnSpecification&gt; LIST_METADATA =</span>
+<span class="fc" id="L73">            ImmutableList.of(new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;keyspace_name&quot;, true), UTF8Type.instance),</span>
+                             new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;type&quot;, true), UTF8Type.instance),
+                             new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;name&quot;, true), UTF8Type.instance));
+
+    /**
+     * The columns returned by the describe queries that returns the CREATE STATEMENT for the different elements (e.g. DESCRIBE KEYSPACE, DESCRIBE TABLE ...)
+     */
+<span class="fc" id="L80">    private static final List&lt;ColumnSpecification&gt; ELEMENT_METADATA =</span>
+<span class="fc" id="L81">            ImmutableList.&lt;ColumnSpecification&gt;builder().addAll(LIST_METADATA)</span>
+<span class="fc" id="L82">                                                        .add(new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;create_statement&quot;, true), UTF8Type.instance))</span>
+<span class="fc" id="L83">                                                        .build();</span>
+
+    /**
+     * &quot;Magic version&quot; for the paging state.
+     */
+    private static final int PAGING_STATE_VERSION = 0x0001;
+
+    static final String SCHEMA_CHANGED_WHILE_PAGING_MESSAGE = &quot;The schema has changed since the previous page of the DESCRIBE statement result. &quot; +
+                                                              &quot;Please retry the DESCRIBE statement.&quot;;
+
+    private boolean includeInternalDetails;
+
+    public final void withInternalDetails()
+    {
+<span class="fc" id="L97">        this.includeInternalDetails = true;</span>
+<span class="fc" id="L98">    }</span>
+
+    @Override
+    public final CQLStatement prepare(ClientState clientState) throws RequestValidationException
+    {
+<span class="fc" id="L103">        return this;</span>
+    }
+
+    public final List&lt;ColumnSpecification&gt; getBindVariables()
+    {
+<span class="fc" id="L108">        return Collections.emptyList();</span>
+    }
+
+    @Override
+    public final void authorize(ClientState state)
+    {
+<span class="fc" id="L114">    }</span>
+
+    @Override
+    public final void validate(ClientState state)
+    {
+<span class="fc" id="L119">    }</span>
+
+    public final AuditLogContext getAuditLogContext()
+    {
+<span class="nc" id="L123">        return new AuditLogContext(AuditLogEntryType.DESCRIBE);</span>
+    }
+
+    @Override
+    public final ResultMessage execute(QueryState state, QueryOptions options, long queryStartNanoTime) throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L129">        return executeLocally(state, options);</span>
+    }
+
+    @Override
+    public ResultMessage executeLocally(QueryState state, QueryOptions options)
+    {
+<span class="fc" id="L135">        Keyspaces keyspaces = Schema.instance.distributedAndLocalKeyspaces();</span>
+<span class="fc" id="L136">        UUID schemaVersion = Schema.instance.getVersion();</span>
+
+<span class="fc" id="L138">        keyspaces = Keyspaces.builder()</span>
+<span class="fc" id="L139">                             .add(keyspaces)</span>
+<span class="fc" id="L140">                             .add(VirtualKeyspaceRegistry.instance.virtualKeyspacesMetadata())</span>
+<span class="fc" id="L141">                             .build();</span>
+
+<span class="fc" id="L143">        PagingState pagingState = options.getPagingState();</span>
+
+        // The paging implemented here uses some arbitray row number as the partition-key for paging,
+        // which is used to skip/limit the result from the Java Stream. This works good enough for
+        // reasonably sized schemas. Even a 'DESCRIBE SCHEMA' for an abnormally schema with 10000 tables
+        // completes within a few seconds. This seems good enough for now. Once Cassandra actually supports
+        // more than a few hundred tables, the implementation here should be reconsidered.
+        //
+        // Paging is only supported on row-level.
+        //
+        // The &quot;partition key&quot; in the paging-state contains a serialized object:
+        //   (short) version, currently 0x0001
+        //   (long) row offset
+        //   (vint bytes) serialized schema hash (currently the result of Keyspaces.hashCode())
+        //
+
+<span class="fc" id="L159">        long offset = getOffset(pagingState, schemaVersion);</span>
+<span class="fc" id="L160">        int pageSize = options.getPageSize();</span>
+
+<span class="fc" id="L162">        Stream&lt;? extends T&gt; stream = describe(state.getClientState(), keyspaces);</span>
+
+<span class="fc bfc" id="L164" title="All 2 branches covered.">        if (offset &gt; 0L)</span>
+<span class="fc" id="L165">            stream = stream.skip(offset);</span>
+<span class="fc bfc" id="L166" title="All 2 branches covered.">        if (pageSize &gt; 0)</span>
+<span class="fc" id="L167">            stream = stream.limit(pageSize);</span>
+
+<span class="fc" id="L169">        List&lt;List&lt;ByteBuffer&gt;&gt; rows = stream.map(e -&gt; toRow(e, includeInternalDetails))</span>
+<span class="fc" id="L170">                                            .collect(Collectors.toList());</span>
+
+<span class="fc" id="L172">        ResultSet.ResultMetadata resultMetadata = new ResultSet.ResultMetadata(metadata(state.getClientState()));</span>
+<span class="fc" id="L173">        ResultSet result = new ResultSet(resultMetadata, rows);</span>
+
+<span class="fc bfc" id="L175" title="All 4 branches covered.">        if (pageSize &gt; 0 &amp;&amp; rows.size() == pageSize)</span>
+        {
+<span class="fc" id="L177">            result.metadata.setHasMorePages(getPagingState(offset + pageSize, schemaVersion));</span>
+        }
+
+<span class="fc" id="L180">        return new ResultMessage.Rows(result);</span>
+    }
+
+    /**
+     * Returns the columns of the {@code ResultMetadata}
+     */
+    protected abstract List&lt;ColumnSpecification&gt; metadata(ClientState state);
+
+    private PagingState getPagingState(long nextPageOffset, UUID schemaVersion)
+    {
+<span class="fc" id="L190">        try (DataOutputBuffer out = new DataOutputBuffer())</span>
+        {
+<span class="fc" id="L192">            out.writeShort(PAGING_STATE_VERSION);</span>
+<span class="fc" id="L193">            out.writeUTF(FBUtilities.getReleaseVersionString());</span>
+<span class="fc" id="L194">            out.write(UUIDGen.decompose(schemaVersion));</span>
+<span class="fc" id="L195">            out.writeLong(nextPageOffset);</span>
+
+<span class="fc" id="L197">            return new PagingState(out.asNewBuffer(),</span>
+                                   null,
+                                   Integer.MAX_VALUE,
+                                   Integer.MAX_VALUE);
+        }
+<span class="nc" id="L202">        catch (IOException e)</span>
+        {
+<span class="nc" id="L204">            throw new InvalidRequestException(&quot;Invalid paging state.&quot;, e);</span>
+        }
+    }
+
+    private long getOffset(PagingState pagingState, UUID schemaVersion)
+    {
+<span class="fc bfc" id="L210" title="All 2 branches covered.">        if (pagingState == null)</span>
+<span class="fc" id="L211">            return 0L;</span>
+
+<span class="fc" id="L213">        try (DataInputBuffer in = new DataInputBuffer(pagingState.partitionKey, false))</span>
+        {
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">            checkTrue(in.readShort() == PAGING_STATE_VERSION, &quot;Incompatible paging state&quot;);</span>
+
+<span class="fc" id="L217">            final String pagingStateServerVersion = in.readUTF();</span>
+<span class="fc" id="L218">            final String releaseVersion = FBUtilities.getReleaseVersionString();</span>
+<span class="fc" id="L219">            checkTrue(pagingStateServerVersion.equals(releaseVersion),</span>
+                      &quot;The server version of the paging state %s is different from the one of the server %s&quot;,
+                      pagingStateServerVersion,
+                      releaseVersion);
+
+<span class="fc" id="L224">            byte[] bytes = new byte[UUIDGen.UUID_LEN];</span>
+<span class="fc" id="L225">            in.read(bytes);</span>
+<span class="fc" id="L226">            UUID version = UUIDGen.getUUID(ByteBuffer.wrap(bytes));</span>
+<span class="fc" id="L227">            checkTrue(schemaVersion.equals(version), SCHEMA_CHANGED_WHILE_PAGING_MESSAGE);</span>
+
+<span class="fc" id="L229">            return in.readLong();</span>
+        }
+<span class="nc" id="L231">        catch (IOException e)</span>
+        {
+<span class="nc" id="L233">            throw new InvalidRequestException(&quot;Invalid paging state.&quot;, e);</span>
+        }
+    }
+
+    protected abstract List&lt;ByteBuffer&gt; toRow(T element, boolean withInternals);
+
+    /**
+     * Returns the schema elements that must be part of the output.
+     */
+    protected abstract Stream&lt;? extends T&gt; describe(ClientState state, Keyspaces keyspaces);
+
+    /**
+     * Returns the metadata for the given keyspace or throws a {@link KeyspaceNotDefinedException} exception.
+     */
+    private static KeyspaceMetadata validateKeyspace(String ks, Keyspaces keyspaces)
+    {
+<span class="fc" id="L249">        return keyspaces.get(ks)</span>
+<span class="fc" id="L250">                        .orElseThrow(() -&gt; new KeyspaceNotDefinedException(format(&quot;'%s' not found in keyspaces&quot;, ks)));</span>
+    }
+
+    /**
+     * {@code DescribeStatement} implementation used for describe queries that only list elements names.
+     */
+    public static final class Listing extends DescribeStatement&lt;SchemaElement&gt;
+    {
+        private final java.util.function.Function&lt;KeyspaceMetadata, Stream&lt;? extends SchemaElement&gt;&gt; elementsProvider;
+
+        public Listing(java.util.function.Function&lt;KeyspaceMetadata, Stream&lt;? extends SchemaElement&gt;&gt; elementsProvider)
+<span class="fc" id="L261">        {</span>
+<span class="fc" id="L262">            this.elementsProvider = elementsProvider;</span>
+<span class="fc" id="L263">        }</span>
+
+        @Override
+        protected Stream&lt;? extends SchemaElement&gt; describe(ClientState state, Keyspaces keyspaces)
+        {
+<span class="fc" id="L268">            String keyspace = state.getRawKeyspace();</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">            Stream&lt;KeyspaceMetadata&gt; stream = keyspace == null ? keyspaces.stream().sorted(SchemaElement.NAME_COMPARATOR)</span>
+<span class="fc" id="L270">                                                               : Stream.of(validateKeyspace(keyspace, keyspaces));</span>
+
+<span class="fc" id="L272">            return stream.flatMap(k -&gt; elementsProvider.apply(k).sorted(SchemaElement.NAME_COMPARATOR));</span>
+        }
+
+        @Override
+        protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+        {
+<span class="fc" id="L278">            return LIST_METADATA;</span>
+        }
+
+        @Override
+        protected List&lt;ByteBuffer&gt; toRow(SchemaElement element, boolean withInternals)
+        {
+<span class="fc" id="L284">            return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),</span>
+<span class="fc" id="L285">                                    bytes(element.elementType().toString()),</span>
+<span class="fc" id="L286">                                    bytes(element.elementNameQuotedIfNeeded()));</span>
+        }
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE TABLES}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; tables()
+    {
+<span class="fc" id="L295">        return new Listing(ks -&gt; ks.tables.stream());</span>
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE TYPES}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; types()
+    {
+<span class="fc" id="L303">        return new Listing(ks -&gt; ks.types.stream());</span>
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE FUNCTIONS}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; functions()
+    {
+<span class="fc" id="L311">        return new Listing(ks -&gt; ks.userFunctions.udfs());</span>
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE AGGREGATES}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; aggregates()
+    {
+<span class="fc" id="L319">        return new Listing(ks -&gt; ks.userFunctions.udas());</span>
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE KEYSPACES}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; keyspaces()
+    {
+<span class="fc" id="L327">        return new DescribeStatement&lt;SchemaElement&gt;()</span>
+<span class="fc" id="L328">        {</span>
+            @Override
+            protected Stream&lt;? extends SchemaElement&gt; describe(ClientState state, Keyspaces keyspaces)
+            {
+<span class="fc" id="L332">                return keyspaces.stream().sorted(SchemaElement.NAME_COMPARATOR);</span>
+            }
+
+            @Override
+            protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+            {
+<span class="fc" id="L338">                return LIST_METADATA;</span>
+            }
+
+            @Override
+            protected List&lt;ByteBuffer&gt; toRow(SchemaElement element, boolean withInternals)
+            {
+<span class="fc" id="L344">                return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),</span>
+<span class="fc" id="L345">                                        bytes(element.elementType().toString()),</span>
+<span class="fc" id="L346">                                        bytes(element.elementNameQuotedIfNeeded()));</span>
+            }
+        };
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE [FULL] SCHEMA}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; schema(boolean includeSystemKeyspaces)
+    {
+<span class="fc" id="L356">        return new DescribeStatement&lt;SchemaElement&gt;()</span>
+<span class="fc" id="L357">        {</span>
+            @Override
+            protected Stream&lt;? extends SchemaElement&gt; describe(ClientState state, Keyspaces keyspaces)
+            {
+<span class="fc" id="L361">                return keyspaces.stream()</span>
+<span class="pc bpc" id="L362" title="1 of 4 branches missed.">                                .filter(ks -&gt; includeSystemKeyspaces || !SchemaConstants.isSystemKeyspace(ks.name))</span>
+<span class="fc" id="L363">                                .sorted(SchemaElement.NAME_COMPARATOR)</span>
+<span class="fc" id="L364">                                .flatMap(ks -&gt; getKeyspaceElements(ks, false));</span>
+            }
+
+            @Override
+            protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+            {
+<span class="fc" id="L370">                return ELEMENT_METADATA;</span>
+            }
+
+            @Override
+            protected List&lt;ByteBuffer&gt; toRow(SchemaElement element, boolean withInternals)
+            {
+<span class="fc" id="L376">                return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),</span>
+<span class="fc" id="L377">                                        bytes(element.elementType().toString()),</span>
+<span class="fc" id="L378">                                        bytes(element.elementNameQuotedIfNeeded()),</span>
+<span class="fc" id="L379">                                        bytes(element.toCqlString(withInternals, false)));</span>
+            }
+        };
+    }
+
+    /**
+     * {@code DescribeStatement} implementation used for describe queries for a single schema element.
+     */
+    public static class Element extends DescribeStatement&lt;SchemaElement&gt;
+    {
+        /**
+         * The keyspace name
+         */
+        private final String keyspace;
+
+        /**
+         * The element name
+         */
+        private final String name;
+
+        private final BiFunction&lt;KeyspaceMetadata, String, Stream&lt;? extends SchemaElement&gt;&gt; elementsProvider;
+
+        public Element(String keyspace, String name, BiFunction&lt;KeyspaceMetadata, String, Stream&lt;? extends SchemaElement&gt;&gt; elementsProvider)
+<span class="fc" id="L402">        {</span>
+<span class="fc" id="L403">            this.keyspace = keyspace;</span>
+<span class="fc" id="L404">            this.name = name;</span>
+<span class="fc" id="L405">            this.elementsProvider = elementsProvider;</span>
+<span class="fc" id="L406">        }</span>
+
+        @Override
+        protected Stream&lt;? extends SchemaElement&gt; describe(ClientState state, Keyspaces keyspaces)
+        {
+<span class="fc bfc" id="L411" title="All 2 branches covered.">            String ks = keyspace == null ? checkNotNull(state.getRawKeyspace(), &quot;No keyspace specified and no current keyspace&quot;)</span>
+<span class="fc" id="L412">                                         : keyspace;</span>
+
+<span class="fc" id="L414">            return elementsProvider.apply(validateKeyspace(ks, keyspaces), name);</span>
+        }
+
+        @Override
+        protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+        {
+<span class="fc" id="L420">            return ELEMENT_METADATA;</span>
+        }
+
+        @Override
+        protected List&lt;ByteBuffer&gt; toRow(SchemaElement element, boolean withInternals)
+        {
+<span class="fc" id="L426">            return ImmutableList.of(bytes(element.elementKeyspaceQuotedIfNeeded()),</span>
+<span class="fc" id="L427">                                    bytes(element.elementType().toString()),</span>
+<span class="fc" id="L428">                                    bytes(element.elementNameQuotedIfNeeded()),</span>
+<span class="fc" id="L429">                                    bytes(element.toCqlString(withInternals, false)));</span>
+        }
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE KEYSPACE}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; keyspace(String keyspace, boolean onlyKeyspaceDefinition)
+    {
+<span class="fc" id="L438">        return new Element(keyspace, null, (ks, t) -&gt; getKeyspaceElements(ks, onlyKeyspaceDefinition));</span>
+    }
+
+    private static Stream&lt;? extends SchemaElement&gt; getKeyspaceElements(KeyspaceMetadata ks, boolean onlyKeyspace)
+    {
+<span class="fc" id="L443">        Stream&lt;? extends SchemaElement&gt; s = Stream.of(ks);</span>
+
+<span class="fc bfc" id="L445" title="All 2 branches covered.">        if (!onlyKeyspace)</span>
+        {
+<span class="fc" id="L447">            s = Stream.concat(s, ks.types.sortedStream());</span>
+<span class="fc" id="L448">            s = Stream.concat(s, ks.userFunctions.udfs().sorted(SchemaElement.NAME_COMPARATOR));</span>
+<span class="fc" id="L449">            s = Stream.concat(s, ks.userFunctions.udas().sorted(SchemaElement.NAME_COMPARATOR));</span>
+<span class="fc" id="L450">            s = Stream.concat(s, ks.tables.stream().sorted(SchemaElement.NAME_COMPARATOR)</span>
+<span class="fc" id="L451">                                                   .flatMap(tm -&gt; getTableElements(ks, tm)));</span>
+        }
+
+<span class="fc" id="L454">        return s;</span>
+    }
+
+    private static Stream&lt;? extends SchemaElement&gt; getTableElements(KeyspaceMetadata ks, TableMetadata table)
+    {
+<span class="fc" id="L459">        Stream&lt;? extends SchemaElement&gt; s = Stream.of(table);</span>
+<span class="fc" id="L460">        s = Stream.concat(s, table.indexes.stream()</span>
+<span class="fc" id="L461">                                          .map(i -&gt; toDescribable(table, i))</span>
+<span class="fc" id="L462">                                          .sorted(SchemaElement.NAME_COMPARATOR));</span>
+<span class="fc" id="L463">        s = Stream.concat(s, ks.views.stream(table.id)</span>
+<span class="fc" id="L464">                                     .sorted(SchemaElement.NAME_COMPARATOR));</span>
+<span class="fc" id="L465">        return s;</span>
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE TABLE}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; table(String keyspace, String name)
+    {
+<span class="fc" id="L473">        return new Element(keyspace, name, (ks, t) -&gt; {</span>
+
+<span class="fc" id="L475">            TableMetadata table = checkNotNull(ks.getTableNullable(t),</span>
+                                               &quot;Table '%s' not found in keyspace '%s'&quot;, t, ks.name);
+
+<span class="fc" id="L478">            return Stream.concat(Stream.of(table), table.indexes.stream()</span>
+<span class="fc" id="L479">                                                                .map(index -&gt; toDescribable(table, index))</span>
+<span class="fc" id="L480">                                                                .sorted(SchemaElement.NAME_COMPARATOR));</span>
+        });
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE INDEX}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; index(String keyspace, String name)
+    {
+<span class="fc" id="L489">        return new Element(keyspace, name, (ks, index) -&gt; {</span>
+
+<span class="fc" id="L491">            TableMetadata tm = ks.findIndexedTable(index)</span>
+<span class="pc" id="L492">                                 .orElseThrow(() -&gt; invalidRequest(&quot;Table for existing index '%s' not found in '%s'&quot;,</span>
+                                                                   index,
+                                                                   ks.name));
+<span class="fc" id="L495">            return tm.indexes.get(index)</span>
+<span class="fc" id="L496">                             .map(i -&gt; toDescribable(tm, i))</span>
+<span class="fc" id="L497">                             .map(Stream::of)</span>
+<span class="pc" id="L498">                             .orElseThrow(() -&gt; invalidRequest(&quot;Index '%s' not found in '%s'&quot;, index, ks.name));</span>
+        });
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE MATERIALIZED VIEW}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; view(String keyspace, String name)
+    {
+<span class="fc" id="L507">        return new Element(keyspace, name, (ks, view) -&gt; {</span>
+
+<span class="fc" id="L509">            return ks.views.get(view)</span>
+<span class="fc" id="L510">                           .map(Stream::of)</span>
+<span class="fc" id="L511">                           .orElseThrow(() -&gt; invalidRequest(&quot;Materialized view '%s' not found in '%s'&quot;, view, ks.name));</span>
+        });
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE TYPE}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; type(String keyspace, String name)
+    {
+<span class="fc" id="L520">        return new Element(keyspace, name, (ks, type) -&gt; {</span>
+
+<span class="fc" id="L522">            return ks.types.get(ByteBufferUtil.bytes(type))</span>
+<span class="fc" id="L523">                           .map(Stream::of)</span>
+<span class="pc" id="L524">                           .orElseThrow(() -&gt; invalidRequest(&quot;User defined type '%s' not found in '%s'&quot;,</span>
+                                                             type,
+                                                             ks.name));
+        });
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE FUNCTION}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; function(String keyspace, String name)
+    {
+<span class="fc" id="L535">        return new Element(keyspace, name, (ks, n) -&gt; {</span>
+
+<span class="fc" id="L537">            return checkNotEmpty(ks.userFunctions.getUdfs(new FunctionName(ks.name, n)),</span>
+<span class="fc" id="L538">                                 &quot;User defined function '%s' not found in '%s'&quot;, n, ks.name).stream()</span>
+<span class="fc" id="L539">                                                                                             .sorted(SchemaElement.NAME_COMPARATOR);</span>
+        });
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE FUNCTION}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; aggregate(String keyspace, String name)
+    {
+<span class="fc" id="L548">        return new Element(keyspace, name, (ks, n) -&gt; {</span>
+
+<span class="fc" id="L550">            return checkNotEmpty(ks.userFunctions.getUdas(new FunctionName(ks.name, n)),</span>
+<span class="fc" id="L551">                                 &quot;User defined aggregate '%s' not found in '%s'&quot;, n, ks.name).stream()</span>
+<span class="fc" id="L552">                                                                                              .sorted(SchemaElement.NAME_COMPARATOR);</span>
+        });
+    }
+
+    private static SchemaElement toDescribable(TableMetadata table, IndexMetadata index)
+    {
+<span class="fc" id="L558">        return new SchemaElement()</span>
+<span class="fc" id="L559">                {</span>
+                    @Override
+                    public SchemaElementType elementType()
+                    {
+<span class="fc" id="L563">                        return SchemaElementType.INDEX;</span>
+                    }
+
+                    @Override
+                    public String elementKeyspace()
+                    {
+<span class="fc" id="L569">                        return table.keyspace;</span>
+                    }
+
+                    @Override
+                    public String elementName()
+                    {
+<span class="fc" id="L575">                        return index.name;</span>
+                    }
+
+                    @Override
+                    public String toCqlString(boolean withInternals, boolean ifNotExists)
+                    {
+<span class="fc" id="L581">                        return index.toCqlString(table, ifNotExists);</span>
+                    }
+                };
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for the generic {@code DESCRIBE ...}.
+     */
+    public static DescribeStatement&lt;SchemaElement&gt; generic(String keyspace, String name)
+    {
+<span class="fc" id="L591">        return new DescribeStatement&lt;SchemaElement&gt;()</span>
+<span class="fc" id="L592">        {</span>
+            private DescribeStatement&lt;SchemaElement&gt; delegate;
+
+            private DescribeStatement&lt;SchemaElement&gt; resolve(ClientState state, Keyspaces keyspaces)
+            {
+<span class="fc" id="L597">                String ks = keyspace;</span>
+
+                // from cqlsh help: &quot;keyspace or a table or an index or a materialized view (in this order).&quot;
+<span class="fc bfc" id="L600" title="All 2 branches covered.">                if (keyspace == null)</span>
+                {
+<span class="fc bfc" id="L602" title="All 2 branches covered.">                    if (keyspaces.containsKeyspace(name))</span>
+<span class="fc" id="L603">                        return keyspace(name, false);</span>
+
+<span class="fc" id="L605">                    String rawKeyspace = state.getRawKeyspace();</span>
+<span class="fc bfc" id="L606" title="All 2 branches covered.">                    ks = rawKeyspace == null ? name : rawKeyspace;</span>
+                }
+
+<span class="fc" id="L609">                KeyspaceMetadata keyspaceMetadata = validateKeyspace(ks, keyspaces);</span>
+
+<span class="fc bfc" id="L611" title="All 2 branches covered.">                if (keyspaceMetadata.tables.getNullable(name) != null)</span>
+<span class="fc" id="L612">                    return table(ks, name);</span>
+
+<span class="fc" id="L614">                Optional&lt;TableMetadata&gt; indexed = keyspaceMetadata.findIndexedTable(name);</span>
+<span class="fc bfc" id="L615" title="All 2 branches covered.">                if (indexed.isPresent())</span>
+                {
+<span class="fc" id="L617">                    Optional&lt;IndexMetadata&gt; index = indexed.get().indexes.get(name);</span>
+<span class="pc bpc" id="L618" title="1 of 2 branches missed.">                    if (index.isPresent())</span>
+<span class="fc" id="L619">                        return index(ks, name);</span>
+                }
+
+<span class="fc bfc" id="L622" title="All 2 branches covered.">                if (keyspaceMetadata.views.getNullable(name) != null)</span>
+<span class="fc" id="L623">                    return view(ks, name);</span>
+
+<span class="fc" id="L625">                throw invalidRequest(&quot;'%s' not found in keyspace '%s'&quot;, name, ks);</span>
+            }
+
+            @Override
+            protected Stream&lt;? extends SchemaElement&gt; describe(ClientState state, Keyspaces keyspaces)
+            {
+<span class="fc" id="L631">                delegate = resolve(state, keyspaces);</span>
+<span class="fc" id="L632">                return delegate.describe(state, keyspaces);</span>
+            }
+
+            @Override
+            protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+            {
+<span class="fc" id="L638">                return delegate.metadata(state);</span>
+            }
+
+            @Override
+            protected List&lt;ByteBuffer&gt; toRow(SchemaElement element, boolean withInternals)
+            {
+<span class="fc" id="L644">                return delegate.toRow(element, withInternals);</span>
+            }
+        };
+    }
+
+    /**
+     * Creates a {@link DescribeStatement} for {@code DESCRIBE CLUSTER}.
+     */
+    public static DescribeStatement&lt;List&lt;Object&gt;&gt; cluster()
+    {
+<span class="fc" id="L654">        return new DescribeStatement&lt;List&lt;Object&gt;&gt;()</span>
+<span class="fc" id="L655">        {</span>
+            /**
+             * The column index of the cluster name
+             */
+            private static final int CLUSTER_NAME_INDEX = 0;
+
+            /**
+             * The column index of the partitioner name
+             */
+            private static final int PARTITIONER_NAME_INDEX = 1;
+
+            /**
+             * The column index of the snitch class
+             */
+            private static final int SNITCH_CLASS_INDEX = 2;
+
+            /**
+             * The range ownerships index
+             */
+            private static final int RANGE_OWNERSHIPS_INDEX = 3;
+
+            @Override
+            protected Stream&lt;List&lt;Object&gt;&gt; describe(ClientState state, Keyspaces keyspaces)
+            {
+<span class="fc" id="L679">                List&lt;Object&gt; list = new ArrayList&lt;Object&gt;();</span>
+<span class="fc" id="L680">                list.add(DatabaseDescriptor.getClusterName());</span>
+<span class="fc" id="L681">                list.add(trimIfPresent(DatabaseDescriptor.getPartitionerName(), &quot;org.apache.cassandra.dht.&quot;));</span>
+<span class="fc" id="L682">                list.add(trimIfPresent(DatabaseDescriptor.getEndpointSnitch().getClass().getName(),</span>
+                                            &quot;org.apache.cassandra.locator.&quot;));
+
+<span class="fc" id="L685">                String useKs = state.getRawKeyspace();</span>
+<span class="fc bfc" id="L686" title="All 2 branches covered.">                if (mustReturnsRangeOwnerships(useKs))</span>
+                {
+<span class="fc" id="L688">                    list.add(StorageService.instance.getRangeToAddressMap(useKs)</span>
+<span class="fc" id="L689">                                                    .entrySet()</span>
+<span class="fc" id="L690">                                                    .stream()</span>
+<span class="fc" id="L691">                                                    .sorted(Comparator.comparing(Map.Entry::getKey))</span>
+<span class="fc" id="L692">                                                    .collect(Collectors.toMap(e -&gt; e.getKey().right.toString(),</span>
+<span class="fc" id="L693">                                                                              e -&gt; e.getValue()</span>
+<span class="fc" id="L694">                                                                                    .stream()</span>
+<span class="fc" id="L695">                                                                                    .map(r -&gt; r.endpoint().toString())</span>
+<span class="fc" id="L696">                                                                                    .collect(Collectors.toList()))));</span>
+                }
+<span class="fc" id="L698">                return Stream.of(list);</span>
+            }
+
+            private boolean mustReturnsRangeOwnerships(String useKs)
+            {
+<span class="pc bpc" id="L703" title="1 of 6 branches missed.">                return useKs != null &amp;&amp; !SchemaConstants.isLocalSystemKeyspace(useKs) &amp;&amp; !SchemaConstants.isSystemKeyspace(useKs);</span>
+            }
+
+            @Override
+            protected List&lt;ColumnSpecification&gt; metadata(ClientState state)
+            {
+<span class="fc" id="L709">                ImmutableList.Builder&lt;ColumnSpecification&gt; builder = ImmutableList.builder();</span>
+<span class="fc" id="L710">                builder.add(new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;cluster&quot;, true), UTF8Type.instance),</span>
+                                        new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;partitioner&quot;, true), UTF8Type.instance),
+                                        new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;snitch&quot;, true), UTF8Type.instance));
+
+<span class="fc bfc" id="L714" title="All 2 branches covered.">                if (mustReturnsRangeOwnerships(state.getRawKeyspace()))</span>
+<span class="fc" id="L715">                    builder.add(new ColumnSpecification(KS, CF, new ColumnIdentifier(&quot;range_ownership&quot;, true), MapType.getInstance(UTF8Type.instance,</span>
+<span class="fc" id="L716">                                                                                                                                   ListType.getInstance(UTF8Type.instance, false), false)));</span>
+
+<span class="fc" id="L718">                return builder.build();</span>
+            }
+
+            @Override
+            protected List&lt;ByteBuffer&gt; toRow(List&lt;Object&gt; elements, boolean withInternals)
+            {
+<span class="fc" id="L724">                ImmutableList.Builder&lt;ByteBuffer&gt; builder = ImmutableList.builder();</span>
+
+<span class="fc" id="L726">                builder.add(UTF8Type.instance.decompose((String) elements.get(CLUSTER_NAME_INDEX)),</span>
+<span class="fc" id="L727">                            UTF8Type.instance.decompose((String) elements.get(PARTITIONER_NAME_INDEX)),</span>
+<span class="fc" id="L728">                            UTF8Type.instance.decompose((String) elements.get(SNITCH_CLASS_INDEX)));</span>
+
+<span class="fc bfc" id="L730" title="All 2 branches covered.">                if (elements.size() &gt; 3)</span>
+                {
+<span class="fc" id="L732">                    MapType&lt;String, List&lt;String&gt;&gt; rangeOwnershipType = MapType.getInstance(UTF8Type.instance,</span>
+<span class="fc" id="L733">                                                                                           ListType.getInstance(UTF8Type.instance, false),</span>
+                                                                                           false);
+
+<span class="fc" id="L736">                    builder.add(rangeOwnershipType.decompose((Map&lt;String, List&lt;String&gt;&gt;) elements.get(RANGE_OWNERSHIPS_INDEX)));</span>
+                }
+
+<span class="fc" id="L739">                return builder.build();</span>
+            }
+
+            private String trimIfPresent(String src, String begin)
+            {
+<span class="fc bfc" id="L744" title="All 2 branches covered.">                if (src.startsWith(begin))</span>
+<span class="fc" id="L745">                    return src.substring(begin.length());</span>
+<span class="fc" id="L746">                return src;</span>
+            }
+        };
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

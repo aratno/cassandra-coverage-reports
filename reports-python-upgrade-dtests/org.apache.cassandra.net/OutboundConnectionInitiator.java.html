@@ -1,0 +1,532 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundConnectionInitiator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundConnectionInitiator.java</span></div><h1>OutboundConnectionInitiator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.ClosedChannelException;
+import java.security.cert.Certificate;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import io.netty.util.concurrent.Future; //checkstyle: permit this import
+import io.netty.util.concurrent.Promise; //checkstyle: permit this import
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandler;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.EventLoop;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.ssl.SslClosedEngineException;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.ScheduledFuture;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.OutboundConnectionInitiator.Result.MessagingSuccess;
+import org.apache.cassandra.net.OutboundConnectionInitiator.Result.StreamingSuccess;
+import org.apache.cassandra.security.ISslContextFactory;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.memory.BufferPools;
+
+import static java.util.concurrent.TimeUnit.*;
+import static org.apache.cassandra.auth.IInternodeAuthenticator.InternodeConnectionDirection.OUTBOUND;
+import static org.apache.cassandra.auth.IInternodeAuthenticator.InternodeConnectionDirection.OUTBOUND_PRECONNECT;
+import static org.apache.cassandra.net.InternodeConnectionUtils.DISCARD_HANDLER_NAME;
+import static org.apache.cassandra.net.InternodeConnectionUtils.SSL_FACTORY_CONTEXT_DESCRIPTION;
+import static org.apache.cassandra.net.InternodeConnectionUtils.SSL_HANDLER_NAME;
+import static org.apache.cassandra.net.InternodeConnectionUtils.certificates;
+import static org.apache.cassandra.net.HandshakeProtocol.*;
+import static org.apache.cassandra.net.ConnectionType.STREAMING;
+import static org.apache.cassandra.net.OutboundConnectionInitiator.Result.incompatible;
+import static org.apache.cassandra.net.OutboundConnectionInitiator.Result.messagingSuccess;
+import static org.apache.cassandra.net.OutboundConnectionInitiator.Result.streamingSuccess;
+import static org.apache.cassandra.net.SocketFactory.*;
+
+/**
+ * A {@link ChannelHandler} to execute the send-side of the internode handshake protocol.
+ * As soon as the handler is added to the channel via {@link ChannelInboundHandler#channelActive(ChannelHandlerContext)}
+ * (which is only invoked if the underlying TCP connection was properly established), the {@link Initiate}
+ * handshake is sent. See {@link HandshakeProtocol} for full details.
+ * &lt;p&gt;
+ * Upon completion of the handshake (on success or fail), the {@link #resultPromise} is completed.
+ * See {@link Result} for details about the different result states.
+ * &lt;p&gt;
+ * This class extends {@link ByteToMessageDecoder}, which is a {@link ChannelInboundHandler}, because this handler
+ * waits for the peer's handshake response (the {@link Accept} of the internode messaging handshake protocol).
+ */
+public class OutboundConnectionInitiator&lt;SuccessType extends OutboundConnectionInitiator.Result.Success&gt;
+{
+<span class="fc" id="L93">    private static final Logger logger = LoggerFactory.getLogger(OutboundConnectionInitiator.class);</span>
+
+    private final ConnectionType type;
+    private final SslFallbackConnectionType sslConnectionType;
+    private final OutboundConnectionSettings settings;
+    private final Promise&lt;Result&lt;SuccessType&gt;&gt; resultPromise;
+    private boolean isClosed;
+
+    private OutboundConnectionInitiator(ConnectionType type, SslFallbackConnectionType sslConnectionType, OutboundConnectionSettings settings,
+                                        Promise&lt;Result&lt;SuccessType&gt;&gt; resultPromise)
+<span class="fc" id="L103">    {</span>
+<span class="fc" id="L104">        this.type = type;</span>
+<span class="fc" id="L105">        this.sslConnectionType = sslConnectionType;</span>
+
+<span class="fc" id="L107">        this.settings = settings;</span>
+<span class="fc" id="L108">        this.resultPromise = resultPromise;</span>
+<span class="fc" id="L109">    }</span>
+
+    /**
+     * Initiate a connection with the requested messaging version.
+     * if the other node supports a newer version, or doesn't support this version, we will fail to connect
+     * and try again with the version they reported
+     *
+     * The returned {@code Future} is guaranteed to be completed on the supplied eventLoop.
+     */
+    public static Future&lt;Result&lt;StreamingSuccess&gt;&gt; initiateStreaming(EventLoop eventLoop, OutboundConnectionSettings settings,
+                                                                     SslFallbackConnectionType sslConnectionType)
+    {
+<span class="fc" id="L121">        return new OutboundConnectionInitiator&lt;StreamingSuccess&gt;(STREAMING, sslConnectionType, settings, AsyncPromise.withExecutor(eventLoop))</span>
+<span class="fc" id="L122">               .initiate(eventLoop);</span>
+    }
+
+    /**
+     * Initiate a connection with the requested messaging version.
+     * if the other node supports a newer version, or doesn't support this version, we will fail to connect
+     * and try again with the version they reported
+     *
+     * The returned {@code Future} is guaranteed to be completed on the supplied eventLoop.
+     */
+    static Future&lt;Result&lt;MessagingSuccess&gt;&gt; initiateMessaging(EventLoop eventLoop, ConnectionType type, SslFallbackConnectionType sslConnectionType,
+                                                              OutboundConnectionSettings settings, Promise&lt;Result&lt;MessagingSuccess&gt;&gt; result)
+    {
+<span class="fc" id="L135">        return new OutboundConnectionInitiator&lt;&gt;(type, sslConnectionType, settings, result)</span>
+<span class="fc" id="L136">               .initiate(eventLoop);</span>
+    }
+
+    private Future&lt;Result&lt;SuccessType&gt;&gt; initiate(EventLoop eventLoop)
+    {
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L142">            logger.trace(&quot;creating outbound bootstrap to {}&quot;, settings);</span>
+
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">        if (!settings.authenticator.authenticate(settings.to.getAddress(), settings.to.getPort(), null, OUTBOUND_PRECONNECT))</span>
+        {
+            // interrupt other connections, so they must attempt to re-authenticate
+<span class="nc" id="L147">            MessagingService.instance().interruptOutbound(settings.to);</span>
+<span class="nc" id="L148">            logger.error(&quot;Authentication failed to &quot; + settings.connectToId());</span>
+<span class="nc" id="L149">            return ImmediateFuture.failure(new IOException(&quot;Authentication failed to &quot; + settings.connectToId()));</span>
+        }
+
+
+        // this is a bit ugly, but is the easiest way to ensure that if we timeout we can propagate a suitable error message
+        // and still guarantee that, if on timing out we raced with success, the successfully created channel is handled
+<span class="fc" id="L155">        AtomicBoolean timedout = new AtomicBoolean();</span>
+<span class="fc" id="L156">        io.netty.util.concurrent.Future&lt;Void&gt; bootstrap = createBootstrap(eventLoop)</span>
+<span class="fc" id="L157">                                 .connect()</span>
+<span class="fc" id="L158">                                 .addListener(future -&gt; {</span>
+<span class="fc" id="L159">                                     eventLoop.execute(() -&gt; {</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">                                         if (!future.isSuccess())</span>
+                                         {
+<span class="pc bpc" id="L162" title="3 of 4 branches missed.">                                             if (future.isCancelled() &amp;&amp; !timedout.get())</span>
+<span class="nc" id="L163">                                                 resultPromise.cancel(true);</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">                                             else if (future.isCancelled())</span>
+<span class="nc" id="L165">                                                 resultPromise.tryFailure(new IOException(&quot;Timeout handshaking with &quot; + settings.connectToId()));</span>
+                                             else
+<span class="fc" id="L167">                                                 resultPromise.tryFailure(future.cause());</span>
+                                         }
+<span class="fc" id="L169">                                     });</span>
+<span class="fc" id="L170">                                 });</span>
+
+<span class="fc" id="L172">        ScheduledFuture&lt;?&gt; timeout = eventLoop.schedule(() -&gt; {</span>
+<span class="nc" id="L173">            timedout.set(true);</span>
+<span class="nc" id="L174">            bootstrap.cancel(false);</span>
+<span class="nc" id="L175">        }, TIMEOUT_MILLIS, MILLISECONDS);</span>
+<span class="fc" id="L176">        bootstrap.addListener(future -&gt; timeout.cancel(true));</span>
+
+        // Note that the bootstrap future's listeners may be invoked outside of the eventLoop,
+        // as Epoll failures on connection and disconnect may be run on the GlobalEventExecutor
+        // Since this FutureResult's listeners are all given to our resultPromise, they are guaranteed to be invoked by the eventLoop.
+<span class="fc" id="L181">        return new FutureResult&lt;&gt;(resultPromise, bootstrap);</span>
+    }
+
+    /**
+     * Create the {@link Bootstrap} for connecting to a remote peer. This method does &lt;b&gt;not&lt;/b&gt; attempt to connect to the peer,
+     * and thus does not block.
+     */
+    private Bootstrap createBootstrap(EventLoop eventLoop)
+    {
+<span class="fc" id="L190">        Bootstrap bootstrap = settings.socketFactory</span>
+<span class="fc" id="L191">                                      .newClientBootstrap(eventLoop, settings.tcpUserTimeoutInMS)</span>
+<span class="fc" id="L192">                                      .option(ChannelOption.ALLOCATOR, GlobalBufferPoolAllocator.instance)</span>
+<span class="fc" id="L193">                                      .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, settings.tcpConnectTimeoutInMS)</span>
+<span class="fc" id="L194">                                      .option(ChannelOption.SO_KEEPALIVE, true)</span>
+<span class="fc" id="L195">                                      .option(ChannelOption.SO_REUSEADDR, true)</span>
+<span class="fc" id="L196">                                      .option(ChannelOption.TCP_NODELAY, settings.tcpNoDelay)</span>
+<span class="fc" id="L197">                                      .option(ChannelOption.MESSAGE_SIZE_ESTIMATOR, NoSizeEstimator.instance)</span>
+<span class="fc" id="L198">                                      .handler(new Initializer());</span>
+
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">        if (settings.socketSendBufferSizeInBytes &gt; 0)</span>
+<span class="nc" id="L201">            bootstrap.option(ChannelOption.SO_SNDBUF, settings.socketSendBufferSizeInBytes);</span>
+
+<span class="fc" id="L203">        InetAddressAndPort remoteAddress = settings.connectTo;</span>
+<span class="fc" id="L204">        bootstrap.remoteAddress(new InetSocketAddress(remoteAddress.getAddress(), remoteAddress.getPort()));</span>
+<span class="fc" id="L205">        return bootstrap;</span>
+    }
+
+<span class="fc" id="L208">    public enum SslFallbackConnectionType</span>
+    {
+<span class="fc" id="L210">        SERVER_CONFIG, // Original configuration of the server</span>
+<span class="fc" id="L211">        MTLS,</span>
+<span class="fc" id="L212">        SSL,</span>
+<span class="fc" id="L213">        NO_SSL</span>
+    }
+
+<span class="fc" id="L216">    private class Initializer extends ChannelInitializer&lt;SocketChannel&gt;</span>
+    {
+        public void initChannel(SocketChannel channel) throws Exception
+        {
+<span class="fc" id="L220">            ChannelPipeline pipeline = channel.pipeline();</span>
+
+            // order of handlers: ssl -&gt; server-authentication -&gt; logger -&gt; handshakeHandler
+<span class="pc bpc" id="L223" title="3 of 8 branches missed.">            if ((sslConnectionType == SslFallbackConnectionType.SERVER_CONFIG &amp;&amp; settings.withEncryption())</span>
+                || sslConnectionType == SslFallbackConnectionType.SSL || sslConnectionType == SslFallbackConnectionType.MTLS)
+            {
+<span class="fc" id="L226">                SslContext sslContext = getSslContext(sslConnectionType);</span>
+                // for some reason channel.remoteAddress() will return null
+<span class="fc" id="L228">                InetAddressAndPort address = settings.to;</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">                InetSocketAddress peer = settings.encryption.require_endpoint_verification ? new InetSocketAddress(address.getAddress(), address.getPort()) : null;</span>
+<span class="fc" id="L230">                SslHandler sslHandler = newSslHandler(channel, sslContext, peer);</span>
+<span class="fc" id="L231">                logger.trace(&quot;creating outbound netty SslContext: context={}, engine={}&quot;, sslContext.getClass().getName(), sslHandler.engine().getClass().getName());</span>
+<span class="fc" id="L232">                pipeline.addFirst(SSL_HANDLER_NAME, sslHandler);</span>
+            }
+<span class="fc" id="L234">            pipeline.addLast(&quot;server-authentication&quot;, new ServerAuthenticationHandler(settings));</span>
+
+            if (WIRETRACE)
+                pipeline.addLast(&quot;logger&quot;, new LoggingHandler(LogLevel.INFO));
+
+<span class="fc" id="L239">            pipeline.addLast(&quot;handshake&quot;, new Handler());</span>
+<span class="fc" id="L240">        }</span>
+
+        private SslContext getSslContext(SslFallbackConnectionType connectionType) throws IOException
+        {
+<span class="fc" id="L244">            boolean requireClientAuth = false;</span>
+<span class="pc bpc" id="L245" title="2 of 4 branches missed.">            if (connectionType == SslFallbackConnectionType.MTLS || connectionType == SslFallbackConnectionType.SSL)</span>
+            {
+<span class="nc" id="L247">                requireClientAuth = true;</span>
+            }
+<span class="pc bpc" id="L249" title="1 of 2 branches missed.">            else if (connectionType == SslFallbackConnectionType.SERVER_CONFIG)</span>
+            {
+<span class="fc" id="L251">                requireClientAuth = settings.withEncryption();</span>
+            }
+<span class="fc" id="L253">            return SSLFactory.getOrCreateSslContext(settings.encryption, requireClientAuth, ISslContextFactory.SocketType.CLIENT, SSL_FACTORY_CONTEXT_DESCRIPTION);</span>
+        }
+
+    }
+
+    /**
+     * Authenticates the server before an outbound connection is established. If a connection is SSL based connection
+     * Server's identity is verified during ssl handshake using root certificate in truststore. One may choose to ignore
+     * outbound authentication or perform required authentication for outbound connections in the implementation
+     * of IInternodeAuthenticator interface.
+     */
+    @VisibleForTesting
+    static class ServerAuthenticationHandler extends ByteToMessageDecoder
+    {
+        final OutboundConnectionSettings settings;
+
+        ServerAuthenticationHandler(OutboundConnectionSettings settings)
+<span class="fc" id="L270">        {</span>
+<span class="fc" id="L271">            this.settings = settings;</span>
+<span class="fc" id="L272">        }</span>
+
+        @Override
+        protected void decode(ChannelHandlerContext channelHandlerContext, ByteBuf byteBuf, List&lt;Object&gt; list) throws Exception
+        {
+            // Extract certificates from SSL handler(handler with name &quot;ssl&quot;).
+<span class="fc" id="L278">            final Certificate[] certificates = certificates(channelHandlerContext.channel());</span>
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">            if (!settings.authenticator.authenticate(settings.to.getAddress(), settings.to.getPort(), certificates, OUTBOUND))</span>
+            {
+                // interrupt other connections, so they must attempt to re-authenticate
+<span class="nc" id="L282">                MessagingService.instance().interruptOutbound(settings.to);</span>
+<span class="nc" id="L283">                logger.error(&quot;Authentication failed to &quot; + settings.connectToId());</span>
+
+                // To release all the pending buffered data, replace authentication handler with discard handler.
+                // This avoids pending inbound data to be fired through the pipeline
+<span class="nc" id="L287">                channelHandlerContext.pipeline().replace(this, DISCARD_HANDLER_NAME, new InternodeConnectionUtils.ByteBufDiscardHandler());</span>
+<span class="nc" id="L288">                channelHandlerContext.pipeline().close();</span>
+            }
+            else
+            {
+<span class="fc" id="L292">                channelHandlerContext.pipeline().remove(this);</span>
+            }
+<span class="fc" id="L294">        }</span>
+    }
+
+<span class="fc" id="L297">    private class Handler extends ByteToMessageDecoder</span>
+    {
+        /**
+         * {@inheritDoc}
+         *
+         * Invoked when the channel is made active, and sends out the {@link Initiate}.
+         * In the case of streaming, we do not require a full bi-directional handshake; the initial message,
+         * containing the streaming protocol version, is all that is required.
+         */
+        @Override
+        public void channelActive(final ChannelHandlerContext ctx) throws Exception
+        {
+<span class="fc" id="L309">            Initiate msg = new Initiate(settings.acceptVersions, type, settings.framing, settings.from);</span>
+<span class="fc" id="L310">            logger.trace(&quot;starting handshake with peer {}, msg = {}&quot;, settings.connectToId(), msg);</span>
+
+<span class="fc" id="L312">            AsyncChannelPromise.writeAndFlush(ctx, msg.encode(),</span>
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">                      future -&gt; { if (!future.isSuccess()) exceptionCaught(ctx, future.cause()); });</span>
+
+<span class="fc" id="L315">            ctx.fireChannelActive();</span>
+<span class="fc" id="L316">        }</span>
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception
+        {
+<span class="nc" id="L321">            super.channelInactive(ctx);</span>
+<span class="nc" id="L322">            resultPromise.tryFailure(new ClosedChannelException());</span>
+<span class="nc" id="L323">        }</span>
+
+        /**
+         * {@inheritDoc}
+         *
+         * Invoked when we get the response back from the peer, which should contain the second message of the internode messaging handshake.
+         * &lt;p&gt;
+         * If the peer's protocol version does not equal what we were expecting, immediately close the channel (and socket);
+         * do *not* send out the third message of the internode messaging handshake.
+         * We will reconnect on the appropriate protocol version.
+         */
+        @SuppressWarnings(&quot;unchecked&quot;)
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List&lt;Object&gt; out)
+        {
+            try
+            {
+<span class="fc" id="L340">                Accept msg = Accept.maybeDecode(in);</span>
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">                if (msg == null)</span>
+<span class="nc" id="L342">                    return;</span>
+
+<span class="fc" id="L344">                int useMessagingVersion = msg.useMessagingVersion;</span>
+<span class="fc" id="L345">                int peerMessagingVersion = msg.maxMessagingVersion;</span>
+<span class="fc" id="L346">                logger.trace(&quot;received second handshake message from peer {}, msg = {}&quot;, settings.connectTo, msg);</span>
+
+<span class="fc" id="L348">                FrameEncoder frameEncoder = null;</span>
+                Result&lt;SuccessType&gt; result;
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">                assert useMessagingVersion &gt; 0;</span>
+
+<span class="pc bpc" id="L352" title="2 of 4 branches missed.">                if (useMessagingVersion &lt; settings.acceptVersions.min || useMessagingVersion &gt; settings.acceptVersions.max)</span>
+                {
+<span class="nc" id="L354">                    result = incompatible(useMessagingVersion, peerMessagingVersion);</span>
+                }
+                else
+                {
+                    // This is a bit ugly
+<span class="fc bfc" id="L359" title="All 2 branches covered.">                    if (type.isMessaging())</span>
+                    {
+<span class="pc bpc" id="L361" title="2 of 4 branches missed.">                        switch (settings.framing)</span>
+                        {
+                            case LZ4:
+<span class="fc" id="L364">                                frameEncoder = FrameEncoderLZ4.fastInstance;</span>
+<span class="fc" id="L365">                                break;</span>
+                            case CRC:
+<span class="fc" id="L367">                                frameEncoder = FrameEncoderCrc.instance;</span>
+<span class="fc" id="L368">                                break;</span>
+                            case UNPROTECTED:
+<span class="nc" id="L370">                                frameEncoder = FrameEncoderUnprotected.instance;</span>
+                                break;
+                        }
+
+<span class="fc" id="L374">                        result = (Result&lt;SuccessType&gt;) messagingSuccess(ctx.channel(), useMessagingVersion, frameEncoder.allocator());</span>
+                    }
+                    else
+                    {
+<span class="fc" id="L378">                        result = (Result&lt;SuccessType&gt;) streamingSuccess(ctx.channel(), useMessagingVersion);</span>
+                    }
+                }
+
+<span class="fc" id="L382">                ChannelPipeline pipeline = ctx.pipeline();</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">                if (result.isSuccess())</span>
+                {
+<span class="fc" id="L385">                    BufferPools.forNetworking().setRecycleWhenFreeForCurrentThread(false);</span>
+<span class="fc bfc" id="L386" title="All 2 branches covered.">                    if (type.isMessaging())</span>
+                    {
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">                        assert frameEncoder != null;</span>
+<span class="fc" id="L389">                        pipeline.addLast(&quot;frameEncoder&quot;, frameEncoder);</span>
+                    }
+<span class="fc" id="L391">                    pipeline.remove(this);</span>
+                }
+                else
+                {
+<span class="nc" id="L395">                    pipeline.close();</span>
+                }
+
+<span class="pc bpc" id="L398" title="3 of 4 branches missed.">                if (!resultPromise.trySuccess(result) &amp;&amp; result.isSuccess())</span>
+<span class="nc" id="L399">                    result.success().channel.close();</span>
+            }
+<span class="nc" id="L401">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L403">                exceptionCaught(ctx, t);</span>
+<span class="fc" id="L404">            }</span>
+<span class="fc" id="L405">        }</span>
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
+        {
+<span class="nc bnc" id="L410" title="All 4 branches missed.">            if (isClosed &amp;&amp; cause instanceof SslClosedEngineException)</span>
+            {
+                /*
+                 * Occasionally Netty will invoke this handler to process an exception of the following kind:
+                 *      io.netty.channel.unix.Errors$NativeIoException: readAddress(..) failed: Connection reset by peer
+                 *
+                 * When we invoke ctx.close() later in this method, the listener, set up in channelActive(), might be
+                 * failed with an SslClosedEngineException(&quot;SSLEngine closed already&quot;) by Netty, and exceptionCaught() will be invoked
+                 * once again, this time to handle the SSLException triggered by ctx.close().
+                 *
+                 * The exception at this stage is benign, and we shouldn't be double-logging the failure to connect.
+                 */
+<span class="nc" id="L422">                return;</span>
+            }
+
+            try
+            {
+<span class="nc" id="L427">                JVMStabilityInspector.inspectThrowable(cause);</span>
+<span class="nc" id="L428">                resultPromise.tryFailure(cause);</span>
+<span class="nc bnc" id="L429" title="All 2 branches missed.">                if (isCausedByConnectionReset(cause))</span>
+<span class="nc" id="L430">                    logger.info(&quot;Failed to connect to peer {}&quot;, settings.connectToId(), cause);</span>
+                else
+<span class="nc" id="L432">                    logger.error(&quot;Failed to handshake with peer {}&quot;, settings.connectToId(), cause);</span>
+<span class="nc" id="L433">                isClosed = true;</span>
+<span class="nc" id="L434">                ctx.close();</span>
+            }
+<span class="nc" id="L436">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L438">                logger.error(&quot;Unexpected exception in {}.exceptionCaught&quot;, this.getClass().getSimpleName(), t);</span>
+<span class="nc" id="L439">            }</span>
+<span class="nc" id="L440">        }</span>
+    }
+
+    /**
+     * The result of the handshake. Handshake has 3 possible outcomes:
+     *  1) it can be successful, in which case the channel and version to used is returned in this result.
+     *  2) we may decide to disconnect to reconnect with another protocol version (namely, the version is passed in this result).
+     *  3) we can have a negotiation failure for an unknown reason. (#sadtrombone)
+     */
+    public static class Result&lt;SuccessType extends Result.Success&gt;
+    {
+        /**
+         * Describes the result of receiving the response back from the peer (Message 2 of the handshake)
+         * and implies an action that should be taken.
+         */
+<span class="fc" id="L455">        enum Outcome</span>
+        {
+<span class="fc" id="L457">            SUCCESS, RETRY, INCOMPATIBLE</span>
+        }
+
+        public static class Success&lt;SuccessType extends Success&gt; extends Result&lt;SuccessType&gt;
+        {
+            public final Channel channel;
+            public final int messagingVersion;
+            Success(Channel channel, int messagingVersion)
+            {
+<span class="fc" id="L466">                super(Outcome.SUCCESS);</span>
+<span class="fc" id="L467">                this.channel = channel;</span>
+<span class="fc" id="L468">                this.messagingVersion = messagingVersion;</span>
+<span class="fc" id="L469">            }</span>
+        }
+
+        public static class StreamingSuccess extends Success&lt;StreamingSuccess&gt;
+        {
+            StreamingSuccess(Channel channel, int messagingVersion)
+            {
+<span class="fc" id="L476">                super(channel, messagingVersion);</span>
+<span class="fc" id="L477">            }</span>
+        }
+
+        public static class MessagingSuccess extends Success&lt;MessagingSuccess&gt;
+        {
+            public final FrameEncoder.PayloadAllocator allocator;
+            MessagingSuccess(Channel channel, int messagingVersion, FrameEncoder.PayloadAllocator allocator)
+            {
+<span class="fc" id="L485">                super(channel, messagingVersion);</span>
+<span class="fc" id="L486">                this.allocator = allocator;</span>
+<span class="fc" id="L487">            }</span>
+        }
+
+        static class Retry&lt;SuccessType extends Success&gt; extends Result&lt;SuccessType&gt;
+        {
+            final int withMessagingVersion;
+            Retry(int withMessagingVersion)
+            {
+<span class="nc" id="L495">                super(Outcome.RETRY);</span>
+<span class="nc" id="L496">                this.withMessagingVersion = withMessagingVersion;</span>
+<span class="nc" id="L497">            }</span>
+        }
+
+        static class Incompatible&lt;SuccessType extends Success&gt; extends Result&lt;SuccessType&gt;
+        {
+            final int closestSupportedVersion;
+            final int maxMessagingVersion;
+            Incompatible(int closestSupportedVersion, int maxMessagingVersion)
+            {
+<span class="nc" id="L506">                super(Outcome.INCOMPATIBLE);</span>
+<span class="nc" id="L507">                this.closestSupportedVersion = closestSupportedVersion;</span>
+<span class="nc" id="L508">                this.maxMessagingVersion = maxMessagingVersion;</span>
+<span class="nc" id="L509">            }</span>
+        }
+
+        final Outcome outcome;
+
+        private Result(Outcome outcome)
+<span class="fc" id="L515">        {</span>
+<span class="fc" id="L516">            this.outcome = outcome;</span>
+<span class="fc" id="L517">        }</span>
+
+<span class="pc bpc" id="L519" title="1 of 2 branches missed.">        boolean isSuccess() { return outcome == Outcome.SUCCESS; }</span>
+<span class="fc" id="L520">        public SuccessType success() { return (SuccessType) this; }</span>
+<span class="fc" id="L521">        static MessagingSuccess messagingSuccess(Channel channel, int messagingVersion, FrameEncoder.PayloadAllocator allocator) { return new MessagingSuccess(channel, messagingVersion, allocator); }</span>
+<span class="fc" id="L522">        static StreamingSuccess streamingSuccess(Channel channel, int messagingVersion) { return new StreamingSuccess(channel, messagingVersion); }</span>
+
+<span class="nc" id="L524">        public Retry retry() { return (Retry) this; }</span>
+<span class="nc" id="L525">        static &lt;SuccessType extends Success&gt; Result&lt;SuccessType&gt; retry(int withMessagingVersion) { return new Retry&lt;&gt;(withMessagingVersion); }</span>
+
+<span class="nc" id="L527">        public Incompatible incompatible() { return (Incompatible) this; }</span>
+<span class="nc" id="L528">        static &lt;SuccessType extends Success&gt; Result&lt;SuccessType&gt; incompatible(int closestSupportedVersion, int maxMessagingVersion) { return new Incompatible(closestSupportedVersion, maxMessagingVersion); }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

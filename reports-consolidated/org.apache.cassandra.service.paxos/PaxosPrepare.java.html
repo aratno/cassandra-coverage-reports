@@ -1,0 +1,1254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosPrepare.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosPrepare.java</span></div><h1>PaxosPrepare.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.PaxosMetrics;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.PendingRangeCalculatorService;
+import org.apache.cassandra.service.paxos.PaxosPrepare.Status.Outcome;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.vint.VIntCoding;
+
+import static java.util.Collections.emptyMap;
+import static org.apache.cassandra.exceptions.RequestFailureReason.UNKNOWN;
+import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
+import static org.apache.cassandra.net.Verb.PAXOS2_PREPARE_REQ;
+import static org.apache.cassandra.net.Verb.PAXOS2_PREPARE_RSP;
+import static org.apache.cassandra.service.paxos.Ballot.Flag.NONE;
+import static org.apache.cassandra.service.paxos.Commit.*;
+import static org.apache.cassandra.service.paxos.Commit.CompareResult.WAS_REPROPOSED_BY;
+import static org.apache.cassandra.service.paxos.Paxos.*;
+import static org.apache.cassandra.service.paxos.PaxosPrepare.Status.Outcome.*;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.service.paxos.PaxosState.*;
+import static org.apache.cassandra.service.paxos.PaxosState.MaybePromise.Outcome.*;
+import static org.apache.cassandra.utils.CollectionSerializer.deserializeMap;
+import static org.apache.cassandra.utils.CollectionSerializer.newHashMap;
+import static org.apache.cassandra.utils.CollectionSerializer.serializeMap;
+import static org.apache.cassandra.utils.CollectionSerializer.serializedSizeMap;
+import static org.apache.cassandra.utils.concurrent.Awaitable.SyncAwaitable.waitUntil;
+
+/**
+ * Perform one paxos &quot;prepare&quot; attempt, with various optimisations.
+ *
+ * The prepare step entails asking for a quorum of nodes to promise to accept our later proposal. It can
+ * yield one of five logical answers:
+ *
+ *   1) Success         - we have received a quorum of promises, and we know that a quorum of nodes
+ *                        witnessed the prior round's commit (if any)
+ *   2) Timeout         - we have not received enough responses at all before our deadline passed
+ *   3) Failure         - we have received too many explicit failures to succeed
+ *   4) Superseded      - we have been informed of a later ballot that has been promised
+ *   5) FoundInProgress - we have been informed of an earlier promise that has been accepted
+ *
+ * Success hinges on two distinct criteria being met, as the quorum of promises may not guarantee a quorum of
+ * witnesses of the prior round's commit.  We track this separately by recording those nodes that have witnessed
+ * the prior round's commit.  On receiving a quorum of promises, we submit the prior round's commit to any promisers
+ * that had not witnessed it, while continuing to wait for responses to our original request: as soon as we hear of
+ * a quorum that have witnessed it, either by our refresh request or by responses to the original request, we yield Success.
+ *
+ * Success is also accompanied by a quorum of read responses, avoiding another round-trip to obtain this result.
+ *
+ * This operation may be started either with a solo Prepare command, or with a prefixed Commit command.
+ * If we are completing an in-progress round we previously discovered, we save another round-trip by committing and
+ * preparing simultaneously.
+ */
+public class PaxosPrepare extends PaxosRequestCallback&lt;PaxosPrepare.Response&gt; implements PaxosPrepareRefresh.Callbacks, Paxos.Async&lt;PaxosPrepare.Status&gt;
+{
+<span class="fc" id="L106">    private static final Logger logger = LoggerFactory.getLogger(PaxosPrepare.class);</span>
+
+    private static Runnable onLinearizabilityViolation;
+
+<span class="fc" id="L110">    public static final RequestHandler requestHandler = new RequestHandler();</span>
+<span class="fc" id="L111">    public static final RequestSerializer requestSerializer = new RequestSerializer();</span>
+<span class="fc" id="L112">    public static final ResponseSerializer responseSerializer = new ResponseSerializer();</span>
+
+    /**
+     * Represents the current status of a prepare action: it is a status rather than a result,
+     * as the result may be unknown without sufficient responses (though in most cases it is final status).
+     */
+    static class Status
+    {
+<span class="fc" id="L120">        enum Outcome { READ_PERMITTED, PROMISED, SUPERSEDED, FOUND_INCOMPLETE_ACCEPTED, FOUND_INCOMPLETE_COMMITTED, MAYBE_FAILURE, ELECTORATE_MISMATCH }</span>
+
+        final Outcome outcome;
+        final Participants participants;
+
+        Status(Outcome outcome, Participants participants)
+<span class="fc" id="L126">        {</span>
+<span class="fc" id="L127">            this.outcome = outcome;</span>
+<span class="fc" id="L128">            this.participants = participants;</span>
+<span class="fc" id="L129">        }</span>
+        @Nullable
+        Ballot retryWithAtLeast()
+        {
+<span class="pc bpc" id="L133" title="2 of 3 branches missed.">            switch (outcome)</span>
+            {
+<span class="nc" id="L135">                case READ_PERMITTED: return ((Success) this).supersededBy;</span>
+<span class="fc" id="L136">                case SUPERSEDED: return ((Superseded) this).by;</span>
+<span class="nc" id="L137">                default: return null;</span>
+            }
+        }
+<span class="fc" id="L140">        Success success() { return (Success) this; }</span>
+<span class="fc" id="L141">        FoundIncompleteAccepted incompleteAccepted() { return (FoundIncompleteAccepted) this; }</span>
+<span class="nc" id="L142">        FoundIncompleteCommitted incompleteCommitted() { return (FoundIncompleteCommitted) this; }</span>
+<span class="fc" id="L143">        Paxos.MaybeFailure maybeFailure() { return ((MaybeFailure) this).info; }</span>
+    }
+
+    static class Success extends WithRequestedBallot
+    {
+        final List&lt;Message&lt;ReadResponse&gt;&gt; responses;
+        final boolean isReadSafe; // read responses constitute a linearizable read (though short read protection would invalidate that)
+        final @Nullable
+        Ballot supersededBy; // if known and READ_SUCCESS
+
+        Success(Outcome outcome, Ballot ballot, Participants participants, List&lt;Message&lt;ReadResponse&gt;&gt; responses, boolean isReadSafe, @Nullable Ballot supersededBy)
+        {
+<span class="fc" id="L155">            super(outcome, participants, ballot);</span>
+<span class="fc" id="L156">            this.responses = responses;</span>
+<span class="fc" id="L157">            this.isReadSafe = isReadSafe;</span>
+<span class="fc" id="L158">            this.supersededBy = supersededBy;</span>
+<span class="fc" id="L159">        }</span>
+
+        static Success read(Ballot ballot, Participants participants, List&lt;Message&lt;ReadResponse&gt;&gt; responses, @Nullable Ballot supersededBy)
+        {
+<span class="fc" id="L163">            return new Success(Outcome.READ_PERMITTED, ballot, participants, responses, true, supersededBy);</span>
+        }
+
+        static Success readOrWrite(Ballot ballot, Participants participants, List&lt;Message&lt;ReadResponse&gt;&gt; responses, boolean isReadConsistent)
+        {
+<span class="fc" id="L168">            return new Success(Outcome.PROMISED, ballot, participants, responses, isReadConsistent, null);</span>
+        }
+
+<span class="nc" id="L171">        public String toString() { return &quot;Success(&quot; + ballot + &quot;, &quot; + participants.electorate + ')'; }</span>
+    }
+
+    /**
+     * The ballot we sought promises for has been superseded by another proposer's
+     *
+     * Note: we extend this for Success, so that supersededBy() can be called for ReadSuccess
+     */
+    static class Superseded extends Status
+    {
+        final Ballot by;
+
+        Superseded(Ballot by, Participants participants)
+        {
+<span class="fc" id="L185">            super(SUPERSEDED, participants);</span>
+<span class="fc" id="L186">            this.by = by;</span>
+<span class="fc" id="L187">        }</span>
+
+<span class="nc" id="L189">        public String toString() { return &quot;Superseded(&quot; + by + ')'; }</span>
+    }
+
+    static class WithRequestedBallot extends Status
+    {
+        final Ballot ballot;
+
+        WithRequestedBallot(Outcome outcome, Participants participants, Ballot ballot)
+        {
+<span class="fc" id="L198">            super(outcome, participants);</span>
+<span class="fc" id="L199">            this.ballot = ballot;</span>
+<span class="fc" id="L200">        }</span>
+    }
+
+    static class FoundIncomplete extends WithRequestedBallot
+    {
+        private FoundIncomplete(Outcome outcome, Participants participants, Ballot promisedBallot)
+        {
+<span class="fc" id="L207">            super(outcome, participants, promisedBallot);</span>
+<span class="fc" id="L208">        }</span>
+    }
+
+    /**
+     * We have been informed of a promise made by one of the replicas we contacted, that was not accepted by all replicas
+     * (though may have been accepted by a majority; we don't know).
+     * In this case we cannot readily know if we have prevented this proposal from being completed, so we attempt
+     * to finish it ourselves (unfortunately leaving the proposer to timeout, given the current semantics)
+     * TODO: we should consider waiting for more responses in case we encounter any successful commit, or a majority
+     *       of acceptors?
+     */
+    static class FoundIncompleteAccepted extends FoundIncomplete
+    {
+        final Accepted accepted;
+
+        private FoundIncompleteAccepted(Ballot promisedBallot, Participants participants, Accepted accepted)
+        {
+<span class="fc" id="L225">            super(FOUND_INCOMPLETE_ACCEPTED, participants, promisedBallot);</span>
+<span class="fc" id="L226">            this.accepted = accepted;</span>
+<span class="fc" id="L227">        }</span>
+
+        public String toString()
+        {
+<span class="nc" id="L231">            return &quot;FoundIncomplete&quot; + accepted;</span>
+        }
+    }
+
+    /**
+     * We have been informed of a proposal that was accepted by a majority, but we do not know has been
+     * committed to a majority, and we failed to read from a single natural replica that had witnessed this
+     * commit when we performed the read.
+     * Since this is an edge case, we simply start again, to keep the control flow more easily understood;
+     * the commit shouldld be committed to a majority as part of our re-prepare.
+     */
+    static class FoundIncompleteCommitted extends FoundIncomplete
+    {
+        final Committed committed;
+
+        private FoundIncompleteCommitted(Ballot promisedBallot, Participants participants, Committed committed)
+        {
+<span class="nc" id="L248">            super(FOUND_INCOMPLETE_COMMITTED, participants, promisedBallot);</span>
+<span class="nc" id="L249">            this.committed = committed;</span>
+<span class="nc" id="L250">        }</span>
+
+        public String toString()
+        {
+<span class="nc" id="L254">            return &quot;FoundIncomplete&quot; + committed;</span>
+        }
+    }
+
+    static class MaybeFailure extends Status
+    {
+        final Paxos.MaybeFailure info;
+        private MaybeFailure(Paxos.MaybeFailure info, Participants participants)
+        {
+<span class="fc" id="L263">            super(MAYBE_FAILURE, participants);</span>
+<span class="fc" id="L264">            this.info = info;</span>
+<span class="fc" id="L265">        }</span>
+
+<span class="nc" id="L267">        public String toString() { return info.toString(); }</span>
+    }
+
+    static class ElectorateMismatch extends WithRequestedBallot
+    {
+        private ElectorateMismatch(Participants participants, Ballot ballot)
+        {
+<span class="fc" id="L274">            super(ELECTORATE_MISMATCH, participants, ballot);</span>
+<span class="fc" id="L275">        }</span>
+    }
+
+    private final boolean acceptEarlyReadPermission;
+    private final AbstractRequest&lt;?&gt; request;
+    private Ballot supersededBy; // cannot be promised, as a newer promise has been made
+    private Accepted latestAccepted; // the latest latestAcceptedButNotCommitted response we have received (which may still have been committed elsewhere)
+    private Committed latestCommitted; // latest actually committed proposal
+
+    private final Participants participants;
+
+    private final List&lt;Message&lt;ReadResponse&gt;&gt; readResponses;
+    private boolean haveReadResponseWithLatest;
+    private boolean haveQuorumOfPermissions; // permissions =&gt; SUCCESS or READ_SUCCESS
+    private List&lt;InetAddressAndPort&gt; withLatest; // promised and have latest commit
+    private List&lt;InetAddressAndPort&gt; needLatest; // promised without having witnessed latest commit, nor yet been refreshed by us
+    private int failures; // failed either on initial request or on refresh
+<span class="fc" id="L292">    private boolean hasProposalStability = true; // no successful modifying proposal could have raced with us and not been seen</span>
+<span class="fc" id="L293">    private boolean hasOnlyPromises = true;</span>
+    private long maxLowBound;
+
+    private Status outcome;
+    private final Consumer&lt;Status&gt; onDone;
+
+    private PaxosPrepareRefresh refreshStaleParticipants;
+<span class="fc" id="L300">    private boolean linearizabilityViolationDetected = false;</span>
+
+    PaxosPrepare(Participants participants, AbstractRequest&lt;?&gt; request, boolean acceptEarlyReadPermission, Consumer&lt;Status&gt; onDone)
+<span class="fc" id="L303">    {</span>
+<span class="fc" id="L304">        this.acceptEarlyReadPermission = acceptEarlyReadPermission;</span>
+<span class="pc bpc" id="L305" title="1 of 2 branches missed.">        assert participants.sizeOfConsensusQuorum &gt; 0;</span>
+<span class="fc" id="L306">        this.participants = participants;</span>
+<span class="fc" id="L307">        this.request = request;</span>
+<span class="fc" id="L308">        this.readResponses = new ArrayList&lt;&gt;(participants.sizeOfConsensusQuorum);</span>
+<span class="fc" id="L309">        this.withLatest = new ArrayList&lt;&gt;(participants.sizeOfConsensusQuorum);</span>
+<span class="fc" id="L310">        this.latestAccepted = this.latestCommitted = Committed.none(request.partitionKey, request.table);</span>
+<span class="fc" id="L311">        this.onDone = onDone;</span>
+<span class="fc" id="L312">    }</span>
+
+    private boolean hasInProgressProposal()
+    {
+        // no need to commit a no-op; either it
+        //   1) reached a majority, in which case it was agreed, had no effect and we can do nothing; or
+        //   2) did not reach a majority, was not agreed, and was not user visible as a result so we can ignore it
+<span class="fc bfc" id="L319" title="All 2 branches covered.">        if (latestAccepted.update.isEmpty())</span>
+<span class="fc" id="L320">            return false;</span>
+
+        // If we aren't newer than latestCommitted, then we're done
+<span class="fc bfc" id="L323" title="All 2 branches covered.">        if (!latestAccepted.isAfter(latestCommitted))</span>
+<span class="fc" id="L324">            return false;</span>
+
+<span class="fc bfc" id="L326" title="All 2 branches covered.">        if (latestAccepted.ballot.uuidTimestamp() &lt;= maxLowBound)</span>
+<span class="fc" id="L327">            return false;</span>
+
+        // We can be a re-proposal of latestCommitted, in which case we do not need to re-propose it
+<span class="fc bfc" id="L330" title="All 2 branches covered.">        return !latestAccepted.isReproposalOf(latestCommitted);</span>
+    }
+
+    static PaxosPrepare prepare(Participants participants, SinglePartitionReadCommand readCommand, boolean isWrite, boolean acceptEarlyReadPermission) throws UnavailableException
+    {
+<span class="fc" id="L335">        return prepare(null, participants, readCommand, isWrite, acceptEarlyReadPermission);</span>
+    }
+
+    static PaxosPrepare prepare(Ballot minimumBallot, Participants participants, SinglePartitionReadCommand readCommand, boolean isWrite, boolean acceptEarlyReadPermission) throws UnavailableException
+    {
+<span class="fc" id="L340">        return prepareWithBallot(newBallot(minimumBallot, participants.consistencyForConsensus), participants, readCommand, isWrite, acceptEarlyReadPermission);</span>
+    }
+
+    static PaxosPrepare prepareWithBallot(Ballot ballot, Participants participants, SinglePartitionReadCommand readCommand, boolean isWrite, boolean acceptEarlyReadPermission)
+    {
+<span class="fc" id="L345">        Tracing.trace(&quot;Preparing {} with read&quot;, ballot);</span>
+<span class="fc" id="L346">        Request request = new Request(ballot, participants.electorate, readCommand, isWrite);</span>
+<span class="fc" id="L347">        return prepareWithBallotInternal(participants, request, acceptEarlyReadPermission, null);</span>
+    }
+
+    @SuppressWarnings(&quot;SameParameterValue&quot;)
+    static &lt;T extends Consumer&lt;Status&gt;&gt; T prepareWithBallot(Ballot ballot, Participants participants, DecoratedKey partitionKey, TableMetadata table, boolean isWrite, boolean acceptEarlyReadPermission, T onDone)
+    {
+<span class="fc" id="L353">        Tracing.trace(&quot;Preparing {}&quot;, ballot);</span>
+<span class="fc" id="L354">        prepareWithBallotInternal(participants, new Request(ballot, participants.electorate, partitionKey, table, isWrite), acceptEarlyReadPermission, onDone);</span>
+<span class="fc" id="L355">        return onDone;</span>
+    }
+
+    private static PaxosPrepare prepareWithBallotInternal(Participants participants, Request request, boolean acceptEarlyReadPermission, Consumer&lt;Status&gt; onDone)
+    {
+<span class="fc" id="L360">        PaxosPrepare prepare = new PaxosPrepare(participants, request, acceptEarlyReadPermission, onDone);</span>
+<span class="fc" id="L361">        Message&lt;Request&gt; message = Message.out(PAXOS2_PREPARE_REQ, request);</span>
+<span class="fc" id="L362">        start(prepare, participants, message, RequestHandler::execute);</span>
+<span class="fc" id="L363">        return prepare;</span>
+    }
+
+    /**
+     * Submit the message to our peers, and submit it for local execution if relevant
+     */
+    static &lt;R extends AbstractRequest&lt;R&gt;&gt; void start(PaxosPrepare prepare, Participants participants, Message&lt;R&gt; send, BiFunction&lt;R, InetAddressAndPort, Response&gt; selfHandler)
+    {
+<span class="fc" id="L371">        boolean executeOnSelf = false;</span>
+<span class="fc bfc" id="L372" title="All 2 branches covered.">        for (int i = 0, size = participants.sizeOfPoll() ; i &lt; size ; ++i)</span>
+        {
+<span class="fc" id="L374">            InetAddressAndPort destination = participants.voter(i);</span>
+<span class="fc" id="L375">            boolean isPending = participants.electorate.isPending(destination);</span>
+<span class="fc" id="L376">            logger.trace(&quot;{} to {}&quot;, send.payload, destination);</span>
+<span class="fc bfc" id="L377" title="All 2 branches covered.">            if (shouldExecuteOnSelf(destination))</span>
+<span class="fc" id="L378">                executeOnSelf = true;</span>
+            else
+<span class="fc bfc" id="L380" title="All 2 branches covered.">                MessagingService.instance().sendWithCallback(isPending ? withoutRead(send) : send, destination, prepare);</span>
+        }
+
+<span class="fc bfc" id="L383" title="All 2 branches covered.">        if (executeOnSelf)</span>
+<span class="fc" id="L384">            send.verb().stage.execute(() -&gt; prepare.executeOnSelf(send.payload, selfHandler));</span>
+<span class="fc" id="L385">    }</span>
+
+    // TODO: extend Sync?
+    public synchronized Status awaitUntil(long deadline)
+    {
+        try
+        {
+            //noinspection StatementWithEmptyBody
+<span class="fc bfc" id="L393" title="All 4 branches covered.">            while (!isDone() &amp;&amp; waitUntil(this, deadline)) {}</span>
+
+<span class="fc bfc" id="L395" title="All 2 branches covered.">            if (!isDone())</span>
+<span class="fc" id="L396">                signalDone(MAYBE_FAILURE);</span>
+
+<span class="fc" id="L398">            return outcome;</span>
+        }
+<span class="nc" id="L400">        catch (InterruptedException e)</span>
+        {
+            // can only normally be interrupted if the system is shutting down; should rethrow as a write failure but propagate the interrupt
+<span class="nc" id="L403">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L404">            return new MaybeFailure(new Paxos.MaybeFailure(true, participants.sizeOfPoll(), participants.sizeOfConsensusQuorum, 0, emptyMap()), participants);</span>
+        }
+    }
+
+    private boolean isDone()
+    {
+<span class="fc bfc" id="L410" title="All 2 branches covered.">        return outcome != null;</span>
+    }
+
+    private int withLatest()
+    {
+<span class="fc" id="L415">        return withLatest.size();</span>
+    }
+
+    private int needLatest()
+    {
+<span class="fc bfc" id="L420" title="All 2 branches covered.">        return needLatest == null ? 0 : needLatest.size();</span>
+    }
+
+    private static boolean needsGossipUpdate(Map&lt;InetAddressAndPort, EndpointState&gt; gossipInfo)
+    {
+<span class="pc bpc" id="L425" title="1 of 2 branches missed.">        if (gossipInfo.isEmpty())</span>
+<span class="nc" id="L426">            return false;</span>
+
+<span class="fc bfc" id="L428" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, EndpointState&gt; entry : gossipInfo.entrySet())</span>
+        {
+<span class="fc" id="L430">            EndpointState remote = entry.getValue();</span>
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">            if (remote == null)</span>
+<span class="nc" id="L432">                continue;</span>
+<span class="fc" id="L433">            EndpointState local = Gossiper.instance.getEndpointStateForEndpoint(entry.getKey());</span>
+<span class="fc bfc" id="L434" title="All 4 branches covered.">            if (local == null || local.isSupersededBy(remote))</span>
+<span class="fc" id="L435">                return true;</span>
+<span class="fc" id="L436">        }</span>
+
+<span class="fc" id="L438">        return false;</span>
+    }
+
+    public synchronized void onResponse(Response response, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L444">            logger.trace(&quot;{} for {} from {}&quot;, response, request.ballot, from);</span>
+
+<span class="fc bfc" id="L446" title="All 2 branches covered.">        if (isDone())</span>
+        {
+<span class="fc" id="L448">            maybeCheckForLinearizabilityViolation(response, from);</span>
+<span class="fc" id="L449">            return;</span>
+        }
+
+<span class="fc bfc" id="L452" title="All 2 branches covered.">        if (response.isRejected())</span>
+        {
+<span class="fc" id="L454">            Rejected rejected = response.rejected();</span>
+<span class="fc" id="L455">            supersededBy = rejected.supersededBy;</span>
+<span class="fc" id="L456">            signalDone(SUPERSEDED);</span>
+<span class="fc" id="L457">            return;</span>
+        }
+
+<span class="fc" id="L460">        Permitted permitted = response.permitted();</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">        if (permitted.gossipInfo.isEmpty())</span>
+            // we agree about the electorate, so can simply accept the promise/permission
+<span class="fc" id="L463">            permitted(permitted, from);</span>
+<span class="fc bfc" id="L464" title="All 2 branches covered.">        else if (!needsGossipUpdate(permitted.gossipInfo))</span>
+            // our gossip is up-to-date, but our original electorate could have been built with stale gossip, so verify it
+<span class="fc" id="L466">            permittedOrTerminateIfElectorateMismatch(permitted, from);</span>
+        else
+            // otherwise our beliefs about the ring potentially diverge, so update gossip with the peer's information
+<span class="fc" id="L469">            Stage.GOSSIP.executor().execute(() -&gt; {</span>
+<span class="fc" id="L470">                Gossiper.instance.notifyFailureDetector(permitted.gossipInfo);</span>
+<span class="fc" id="L471">                Gossiper.instance.applyStateLocally(permitted.gossipInfo);</span>
+
+                // TODO: We should also wait for schema pulls/pushes, however this would be quite an involved change to MigrationManager
+                //       (which currently drops some migration tasks on the floor).
+                //       Note it would be fine for us to fail to complete the migration task and simply treat this response as a failure/timeout.
+
+                // once any pending ranges have been calculated, refresh our Participants list and submit the promise
+<span class="fc" id="L478">                PendingRangeCalculatorService.instance.executeWhenFinished(() -&gt; permittedOrTerminateIfElectorateMismatch(permitted, from));</span>
+<span class="fc" id="L479">            });</span>
+<span class="fc" id="L480">    }</span>
+
+    private synchronized void permittedOrTerminateIfElectorateMismatch(Permitted permitted, InetAddressAndPort from)
+    {
+<span class="fc bfc" id="L484" title="All 2 branches covered.">        if (isDone()) // this execution is asynchronous wrt promise arrival, so must recheck done status</span>
+<span class="fc" id="L485">            return;</span>
+
+        // if the electorate has changed, finish so we can retry with the updated view of the ring
+<span class="fc bfc" id="L488" title="All 2 branches covered.">        if (!Electorate.get(request.table, request.partitionKey, consistency(request.ballot)).equals(participants.electorate))</span>
+        {
+<span class="fc" id="L490">            signalDone(ELECTORATE_MISMATCH);</span>
+<span class="fc" id="L491">            return;</span>
+        }
+
+        // otherwise continue as normal
+<span class="fc" id="L495">        permitted(permitted, from);</span>
+<span class="fc" id="L496">    }</span>
+
+    private void permitted(Permitted permitted, InetAddressAndPort from)
+    {
+<span class="fc bfc" id="L500" title="All 2 branches covered.">        if (permitted.outcome != PROMISE)</span>
+        {
+<span class="fc" id="L502">            hasOnlyPromises = false;</span>
+<span class="fc bfc" id="L503" title="All 2 branches covered.">            if (supersededBy == null)</span>
+<span class="fc" id="L504">                supersededBy = permitted.supersededBy;</span>
+        }
+
+<span class="fc bfc" id="L507" title="All 2 branches covered.">        if (permitted.lowBound &gt; maxLowBound)</span>
+<span class="fc" id="L508">            maxLowBound = permitted.lowBound;</span>
+
+<span class="fc bfc" id="L510" title="All 2 branches covered.">        if (!haveQuorumOfPermissions)</span>
+        {
+<span class="fc" id="L512">            CompareResult compareLatest = permitted.latestCommitted.compareWith(latestCommitted);</span>
+<span class="pc bpc" id="L513" title="1 of 5 branches missed.">            switch (compareLatest)</span>
+            {
+<span class="nc" id="L515">                default: throw new IllegalStateException();</span>
+                case IS_REPROPOSAL:
+<span class="fc" id="L517">                    latestCommitted = permitted.latestCommitted;</span>
+                case WAS_REPROPOSED_BY:
+                case SAME:
+<span class="fc" id="L520">                    withLatest.add(from);</span>
+<span class="fc bfc" id="L521" title="All 2 branches covered.">                    haveReadResponseWithLatest |= permitted.readResponse != null;</span>
+<span class="fc" id="L522">                    break;</span>
+                case BEFORE:
+<span class="fc bfc" id="L524" title="All 2 branches covered.">                    if (needLatest == null)</span>
+<span class="fc" id="L525">                        needLatest = new ArrayList&lt;&gt;(participants.sizeOfPoll() - withLatest.size());</span>
+<span class="fc" id="L526">                    needLatest.add(from);</span>
+<span class="fc" id="L527">                    break;</span>
+                case AFTER:
+                    // move with-&gt;need
+<span class="fc bfc" id="L530" title="All 2 branches covered.">                    if (!withLatest.isEmpty())</span>
+                    {
+<span class="pc bpc" id="L532" title="1 of 2 branches missed.">                        if (needLatest == null)</span>
+                        {
+<span class="fc" id="L534">                            needLatest = withLatest;</span>
+<span class="fc" id="L535">                            withLatest = new ArrayList&lt;&gt;(Math.min(participants.sizeOfPoll() - needLatest.size(), participants.sizeOfConsensusQuorum));</span>
+                        }
+                        else
+                        {
+<span class="nc" id="L539">                            needLatest.addAll(withLatest);</span>
+<span class="nc" id="L540">                            withLatest.clear();</span>
+                        }
+                    }
+
+<span class="fc" id="L544">                    withLatest.add(from);</span>
+<span class="fc bfc" id="L545" title="All 2 branches covered.">                    haveReadResponseWithLatest = permitted.readResponse != null;</span>
+<span class="fc" id="L546">                    latestCommitted = permitted.latestCommitted;</span>
+            }
+
+<span class="fc bfc" id="L549" title="All 2 branches covered.">            if (isAfter(permitted.latestAcceptedButNotCommitted, latestAccepted))</span>
+<span class="fc" id="L550">                latestAccepted = permitted.latestAcceptedButNotCommitted;</span>
+
+<span class="fc bfc" id="L552" title="All 2 branches covered.">            if (permitted.readResponse != null)</span>
+            {
+<span class="fc" id="L554">                hasProposalStability &amp;= permitted.hadProposalStability;</span>
+<span class="fc" id="L555">                addReadResponse(permitted.readResponse, from);</span>
+            }
+<span class="fc" id="L557">        }</span>
+        else
+        {
+<span class="pc bpc" id="L560" title="2 of 4 branches missed.">            switch (permitted.latestCommitted.compareWith(latestCommitted))</span>
+            {
+<span class="nc" id="L562">                default: throw new IllegalStateException();</span>
+                case SAME:
+                case IS_REPROPOSAL:
+                case WAS_REPROPOSED_BY:
+<span class="fc" id="L566">                    withLatest.add(from);</span>
+<span class="fc" id="L567">                    break;</span>
+
+                case AFTER:
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                    if (maybeCheckForLinearizabilityViolation(permitted, from))</span>
+<span class="nc" id="L571">                        return;</span>
+                    // witnessing future commit doesn't imply have seen prior, so add to refresh list
+
+                case BEFORE:
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">                    if (needLatest == null)</span>
+<span class="nc" id="L576">                        needLatest = new ArrayList&lt;&gt;(participants.sizeOfPoll() - withLatest.size());</span>
+<span class="fc" id="L577">                    needLatest.add(from);</span>
+            }
+        }
+
+<span class="fc bfc" id="L581" title="All 2 branches covered.">        haveQuorumOfPermissions |= withLatest() + needLatest() &gt;= participants.sizeOfConsensusQuorum;</span>
+<span class="fc bfc" id="L582" title="All 2 branches covered.">        if (haveQuorumOfPermissions)</span>
+        {
+<span class="pc bpc" id="L584" title="1 of 4 branches missed.">            if (request.read != null &amp;&amp; readResponses.size() &lt; participants.sizeOfReadQuorum)</span>
+<span class="nc" id="L585">                throw new IllegalStateException(&quot;Insufficient read responses: &quot; + readResponses + &quot;; need &quot; + participants.sizeOfReadQuorum);</span>
+
+<span class="fc bfc" id="L587" title="All 4 branches covered.">            if (!hasOnlyPromises &amp;&amp; !hasProposalStability)</span>
+<span class="fc" id="L588">                signalDone(SUPERSEDED);</span>
+
+            // We must be certain to have witnessed a quorum of responses before completing any in-progress proposal
+            // else we may complete a stale proposal that did not reach a quorum (and may do so in preference
+            // to a different in progress proposal that did reach a quorum).
+
+            // We should also be sure to return any in progress proposal in preference to any incompletely committed
+            // earlier commits (since, while we should encounter it next round, any commit that is incomplete in the
+            // presence of an incomplete proposal can be ignored, as either the proposal is a re-proposal of the same
+            // commit or the commit has already reached a quorum
+<span class="fc bfc" id="L598" title="All 2 branches covered.">            else if (hasInProgressProposal())</span>
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">                signalDone(hasOnlyPromises ? FOUND_INCOMPLETE_ACCEPTED : SUPERSEDED);</span>
+
+<span class="fc bfc" id="L601" title="All 2 branches covered.">            else if (withLatest() &gt;= participants.sizeOfConsensusQuorum)</span>
+<span class="fc bfc" id="L602" title="All 2 branches covered.">                signalDone(hasOnlyPromises ? PROMISED : READ_PERMITTED);</span>
+
+            // otherwise if we have any read response with the latest commit,
+            // try to simply ensure it has been persisted to a consensus group
+<span class="pc bpc" id="L606" title="1 of 2 branches missed.">            else if (haveReadResponseWithLatest)</span>
+            {
+<span class="fc" id="L608">                refreshStaleParticipants();</span>
+                // if an optimistic read is possible, and we are performing a read,
+                // we can safely answer immediately without waiting for the refresh
+<span class="fc bfc" id="L611" title="All 4 branches covered.">                if (hasProposalStability &amp;&amp; acceptEarlyReadPermission)</span>
+<span class="fc" id="L612">                    signalDone(Outcome.READ_PERMITTED);</span>
+            }
+
+            // otherwise we need to run our reads again anyway,
+            // and the chance of receiving another response with latest may be slim.
+            // so we just start again
+            else
+<span class="nc" id="L619">                signalDone(FOUND_INCOMPLETE_COMMITTED);</span>
+        }
+<span class="fc" id="L621">    }</span>
+
+    private boolean maybeCheckForLinearizabilityViolation(Response response, InetAddressAndPort from)
+    {
+<span class="fc bfc" id="L625" title="All 6 branches covered.">        if (!response.isPromised() || !haveQuorumOfPermissions || !hasOnlyPromises)</span>
+<span class="fc" id="L626">            return false;</span>
+
+<span class="fc" id="L628">        Permitted permitted = response.permitted();</span>
+<span class="fc bfc" id="L629" title="All 2 branches covered.">        if (permitted.latestCommitted.compareWith(latestCommitted) == CompareResult.AFTER)</span>
+<span class="fc" id="L630">            return checkForLinearizabilityViolation(permitted, from);</span>
+<span class="fc" id="L631">        return false;</span>
+    }
+
+    private static boolean isRunningLegacyPaxos()
+    {
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">        switch (getPaxosVariant())</span>
+        {
+            case v1:
+            case v1_without_linearizable_reads_or_rejected_writes:
+<span class="nc" id="L640">                return true;</span>
+            default:
+<span class="fc" id="L642">                return false;</span>
+        }
+    }
+
+    private Ballot getLowBoundForKey()
+    {
+<span class="fc" id="L648">        ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(request.table.id);</span>
+<span class="pc bpc" id="L649" title="1 of 2 branches missed.">        return cfs != null ? cfs.getPaxosRepairLowBound(request.partitionKey) : Ballot.none();</span>
+    }
+
+    /**
+     * The linearizability check is incompatible with legacy paxos due to at least 2 issues:
+     *  1. The prepare phase doesn't evaluate accepted/committed ballots when promising ballots (excluding legacy_fixed)
+     *  2. Commits made at LOCAL_SERIAL are sent to all DCs
+     * Both issues will trigger linearizability violations, but are fixed by paxos repair. So we shouldn't do
+     * linearizability checks unless we're running v2 paxos and have had at least one paxos repair covering this
+     * operation's key.
+     */
+    private boolean isCompatibleWithLinearizabilityCheck()
+    {
+<span class="pc bpc" id="L662" title="1 of 2 branches missed.">        if (isRunningLegacyPaxos())</span>
+<span class="nc" id="L663">            return false;</span>
+
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">        return getLowBoundForKey() != Ballot.none();</span>
+    }
+
+    private boolean checkForLinearizabilityViolation(Permitted permitted, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L670" title="1 of 2 branches missed.">        if (!isCompatibleWithLinearizabilityCheck())</span>
+<span class="fc" id="L671">            return false;</span>
+
+<span class="nc bnc" id="L673" title="All 2 branches missed.">        if (linearizabilityViolationDetected)</span>
+<span class="nc" id="L674">            return false;</span>
+        // if we witness a newer commit AND are accepted something has gone wrong, except:
+
+        // if we have raced with an ongoing commit, having missed all of them initially
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        if (permitted.latestCommitted.hasSameBallot(latestAccepted))</span>
+<span class="nc" id="L679">            return false;</span>
+
+        // or in the case that we have an empty proposal accepted, since that will not be committed
+        // in theory in this case we could now restart refreshStaleParticipants, but this would
+        // unnecessarily complicate the logic so instead we accept that we will unnecessarily re-propose
+<span class="nc bnc" id="L684" title="All 6 branches missed.">        if (latestAccepted != null &amp;&amp; latestAccepted.update.isEmpty() &amp;&amp; latestAccepted.isAfter(permitted.latestCommitted))</span>
+<span class="nc" id="L685">            return false;</span>
+
+        // or in the case that both are older than the most recent repair low bound), in which case a topology change
+        // could have ocurred that means not all paxos state tables know of the accept/commit, though it is persistent
+        // in theory in this case we could ignore this entirely and call ourselves done
+        // TODO: consider this more; is it possible we cause problems by reproposing an old accept?
+        //  shouldn't be, as any newer accept that reaches a quorum will supersede
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        if (permitted.latestCommitted.ballot.uuidTimestamp() &lt;= maxLowBound)</span>
+<span class="nc" id="L693">            return false;</span>
+
+        // if the lateset commit ballot doesn't have an encoded consistency level, it's from a legacy paxos operation.
+        // Legacy paxos operations would send commits to all replicas for LOCAL_SERIAL operations, which look like
+        // linearizability violations from datacenters the operation wasn't run in, so we ignore them here.
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (permitted.latestCommitted.ballot.flag() == NONE)</span>
+<span class="nc" id="L699">            return false;</span>
+
+        // If we discovered an incomplete proposal, it could have since completed successfullly
+<span class="nc bnc" id="L702" title="All 4 branches missed.">        if (latestAccepted != null &amp;&amp; outcome.outcome == FOUND_INCOMPLETE_ACCEPTED)</span>
+        {
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            switch (permitted.latestCommitted.compareWith(latestAccepted))</span>
+            {
+                case WAS_REPROPOSED_BY:
+                case SAME:
+<span class="nc" id="L708">                    return false;</span>
+            }
+        }
+
+<span class="nc" id="L712">        long gcGraceMicros = TimeUnit.SECONDS.toMicros(permitted.latestCommitted.update.metadata().params.gcGraceSeconds);</span>
+        // paxos repair uses stale ballots, so comparing against request.ballot time will not completely prevent false
+        // positives, since compaction may have removed paxos metadata on some nodes and not others. It's also possible
+        // clock skew has placed the ballot to repair in the future, so we use now or the ballot, whichever is higher.
+<span class="nc" id="L716">        long maxNowMicros = Math.max(currentTimeMillis() * 1000, request.ballot.unixMicros());</span>
+<span class="nc" id="L717">        long ageMicros = maxNowMicros - permitted.latestCommitted.ballot.unixMicros();</span>
+
+<span class="nc" id="L719">        String modifier = &quot;&quot;;</span>
+        boolean isTtlViolation;
+<span class="nc bnc" id="L721" title="All 4 branches missed.">        if (isTtlViolation = (ageMicros &gt;= gcGraceMicros))</span>
+        {
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (participants.hasOldParticipants())</span>
+<span class="nc" id="L724">                modifier = &quot; (older than legacy TTL expiry with at least one legacy participant)&quot;;</span>
+            else
+<span class="nc" id="L726">                modifier = &quot; (older than legacy TTL expiry)&quot;;</span>
+        }
+<span class="nc" id="L728">        String message = String.format(&quot;Linearizability violation%s: %s witnessed %s of latest %s (withLatest: %s, readResponses: %s, maxLowBound: %s, status: %s); %s promised with latest %s&quot;,</span>
+<span class="nc" id="L729">                                       modifier, request.ballot, consistency(request.ballot), latestCommitted,</span>
+                                       withLatest, readResponses
+<span class="nc" id="L731">                        .stream()</span>
+<span class="nc" id="L732">                        .map(Message::from)</span>
+<span class="nc" id="L733">                        .map(Object::toString)</span>
+<span class="nc" id="L734">                        .collect(Collectors.joining(&quot;, &quot;, &quot;[&quot;, &quot;]&quot;)),</span>
+<span class="nc" id="L735">                                       maxLowBound, outcome, from, permitted.latestCommitted);</span>
+
+<span class="nc" id="L737">        PaxosMetrics.linearizabilityViolations.inc();</span>
+<span class="nc" id="L738">        linearizabilityViolationDetected = true;</span>
+
+        try
+        {
+<span class="nc bnc" id="L742" title="All 4 branches missed.">            switch (DatabaseDescriptor.paxosOnLinearizabilityViolations())</span>
+            {
+<span class="nc" id="L744">                default: throw new AssertionError();</span>
+                case fail:
+<span class="nc" id="L746">                    signalDone(new MaybeFailure(new Paxos.MaybeFailure(true, &quot;A linearizability violation was detected&quot;, participants.sizeOfPoll(), participants.sizeOfConsensusQuorum, withLatest() + needLatest(), Collections.emptyMap()), participants));</span>
+<span class="nc" id="L747">                    return true;</span>
+                case log:
+<span class="nc bnc" id="L749" title="All 4 branches missed.">                    if (isTtlViolation &amp;&amp; LOG_TTL_LINEARIZABILITY_VIOLATIONS) logger.warn(message);</span>
+<span class="nc" id="L750">                    else logger.error(message);</span>
+<span class="nc" id="L751">                    return false;</span>
+                case ignore:
+<span class="nc" id="L753">                    return false;</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L758">            Runnable run = onLinearizabilityViolation;</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (run != null)</span>
+<span class="nc" id="L760">                run.run();</span>
+        }
+    }
+
+    /**
+     * Save a read response from a node that we know to have witnessed the most recent commit
+     *
+     * Must be invoked while owning lock
+     */
+    private void addReadResponse(ReadResponse response, InetAddressAndPort from)
+    {
+<span class="fc" id="L771">        readResponses.add(Message.synthetic(from, PAXOS2_PREPARE_RSP, response));</span>
+<span class="fc" id="L772">    }</span>
+
+    @Override
+    public synchronized void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="pc bpc" id="L777" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L778">            logger.trace(&quot;{} {} failure from {}&quot;, request, reason, from);</span>
+
+<span class="fc bfc" id="L780" title="All 2 branches covered.">        if (isDone())</span>
+<span class="fc" id="L781">            return;</span>
+
+<span class="fc" id="L783">        super.onFailureWithMutex(from, reason);</span>
+<span class="fc" id="L784">        ++failures;</span>
+
+<span class="fc bfc" id="L786" title="All 2 branches covered.">        if (failures + participants.sizeOfConsensusQuorum == 1 + participants.sizeOfPoll())</span>
+<span class="fc" id="L787">            signalDone(MAYBE_FAILURE);</span>
+<span class="fc" id="L788">    }</span>
+
+    private void signalDone(Outcome kindOfOutcome)
+    {
+<span class="fc" id="L792">        signalDone(toStatus(kindOfOutcome));</span>
+<span class="fc" id="L793">    }</span>
+
+    private void signalDone(Status status)
+    {
+<span class="pc bpc" id="L797" title="1 of 2 branches missed.">        if (isDone())</span>
+<span class="nc" id="L798">            throw new IllegalStateException();</span>
+
+<span class="fc" id="L800">        this.outcome = status;</span>
+<span class="fc bfc" id="L801" title="All 2 branches covered.">        if (onDone != null)</span>
+<span class="fc" id="L802">            onDone.accept(outcome);</span>
+<span class="fc" id="L803">        notifyAll();</span>
+<span class="fc" id="L804">    }</span>
+
+    private Status toStatus(Outcome outcome)
+    {
+<span class="pc bpc" id="L808" title="2 of 8 branches missed.">        switch (outcome)</span>
+        {
+            case ELECTORATE_MISMATCH:
+<span class="fc" id="L811">                return new ElectorateMismatch(participants, request.ballot);</span>
+            case SUPERSEDED:
+<span class="fc" id="L813">                return new Superseded(supersededBy, participants);</span>
+            case FOUND_INCOMPLETE_ACCEPTED:
+<span class="fc" id="L815">                return new FoundIncompleteAccepted(request.ballot, participants, latestAccepted);</span>
+            case FOUND_INCOMPLETE_COMMITTED:
+<span class="nc" id="L817">                return new FoundIncompleteCommitted(request.ballot, participants, latestCommitted);</span>
+            case PROMISED:
+<span class="fc" id="L819">                return Success.readOrWrite(request.ballot, participants, readResponses, hasProposalStability);</span>
+            case READ_PERMITTED:
+<span class="pc bpc" id="L821" title="1 of 2 branches missed.">                if (!hasProposalStability)</span>
+<span class="nc" id="L822">                    throw new IllegalStateException();</span>
+<span class="fc" id="L823">                return Success.read(request.ballot, participants, readResponses, supersededBy);</span>
+            case MAYBE_FAILURE:
+<span class="fc" id="L825">                return new MaybeFailure(new Paxos.MaybeFailure(participants, withLatest(), failureReasonsAsMap()), participants);</span>
+            default:
+<span class="nc" id="L827">                throw new IllegalStateException();</span>
+        }
+    }
+
+    /**
+     * See {@link PaxosPrepareRefresh}
+     *
+     * Must be invoked while owning lock
+     */
+    private void refreshStaleParticipants()
+    {
+<span class="fc bfc" id="L838" title="All 2 branches covered.">        if (refreshStaleParticipants == null)</span>
+<span class="fc" id="L839">            refreshStaleParticipants = new PaxosPrepareRefresh(request.ballot, participants, latestCommitted, this);</span>
+
+<span class="fc" id="L841">        refreshStaleParticipants.refresh(needLatest);</span>
+<span class="fc" id="L842">        needLatest.clear();</span>
+<span class="fc" id="L843">    }</span>
+
+    @Override
+    public void onRefreshFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="nc" id="L848">        onFailure(from, reason);</span>
+<span class="nc" id="L849">    }</span>
+
+    public synchronized void onRefreshSuccess(Ballot isSupersededBy, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L853" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc bnc" id="L854" title="All 2 branches missed.">            logger.trace(&quot;Refresh {} from {}&quot;, isSupersededBy == null ? &quot;Success&quot; : &quot;SupersededBy(&quot; + isSupersededBy + ')', from);</span>
+
+<span class="fc bfc" id="L856" title="All 2 branches covered.">        if (isDone())</span>
+<span class="fc" id="L857">            return;</span>
+
+<span class="fc bfc" id="L859" title="All 2 branches covered.">        if (isSupersededBy != null)</span>
+        {
+<span class="fc" id="L861">            supersededBy = isSupersededBy;</span>
+<span class="pc bpc" id="L862" title="1 of 2 branches missed.">            if (hasProposalStability) signalDone(Outcome.READ_PERMITTED);</span>
+<span class="fc" id="L863">            else signalDone(SUPERSEDED);</span>
+        }
+        else
+        {
+<span class="fc" id="L867">            withLatest.add(from);</span>
+<span class="fc bfc" id="L868" title="All 2 branches covered.">            if (withLatest.size() &gt;= participants.sizeOfConsensusQuorum)</span>
+<span class="pc bpc" id="L869" title="1 of 2 branches missed.">                signalDone(hasOnlyPromises ? Outcome.PROMISED : Outcome.READ_PERMITTED);</span>
+        }
+<span class="fc" id="L871">    }</span>
+
+    static abstract class AbstractRequest&lt;R extends AbstractRequest&lt;R&gt;&gt;
+    {
+        final Ballot ballot;
+        final Electorate electorate;
+        final SinglePartitionReadCommand read;
+        final boolean isForWrite;
+        final DecoratedKey partitionKey;
+        final TableMetadata table;
+
+        AbstractRequest(Ballot ballot, Electorate electorate, SinglePartitionReadCommand read, boolean isForWrite)
+<span class="fc" id="L883">        {</span>
+<span class="fc" id="L884">            this.ballot = ballot;</span>
+<span class="fc" id="L885">            this.electorate = electorate;</span>
+<span class="fc" id="L886">            this.read = read;</span>
+<span class="fc" id="L887">            this.isForWrite = isForWrite;</span>
+<span class="fc" id="L888">            this.partitionKey = read.partitionKey();</span>
+<span class="fc" id="L889">            this.table = read.metadata();</span>
+<span class="fc" id="L890">        }</span>
+
+        AbstractRequest(Ballot ballot, Electorate electorate, DecoratedKey partitionKey, TableMetadata table, boolean isForWrite)
+<span class="fc" id="L893">        {</span>
+<span class="fc" id="L894">            this.ballot = ballot;</span>
+<span class="fc" id="L895">            this.electorate = electorate;</span>
+<span class="fc" id="L896">            this.partitionKey = partitionKey;</span>
+<span class="fc" id="L897">            this.table = table;</span>
+<span class="fc" id="L898">            this.read = null;</span>
+<span class="fc" id="L899">            this.isForWrite = isForWrite;</span>
+<span class="fc" id="L900">        }</span>
+
+        abstract R withoutRead();
+
+        public String toString()
+        {
+<span class="nc" id="L906">            return &quot;Prepare(&quot; + ballot + ')';</span>
+        }
+    }
+
+    static class Request extends AbstractRequest&lt;Request&gt;
+    {
+        Request(Ballot ballot, Electorate electorate, SinglePartitionReadCommand read, boolean isWrite)
+        {
+<span class="fc" id="L914">            super(ballot, electorate, read, isWrite);</span>
+<span class="fc" id="L915">        }</span>
+
+        private Request(Ballot ballot, Electorate electorate, DecoratedKey partitionKey, TableMetadata table, boolean isWrite)
+        {
+<span class="fc" id="L919">            super(ballot, electorate, partitionKey, table, isWrite);</span>
+<span class="fc" id="L920">        }</span>
+
+        Request withoutRead()
+        {
+<span class="pc bpc" id="L924" title="1 of 2 branches missed.">            return read == null ? this : new Request(ballot, electorate, partitionKey, table, isForWrite);</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L929">            return &quot;Prepare(&quot; + ballot + ')';</span>
+        }
+    }
+
+    static class Response
+    {
+        final MaybePromise.Outcome outcome;
+
+        Response(MaybePromise.Outcome outcome)
+<span class="fc" id="L938">        {</span>
+<span class="fc" id="L939">            this.outcome = outcome;</span>
+<span class="fc" id="L940">        }</span>
+<span class="fc" id="L941">        Permitted permitted() { return (Permitted) this; }</span>
+<span class="fc" id="L942">        Rejected rejected() { return (Rejected) this; }</span>
+
+        public boolean isRejected()
+        {
+<span class="fc bfc" id="L946" title="All 2 branches covered.">            return outcome == REJECT;</span>
+        }
+
+        public boolean isPromised()
+        {
+<span class="fc bfc" id="L951" title="All 2 branches covered.">            return outcome == PROMISE;</span>
+        }
+    }
+
+    static class Permitted extends Response
+    {
+        final long lowBound;
+        // a proposal that has been accepted but not committed, i.e. must be null or &gt; latestCommit
+        @Nullable final Accepted latestAcceptedButNotCommitted;
+        final Committed latestCommitted;
+        @Nullable final ReadResponse readResponse;
+        // latestAcceptedButNotCommitted and latestCommitted were the same before and after the read occurred, and no incomplete promise was witnessed
+        final boolean hadProposalStability;
+        final Map&lt;InetAddressAndPort, EndpointState&gt; gossipInfo;
+        @Nullable final Ballot supersededBy;
+
+        Permitted(MaybePromise.Outcome outcome, long lowBound, @Nullable Accepted latestAcceptedButNotCommitted, Committed latestCommitted, @Nullable ReadResponse readResponse, boolean hadProposalStability, Map&lt;InetAddressAndPort, EndpointState&gt; gossipInfo, @Nullable Ballot supersededBy)
+        {
+<span class="fc" id="L969">            super(outcome);</span>
+<span class="fc" id="L970">            this.lowBound = lowBound;</span>
+<span class="fc" id="L971">            this.latestAcceptedButNotCommitted = latestAcceptedButNotCommitted;</span>
+<span class="fc" id="L972">            this.latestCommitted = latestCommitted;</span>
+<span class="fc" id="L973">            this.hadProposalStability = hadProposalStability;</span>
+<span class="fc" id="L974">            this.readResponse = readResponse;</span>
+<span class="fc" id="L975">            this.gossipInfo = gossipInfo;</span>
+<span class="fc" id="L976">            this.supersededBy = supersededBy;</span>
+<span class="fc" id="L977">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L982">            return &quot;Promise(&quot; + latestAcceptedButNotCommitted + &quot;, &quot; + latestCommitted + &quot;, &quot; + hadProposalStability + &quot;, &quot; + gossipInfo + ')';</span>
+        }
+    }
+
+    static class Rejected extends Response
+    {
+        final Ballot supersededBy;
+
+        Rejected(Ballot supersededBy)
+        {
+<span class="fc" id="L992">            super(REJECT);</span>
+<span class="fc" id="L993">            this.supersededBy = supersededBy;</span>
+<span class="fc" id="L994">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L999">            return &quot;RejectPromise(supersededBy=&quot; + supersededBy + ')';</span>
+        }
+    }
+
+<span class="fc" id="L1003">    public static class RequestHandler implements IVerbHandler&lt;Request&gt;</span>
+    {
+        @Override
+        public void doVerb(Message&lt;Request&gt; message)
+        {
+<span class="fc" id="L1008">            Response response = execute(message.payload, message.from());</span>
+<span class="pc bpc" id="L1009" title="1 of 2 branches missed.">            if (response == null)</span>
+<span class="nc" id="L1010">                MessagingService.instance().respondWithFailure(UNKNOWN, message);</span>
+            else
+<span class="fc" id="L1012">                MessagingService.instance().respond(response, message);</span>
+<span class="fc" id="L1013">        }</span>
+
+        static Response execute(AbstractRequest&lt;?&gt; request, InetAddressAndPort from)
+        {
+<span class="pc bpc" id="L1017" title="1 of 4 branches missed.">            if (!isInRangeAndShouldProcess(from, request.partitionKey, request.table, request.read != null))</span>
+<span class="nc" id="L1018">                return null;</span>
+
+<span class="fc" id="L1020">            long start = nanoTime();</span>
+<span class="fc" id="L1021">            try (PaxosState state = get(request.partitionKey, request.table))</span>
+            {
+<span class="fc" id="L1023">                return execute(request, state);</span>
+            }
+            finally
+            {
+<span class="fc" id="L1027">                Keyspace.openAndGetStore(request.table).metric.casPrepare.addNano(nanoTime() - start);</span>
+            }
+        }
+
+        static Response execute(AbstractRequest&lt;?&gt; request, PaxosState state)
+        {
+<span class="fc" id="L1033">            MaybePromise result = state.promiseIfNewer(request.ballot, request.isForWrite);</span>
+<span class="pc bpc" id="L1034" title="1 of 3 branches missed.">            switch (result.outcome)</span>
+            {
+                case PROMISE:
+                case PERMIT_READ:
+                    // verify electorates; if they differ, send back gossip info for superset of two participant sets
+<span class="fc" id="L1039">                    Map&lt;InetAddressAndPort, EndpointState&gt; gossipInfo = verifyElectorate(request.electorate, Electorate.get(request.table, request.partitionKey, consistency(request.ballot)));</span>
+<span class="fc" id="L1040">                    ReadResponse readResponse = null;</span>
+
+                    // Check we cannot race with a proposal, i.e. that we have not made a promise that
+                    // could be in the process of making a proposal. If a majority of nodes have made no such promise
+                    // then either we must have witnessed it (since it must have been committed), or the proposal
+                    // will now be rejected by our promises.
+
+                    // This is logicaly complicated a bit by reading from a subset of the consensus group when there are
+                    // pending nodes, however electorate verification we will cause us to retry if the pending status changes
+                    // during execution; otherwise if the most recent commit we witnessed wasn't witnessed by a read response
+                    // we will abort and retry, and we must witness it by the above argument.
+
+                    Ballot mostRecentCommit = result.before.accepted != null
+<span class="pc bpc" id="L1053" title="1 of 2 branches missed.">                                              &amp;&amp; result.before.accepted.ballot.compareTo(result.before.committed.ballot) &gt; 0</span>
+<span class="fc bfc" id="L1054" title="All 4 branches covered.">                                              &amp;&amp; result.before.accepted.update.isEmpty()</span>
+<span class="fc" id="L1055">                                              ? result.before.accepted.ballot : result.before.committed.ballot;</span>
+
+<span class="fc bfc" id="L1057" title="All 2 branches covered.">                    boolean hasProposalStability = mostRecentCommit.equals(result.before.promisedWrite)</span>
+<span class="fc bfc" id="L1058" title="All 2 branches covered.">                                                   || mostRecentCommit.compareTo(result.before.promisedWrite) &gt; 0;</span>
+
+<span class="fc bfc" id="L1060" title="All 2 branches covered.">                    if (request.read != null)</span>
+                    {
+<span class="fc" id="L1062">                        try (ReadExecutionController executionController = request.read.executionController();</span>
+<span class="fc" id="L1063">                             UnfilteredPartitionIterator iterator = request.read.executeLocally(executionController))</span>
+                        {
+<span class="fc" id="L1065">                            readResponse = request.read.createResponse(iterator, executionController.getRepairedDataInfo());</span>
+                        }
+
+<span class="fc bfc" id="L1068" title="All 2 branches covered.">                        if (hasProposalStability)</span>
+                        {
+<span class="fc" id="L1070">                            Snapshot now = state.current(request.ballot);</span>
+<span class="fc bfc" id="L1071" title="All 6 branches covered.">                            hasProposalStability = now.promisedWrite == result.after.promisedWrite</span>
+                                    &amp;&amp; now.committed == result.after.committed
+                                    &amp;&amp; now.accepted == result.after.accepted;
+                        }
+                    }
+
+<span class="fc bfc" id="L1077" title="All 2 branches covered.">                    Ballot supersededBy = result.outcome == PROMISE ? null : result.after.latestWitnessedOrLowBound();</span>
+<span class="fc" id="L1078">                    Accepted acceptedButNotCommitted = result.after.accepted;</span>
+<span class="fc" id="L1079">                    Committed committed = result.after.committed;</span>
+
+<span class="fc" id="L1081">                    ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(request.table.id);</span>
+<span class="fc" id="L1082">                    long lowBound = cfs.getPaxosRepairLowBound(request.partitionKey).uuidTimestamp();</span>
+<span class="fc" id="L1083">                    return new Permitted(result.outcome, lowBound, acceptedButNotCommitted, committed, readResponse, hasProposalStability, gossipInfo, supersededBy);</span>
+
+                case REJECT:
+<span class="fc" id="L1086">                    return new Rejected(result.supersededBy());</span>
+
+                default:
+<span class="nc" id="L1089">                    throw new IllegalStateException();</span>
+            }
+        }
+    }
+
+<span class="fc" id="L1094">    static abstract class AbstractRequestSerializer&lt;R extends AbstractRequest&lt;R&gt;, T&gt; implements IVersionedSerializer&lt;R&gt;</span>
+    {
+        abstract R construct(T param, Ballot ballot, Electorate electorate, SinglePartitionReadCommand read, boolean isWrite);
+        abstract R construct(T param, Ballot ballot, Electorate electorate, DecoratedKey partitionKey, TableMetadata table, boolean isWrite);
+
+        @Override
+        public void serialize(R request, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L1102">            request.ballot.serialize(out);</span>
+<span class="fc" id="L1103">            Electorate.serializer.serialize(request.electorate, out, version);</span>
+<span class="fc bfc" id="L1104" title="All 4 branches covered.">            out.writeByte((request.read != null ? 1 : 0) | (request.isForWrite ? 0 : 2));</span>
+<span class="fc bfc" id="L1105" title="All 2 branches covered.">            if (request.read != null)</span>
+            {
+
+<span class="fc" id="L1108">                ReadCommand.serializer.serialize(request.read, out, version);</span>
+            }
+            else
+            {
+<span class="fc" id="L1112">                request.table.id.serialize(out);</span>
+<span class="fc" id="L1113">                DecoratedKey.serializer.serialize(request.partitionKey, out, version);</span>
+            }
+<span class="fc" id="L1115">        }</span>
+
+        public R deserialize(T param, DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L1119">            Ballot ballot = Ballot.deserialize(in);</span>
+<span class="fc" id="L1120">            Electorate electorate = Electorate.serializer.deserialize(in, version);</span>
+<span class="fc" id="L1121">            byte flag = in.readByte();</span>
+<span class="fc bfc" id="L1122" title="All 2 branches covered.">            if ((flag &amp; 1) != 0)</span>
+            {
+<span class="fc" id="L1124">                SinglePartitionReadCommand readCommand = (SinglePartitionReadCommand) ReadCommand.serializer.deserialize(in, version);</span>
+<span class="fc bfc" id="L1125" title="All 2 branches covered.">                return construct(param, ballot, electorate, readCommand, (flag &amp; 2) == 0);</span>
+            }
+            else
+            {
+<span class="fc" id="L1129">                TableMetadata table = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));</span>
+<span class="fc" id="L1130">                DecoratedKey partitionKey = (DecoratedKey) DecoratedKey.serializer.deserialize(in, table.partitioner, version);</span>
+<span class="fc bfc" id="L1131" title="All 2 branches covered.">                return construct(param, ballot, electorate, partitionKey, table, (flag &amp; 2) != 0);</span>
+            }
+        }
+
+        @Override
+        public long serializedSize(R request, int version)
+        {
+<span class="fc" id="L1138">            return Ballot.sizeInBytes()</span>
+<span class="fc" id="L1139">                   + Electorate.serializer.serializedSize(request.electorate, version)</span>
+<span class="fc bfc" id="L1140" title="All 2 branches covered.">                   + 1 + (request.read != null</span>
+<span class="fc" id="L1141">                        ? ReadCommand.serializer.serializedSize(request.read, version)</span>
+<span class="fc" id="L1142">                        : request.table.id.serializedSize()</span>
+<span class="fc" id="L1143">                            + DecoratedKey.serializer.serializedSize(request.partitionKey, version));</span>
+        }
+    }
+
+<span class="fc" id="L1147">    public static class RequestSerializer extends AbstractRequestSerializer&lt;Request, Object&gt;</span>
+    {
+        Request construct(Object ignore, Ballot ballot, Electorate electorate, SinglePartitionReadCommand read, boolean isWrite)
+        {
+<span class="fc" id="L1151">            return new Request(ballot, electorate, read, isWrite);</span>
+        }
+
+        Request construct(Object ignore, Ballot ballot, Electorate electorate, DecoratedKey partitionKey, TableMetadata table, boolean isWrite)
+        {
+<span class="fc" id="L1156">            return new Request(ballot, electorate, partitionKey, table, isWrite);</span>
+        }
+
+        public Request deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L1161">            return deserialize(null, in, version);</span>
+        }
+    }
+
+<span class="fc" id="L1165">    public static class ResponseSerializer implements IVersionedSerializer&lt;Response&gt;</span>
+    {
+        public void serialize(Response response, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc bfc" id="L1169" title="All 2 branches covered.">            if (response.isRejected())</span>
+            {
+<span class="fc" id="L1171">                out.writeByte(0);</span>
+<span class="fc" id="L1172">                Rejected rejected = (Rejected) response;</span>
+<span class="fc" id="L1173">                rejected.supersededBy.serialize(out);</span>
+<span class="fc" id="L1174">            }</span>
+            else
+            {
+<span class="fc" id="L1177">                Permitted promised = (Permitted) response;</span>
+<span class="fc" id="L1178">                out.writeByte(1</span>
+<span class="fc bfc" id="L1179" title="All 2 branches covered.">                        | (promised.latestAcceptedButNotCommitted != null ? 2  : 0)</span>
+<span class="fc bfc" id="L1180" title="All 2 branches covered.">                        | (promised.readResponse != null                  ? 4  : 0)</span>
+<span class="fc bfc" id="L1181" title="All 2 branches covered.">                        | (promised.hadProposalStability                  ? 8  : 0)</span>
+<span class="fc bfc" id="L1182" title="All 2 branches covered.">                        | (promised.outcome == PERMIT_READ ? 16 : 0)</span>
+                );
+<span class="fc" id="L1184">                out.writeUnsignedVInt(promised.lowBound);</span>
+<span class="fc bfc" id="L1185" title="All 2 branches covered.">                if (promised.latestAcceptedButNotCommitted != null)</span>
+<span class="fc" id="L1186">                    Accepted.serializer.serialize(promised.latestAcceptedButNotCommitted, out, version);</span>
+<span class="fc" id="L1187">                Committed.serializer.serialize(promised.latestCommitted, out, version);</span>
+<span class="fc bfc" id="L1188" title="All 2 branches covered.">                if (promised.readResponse != null)</span>
+<span class="fc" id="L1189">                    ReadResponse.serializer.serialize(promised.readResponse, out, version);</span>
+<span class="fc" id="L1190">                serializeMap(inetAddressAndPortSerializer, EndpointState.nullableSerializer, promised.gossipInfo, out, version);</span>
+<span class="fc bfc" id="L1191" title="All 2 branches covered.">                if (promised.outcome == PERMIT_READ)</span>
+<span class="fc" id="L1192">                    promised.supersededBy.serialize(out);</span>
+            }
+<span class="fc" id="L1194">        }</span>
+
+        public Response deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L1198">            byte flags = in.readByte();</span>
+<span class="fc bfc" id="L1199" title="All 2 branches covered.">            if (flags == 0)</span>
+            {
+<span class="fc" id="L1201">                Ballot supersededBy = Ballot.deserialize(in);</span>
+<span class="fc" id="L1202">                return new Rejected(supersededBy);</span>
+            }
+            else
+            {
+<span class="fc" id="L1206">                long lowBound = in.readUnsignedVInt();</span>
+<span class="fc bfc" id="L1207" title="All 2 branches covered.">                Accepted acceptedNotCommitted = (flags &amp; 2) != 0 ? Accepted.serializer.deserialize(in, version) : null;</span>
+<span class="fc" id="L1208">                Committed committed = Committed.serializer.deserialize(in, version);</span>
+<span class="fc bfc" id="L1209" title="All 2 branches covered.">                ReadResponse readResponse = (flags &amp; 4) != 0 ? ReadResponse.serializer.deserialize(in, version) : null;</span>
+<span class="fc" id="L1210">                Map&lt;InetAddressAndPort, EndpointState&gt; gossipInfo = deserializeMap(inetAddressAndPortSerializer, EndpointState.nullableSerializer, newHashMap(), in, version);</span>
+<span class="fc bfc" id="L1211" title="All 2 branches covered.">                MaybePromise.Outcome outcome = (flags &amp; 16) != 0 ? PERMIT_READ : PROMISE;</span>
+<span class="fc bfc" id="L1212" title="All 2 branches covered.">                boolean hasProposalStability = (flags &amp; 8) != 0;</span>
+<span class="fc" id="L1213">                Ballot supersededBy = null;</span>
+<span class="fc bfc" id="L1214" title="All 2 branches covered.">                if (outcome == PERMIT_READ)</span>
+<span class="fc" id="L1215">                    supersededBy = Ballot.deserialize(in);</span>
+<span class="fc" id="L1216">                return new Permitted(outcome, lowBound, acceptedNotCommitted, committed, readResponse, hasProposalStability, gossipInfo, supersededBy);</span>
+            }
+        }
+
+        public long serializedSize(Response response, int version)
+        {
+<span class="fc bfc" id="L1222" title="All 2 branches covered.">            if (response.isRejected())</span>
+            {
+<span class="fc" id="L1224">                return 1 + Ballot.sizeInBytes();</span>
+            }
+            else
+            {
+<span class="fc" id="L1228">                Permitted permitted = (Permitted) response;</span>
+<span class="fc" id="L1229">                return 1</span>
+<span class="fc" id="L1230">                        + VIntCoding.computeUnsignedVIntSize(permitted.lowBound)</span>
+<span class="fc bfc" id="L1231" title="All 2 branches covered.">                        + (permitted.latestAcceptedButNotCommitted == null ? 0 : Accepted.serializer.serializedSize(permitted.latestAcceptedButNotCommitted, version))</span>
+<span class="fc" id="L1232">                        + Committed.serializer.serializedSize(permitted.latestCommitted, version)</span>
+<span class="fc bfc" id="L1233" title="All 2 branches covered.">                        + (permitted.readResponse == null ? 0 : ReadResponse.serializer.serializedSize(permitted.readResponse, version))</span>
+<span class="fc" id="L1234">                        + serializedSizeMap(inetAddressAndPortSerializer, EndpointState.nullableSerializer, permitted.gossipInfo, version)</span>
+<span class="fc bfc" id="L1235" title="All 2 branches covered.">                        + (permitted.outcome == PERMIT_READ ? Ballot.sizeInBytes() : 0);</span>
+            }
+        }
+    }
+
+    static &lt;R extends AbstractRequest&lt;R&gt;&gt; Message&lt;R&gt; withoutRead(Message&lt;R&gt; send)
+    {
+<span class="pc bpc" id="L1242" title="1 of 2 branches missed.">        if (send.payload.read == null)</span>
+<span class="nc" id="L1243">            return send;</span>
+
+<span class="fc" id="L1245">        return send.withPayload(send.payload.withoutRead());</span>
+    }
+
+    public static void setOnLinearizabilityViolation(Runnable runnable)
+    {
+<span class="nc bnc" id="L1250" title="All 4 branches missed.">        assert onLinearizabilityViolation == null || runnable == null;</span>
+<span class="nc" id="L1251">        onLinearizabilityViolation = runnable;</span>
+<span class="nc" id="L1252">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

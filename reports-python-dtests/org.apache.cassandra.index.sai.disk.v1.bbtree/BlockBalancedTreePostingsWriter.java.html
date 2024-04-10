@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BlockBalancedTreePostingsWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1.bbtree</a> &gt; <span class="el_source">BlockBalancedTreePostingsWriter.java</span></div><h1>BlockBalancedTreePostingsWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai.disk.v1.bbtree;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Multimap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.agrona.collections.IntArrayList;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
+import org.apache.cassandra.index.sai.disk.v1.postings.MergePostingList;
+import org.apache.cassandra.index.sai.disk.v1.postings.PackedLongsPostingList;
+import org.apache.cassandra.index.sai.disk.v1.postings.PostingsWriter;
+import org.apache.cassandra.index.sai.postings.PeekablePostingList;
+import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.packed.PackedLongValues;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
+
+/**
+ * Writes leaf postings and auxiliary posting lists for bbtree nodes. If a node has a posting list attached,
+ * it will contain every row id from all leaves reachable from that node.
+ * &lt;p&gt;
+ * Writer is stateful, because it needs to collect data from the balanced tree data structure first to find set of eligible
+ * nodes and leaf nodes reachable from them.
+ * &lt;p&gt;
+ * The leaf blocks are written in value order (in the order we pass them to the {@link BlockBalancedTreeWriter}).
+ * This allows us to skip reading the leaves, instead just order leaf blocks by their offset in the index file,
+ * and correlate them with buffered posting lists.
+ */
+@NotThreadSafe
+public class BlockBalancedTreePostingsWriter implements BlockBalancedTreeWalker.TraversalCallback
+{
+<span class="nc" id="L72">    private static final Logger logger = LoggerFactory.getLogger(BlockBalancedTreePostingsWriter.class);</span>
+
+<span class="nc" id="L74">    private final TreeMap&lt;Long, Integer&gt; leafOffsetToNodeID = new TreeMap&lt;&gt;(Long::compareTo);</span>
+<span class="nc" id="L75">    private final Multimap&lt;Integer, Integer&gt; nodeToChildLeaves = HashMultimap.create();</span>
+
+    /**
+     * Minimum number of reachable leaves for a given node to be eligible for an auxiliary posting list.
+     */
+    private final int minimumPostingsLeaves;
+    /**
+     * Skip, or the sampling interval, for selecting a balanced tree level that is eligible for an auxiliary posting list.
+     * Sampling starts from 0, but the balanced tree root node is at level 1. For skip = 4, eligible levels are 4, 8, 12, etc. (no
+     * level 0, because there is no node at level 0).
+     */
+    private final int postingsSkip;
+
+<span class="nc" id="L88">    int numNonLeafPostings = 0;</span>
+<span class="nc" id="L89">    int numLeafPostings = 0;</span>
+
+    public BlockBalancedTreePostingsWriter()
+<span class="nc" id="L92">    {</span>
+<span class="nc" id="L93">        minimumPostingsLeaves = CassandraRelevantProperties.SAI_MINIMUM_POSTINGS_LEAVES.getInt();</span>
+<span class="nc" id="L94">        postingsSkip = CassandraRelevantProperties.SAI_POSTINGS_SKIP.getInt();</span>
+<span class="nc" id="L95">    }</span>
+
+    /**
+     * Called when a leaf node is hit as we traverse the packed index.
+     *
+     * @param leafNodeID the current leaf node ID in the packed inded
+     * @param leafBlockFP the file pointer to the on-disk leaf block
+     * @param pathToRoot the path to the root leaf above this leaf. Contains all the intermediate leaf node IDs.
+     */
+    @Override
+    public void onLeaf(int leafNodeID, long leafBlockFP, IntArrayList pathToRoot)
+    {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        checkArgument(!pathToRoot.containsInt(leafNodeID));</span>
+<span class="nc bnc" id="L108" title="All 4 branches missed.">        checkArgument(pathToRoot.isEmpty() || leafNodeID &gt; pathToRoot.get(pathToRoot.size() - 1));</span>
+
+<span class="nc" id="L110">        leafOffsetToNodeID.put(leafBlockFP, leafNodeID);</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        for (int i = 0; i &lt; pathToRoot.size(); i++)</span>
+        {
+<span class="nc" id="L113">            int level = i + 1;</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            if (isLevelEligibleForPostingList(level))</span>
+            {
+<span class="nc" id="L116">                int nodeID = pathToRoot.get(i);</span>
+<span class="nc" id="L117">                nodeToChildLeaves.put(nodeID, leafNodeID);</span>
+            }
+        }
+<span class="nc" id="L120">    }</span>
+
+    /**
+     * Writes merged posting lists for eligible internal nodes and leaf postings for each leaf in the tree.
+     * The merged postings list for an internal node contains all postings from the postings lists of leaf nodes
+     * in the subtree rooted at that node.
+     * &lt;p&gt;
+     * After writing out the postings, it writes a map of node ID -&gt; postings file pointer for all
+     * nodes with an attached postings list. It then returns the file pointer to this map.
+     */
+    public long finish(IndexOutputWriter out, List&lt;PackedLongValues&gt; leafPostings, IndexContext indexContext) throws IOException
+    {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        checkState(leafPostings.size() == leafOffsetToNodeID.size(),</span>
+                   &quot;Expected equal number of postings lists (%s) and leaf offsets (%s).&quot;,
+<span class="nc" id="L134">                   leafPostings.size(), leafOffsetToNodeID.size());</span>
+
+<span class="nc" id="L136">        try (PostingsWriter postingsWriter = new PostingsWriter(out))</span>
+        {
+<span class="nc" id="L138">            Iterator&lt;PackedLongValues&gt; postingsIterator = leafPostings.iterator();</span>
+<span class="nc" id="L139">            Map&lt;Integer, PackedLongValues&gt; leafToPostings = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L140">            leafOffsetToNodeID.forEach((fp, nodeID) -&gt; leafToPostings.put(nodeID, postingsIterator.next()));</span>
+
+<span class="nc" id="L142">            long postingsRamBytesUsed = leafPostings.stream()</span>
+<span class="nc" id="L143">                                                .mapToLong(PackedLongValues::ramBytesUsed)</span>
+<span class="nc" id="L144">                                                .sum();</span>
+
+<span class="nc" id="L146">            List&lt;Integer&gt; internalNodeIDs = nodeToChildLeaves.keySet()</span>
+<span class="nc" id="L147">                                                             .stream()</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                                                             .filter(i -&gt; nodeToChildLeaves.get(i).size() &gt;= minimumPostingsLeaves)</span>
+<span class="nc" id="L149">                                                             .collect(Collectors.toList());</span>
+
+<span class="nc" id="L151">            Collection&lt;Integer&gt; leafNodeIDs = leafOffsetToNodeID.values();</span>
+
+<span class="nc" id="L153">            logger.debug(indexContext.logMessage(&quot;Writing posting lists for {} internal and {} leaf balanced tree nodes. Leaf postings memory usage: {}.&quot;),</span>
+<span class="nc" id="L154">                         internalNodeIDs.size(), leafNodeIDs.size(), FBUtilities.prettyPrintMemory(postingsRamBytesUsed));</span>
+
+<span class="nc" id="L156">            long startFP = out.getFilePointer();</span>
+<span class="nc" id="L157">            Stopwatch flushTime = Stopwatch.createStarted();</span>
+<span class="nc" id="L158">            TreeMap&lt;Integer, Long&gt; nodeIDToPostingsFilePointer = new TreeMap&lt;&gt;();</span>
+<span class="nc" id="L159">            PriorityQueue&lt;PeekablePostingList&gt; postingLists = new PriorityQueue&lt;&gt;(minimumPostingsLeaves, Comparator.comparingLong(PeekablePostingList::peek));</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            for (int nodeID : Iterables.concat(internalNodeIDs, leafNodeIDs))</span>
+            {
+<span class="nc" id="L162">                Collection&lt;Integer&gt; leaves = nodeToChildLeaves.get(nodeID);</span>
+
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                if (leaves.isEmpty())</span>
+                {
+<span class="nc" id="L166">                    leaves = Collections.singletonList(nodeID);</span>
+<span class="nc" id="L167">                    numLeafPostings++;</span>
+                }
+                else
+                {
+<span class="nc" id="L171">                    numNonLeafPostings++;</span>
+                }
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                for (Integer leaf : leaves)</span>
+<span class="nc" id="L175">                    postingLists.add(PeekablePostingList.makePeekable(new PackedLongsPostingList(leafToPostings.get(leaf))));</span>
+
+<span class="nc" id="L177">                try (PostingList mergedPostingList = MergePostingList.merge(postingLists))</span>
+                {
+<span class="nc" id="L179">                    long postingFilePosition = postingsWriter.write(mergedPostingList);</span>
+                    // During compaction, we could end up with an empty postings due to deletions.
+                    // The writer will return a fp of -1 if no postings were written.
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                    if (postingFilePosition &gt;= 0)</span>
+<span class="nc" id="L183">                        nodeIDToPostingsFilePointer.put(nodeID, postingFilePosition);</span>
+                }
+<span class="nc" id="L185">                postingLists.clear();</span>
+<span class="nc" id="L186">            }</span>
+<span class="nc" id="L187">            flushTime.stop();</span>
+<span class="nc" id="L188">            logger.debug(indexContext.logMessage(&quot;Flushed {} of posting lists for balanced tree nodes in {} ms.&quot;),</span>
+<span class="nc" id="L189">                         FBUtilities.prettyPrintMemory(out.getFilePointer() - startFP),</span>
+<span class="nc" id="L190">                         flushTime.elapsed(TimeUnit.MILLISECONDS));</span>
+
+<span class="nc" id="L192">            long indexFilePointer = out.getFilePointer();</span>
+<span class="nc" id="L193">            writeMap(nodeIDToPostingsFilePointer, out);</span>
+<span class="nc" id="L194">            postingsWriter.complete();</span>
+<span class="nc" id="L195">            return indexFilePointer;</span>
+        }
+    }
+
+    private boolean isLevelEligibleForPostingList(int level)
+    {
+<span class="nc bnc" id="L201" title="All 4 branches missed.">        return level &gt; 1 &amp;&amp; level % postingsSkip == 0;</span>
+    }
+
+    private void writeMap(Map&lt;Integer, Long&gt; map, IndexOutput out) throws IOException
+    {
+<span class="nc" id="L206">        out.writeVInt(map.size());</span>
+
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        for (Map.Entry&lt;Integer, Long&gt; e : map.entrySet())</span>
+        {
+<span class="nc" id="L210">            out.writeVInt(e.getKey());</span>
+<span class="nc" id="L211">            out.writeVLong(e.getValue());</span>
+<span class="nc" id="L212">        }</span>
+<span class="nc" id="L213">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

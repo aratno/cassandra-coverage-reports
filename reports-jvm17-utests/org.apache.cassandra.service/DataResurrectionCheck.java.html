@@ -1,0 +1,309 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DataResurrectionCheck.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">DataResurrectionCheck.java</span></div><h1>DataResurrectionCheck.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service;
+
+import java.io.IOException;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.StartupChecksOptions;
+import org.apache.cassandra.exceptions.StartupException;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.Pair;
+
+import static java.lang.String.format;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toSet;
+import static org.apache.cassandra.exceptions.StartupException.ERR_WRONG_DISK_STATE;
+import static org.apache.cassandra.exceptions.StartupException.ERR_WRONG_MACHINE_STATE;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+<span class="fc" id="L60">public class DataResurrectionCheck implements StartupCheck</span>
+{
+<span class="fc" id="L62">    private static final Logger LOGGER = LoggerFactory.getLogger(DataResurrectionCheck.class);</span>
+
+    public static final String HEARTBEAT_FILE_CONFIG_PROPERTY = &quot;heartbeat_file&quot;;
+    public static final String EXCLUDED_KEYSPACES_CONFIG_PROPERTY = &quot;excluded_keyspaces&quot;;
+    public static final String EXCLUDED_TABLES_CONFIG_PROPERTY = &quot;excluded_tables&quot;;
+
+    public static final String DEFAULT_HEARTBEAT_FILE = &quot;cassandra-heartbeat&quot;;
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class Heartbeat
+    {
+        @JsonProperty(&quot;last_heartbeat&quot;)
+        public final Instant lastHeartbeat;
+
+        /** needed for jackson serialization */
+        @SuppressWarnings(&quot;unused&quot;)
+<span class="fc" id="L78">        private Heartbeat() {</span>
+<span class="fc" id="L79">            this.lastHeartbeat = null;</span>
+<span class="fc" id="L80">        }</span>
+
+        public Heartbeat(Instant lastHeartbeat)
+<span class="fc" id="L83">        {</span>
+<span class="fc" id="L84">            this.lastHeartbeat = lastHeartbeat;</span>
+<span class="fc" id="L85">        }</span>
+
+        public void serializeToJsonFile(File outputFile) throws IOException
+        {
+<span class="fc" id="L89">            JsonUtils.serializeToJsonFile(this, outputFile);</span>
+<span class="fc" id="L90">        }</span>
+
+        public static Heartbeat deserializeFromJsonFile(File file) throws IOException
+        {
+<span class="fc" id="L94">            return JsonUtils.deserializeFromJsonFile(Heartbeat.class, file);</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L101" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L102">            Heartbeat manifest = (Heartbeat) o;</span>
+<span class="nc" id="L103">            return Objects.equals(lastHeartbeat, manifest.lastHeartbeat);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L109">            return Objects.hash(lastHeartbeat);</span>
+        }
+    }
+
+    @VisibleForTesting
+    static class TableGCPeriod
+    {
+        String table;
+        int gcPeriod;
+
+        TableGCPeriod(String table, int gcPeriod)
+<span class="fc" id="L120">        {</span>
+<span class="fc" id="L121">            this.table = table;</span>
+<span class="fc" id="L122">            this.gcPeriod = gcPeriod;</span>
+<span class="fc" id="L123">        }</span>
+    }
+
+    static File getHeartbeatFile(Map&lt;String, Object&gt; config)
+    {
+<span class="fc" id="L128">        String heartbeatFileConfigValue = (String) config.get(HEARTBEAT_FILE_CONFIG_PROPERTY);</span>
+        File heartbeatFile;
+
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (heartbeatFileConfigValue != null)</span>
+        {
+<span class="fc" id="L133">            heartbeatFile = new File(heartbeatFileConfigValue);</span>
+        }
+        else
+        {
+<span class="nc" id="L137">            String[] dataFileLocations = DatabaseDescriptor.getLocalSystemKeyspacesDataFileLocations();</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            assert dataFileLocations.length != 0;</span>
+<span class="nc" id="L139">            heartbeatFile = new File(dataFileLocations[0], DEFAULT_HEARTBEAT_FILE);</span>
+        }
+
+<span class="fc" id="L142">        LOGGER.trace(&quot;Resolved heartbeat file for data resurrection check: &quot; + heartbeatFile);</span>
+
+<span class="fc" id="L144">        return heartbeatFile;</span>
+    }
+
+    @Override
+    public StartupChecks.StartupCheckType getStartupCheckType()
+    {
+<span class="fc" id="L150">        return StartupChecks.StartupCheckType.check_data_resurrection;</span>
+    }
+
+    @Override
+    public void execute(StartupChecksOptions options) throws StartupException
+    {
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        if (options.isDisabled(getStartupCheckType()))</span>
+<span class="fc" id="L157">            return;</span>
+
+<span class="fc" id="L159">        Map&lt;String, Object&gt; config = options.getConfig(StartupChecks.StartupCheckType.check_data_resurrection);</span>
+<span class="fc" id="L160">        File heartbeatFile = getHeartbeatFile(config);</span>
+
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        if (!heartbeatFile.exists())</span>
+        {
+<span class="nc" id="L164">            LOGGER.debug(&quot;Heartbeat file {} not found! Skipping heartbeat startup check.&quot;, heartbeatFile.absolutePath());</span>
+<span class="nc" id="L165">            return;</span>
+        }
+
+        Heartbeat heartbeat;
+
+        try
+        {
+<span class="fc" id="L172">            heartbeat = Heartbeat.deserializeFromJsonFile(heartbeatFile);</span>
+        }
+<span class="nc" id="L174">        catch (IOException ex)</span>
+        {
+<span class="nc" id="L176">            throw new StartupException(ERR_WRONG_DISK_STATE, &quot;Failed to deserialize heartbeat file &quot; + heartbeatFile);</span>
+<span class="fc" id="L177">        }</span>
+
+<span class="pc bpc" id="L179" title="1 of 2 branches missed.">        if (heartbeat.lastHeartbeat == null)</span>
+<span class="nc" id="L180">            return;</span>
+
+<span class="fc" id="L182">        long heartbeatMillis = heartbeat.lastHeartbeat.toEpochMilli();</span>
+
+<span class="fc" id="L184">        List&lt;Pair&lt;String, String&gt;&gt; violations = new ArrayList&lt;&gt;();</span>
+
+<span class="fc" id="L186">        Set&lt;String&gt; excludedKeyspaces = getExcludedKeyspaces(config);</span>
+<span class="fc" id="L187">        Set&lt;Pair&lt;String, String&gt;&gt; excludedTables = getExcludedTables(config);</span>
+
+<span class="fc" id="L189">        long currentTimeMillis = currentTimeMillis();</span>
+
+<span class="fc bfc" id="L191" title="All 2 branches covered.">        for (String keyspace : getKeyspaces())</span>
+        {
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">            if (excludedKeyspaces.contains(keyspace))</span>
+<span class="nc" id="L194">                continue;</span>
+
+<span class="fc bfc" id="L196" title="All 2 branches covered.">            for (TableGCPeriod userTable : getTablesGcPeriods(keyspace))</span>
+            {
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">                if (excludedTables.contains(Pair.create(keyspace, userTable.table)))</span>
+<span class="nc" id="L199">                    continue;</span>
+
+<span class="fc" id="L201">                long gcGraceMillis = ((long) userTable.gcPeriod) * 1000;</span>
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">                if (heartbeatMillis + gcGraceMillis &lt; currentTimeMillis)</span>
+<span class="fc" id="L203">                    violations.add(Pair.create(keyspace, userTable.table));</span>
+<span class="fc" id="L204">            }</span>
+<span class="fc" id="L205">        }</span>
+
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">        if (!violations.isEmpty())</span>
+        {
+<span class="fc" id="L209">            String invalidTables = violations.stream()</span>
+<span class="fc" id="L210">                                             .map(p -&gt; format(&quot;%s.%s&quot;, p.left, p.right))</span>
+<span class="fc" id="L211">                                             .collect(joining(&quot;,&quot;));</span>
+
+<span class="fc" id="L213">            String exceptionMessage = format(&quot;There are tables for which gc_grace_seconds is older &quot; +</span>
+                                             &quot;than the lastly known time Cassandra node was up based &quot; +
+                                             &quot;on its heartbeat %s with timestamp %s. Cassandra node will not start &quot; +
+                                             &quot;as it would likely introduce data consistency &quot; +
+                                             &quot;issues (zombies etc). Please resolve these issues manually, &quot; +
+                                             &quot;then remove the heartbeat and start the node again. Invalid tables: %s&quot;,
+                                             heartbeatFile, heartbeat.lastHeartbeat, invalidTables);
+
+<span class="fc" id="L221">            throw new StartupException(ERR_WRONG_MACHINE_STATE, exceptionMessage);</span>
+        }
+<span class="nc" id="L223">    }</span>
+
+    @Override
+    public void postAction(StartupChecksOptions options)
+    {
+        // Schedule heartbeating after all checks have passed, not as part of the check,
+        // as it might happen that other checks after it might fail, but we would be heartbeating already.
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">        if (options.isEnabled(StartupChecks.StartupCheckType.check_data_resurrection))</span>
+        {
+<span class="nc" id="L232">            Map&lt;String, Object&gt; config = options.getConfig(StartupChecks.StartupCheckType.check_data_resurrection);</span>
+<span class="nc" id="L233">            File heartbeatFile = DataResurrectionCheck.getHeartbeatFile(config);</span>
+
+<span class="nc" id="L235">            ScheduledExecutors.scheduledTasks.scheduleAtFixedRate(() -&gt;</span>
+            {
+<span class="nc" id="L237">                Heartbeat heartbeat = new Heartbeat(Instant.ofEpochMilli(Clock.Global.currentTimeMillis()));</span>
+                try
+                {
+<span class="nc" id="L240">                    heartbeatFile.parent().createDirectoriesIfNotExists();</span>
+<span class="nc" id="L241">                    DataResurrectionCheck.LOGGER.trace(&quot;writing heartbeat to file &quot; + heartbeatFile);</span>
+<span class="nc" id="L242">                    heartbeat.serializeToJsonFile(heartbeatFile);</span>
+                }
+<span class="nc" id="L244">                catch (IOException ex)</span>
+                {
+<span class="nc" id="L246">                    DataResurrectionCheck.LOGGER.error(&quot;Unable to serialize heartbeat to &quot; + heartbeatFile, ex);</span>
+<span class="nc" id="L247">                }</span>
+<span class="nc" id="L248">            }, 0, CassandraRelevantProperties.CHECK_DATA_RESURRECTION_HEARTBEAT_PERIOD.getInt(), MILLISECONDS);</span>
+        }
+<span class="fc" id="L250">    }</span>
+
+    @VisibleForTesting
+    public Set&lt;String&gt; getExcludedKeyspaces(Map&lt;String, Object&gt; config)
+    {
+<span class="fc" id="L255">        String excludedKeyspacesConfigValue = (String) config.get(EXCLUDED_KEYSPACES_CONFIG_PROPERTY);</span>
+
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        if (excludedKeyspacesConfigValue == null)</span>
+<span class="fc" id="L258">            return Collections.emptySet();</span>
+        else
+<span class="fc" id="L260">            return Arrays.stream(excludedKeyspacesConfigValue.trim().split(&quot;,&quot;))</span>
+<span class="fc" id="L261">                         .map(String::trim)</span>
+<span class="fc" id="L262">                         .collect(toSet());</span>
+    }
+
+    @VisibleForTesting
+    public Set&lt;Pair&lt;String, String&gt;&gt; getExcludedTables(Map&lt;String, Object&gt; config)
+    {
+<span class="fc" id="L268">        String excludedKeyspacesConfigValue = (String) config.get(EXCLUDED_TABLES_CONFIG_PROPERTY);</span>
+
+<span class="fc bfc" id="L270" title="All 2 branches covered.">        if (excludedKeyspacesConfigValue == null)</span>
+<span class="fc" id="L271">            return Collections.emptySet();</span>
+
+<span class="fc" id="L273">        Set&lt;Pair&lt;String, String&gt;&gt; pairs = new HashSet&lt;&gt;();</span>
+
+<span class="fc bfc" id="L275" title="All 2 branches covered.">        for (String keyspaceTable : excludedKeyspacesConfigValue.trim().split(&quot;,&quot;))</span>
+        {
+<span class="fc" id="L277">            String[] pair = keyspaceTable.trim().split(&quot;\\.&quot;);</span>
+<span class="pc bpc" id="L278" title="1 of 2 branches missed.">            if (pair.length != 2)</span>
+<span class="nc" id="L279">                continue;</span>
+
+<span class="fc" id="L281">            pairs.add(Pair.create(pair[0].trim(), pair[1].trim()));</span>
+        }
+
+<span class="fc" id="L284">        return pairs;</span>
+    }
+
+    @VisibleForTesting
+    List&lt;String&gt; getKeyspaces()
+    {
+<span class="nc" id="L290">        return SchemaKeyspace.fetchNonSystemKeyspaces()</span>
+<span class="nc" id="L291">                             .stream()</span>
+<span class="nc" id="L292">                             .map(keyspaceMetadata -&gt; keyspaceMetadata.name)</span>
+<span class="nc" id="L293">                             .collect(toList());</span>
+    }
+
+    @VisibleForTesting
+    List&lt;TableGCPeriod&gt; getTablesGcPeriods(String userKeyspace)
+    {
+<span class="nc" id="L299">        Optional&lt;KeyspaceMetadata&gt; keyspaceMetadata = SchemaKeyspace.fetchNonSystemKeyspaces().get(userKeyspace);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (!keyspaceMetadata.isPresent())</span>
+<span class="nc" id="L301">            return Collections.emptyList();</span>
+
+<span class="nc" id="L303">        KeyspaceMetadata ksmd = keyspaceMetadata.get();</span>
+<span class="nc" id="L304">        return ksmd.tables.stream()</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                          .filter(tmd -&gt; tmd.params.gcGraceSeconds &gt; 0)</span>
+<span class="nc" id="L306">                          .map(tmd -&gt; new TableGCPeriod(tmd.name, tmd.params.gcGraceSeconds)).collect(toList());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

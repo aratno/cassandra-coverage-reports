@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeCommands.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads.range</a> &gt; <span class="el_source">RangeCommands.java</span></div><h1>RangeCommands.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.reads.range;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DataRange;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.locator.ReplicaPlans;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+
+<span class="nc" id="L40">public class RangeCommands</span>
+{
+<span class="fc" id="L42">    private static final Logger logger = LoggerFactory.getLogger(RangeCommandIterator.class);</span>
+
+    private static final double CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
+
+    /**
+     * Introduce a maximum number of sub-ranges that the coordinator can request in parallel for range queries. Previously
+     * we would request up to the maximum number of ranges but this causes problems if the number of vnodes is large.
+     * By default we pick 10 requests per core, assuming all replicas have the same number of cores. The idea is that we
+     * don't want a burst of range requests that will back up, hurting all other queries. At the same time,
+     * we want to give range queries a chance to run if resources are available.
+     */
+<span class="fc" id="L53">    private static final int MAX_CONCURRENT_RANGE_REQUESTS = Math.max(1, CassandraRelevantProperties.MAX_CONCURRENT_RANGE_REQUESTS.getInt(FBUtilities.getAvailableProcessors() * 10));</span>
+
+    @SuppressWarnings(&quot;resource&quot;) // created iterators will be closed in CQL layer through the chain of transformations
+    public static PartitionIterator partitions(PartitionRangeReadCommand command,
+                                               ConsistencyLevel consistencyLevel,
+                                               long queryStartNanoTime)
+    {
+        // Note that in general, a RangeCommandIterator will honor the command limit for each range, but will not enforce it globally.
+<span class="fc" id="L61">        RangeCommandIterator rangeCommands = rangeCommandIterator(command, consistencyLevel, queryStartNanoTime);</span>
+<span class="fc" id="L62">        return command.limits().filter(command.postReconciliationProcessing(rangeCommands),</span>
+<span class="fc" id="L63">                                       command.nowInSec(),</span>
+<span class="fc" id="L64">                                       command.selectsFullPartition(),</span>
+<span class="fc" id="L65">                                       command.metadata().enforceStrictLiveness());</span>
+    }
+
+    @VisibleForTesting
+    @SuppressWarnings(&quot;resource&quot;) // created iterators will be closed in CQL layer through the chain of transformations
+    static RangeCommandIterator rangeCommandIterator(PartitionRangeReadCommand command,
+                                                     ConsistencyLevel consistencyLevel,
+                                                     long queryStartNanoTime)
+    {
+<span class="fc" id="L74">        Tracing.trace(&quot;Computing ranges to query&quot;);</span>
+
+<span class="fc" id="L76">        Keyspace keyspace = Keyspace.open(command.metadata().keyspace);</span>
+<span class="fc" id="L77">        ReplicaPlanIterator replicaPlans = new ReplicaPlanIterator(command.dataRange().keyRange(),</span>
+<span class="fc" id="L78">                                                                   command.indexQueryPlan(),</span>
+                                                                   keyspace,
+                                                                   consistencyLevel);
+
+<span class="fc" id="L82">        int maxConcurrencyFactor = Math.min(replicaPlans.size(), MAX_CONCURRENT_RANGE_REQUESTS);</span>
+<span class="fc" id="L83">        int concurrencyFactor = maxConcurrencyFactor;</span>
+<span class="fc" id="L84">        Index.QueryPlan queryPlan = command.indexQueryPlan();</span>
+<span class="pc bpc" id="L85" title="3 of 4 branches missed.">        if (queryPlan == null || queryPlan.shouldEstimateInitialConcurrency())</span>
+        {
+            // our estimate of how many result rows there will be per-range
+<span class="fc" id="L88">            float resultsPerRange = estimateResultsPerRange(command, keyspace);</span>
+            // underestimate how many rows we will get per-range in order to increase the likelihood that we'll
+            // fetch enough rows in the first round
+<span class="fc" id="L91">            resultsPerRange -= resultsPerRange * CONCURRENT_SUBREQUESTS_MARGIN;</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">            concurrencyFactor = resultsPerRange == 0.0</span>
+<span class="fc" id="L93">                                ? 1</span>
+<span class="fc" id="L94">                                : Math.max(1, Math.min(maxConcurrencyFactor, (int) Math.ceil(command.limits().count() / resultsPerRange)));</span>
+<span class="fc" id="L95">            logger.trace(&quot;Estimated result rows per range: {}; requested rows: {}, ranges.size(): {}; concurrent range requests: {}&quot;,</span>
+<span class="fc" id="L96">                         resultsPerRange, command.limits().count(), replicaPlans.size(), concurrencyFactor);</span>
+<span class="fc" id="L97">            Tracing.trace(&quot;Submitting range requests on {} ranges with a concurrency of {} ({} rows per range expected)&quot;,</span>
+<span class="fc" id="L98">                          replicaPlans.size(), concurrencyFactor, resultsPerRange);</span>
+<span class="fc" id="L99">        }</span>
+        else
+        {
+<span class="nc" id="L102">            logger.trace(&quot;Max concurrent range requests: {}; requested rows: {}, ranges.size(): {}; concurrent range requests: {}&quot;,</span>
+<span class="nc" id="L103">                         MAX_CONCURRENT_RANGE_REQUESTS, command.limits().count(), replicaPlans.size(), concurrencyFactor);</span>
+<span class="nc" id="L104">            Tracing.trace(&quot;Submitting range requests on {} ranges with a concurrency of {}&quot;, replicaPlans.size(), concurrencyFactor);</span>
+        }
+
+<span class="fc" id="L107">        ReplicaPlanMerger mergedReplicaPlans = new ReplicaPlanMerger(replicaPlans, keyspace, consistencyLevel);</span>
+<span class="fc" id="L108">        return new RangeCommandIterator(mergedReplicaPlans,</span>
+                                        command,
+                                        concurrencyFactor,
+                                        maxConcurrencyFactor,
+<span class="fc" id="L112">                                        replicaPlans.size(),</span>
+                                        queryStartNanoTime);
+    }
+
+    /**
+     * Estimate the number of result rows per range in the ring based on our local data.
+     * &lt;p&gt;
+     * This assumes that ranges are uniformly distributed across the cluster and
+     * that the queried data is also uniformly distributed.
+     */
+    @VisibleForTesting
+    static float estimateResultsPerRange(PartitionRangeReadCommand command, Keyspace keyspace)
+    {
+<span class="fc" id="L125">        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().id);</span>
+<span class="fc" id="L126">        Index.QueryPlan index = command.indexQueryPlan();</span>
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">        float maxExpectedResults = index == null</span>
+<span class="fc" id="L128">                                   ? command.limits().estimateTotalResults(cfs)</span>
+<span class="pc" id="L129">                                   : index.getEstimatedResultRows();</span>
+
+        // adjust maxExpectedResults by the number of tokens this node has and the replication factor for this ks
+<span class="fc" id="L132">        return (maxExpectedResults / DatabaseDescriptor.getNumTokens())</span>
+<span class="fc" id="L133">               / keyspace.getReplicationStrategy().getReplicationFactor().allReplicas;</span>
+    }
+
+    /**
+     * Added specifically to check for sufficient nodes live to serve partition denylist queries
+     */
+    public static boolean sufficientLiveNodesForSelectStar(TableMetadata metadata, ConsistencyLevel consistency)
+    {
+        try
+        {
+<span class="nc" id="L143">            Keyspace keyspace = Keyspace.open(metadata.keyspace);</span>
+<span class="nc" id="L144">            ReplicaPlanIterator rangeIterator = new ReplicaPlanIterator(DataRange.allData(metadata.partitioner).keyRange(),</span>
+                                                                        null,
+                                                                        keyspace,
+                                                                        consistency);
+
+            // Called for the side effect of running assureSufficientLiveReplicasForRead.
+            // Deliberately called with an invalid vnode count in case it is used elsewhere in the future..
+<span class="nc" id="L151">            rangeIterator.forEachRemaining(r -&gt;  ReplicaPlans.forRangeRead(keyspace, null, consistency, r.range(), -1));</span>
+<span class="nc" id="L152">            return true;</span>
+        }
+<span class="nc" id="L154">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L156">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

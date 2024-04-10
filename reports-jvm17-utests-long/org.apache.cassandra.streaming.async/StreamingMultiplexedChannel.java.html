@@ -1,0 +1,531 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamingMultiplexedChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming.async</a> &gt; <span class="el_source">StreamingMultiplexedChannel.java</span></div><h1>StreamingMultiplexedChannel.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.streaming.async;
+
+import java.io.IOError;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.ClosedByInterruptException;
+import java.util.Collection;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.util.concurrent.Future; // checkstyle: permit this import
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.streaming.StreamDeserializingTask;
+import org.apache.cassandra.streaming.StreamingChannel;
+import org.apache.cassandra.streaming.StreamingDataOutputPlus;
+import org.apache.cassandra.streaming.StreamSession;
+import org.apache.cassandra.streaming.messages.IncomingStreamMessage;
+import org.apache.cassandra.streaming.messages.KeepAliveMessage;
+import org.apache.cassandra.streaming.messages.OutgoingStreamMessage;
+import org.apache.cassandra.streaming.messages.StreamMessage;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.concurrent.Semaphore;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static com.google.common.base.Throwables.getRootCause;
+
+import static java.lang.String.format;
+import static java.lang.Thread.currentThread;
+import static java.util.concurrent.TimeUnit.*;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.config.CassandraRelevantProperties.STREAMING_SESSION_PARALLELTRANSFERS;
+import static org.apache.cassandra.net.MessagingService.VERSION_40;
+import static org.apache.cassandra.streaming.StreamSession.createLogTag;
+import static org.apache.cassandra.streaming.messages.StreamMessage.serialize;
+import static org.apache.cassandra.streaming.messages.StreamMessage.serializedSize;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.FBUtilities.getAvailableProcessors;
+import static org.apache.cassandra.utils.JVMStabilityInspector.inspectThrowable;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
+import static org.apache.cassandra.utils.concurrent.Semaphore.newFairSemaphore;
+
+/**
+ * Responsible for sending {@link StreamMessage}s to a given peer. We manage an array of netty {@link Channel}s
+ * for sending {@link OutgoingStreamMessage} instances; all other {@link StreamMessage} types are sent via
+ * a special control channel. The reason for this is to treat those messages carefully and not let them get stuck
+ * behind a stream transfer.
+ *
+ * One of the challenges when sending streams is we might need to delay shipping the stream if:
+ *
+ * - we've exceeded our network I/O use due to rate limiting (at the cassandra level)
+ * - the receiver isn't keeping up, which causes the local TCP socket buffer to not empty, which causes epoll writes to not
+ * move any bytes to the socket, which causes buffers to stick around in user-land (a/k/a cassandra) memory.
+ *
+ * When those conditions occur, it's easy enough to reschedule processing the stream once the resources pick up
+ * (we acquire the permits from the rate limiter, or the socket drains). However, we need to ensure that
+ * no other messages are submitted to the same channel while the current stream is still being processed.
+ */
+public class StreamingMultiplexedChannel
+{
+<span class="fc" id="L92">    private static final Logger logger = LoggerFactory.getLogger(StreamingMultiplexedChannel.class);</span>
+
+<span class="fc" id="L94">    private static final int DEFAULT_MAX_PARALLEL_TRANSFERS = getAvailableProcessors();</span>
+<span class="fc" id="L95">    private static final int MAX_PARALLEL_TRANSFERS = STREAMING_SESSION_PARALLELTRANSFERS.getInt(DEFAULT_MAX_PARALLEL_TRANSFERS);</span>
+
+    // a simple mechansim for allowing a degree of fairness across multiple sessions
+<span class="fc" id="L98">    private static final Semaphore fileTransferSemaphore = newFairSemaphore(DEFAULT_MAX_PARALLEL_TRANSFERS);</span>
+
+    private final StreamingChannel.Factory factory;
+    private final InetAddressAndPort to;
+    private final StreamSession session;
+    private final int messagingVersion;
+
+    private volatile boolean closed;
+
+    /**
+     * A special {@link Channel} for sending non-stream streaming messages, basically anything that isn't an
+     * {@link OutgoingStreamMessage} (or an {@link IncomingStreamMessage}, but a node doesn't send that, it's only received).
+     */
+    private volatile StreamingChannel controlChannel;
+
+    // note: this really doesn't need to be a LBQ, just something that's thread safe
+<span class="fc" id="L114">    private final Collection&lt;ScheduledFuture&lt;?&gt;&gt; channelKeepAlives = newBlockingQueue();</span>
+
+    private final ExecutorPlus fileTransferExecutor;
+
+    /**
+     * A mapping of each {@link #fileTransferExecutor} thread to a channel that can be written to (on that thread).
+     */
+<span class="fc" id="L121">    private final ConcurrentMap&lt;Thread, StreamingChannel&gt; threadToChannelMap = new ConcurrentHashMap&lt;&gt;();</span>
+
+    public StreamingMultiplexedChannel(StreamSession session, StreamingChannel.Factory factory, InetAddressAndPort to, @Nullable StreamingChannel controlChannel, int messagingVersion)
+<span class="fc" id="L124">    {</span>
+<span class="fc" id="L125">        this.session = session;</span>
+<span class="fc" id="L126">        this.factory = factory;</span>
+<span class="fc" id="L127">        this.to = to;</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">        assert messagingVersion &gt;= VERSION_40;</span>
+<span class="fc" id="L129">        this.messagingVersion = messagingVersion;</span>
+<span class="fc" id="L130">        this.controlChannel = controlChannel;</span>
+
+<span class="fc" id="L132">        String name = session.peer.toString().replace(':', '.');</span>
+<span class="fc" id="L133">        fileTransferExecutor = executorFactory()</span>
+<span class="fc" id="L134">                .configurePooled(&quot;NettyStreaming-Outbound-&quot; + name, MAX_PARALLEL_TRANSFERS)</span>
+<span class="fc" id="L135">                .withKeepAlive(1L, SECONDS).build();</span>
+<span class="fc" id="L136">    }</span>
+
+
+
+    public InetAddressAndPort peer()
+    {
+<span class="fc" id="L142">        return to;</span>
+    }
+
+    public InetSocketAddress connectedTo()
+    {
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        return controlChannel == null ? to : controlChannel.connectedTo();</span>
+    }
+
+    /**
+     * Used by initiator to setup control message channel connecting to follower
+     */
+    private void setupControlMessageChannel() throws IOException
+    {
+<span class="fc bfc" id="L155" title="All 2 branches covered.">        if (controlChannel == null)</span>
+        {
+            /*
+             * Inbound handlers are needed:
+             *  a) for initiator's control channel(the first outbound channel) to receive follower's message.
+             *  b) for streaming receiver (note: both initiator and follower can receive streaming files) to reveive files,
+             *     in {@link Handler#setupStreamingPipeline}
+             */
+<span class="fc" id="L163">            controlChannel = createControlChannel();</span>
+        }
+<span class="fc" id="L165">    }</span>
+
+    private StreamingChannel createControlChannel() throws IOException
+    {
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">        logger.debug(&quot;Creating stream session to {} as {}&quot;, to, session.isFollower() ? &quot;follower&quot; : &quot;initiator&quot;);</span>
+
+<span class="fc" id="L171">        StreamingChannel channel = factory.create(to, messagingVersion, StreamingChannel.Kind.CONTROL);</span>
+<span class="fc" id="L172">        executorFactory().startThread(String.format(&quot;Stream-Deserializer-%s-%s&quot;, to.toString(), channel.id()),</span>
+                                      new StreamDeserializingTask(session, channel, messagingVersion));
+
+<span class="fc" id="L175">        session.attachInbound(channel);</span>
+<span class="fc" id="L176">        session.attachOutbound(channel);</span>
+
+<span class="fc" id="L178">        scheduleKeepAliveTask(channel);</span>
+
+<span class="fc" id="L180">        logger.debug(&quot;Creating control {}&quot;, channel.description());</span>
+<span class="fc" id="L181">        return channel;</span>
+    }
+    
+    private StreamingChannel createFileChannel(InetAddressAndPort connectTo) throws IOException
+    {
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">        logger.debug(&quot;Creating stream session to {} as {}&quot;, to, session.isFollower() ? &quot;follower&quot; : &quot;initiator&quot;);</span>
+
+<span class="fc" id="L188">        StreamingChannel channel = factory.create(to, connectTo, messagingVersion, StreamingChannel.Kind.FILE);</span>
+<span class="fc" id="L189">        session.attachOutbound(channel);</span>
+
+<span class="fc" id="L191">        logger.debug(&quot;Creating file {}&quot;, channel.description());</span>
+<span class="fc" id="L192">        return channel;</span>
+    }
+
+    public Future&lt;?&gt; sendControlMessage(StreamMessage message)
+    {
+        try
+        {
+<span class="fc" id="L199">            setupControlMessageChannel();</span>
+<span class="fc" id="L200">            return sendMessage(controlChannel, message);</span>
+        }
+<span class="nc" id="L202">        catch (Exception e)</span>
+        {
+<span class="nc" id="L204">            close();</span>
+<span class="nc" id="L205">            session.onError(e);</span>
+<span class="nc" id="L206">            return ImmediateFuture.failure(e);</span>
+        }
+
+    }
+    public Future&lt;?&gt; sendMessage(StreamingChannel channel, StreamMessage message)
+    {
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">        if (closed)</span>
+<span class="nc" id="L213">            throw new RuntimeException(&quot;stream has been closed, cannot send &quot; + message);</span>
+
+<span class="fc bfc" id="L215" title="All 2 branches covered.">        if (message instanceof OutgoingStreamMessage)</span>
+        {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (session.isPreview())</span>
+<span class="nc" id="L218">                throw new RuntimeException(&quot;Cannot send stream data messages for preview streaming sessions&quot;);</span>
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="fc" id="L220">                logger.debug(&quot;{} Sending {}&quot;, createLogTag(session), message);</span>
+
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">            InetAddressAndPort connectTo = factory.supportsPreferredIp() ? SystemKeyspace.getPreferredIP(to) : to;</span>
+<span class="fc" id="L223">            return fileTransferExecutor.submit(new FileStreamTask((OutgoingStreamMessage) message, connectTo));</span>
+        }
+
+        try
+        {
+<span class="fc" id="L228">            Future&lt;?&gt; promise = channel.send(outSupplier -&gt; {</span>
+                // we anticipate that the control messages are rather small, so allocating a ByteBuf shouldn't  blow out of memory.
+<span class="fc" id="L230">                long messageSize = serializedSize(message, messagingVersion);</span>
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">                if (messageSize &gt; 1 &lt;&lt; 30)</span>
+                {
+<span class="nc" id="L233">                    throw new IllegalStateException(format(&quot;%s something is seriously wrong with the calculated stream control message's size: %d bytes, type is %s&quot;,</span>
+<span class="nc" id="L234">                                                           createLogTag(session, controlChannel.id()), messageSize, message.type));</span>
+                }
+<span class="fc" id="L236">                try (StreamingDataOutputPlus out = outSupplier.apply((int) messageSize))</span>
+                {
+<span class="fc" id="L238">                    StreamMessage.serialize(message, out, messagingVersion, session);</span>
+                }
+<span class="fc" id="L240">            });</span>
+<span class="fc" id="L241">            promise.addListener(future -&gt; onMessageComplete(future, message));</span>
+<span class="fc" id="L242">            return promise;</span>
+        }
+<span class="nc" id="L244">        catch (Exception e)</span>
+        {
+<span class="nc" id="L246">            close();</span>
+<span class="nc" id="L247">            session.onError(e);</span>
+<span class="nc" id="L248">            return ImmediateFuture.failure(e);</span>
+        }
+    }
+
+    /**
+     * Decides what to do after a {@link StreamMessage} is processed.
+     *
+     * Note: this is called from the netty event loop.
+     *
+     * @return null if the message was processed successfully; else, a {@link java.util.concurrent.Future} to indicate
+     * the status of aborting any remaining tasks in the session.
+     */
+    Future&lt;?&gt; onMessageComplete(Future&lt;?&gt; future, StreamMessage msg)
+    {
+<span class="fc" id="L262">        Throwable cause = future.cause();</span>
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        if (cause == null)</span>
+<span class="fc" id="L264">            return null;</span>
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        Channel channel = future instanceof ChannelFuture ? ((ChannelFuture)future).channel() : null;</span>
+<span class="nc" id="L267">        logger.error(&quot;{} failed to send a stream message/data to peer {}: msg = {}&quot;,</span>
+<span class="nc" id="L268">                     createLogTag(session, channel), to, msg, future.cause());</span>
+
+        // StreamSession will invoke close(), but we have to mark this sender as closed so the session doesn't try
+        // to send any failure messages
+<span class="nc" id="L272">        return session.onError(cause);</span>
+    }
+
+    class FileStreamTask implements Runnable
+    {
+        /**
+         * Time interval, in minutes, to wait between logging a message indicating that we're waiting on a semaphore
+         * permit to become available.
+         */
+        private static final int SEMAPHORE_UNAVAILABLE_LOG_INTERVAL = 3;
+
+        /**
+         * Even though we expect only an {@link OutgoingStreamMessage} at runtime, the type here is {@link StreamMessage}
+         * to facilitate simpler testing.
+         */
+        private final StreamMessage msg;
+
+        private final InetAddressAndPort connectTo;
+
+        FileStreamTask(OutgoingStreamMessage ofm, InetAddressAndPort connectTo)
+<span class="fc" id="L292">        {</span>
+<span class="fc" id="L293">            this.msg = ofm;</span>
+<span class="fc" id="L294">            this.connectTo = connectTo;</span>
+<span class="fc" id="L295">        }</span>
+
+        /**
+         * For testing purposes
+         */
+        FileStreamTask(StreamMessage msg)
+<span class="nc" id="L301">        {</span>
+<span class="nc" id="L302">            this.msg = msg;</span>
+<span class="nc" id="L303">            this.connectTo = null;</span>
+<span class="nc" id="L304">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="pc bpc" id="L309" title="1 of 2 branches missed.">            if (!acquirePermit(SEMAPHORE_UNAVAILABLE_LOG_INTERVAL))</span>
+<span class="nc" id="L310">                return;</span>
+
+<span class="fc" id="L312">            StreamingChannel channel = null;</span>
+            try
+            {
+<span class="fc" id="L315">                channel = getOrCreateFileChannel(connectTo);</span>
+
+                // close the DataOutputStreamPlus as we're done with it - but don't close the channel
+<span class="fc" id="L318">                try (StreamingDataOutputPlus out = channel.acquireOut())</span>
+                {
+<span class="fc" id="L320">                    serialize(msg, out, messagingVersion, session);</span>
+                }
+            }
+<span class="nc" id="L323">            catch (Exception e)</span>
+            {
+<span class="nc" id="L325">                session.onError(e);</span>
+            }
+<span class="nc" id="L327">            catch (Throwable t)</span>
+            {
+<span class="nc bnc" id="L329" title="All 6 branches missed.">                if (closed &amp;&amp; getRootCause(t) instanceof ClosedByInterruptException &amp;&amp; fileTransferExecutor.isShutdown())</span>
+                {
+<span class="nc" id="L331">                    logger.debug(&quot;{} Streaming channel was closed due to the executor pool being shutdown&quot;, createLogTag(session, channel));</span>
+                }
+                else
+                {
+<span class="nc" id="L335">                    inspectThrowable(t);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                    if (!session.state().isFinalState())</span>
+<span class="nc" id="L337">                        session.onError(t);</span>
+                }
+            }
+            finally
+            {
+<span class="fc" id="L342">                fileTransferSemaphore.release(1);</span>
+            }
+<span class="fc" id="L344">        }</span>
+
+        boolean acquirePermit(int logInterval)
+        {
+<span class="fc" id="L348">            long logIntervalNanos = MINUTES.toNanos(logInterval);</span>
+<span class="fc" id="L349">            long timeOfLastLogging = nanoTime();</span>
+            while (true)
+            {
+<span class="pc bpc" id="L352" title="1 of 2 branches missed.">                if (closed)</span>
+<span class="nc" id="L353">                    return false;</span>
+                try
+                {
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">                    if (fileTransferSemaphore.tryAcquire(1, 1, SECONDS))</span>
+<span class="fc" id="L357">                        return true;</span>
+
+                    // log a helpful message to operators in case they are wondering why a given session might not be making progress.
+<span class="nc" id="L360">                    long now = nanoTime();</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                    if (now - timeOfLastLogging &gt; logIntervalNanos)</span>
+                    {
+<span class="nc" id="L363">                        timeOfLastLogging = now;</span>
+<span class="nc" id="L364">                        OutgoingStreamMessage ofm = (OutgoingStreamMessage)msg;</span>
+
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                        if (logger.isInfoEnabled())</span>
+<span class="nc" id="L367">                            logger.info(&quot;{} waiting to acquire a permit to begin streaming {}. This message logs every {} minutes&quot;,</span>
+<span class="nc" id="L368">                                        createLogTag(session), ofm.getName(), logInterval);</span>
+                    }
+                }
+<span class="nc" id="L371">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L373">                    throw new UncheckedInterruptedException(e);</span>
+<span class="nc" id="L374">                }</span>
+            }
+        }
+
+        private StreamingChannel getOrCreateFileChannel(InetAddressAndPort connectTo)
+        {
+<span class="fc" id="L380">            Thread currentThread = currentThread();</span>
+            try
+            {
+<span class="fc" id="L383">                StreamingChannel channel = threadToChannelMap.get(currentThread);</span>
+<span class="pc bpc" id="L384" title="1 of 2 branches missed.">                if (channel != null)</span>
+<span class="nc" id="L385">                    return channel;</span>
+
+<span class="fc" id="L387">                channel = createFileChannel(connectTo);</span>
+<span class="fc" id="L388">                threadToChannelMap.put(currentThread, channel);</span>
+<span class="fc" id="L389">                return channel;</span>
+            }
+<span class="nc" id="L391">            catch (Exception e)</span>
+            {
+<span class="nc" id="L393">                throw new IOError(e);</span>
+            }
+        }
+
+        /**
+         * For testing purposes
+         */
+        void injectChannel(StreamingChannel channel)
+        {
+<span class="nc" id="L402">            Thread currentThread = currentThread();</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if (threadToChannelMap.get(currentThread) != null)</span>
+<span class="nc" id="L404">                throw new IllegalStateException(&quot;previous channel already set&quot;);</span>
+
+<span class="nc" id="L406">            threadToChannelMap.put(currentThread, channel);</span>
+<span class="nc" id="L407">        }</span>
+
+        /**
+         * For testing purposes
+         */
+        void unsetChannel()
+        {
+<span class="nc" id="L414">            threadToChannelMap.remove(currentThread());</span>
+<span class="nc" id="L415">        }</span>
+    }
+
+    /**
+     * Periodically sends the {@link KeepAliveMessage}.
+     * &lt;p&gt;
+     * NOTE: this task, and the callback function are executed in the netty event loop.
+     */
+    class KeepAliveTask implements Runnable
+    {
+        private final StreamingChannel channel;
+
+        /**
+         * A reference to the scheduled task for this instance so that it may be cancelled.
+         */
+        ScheduledFuture&lt;?&gt; future;
+
+        KeepAliveTask(StreamingChannel channel)
+<span class="fc" id="L433">        {</span>
+<span class="fc" id="L434">            this.channel = channel;</span>
+<span class="fc" id="L435">        }</span>
+
+        @Override
+        public void run()
+        {
+            // if the channel has been closed, cancel the scheduled task and return
+<span class="nc bnc" id="L441" title="All 4 branches missed.">            if (!channel.connected() || closed)</span>
+            {
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                if (null != future)</span>
+<span class="nc" id="L444">                    future.cancel(false);</span>
+<span class="nc" id="L445">                return;</span>
+            }
+
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L449">                logger.trace(&quot;{} Sending keep-alive to {}.&quot;, createLogTag(session, channel), session.peer);</span>
+
+<span class="nc" id="L451">            sendControlMessage(new KeepAliveMessage()).addListener(f -&gt;</span>
+            {
+<span class="nc bnc" id="L453" title="All 4 branches missed.">                if (f.isSuccess() || f.isCancelled())</span>
+<span class="nc" id="L454">                    return;</span>
+
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                if (logger.isDebugEnabled())</span>
+<span class="nc" id="L457">                    logger.debug(&quot;{} Could not send keep-alive message (perhaps stream session is finished?).&quot;,</span>
+<span class="nc" id="L458">                                 createLogTag(session, channel), f.cause());</span>
+<span class="nc" id="L459">            });</span>
+<span class="nc" id="L460">        }</span>
+    }
+
+    private void scheduleKeepAliveTask(StreamingChannel channel)
+    {
+<span class="pc bpc" id="L465" title="1 of 2 branches missed.">        if (!(channel instanceof NettyStreamingChannel))</span>
+<span class="nc" id="L466">            return;</span>
+
+<span class="fc" id="L468">        int keepAlivePeriod = DatabaseDescriptor.getStreamingKeepAlivePeriod();</span>
+<span class="pc bpc" id="L469" title="1 of 2 branches missed.">        if (keepAlivePeriod &lt;= 0)</span>
+<span class="nc" id="L470">            return;</span>
+
+<span class="pc bpc" id="L472" title="1 of 2 branches missed.">        if (logger.isDebugEnabled())</span>
+<span class="fc" id="L473">            logger.debug(&quot;{} Scheduling keep-alive task with {}s period.&quot;, createLogTag(session, channel), keepAlivePeriod);</span>
+
+<span class="fc" id="L475">        KeepAliveTask task = new KeepAliveTask(channel);</span>
+<span class="fc" id="L476">        ScheduledFuture&lt;?&gt; scheduledFuture =</span>
+            ((NettyStreamingChannel)channel).channel
+<span class="fc" id="L478">                                            .eventLoop()</span>
+<span class="fc" id="L479">                                            .scheduleAtFixedRate(task, keepAlivePeriod, keepAlivePeriod, TimeUnit.SECONDS);</span>
+<span class="fc" id="L480">        task.future = scheduledFuture;</span>
+<span class="fc" id="L481">        channelKeepAlives.add(scheduledFuture);</span>
+<span class="fc" id="L482">    }</span>
+
+    /**
+     * For testing purposes only.
+     */
+    public void setClosed()
+    {
+<span class="nc" id="L489">        closed = true;</span>
+<span class="nc" id="L490">    }</span>
+
+    void setControlChannel(NettyStreamingChannel channel)
+    {
+<span class="nc" id="L494">        controlChannel = channel;</span>
+<span class="nc" id="L495">    }</span>
+
+    int semaphoreAvailablePermits()
+    {
+<span class="nc" id="L499">        return fileTransferSemaphore.permits();</span>
+    }
+
+    public boolean connected()
+    {
+<span class="nc bnc" id="L504" title="All 6 branches missed.">        return !closed &amp;&amp; (controlChannel == null || controlChannel.connected());</span>
+    }
+
+    public void close()
+    {
+<span class="pc bpc" id="L509" title="1 of 2 branches missed.">        if (closed)</span>
+<span class="nc" id="L510">            return;</span>
+
+<span class="fc" id="L512">        closed = true;</span>
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">        if (logger.isDebugEnabled())</span>
+<span class="fc" id="L514">            logger.debug(&quot;{} Closing stream connection channels on {}&quot;, createLogTag(session), to);</span>
+<span class="fc bfc" id="L515" title="All 2 branches covered.">        for (ScheduledFuture&lt;?&gt; future : channelKeepAlives)</span>
+<span class="fc" id="L516">            future.cancel(false);</span>
+<span class="fc" id="L517">        channelKeepAlives.clear();</span>
+
+<span class="fc" id="L519">        threadToChannelMap.values().forEach(StreamingChannel::close);</span>
+<span class="fc" id="L520">        threadToChannelMap.clear();</span>
+<span class="fc" id="L521">        fileTransferExecutor.shutdownNow();</span>
+<span class="fc" id="L522">    }</span>
+
+    @VisibleForTesting // For testing only -- close the control handle for testing streaming exception handling.
+    public void unsafeCloseControlChannel()
+    {
+<span class="nc" id="L527">        logger.warn(&quot;Unsafe close of control channel&quot;);</span>
+<span class="nc" id="L528">        controlChannel.close().awaitUninterruptibly();</span>
+<span class="nc" id="L529">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

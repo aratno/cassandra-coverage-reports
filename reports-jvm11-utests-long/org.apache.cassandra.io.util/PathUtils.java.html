@@ -1,0 +1,895 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PathUtils.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">PathUtils.java</span></div><h1>PathUtils.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.util;
+
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.IOError;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileStore;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.IntFunction;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.RateLimiter;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static java.nio.file.StandardOpenOption.APPEND;
+import static java.nio.file.StandardOpenOption.CREATE;
+import static java.nio.file.StandardOpenOption.READ;
+import static java.nio.file.StandardOpenOption.TRUNCATE_EXISTING;
+import static java.nio.file.StandardOpenOption.WRITE;
+import static java.util.Collections.unmodifiableSet;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.USE_NIX_RECURSIVE_DELETE;
+import static org.apache.cassandra.utils.Throwables.merge;
+
+import net.openhft.chronicle.core.util.ThrowingFunction;
+
+/**
+ * Vernacular: tryX means return false or 0L on any failure; XIfNotY means propagate any exceptions besides those caused by Y
+ *
+ * This class tries to apply uniform IOException handling, and does not propagate IOException except for NoSuchFileException.
+ * Any harmless/application error exceptions are propagated as UncheckedIOException, and anything else as an FSReadError or FSWriteError.
+ * Semantically this is a little incoherent throughout the codebase, as we intercept IOException haphazardly and treaat
+ * it inconsistently - we should ideally migrate to using {@link #propagate(IOException, Path, boolean)} et al globally.
+ */
+public final class PathUtils
+{
+<span class="fc" id="L90">    private static final boolean consistentDirectoryListings = CassandraRelevantProperties.CONSISTENT_DIRECTORY_LISTINGS.getBoolean();</span>
+
+<span class="fc" id="L92">    private static final Set&lt;StandardOpenOption&gt; READ_OPTIONS = unmodifiableSet(EnumSet.of(READ));</span>
+<span class="fc" id="L93">    private static final Set&lt;StandardOpenOption&gt; WRITE_OPTIONS = unmodifiableSet(EnumSet.of(WRITE, CREATE, TRUNCATE_EXISTING));</span>
+<span class="fc" id="L94">    private static final Set&lt;StandardOpenOption&gt; WRITE_APPEND_OPTIONS = unmodifiableSet(EnumSet.of(WRITE, CREATE, APPEND));</span>
+<span class="fc" id="L95">    private static final Set&lt;StandardOpenOption&gt; READ_WRITE_OPTIONS = unmodifiableSet(EnumSet.of(READ, WRITE, CREATE));</span>
+<span class="fc" id="L96">    private static final FileAttribute&lt;?&gt;[] NO_ATTRIBUTES = new FileAttribute[0];</span>
+
+<span class="fc" id="L98">    private static final Logger logger = LoggerFactory.getLogger(PathUtils.class);</span>
+<span class="fc" id="L99">    private static final NoSpamLogger nospam1m = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+
+<span class="fc" id="L101">    private static Consumer&lt;Path&gt; onDeletion = path -&gt; {</span>
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        if (StorageService.instance.isDaemonSetupCompleted())</span>
+<span class="fc" id="L103">            setDeletionListener(ignore -&gt; {});</span>
+        else
+<span class="fc" id="L105">            logger.trace(&quot;Deleting file during startup: {}&quot;, path);</span>
+<span class="fc" id="L106">    };</span>
+
+    public static FileChannel newReadChannel(Path path) throws NoSuchFileException
+    {
+<span class="fc" id="L110">        return newFileChannel(path, READ_OPTIONS);</span>
+    }
+
+    public static FileChannel newReadWriteChannel(Path path) throws NoSuchFileException
+    {
+<span class="fc" id="L115">        return newFileChannel(path, READ_WRITE_OPTIONS);</span>
+    }
+
+    public static FileChannel newWriteOverwriteChannel(Path path) throws NoSuchFileException
+    {
+<span class="fc" id="L120">        return newFileChannel(path, WRITE_OPTIONS);</span>
+    }
+
+    public static FileChannel newWriteAppendChannel(Path path) throws NoSuchFileException
+    {
+<span class="fc" id="L125">        return newFileChannel(path, WRITE_APPEND_OPTIONS);</span>
+    }
+
+    private static FileChannel newFileChannel(Path path, Set&lt;StandardOpenOption&gt; options) throws NoSuchFileException
+    {
+        try
+        {
+<span class="fc" id="L132">            return FileChannel.open(path, options, PathUtils.NO_ATTRIBUTES);</span>
+        }
+<span class="nc" id="L134">        catch (IOException e)</span>
+        {
+<span class="nc" id="L136">            throw propagateUncheckedOrNoSuchFileException(e, path, options.contains(WRITE));</span>
+        }
+    }
+
+    public static void setDeletionListener(Consumer&lt;Path&gt; newOnDeletion)
+    {
+<span class="fc" id="L142">        onDeletion = newOnDeletion;</span>
+<span class="fc" id="L143">    }</span>
+
+    public static String filename(Path path)
+    {
+<span class="fc" id="L147">        return path.getFileName().toString();</span>
+    }
+
+    public static &lt;T&gt; T[] list(Path path, Function&lt;Stream&lt;Path&gt;, Stream&lt;T&gt;&gt; transform, IntFunction&lt;T[]&gt; arrayFactory)
+    {
+<span class="nc" id="L152">        try (Stream&lt;Path&gt; stream = Files.list(path))</span>
+        {
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            return transform.apply(consistentDirectoryListings ? stream.sorted() : stream)</span>
+<span class="nc" id="L155">                    .toArray(arrayFactory);</span>
+        }
+<span class="nc" id="L157">        catch (NoSuchFileException e)</span>
+        {
+<span class="nc" id="L159">            return null;</span>
+        }
+<span class="nc" id="L161">        catch (IOException e)</span>
+        {
+<span class="nc" id="L163">            throw propagateUnchecked(e, path, false);</span>
+        }
+    }
+
+    public static &lt;T extends Throwable, V&gt; V[] tryList(Path path, Function&lt;Stream&lt;Path&gt;, Stream&lt;V&gt;&gt; transform, IntFunction&lt;V[]&gt; arrayFactory, ThrowingFunction&lt;IOException, V[], T&gt; orElse) throws T
+    {
+<span class="fc" id="L169">        try (Stream&lt;Path&gt; stream = Files.list(path))</span>
+        {
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">            return transform.apply(consistentDirectoryListings ? stream.sorted() : stream)</span>
+<span class="fc" id="L172">                    .toArray(arrayFactory);</span>
+        }
+<span class="nc" id="L174">        catch (IOException e)</span>
+        {
+<span class="nc" id="L176">            return orElse.apply(e);</span>
+        }
+    }
+
+    public static void forEach(Path path, Consumer&lt;Path&gt; forEach)
+    {
+<span class="nc" id="L182">        try (Stream&lt;Path&gt; stream = Files.list(path))</span>
+        {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            (consistentDirectoryListings ? stream.sorted() : stream).forEach(forEach);</span>
+        }
+<span class="nc" id="L186">        catch (IOException e)</span>
+        {
+<span class="nc" id="L188">            throw propagateUnchecked(e, path, false);</span>
+<span class="nc" id="L189">        }</span>
+<span class="nc" id="L190">    }</span>
+
+    public static void forEachRecursive(Path path, Consumer&lt;Path&gt; forEach)
+    {
+<span class="nc" id="L194">        Consumer&lt;Path&gt; forEachRecursive = new Consumer&lt;Path&gt;()</span>
+        {
+            @Override
+            public void accept(Path child)
+            {
+                forEach.accept(child);
+                forEach(child, this);
+            }
+        };
+<span class="nc" id="L203">        forEach(path, forEachRecursive);</span>
+<span class="nc" id="L204">    }</span>
+
+    public static long tryGetLength(Path path)
+    {
+<span class="fc" id="L208">        return tryOnPath(path, Files::size);</span>
+    }
+
+    public static long tryGetLastModified(Path path)
+    {
+<span class="fc" id="L213">        return tryOnPath(path, p -&gt; Files.getLastModifiedTime(p).toMillis());</span>
+    }
+
+    public static boolean trySetLastModified(Path path, long lastModified)
+    {
+        try
+        {
+<span class="nc" id="L220">            Files.setLastModifiedTime(path, FileTime.fromMillis(lastModified));</span>
+<span class="nc" id="L221">            return true;</span>
+        }
+<span class="nc" id="L223">        catch (IOException e)</span>
+        {
+<span class="nc" id="L225">            return false;</span>
+        }
+    }
+
+    public static boolean trySetReadable(Path path, boolean readable)
+    {
+<span class="nc" id="L231">        return trySet(path, PosixFilePermission.OWNER_READ, readable);</span>
+    }
+
+    public static boolean trySetWritable(Path path, boolean writeable)
+    {
+<span class="nc" id="L236">        return trySet(path, PosixFilePermission.OWNER_WRITE, writeable);</span>
+    }
+
+    public static boolean trySetExecutable(Path path, boolean executable)
+    {
+<span class="nc" id="L241">        return trySet(path, PosixFilePermission.OWNER_EXECUTE, executable);</span>
+    }
+
+    public static boolean trySet(Path path, PosixFilePermission permission, boolean set)
+    {
+        try
+        {
+<span class="nc" id="L248">            PosixFileAttributeView view = path.getFileSystem().provider().getFileAttributeView(path, PosixFileAttributeView.class);</span>
+<span class="nc" id="L249">            PosixFileAttributes attributes = view.readAttributes();</span>
+<span class="nc" id="L250">            Set&lt;PosixFilePermission&gt; permissions = attributes.permissions();</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            if (set == permissions.contains(permission))</span>
+<span class="nc" id="L252">                return true;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            if (set) permissions.add(permission);</span>
+<span class="nc" id="L254">            else permissions.remove(permission);</span>
+<span class="nc" id="L255">            view.setPermissions(permissions);</span>
+<span class="nc" id="L256">            return true;</span>
+        }
+<span class="nc" id="L258">        catch (IOException e)</span>
+        {
+<span class="nc" id="L260">            return false;</span>
+        }
+    }
+
+    public static Throwable delete(Path file, Throwable accumulate)
+    {
+        try
+        {
+<span class="nc" id="L268">            delete(file);</span>
+        }
+<span class="nc" id="L270">        catch (FSError t)</span>
+        {
+<span class="nc" id="L272">            accumulate = merge(accumulate, t);</span>
+<span class="nc" id="L273">        }</span>
+<span class="nc" id="L274">        return accumulate;</span>
+    }
+
+    public static void delete(Path file)
+    {
+        try
+        {
+<span class="fc" id="L281">            Files.delete(file);</span>
+<span class="fc" id="L282">            onDeletion.accept(file);</span>
+        }
+<span class="fc" id="L284">        catch (IOException e)</span>
+        {
+<span class="nc" id="L286">            throw propagateUnchecked(e, file, true);</span>
+<span class="fc" id="L287">        }</span>
+<span class="fc" id="L288">    }</span>
+
+    public static void deleteIfExists(Path file)
+    {
+        try
+        {
+<span class="fc" id="L294">            Files.delete(file);</span>
+<span class="fc" id="L295">            onDeletion.accept(file);</span>
+        }
+<span class="nc" id="L297">        catch (IOException e)</span>
+        {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (e instanceof FileNotFoundException | e instanceof NoSuchFileException)</span>
+<span class="nc" id="L300">                return;</span>
+
+<span class="nc" id="L302">            throw propagateUnchecked(e, file, true);</span>
+<span class="fc" id="L303">        }</span>
+<span class="fc" id="L304">    }</span>
+
+    public static boolean tryDelete(Path file)
+    {
+        try
+        {
+<span class="fc" id="L310">            Files.delete(file);</span>
+<span class="fc" id="L311">            onDeletion.accept(file);</span>
+<span class="fc" id="L312">            return true;</span>
+        }
+<span class="nc" id="L314">        catch (IOException e)</span>
+        {
+<span class="nc" id="L316">            return false;</span>
+        }
+    }
+
+    public static void delete(Path file, @Nullable RateLimiter rateLimiter)
+    {
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">        if (rateLimiter != null)</span>
+        {
+<span class="nc" id="L324">            double throttled = rateLimiter.acquire();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (throttled &gt; 0.0)</span>
+<span class="nc" id="L326">                nospam1m.warn(&quot;Throttling file deletion: waited {} seconds to delete {}&quot;, throttled, file);</span>
+        }
+<span class="fc" id="L328">        delete(file);</span>
+<span class="fc" id="L329">    }</span>
+
+    public static Throwable delete(Path file, Throwable accumulate, @Nullable RateLimiter rateLimiter)
+    {
+        try
+        {
+<span class="fc" id="L335">            delete(file, rateLimiter);</span>
+        }
+<span class="nc" id="L337">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L339">            accumulate = merge(accumulate, t);</span>
+<span class="fc" id="L340">        }</span>
+<span class="fc" id="L341">        return accumulate;</span>
+    }
+
+    /**
+     * Uses unix `rm -r` to delete a directory recursively.
+     * Note that, it will trigger {@link #onDeletion} listener only for the provided path and will not call it for any
+     * nested path. This method can be much faster than deleting files and directories recursively by traversing them
+     * with Java. Though, we use it only for tests because it provides less information about the problem when something
+     * goes wrong.
+     *
+     * @param path    path to be deleted
+     * @param quietly if quietly, additional `-f` flag is added to the `rm` command so that it will not complain in case
+     *                the provided path is missing
+     */
+    private static void deleteRecursiveUsingNixCommand(Path path, boolean quietly)
+    {
+<span class="pc bpc" id="L357" title="1 of 2 branches missed.">        String [] cmd = new String[]{ &quot;rm&quot;, quietly ? &quot;-rdf&quot; : &quot;-rd&quot;, path.toAbsolutePath().toString() };</span>
+        try
+        {
+<span class="pc bpc" id="L360" title="2 of 4 branches missed.">            if (!quietly &amp;&amp; !Files.exists(path))</span>
+<span class="nc" id="L361">                throw new NoSuchFileException(path.toString());</span>
+
+<span class="fc" id="L363">            Process p = Runtime.getRuntime().exec(cmd);</span>
+<span class="fc" id="L364">            int result = p.waitFor();</span>
+
+            String out, err;
+<span class="fc" id="L367">            try (BufferedReader outReader = new BufferedReader(new InputStreamReader(p.getInputStream()));</span>
+<span class="fc" id="L368">                 BufferedReader errReader = new BufferedReader(new InputStreamReader(p.getErrorStream())))</span>
+            {
+<span class="fc" id="L370">                out = outReader.lines().collect(Collectors.joining(&quot;\n&quot;));</span>
+<span class="fc" id="L371">                err = errReader.lines().collect(Collectors.joining(&quot;\n&quot;));</span>
+            }
+
+<span class="pc bpc" id="L374" title="3 of 4 branches missed.">            if (result != 0 &amp;&amp; Files.exists(path))</span>
+            {
+<span class="nc" id="L376">                logger.error(&quot;{} returned:\nstdout:\n{}\n\nstderr:\n{}&quot;, Arrays.toString(cmd), out, err);</span>
+<span class="nc" id="L377">                throw new IOException(String.format(&quot;%s returned non-zero exit code: %d%nstdout:%n%s%n%nstderr:%n%s&quot;, Arrays.toString(cmd), result, out, err));</span>
+            }
+
+<span class="fc" id="L380">            onDeletion.accept(path);</span>
+        }
+<span class="nc" id="L382">        catch (IOException e)</span>
+        {
+<span class="nc" id="L384">            throw propagateUnchecked(e, path, true);</span>
+        }
+<span class="nc" id="L386">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L388">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L389">            throw new FSWriteError(e, path);</span>
+<span class="fc" id="L390">        }</span>
+<span class="fc" id="L391">    }</span>
+
+    /**
+     * Deletes all files and subdirectories under &quot;path&quot;.
+     * @param path file to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     */
+    public static void deleteRecursive(Path path)
+    {
+<span class="pc bpc" id="L400" title="2 of 4 branches missed.">        if (USE_NIX_RECURSIVE_DELETE.getBoolean() &amp;&amp; path.getFileSystem() == java.nio.file.FileSystems.getDefault())</span>
+        {
+<span class="fc" id="L402">            deleteRecursiveUsingNixCommand(path, false);</span>
+<span class="fc" id="L403">            return;</span>
+        }
+
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (isDirectory(path))</span>
+<span class="nc" id="L407">            forEach(path, PathUtils::deleteRecursive);</span>
+
+        // The directory is now empty, so now it can be smoked
+<span class="nc" id="L410">        delete(path);</span>
+<span class="nc" id="L411">    }</span>
+
+    /**
+     * Deletes all files and subdirectories under &quot;path&quot;.
+     * @param path file to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     */
+    public static void deleteRecursive(Path path, RateLimiter rateLimiter)
+    {
+<span class="nc bnc" id="L420" title="All 4 branches missed.">        if (USE_NIX_RECURSIVE_DELETE.getBoolean() &amp;&amp; path.getFileSystem() == java.nio.file.FileSystems.getDefault())</span>
+        {
+<span class="nc" id="L422">            deleteRecursiveUsingNixCommand(path, false);</span>
+<span class="nc" id="L423">            return;</span>
+        }
+
+<span class="nc" id="L426">        deleteRecursive(path, rateLimiter, p -&gt; deleteRecursive(p, rateLimiter));</span>
+<span class="nc" id="L427">    }</span>
+
+    /**
+     * Deletes all files and subdirectories under &quot;path&quot;.
+     * @param path file to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     */
+    private static void deleteRecursive(Path path, RateLimiter rateLimiter, Consumer&lt;Path&gt; deleteRecursive)
+    {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (isDirectory(path))</span>
+<span class="nc" id="L437">            forEach(path, deleteRecursive);</span>
+
+        // The directory is now empty so now it can be smoked
+<span class="nc" id="L440">        delete(path, rateLimiter);</span>
+<span class="nc" id="L441">    }</span>
+
+    /**
+     * Schedules deletion of all file and subdirectories under &quot;dir&quot; on JVM shutdown.
+     * @param dir Directory to be deleted
+     */
+    public synchronized static void deleteRecursiveOnExit(Path dir)
+    {
+<span class="nc" id="L449">        ON_EXIT.add(dir, true);</span>
+<span class="nc" id="L450">    }</span>
+
+    /**
+     * Schedules deletion of the file only on JVM shutdown.
+     * @param file File to be deleted
+     */
+    public synchronized static void deleteOnExit(Path file)
+    {
+<span class="fc" id="L458">        ON_EXIT.add(file, false);</span>
+<span class="fc" id="L459">    }</span>
+
+    public static boolean tryRename(Path from, Path to)
+    {
+<span class="nc" id="L463">        logger.trace(&quot;Renaming {} to {}&quot;, from, to);</span>
+        try
+        {
+<span class="nc" id="L466">            atomicMoveWithFallback(from, to);</span>
+<span class="nc" id="L467">            return true;</span>
+        }
+<span class="nc" id="L469">        catch (IOException e)</span>
+        {
+<span class="nc" id="L471">            logger.trace(&quot;Could not move file {} to {}&quot;, from, to, e);</span>
+<span class="nc" id="L472">            return false;</span>
+        }
+    }
+
+    public static void rename(Path from, Path to)
+    {
+<span class="fc" id="L478">        logger.trace(&quot;Renaming {} to {}&quot;, from, to);</span>
+        try
+        {
+<span class="fc" id="L481">            atomicMoveWithFallback(from, to);</span>
+        }
+<span class="nc" id="L483">        catch (IOException e)</span>
+        {
+<span class="nc" id="L485">            logger.trace(&quot;Could not move file {} to {}&quot;, from, to, e);</span>
+
+            // TODO: try to decide if is read or write? for now, have assumed write
+<span class="nc" id="L488">            throw propagateUnchecked(String.format(&quot;Failed to rename %s to %s&quot;, from, to), e, to, true);</span>
+<span class="fc" id="L489">        }</span>
+<span class="fc" id="L490">    }</span>
+
+    /**
+     * Move a file atomically, if it fails, it falls back to a non-atomic operation
+     */
+    private static void atomicMoveWithFallback(Path from, Path to) throws IOException
+    {
+        try
+        {
+<span class="fc" id="L499">            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);</span>
+        }
+<span class="nc" id="L501">        catch (AtomicMoveNotSupportedException e)</span>
+        {
+<span class="nc" id="L503">            logger.trace(&quot;Could not do an atomic move&quot;, e);</span>
+<span class="nc" id="L504">            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);</span>
+<span class="fc" id="L505">        }</span>
+<span class="fc" id="L506">    }</span>
+
+    // true if can determine exists, false if any exception occurs
+    public static boolean exists(Path path)
+    {
+<span class="fc" id="L511">        return Files.exists(path);</span>
+    }
+
+    // true if can determine is a directory, false if any exception occurs
+    public static boolean isDirectory(Path path)
+    {
+<span class="fc" id="L517">        return Files.isDirectory(path);</span>
+    }
+
+    // true if can determine is a regular file, false if any exception occurs
+    public static boolean isFile(Path path)
+    {
+<span class="nc" id="L523">        return Files.isRegularFile(path);</span>
+    }
+
+    /**
+     * @param path create file if not exists
+     * @throws IOError if cannot perform the operation
+     * @return true if a new file was created
+     */
+    public static boolean createFileIfNotExists(Path path)
+    {
+<span class="fc" id="L533">        return ifNotExists(path, Files::createFile);</span>
+    }
+
+    /**
+     * @param path create directory if not exists
+     * @throws IOError if cannot perform the operation
+     * @return true if a new directory was created
+     */
+    public static boolean createDirectoryIfNotExists(Path path)
+    {
+<span class="nc" id="L543">        return ifNotExists(path, Files::createDirectory);</span>
+    }
+
+    /**
+     * @param path create directory (and parents) if not exists
+     * @throws IOError if cannot perform the operation
+     * @return true if a new directory was created
+     */
+    public static boolean createDirectoriesIfNotExists(Path path)
+    {
+<span class="fc" id="L553">        return ifNotExists(path, Files::createDirectories);</span>
+    }
+
+    /**
+     * @param path create directory if not exists and action can be performed
+     * @return true if a new directory was created, false otherwise (for any reason)
+     */
+    public static boolean tryCreateDirectory(Path path)
+    {
+<span class="fc" id="L562">        return tryConsume(path, Files::createDirectory);</span>
+    }
+
+    /**
+     * @param path create directory (and parents) if not exists and action can be performed
+     * @return true if the new directory was created, false otherwise (for any reason)
+     */
+    public static boolean tryCreateDirectories(Path path)
+    {
+<span class="fc bfc" id="L571" title="All 2 branches covered.">        if (exists(path))</span>
+<span class="fc" id="L572">            return false;</span>
+
+<span class="fc" id="L574">        tryCreateDirectories(path.toAbsolutePath().getParent());</span>
+<span class="fc" id="L575">        return tryCreateDirectory(path);</span>
+    }
+
+    /**
+     * @return file if exists, otherwise nearest parent that exists; null if nothing in path exists
+     */
+    public static Path findExistingAncestor(Path file)
+    {
+<span class="pc bpc" id="L583" title="1 of 2 branches missed.">        if (!file.equals(file.normalize()))</span>
+<span class="nc" id="L584">            throw new IllegalArgumentException(&quot;Must be invoked on a path without redundant elements&quot;);</span>
+
+<span class="fc" id="L586">        Path parent = file;</span>
+<span class="pc bpc" id="L587" title="1 of 4 branches missed.">        while (parent != null &amp;&amp; !Files.exists(parent))</span>
+<span class="fc" id="L588">            parent = parent.getParent();</span>
+<span class="fc" id="L589">        return parent;</span>
+    }
+
+    /**
+     * 1) Convert to an absolute path without redundant path elements;
+     * 2) If the file exists, resolve any links to the underlying fille;
+     * 3) If the file does not exist, find the first ancestor that does and resolve the path from there
+     */
+    public static Path toCanonicalPath(Path file)
+    {
+<span class="fc" id="L599">        Preconditions.checkNotNull(file);</span>
+
+<span class="fc" id="L601">        file = file.toAbsolutePath().normalize();</span>
+<span class="fc" id="L602">        Path parent = findExistingAncestor(file);</span>
+
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">        if (parent == null)</span>
+<span class="nc" id="L605">            return file;</span>
+<span class="fc bfc" id="L606" title="All 2 branches covered.">        if (parent == file)</span>
+<span class="fc" id="L607">            return toRealPath(file);</span>
+<span class="fc" id="L608">        return toRealPath(parent).resolve(parent.relativize(file));</span>
+    }
+
+    private static Path toRealPath(Path path)
+    {
+        try
+        {
+<span class="fc" id="L615">            return path.toRealPath();</span>
+        }
+<span class="nc" id="L617">        catch (IOException e)</span>
+        {
+<span class="nc" id="L619">            throw propagateUnchecked(e, path, false);</span>
+        }
+    }
+
+    /**
+     * Return true if file's canonical path is contained in folder's canonical path.
+     *
+     * Propagates any exceptions encountered finding canonical paths.
+     */
+    public static boolean isContained(Path folder, Path file)
+    {
+<span class="nc" id="L630">        Path realFolder = toCanonicalPath(folder), realFile = toCanonicalPath(file);</span>
+<span class="nc" id="L631">        return realFile.startsWith(realFolder);</span>
+    }
+
+    @VisibleForTesting
+    static public void runOnExitThreadsAndClear()
+    {
+<span class="nc" id="L637">        DeleteOnExit.runOnExitThreadsAndClear();</span>
+<span class="nc" id="L638">    }</span>
+
+    static public void clearOnExitThreads()
+    {
+<span class="nc" id="L642">        DeleteOnExit.clearOnExitThreads();</span>
+<span class="nc" id="L643">    }</span>
+
+
+    private static final class DeleteOnExit implements Runnable
+    {
+        private boolean isRegistered;
+<span class="fc" id="L649">        private final Set&lt;Path&gt; deleteRecursivelyOnExit = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L650">        private final Set&lt;Path&gt; deleteOnExit = new HashSet&lt;&gt;();</span>
+
+<span class="fc" id="L652">        private static List&lt;Thread&gt; onExitThreads = new ArrayList&lt;&gt;();</span>
+
+        private static void runOnExitThreadsAndClear()
+        {
+            List&lt;Thread&gt; toRun;
+<span class="nc" id="L657">            synchronized (onExitThreads)</span>
+            {
+<span class="nc" id="L659">                toRun = new ArrayList&lt;&gt;(onExitThreads);</span>
+<span class="nc" id="L660">                onExitThreads.clear();</span>
+<span class="nc" id="L661">            }</span>
+<span class="nc" id="L662">            Runtime runtime = Runtime.getRuntime();</span>
+<span class="nc" id="L663">            toRun.forEach(onExitThread -&gt; {</span>
+                try
+                {
+<span class="nc" id="L666">                    runtime.removeShutdownHook(onExitThread);</span>
+                    //noinspection CallToThreadRun
+<span class="nc" id="L668">                    onExitThread.run();</span>
+                }
+<span class="nc" id="L670">                catch (Exception ex)</span>
+                {
+<span class="nc" id="L672">                    logger.warn(&quot;Exception thrown when cleaning up files to delete on exit, continuing.&quot;, ex);</span>
+<span class="nc" id="L673">                }</span>
+<span class="nc" id="L674">            });</span>
+<span class="nc" id="L675">        }</span>
+
+        private static void clearOnExitThreads()
+        {
+<span class="nc" id="L679">            synchronized (onExitThreads)</span>
+            {
+<span class="nc" id="L681">                Runtime runtime = Runtime.getRuntime();</span>
+<span class="nc" id="L682">                onExitThreads.forEach(runtime::removeShutdownHook);</span>
+<span class="nc" id="L683">                onExitThreads.clear();</span>
+<span class="nc" id="L684">            }</span>
+<span class="nc" id="L685">        }</span>
+
+        DeleteOnExit()
+<span class="fc" id="L688">        {</span>
+<span class="fc" id="L689">            final Thread onExitThread = new Thread(this); // checkstyle: permit this instantiation</span>
+<span class="fc" id="L690">            synchronized (onExitThreads)</span>
+            {
+<span class="fc" id="L692">                onExitThreads.add(onExitThread);</span>
+<span class="fc" id="L693">            }</span>
+<span class="fc" id="L694">            Runtime.getRuntime().addShutdownHook(onExitThread);</span>
+<span class="fc" id="L695">        }</span>
+
+        synchronized void add(Path path, boolean recursive)
+        {
+<span class="fc bfc" id="L699" title="All 2 branches covered.">            if (!isRegistered)</span>
+            {
+<span class="fc" id="L701">                isRegistered = true;</span>
+            }
+<span class="pc bpc" id="L703" title="1 of 2 branches missed.">            logger.trace(&quot;Scheduling deferred {}deletion of file: {}&quot;, recursive ? &quot;recursive &quot; : &quot;&quot;, path);</span>
+<span class="pc bpc" id="L704" title="1 of 2 branches missed.">            (recursive ? deleteRecursivelyOnExit : deleteOnExit).add(path);</span>
+<span class="fc" id="L705">        }</span>
+
+        public void run()
+        {
+<span class="fc bfc" id="L709" title="All 2 branches covered.">            for (Path path : deleteOnExit)</span>
+            {
+                try
+                {
+<span class="fc bfc" id="L713" title="All 2 branches covered.">                    if (exists(path))</span>
+<span class="nc" id="L714">                        delete(path);</span>
+                }
+<span class="fc" id="L716">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L718">                    logger.warn(&quot;Failed to delete {} on exit&quot;, path, t);</span>
+<span class="fc" id="L719">                }</span>
+<span class="fc" id="L720">            }</span>
+<span class="pc bpc" id="L721" title="1 of 2 branches missed.">            for (Path path : deleteRecursivelyOnExit)</span>
+            {
+                try
+                {
+<span class="nc bnc" id="L725" title="All 2 branches missed.">                    if (exists(path))</span>
+<span class="nc" id="L726">                        deleteRecursive(path);</span>
+                }
+<span class="nc" id="L728">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L730">                    logger.warn(&quot;Failed to delete {} on exit&quot;, path, t);</span>
+<span class="nc" id="L731">                }</span>
+<span class="nc" id="L732">            }</span>
+<span class="fc" id="L733">        }</span>
+    }
+<span class="fc" id="L735">    private static final DeleteOnExit ON_EXIT = new DeleteOnExit();</span>
+
+    public interface IOConsumer { void accept(Path path) throws IOException; }
+    public interface IOToLongFunction&lt;V&gt; { long apply(V path) throws IOException; }
+
+    private static boolean ifNotExists(Path path, IOConsumer consumer)
+    {
+        try
+        {
+<span class="fc" id="L744">            consumer.accept(path);</span>
+<span class="fc" id="L745">            return true;</span>
+        }
+<span class="nc" id="L747">        catch (FileAlreadyExistsException fae)</span>
+        {
+<span class="nc" id="L749">            return false;</span>
+        }
+<span class="nc" id="L751">        catch (IOException e)</span>
+        {
+<span class="nc" id="L753">            throw propagateUnchecked(e, path, true);</span>
+        }
+    }
+
+    private static boolean tryConsume(Path path, IOConsumer function)
+    {
+        try
+        {
+<span class="fc" id="L761">            function.accept(path);</span>
+<span class="fc" id="L762">            return true;</span>
+        }
+<span class="nc" id="L764">        catch (IOException e)</span>
+        {
+<span class="nc" id="L766">            return false;</span>
+        }
+    }
+
+    private static long tryOnPath(Path path, IOToLongFunction&lt;Path&gt; function)
+    {
+        try
+        {
+<span class="fc" id="L774">            return function.apply(path);</span>
+        }
+<span class="nc" id="L776">        catch (IOException e)</span>
+        {
+<span class="nc" id="L778">            return 0L;</span>
+        }
+    }
+
+    private static long tryOnFileStore(Path path, IOToLongFunction&lt;FileStore&gt; function)
+    {
+<span class="pc" id="L784">        return tryOnFileStore(path, function, ignore -&gt; {});</span>
+    }
+
+    private static long tryOnFileStore(Path path, IOToLongFunction&lt;FileStore&gt; function, Consumer&lt;IOException&gt; orElse)
+    {
+        try
+        {
+<span class="fc" id="L791">            Path ancestor = findExistingAncestor(path.toAbsolutePath().normalize());</span>
+<span class="pc bpc" id="L792" title="1 of 2 branches missed.">            if (ancestor == null)</span>
+            {
+<span class="nc" id="L794">                orElse.accept(new NoSuchFileException(path.toString()));</span>
+<span class="nc" id="L795">                return 0L;</span>
+            }
+<span class="fc" id="L797">            return function.apply(Files.getFileStore(ancestor));</span>
+        }
+<span class="nc" id="L799">        catch (IOException e)</span>
+        {
+<span class="nc" id="L801">            orElse.accept(e);</span>
+<span class="nc" id="L802">            return 0L;</span>
+        }
+    }
+
+    /**
+     * Returns the number of bytes (determined by the provided MethodHandle) on the specified partition.
+     * &lt;p&gt;This method handles large file system by returning {@code Long.MAX_VALUE} if the  number of available bytes
+     * overflow. See &lt;a href='https://bugs.openjdk.java.net/browse/JDK-8179320'&gt;JDK-8179320&lt;/a&gt; for more information&lt;/p&gt;
+     *
+     * @param path the partition (or a file within it)
+     */
+    public static long tryGetSpace(Path path, IOToLongFunction&lt;FileStore&gt; getSpace)
+    {
+<span class="fc" id="L815">        return handleLargeFileSystem(tryOnFileStore(path, getSpace));</span>
+    }
+
+    public static long tryGetSpace(Path path, IOToLongFunction&lt;FileStore&gt; getSpace, Consumer&lt;IOException&gt; orElse)
+    {
+<span class="fc" id="L820">        return handleLargeFileSystem(tryOnFileStore(path, getSpace, orElse));</span>
+    }
+
+    /**
+     * Handle large file system by returning {@code Long.MAX_VALUE} when the size overflows.
+     * @param size returned by the Java's FileStore methods
+     * @return the size or {@code Long.MAX_VALUE} if the size was bigger than {@code Long.MAX_VALUE}
+     */
+    private static long handleLargeFileSystem(long size)
+    {
+<span class="pc bpc" id="L830" title="1 of 2 branches missed.">        return size &lt; 0 ? Long.MAX_VALUE : size;</span>
+    }
+
+    /**
+     * Private constructor as the class contains only static methods.
+     */
+    private PathUtils()
+    {
+    }
+
+    /**
+     * propagate an IOException as an FSWriteError, FSReadError or UncheckedIOException
+     */
+    public static RuntimeException propagateUnchecked(IOException ioe, Path path, boolean write)
+    {
+<span class="nc" id="L845">        return propagateUnchecked(null, ioe, path, write);</span>
+    }
+
+    /**
+     * propagate an IOException as an FSWriteError, FSReadError or UncheckedIOException
+     */
+    public static RuntimeException propagateUnchecked(String message, IOException ioe, Path path, boolean write)
+    {
+<span class="pc bpc" id="L853" title="10 of 14 branches missed.">        if (ioe instanceof FileAlreadyExistsException</span>
+            || ioe instanceof NoSuchFileException
+            || ioe instanceof AtomicMoveNotSupportedException
+            || ioe instanceof java.nio.file.DirectoryNotEmptyException
+            || ioe instanceof java.nio.file.FileSystemLoopException
+            || ioe instanceof java.nio.file.NotDirectoryException
+            || ioe instanceof java.nio.file.NotLinkException)
+<span class="fc" id="L860">            throw new UncheckedIOException(message, ioe);</span>
+
+<span class="nc bnc" id="L862" title="All 2 branches missed.">        if (write) throw new FSWriteError(message, ioe, path);</span>
+<span class="nc" id="L863">        else throw new FSReadError(message, ioe, path);</span>
+    }
+
+    /**
+     * propagate an IOException as an FSWriteError, FSReadError or UncheckedIOException - except for NoSuchFileException
+     */
+    public static NoSuchFileException propagateUncheckedOrNoSuchFileException(IOException ioe, Path path, boolean write) throws NoSuchFileException
+    {
+<span class="nc bnc" id="L871" title="All 2 branches missed.">        if (ioe instanceof NoSuchFileException)</span>
+<span class="nc" id="L872">            throw (NoSuchFileException) ioe;</span>
+
+<span class="nc" id="L874">        throw propagateUnchecked(ioe, path, write);</span>
+    }
+
+    /**
+     * propagate an IOException either as itself or an FSWriteError or FSReadError
+     */
+    public static &lt;E extends IOException&gt; E propagate(E ioe, Path path, boolean write) throws E
+    {
+<span class="nc bnc" id="L882" title="All 14 branches missed.">        if (ioe instanceof FileAlreadyExistsException</span>
+            || ioe instanceof NoSuchFileException
+            || ioe instanceof AtomicMoveNotSupportedException
+            || ioe instanceof java.nio.file.DirectoryNotEmptyException
+            || ioe instanceof java.nio.file.FileSystemLoopException
+            || ioe instanceof java.nio.file.NotDirectoryException
+            || ioe instanceof java.nio.file.NotLinkException)
+<span class="nc" id="L889">            throw ioe;</span>
+
+<span class="nc bnc" id="L891" title="All 2 branches missed.">        if (write) throw new FSWriteError(ioe, path);</span>
+<span class="nc" id="L892">        else throw new FSReadError(ioe, path);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

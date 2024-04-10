@@ -1,0 +1,462 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CreateViewStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements.schema</a> &gt; <span class="el_source">CreateViewStatement.java</span></div><h1>CreateViewStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements.schema;
+
+import java.util.*;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.selection.RawSelector;
+import org.apache.cassandra.cql3.selection.Selectable;
+import org.apache.cassandra.cql3.statements.StatementType;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.exceptions.AlreadyExistsException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.Event.SchemaChange;
+import org.apache.cassandra.transport.Event.SchemaChange.Change;
+import org.apache.cassandra.transport.Event.SchemaChange.Target;
+
+import static java.lang.String.join;
+
+import static com.google.common.collect.Iterables.concat;
+import static com.google.common.collect.Iterables.filter;
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.config.CassandraRelevantProperties.MV_ALLOW_FILTERING_NONKEY_COLUMNS_UNSAFE;
+
+public final class CreateViewStatement extends AlterSchemaStatement
+{
+    private final String tableName;
+    private final String viewName;
+
+    private final List&lt;RawSelector&gt; rawColumns;
+    private final List&lt;ColumnIdentifier&gt; partitionKeyColumns;
+    private final List&lt;ColumnIdentifier&gt; clusteringColumns;
+
+    private final WhereClause whereClause;
+
+    private final LinkedHashMap&lt;ColumnIdentifier, Boolean&gt; clusteringOrder;
+    private final TableAttributes attrs;
+
+    private final boolean ifNotExists;
+
+    private ClientState state;
+
+    public CreateViewStatement(String keyspaceName,
+                               String tableName,
+                               String viewName,
+
+                               List&lt;RawSelector&gt; rawColumns,
+                               List&lt;ColumnIdentifier&gt; partitionKeyColumns,
+                               List&lt;ColumnIdentifier&gt; clusteringColumns,
+
+                               WhereClause whereClause,
+
+                               LinkedHashMap&lt;ColumnIdentifier, Boolean&gt; clusteringOrder,
+                               TableAttributes attrs,
+
+                               boolean ifNotExists)
+    {
+        super(keyspaceName);
+        this.tableName = tableName;
+        this.viewName = viewName;
+
+        this.rawColumns = rawColumns;
+        this.partitionKeyColumns = partitionKeyColumns;
+        this.clusteringColumns = clusteringColumns;
+
+        this.whereClause = whereClause;
+
+        this.clusteringOrder = clusteringOrder;
+        this.attrs = attrs;
+
+        this.ifNotExists = ifNotExists;
+    }
+
+    @Override
+    public void validate(ClientState state)
+    {
+        super.validate(state);
+
+        // save the query state to use it for guardrails validation in #apply
+        this.state = state;
+    }
+
+    public Keyspaces apply(Keyspaces schema)
+    {
+        if (!DatabaseDescriptor.getMaterializedViewsEnabled())
+            throw ire(&quot;Materialized views are disabled. Enable in cassandra.yaml to use.&quot;);
+
+        /*
+         * Basic dependency validations
+         */
+
+        KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
+        if (null == keyspace)
+            throw ire(&quot;Keyspace '%s' doesn't exist&quot;, keyspaceName);
+
+        if (keyspace.createReplicationStrategy().hasTransientReplicas())
+            throw new InvalidRequestException(&quot;Materialized views are not supported on transiently replicated keyspaces&quot;);
+
+        TableMetadata table = keyspace.tables.getNullable(tableName);
+        if (null == table)
+            throw ire(&quot;Base table '%s' doesn't exist&quot;, tableName);
+
+        if (keyspace.hasTable(viewName))
+            throw ire(&quot;Cannot create materialized view '%s' - a table with the same name already exists&quot;, viewName);
+
+        if (keyspace.hasView(viewName))
+        {
+            if (ifNotExists)
+                return schema;
+
+            throw new AlreadyExistsException(keyspaceName, viewName);
+        }
+
+        /*
+         * Base table validation
+         */
+
+        if (table.isCounter())
+            throw ire(&quot;Materialized views are not supported on counter tables&quot;);
+
+        if (table.isView())
+            throw ire(&quot;Materialized views cannot be created against other materialized views&quot;);
+
+        // Guardrails on table properties
+        Guardrails.tableProperties.guard(attrs.updatedProperties(), attrs::removeProperty, state);
+
+        // Guardrail to limit number of mvs per table
+        Iterable&lt;ViewMetadata&gt; tableViews = keyspace.views.forTable(table.id);
+        Guardrails.materializedViewsPerTable.guard(Iterables.size(tableViews) + 1,
+                                                   String.format(&quot;%s on table %s&quot;, viewName, table.name),
+                                                   false,
+                                                   state);
+
+        if (table.params.gcGraceSeconds == 0)
+        {
+            throw ire(&quot;Cannot create materialized view '%s' for base table &quot; +
+                      &quot;'%s' with gc_grace_seconds of 0, since this value is &quot; +
+                      &quot;used to TTL undelivered updates. Setting gc_grace_seconds&quot; +
+                      &quot; too low might cause undelivered updates to expire &quot; +
+                      &quot;before being replayed.&quot;,
+                      viewName, tableName);
+        }
+
+        /*
+         * Process SELECT clause
+         */
+
+        Set&lt;ColumnIdentifier&gt; selectedColumns = new HashSet&lt;&gt;();
+
+        if (rawColumns.isEmpty()) // SELECT *
+            table.columns().forEach(c -&gt; selectedColumns.add(c.name));
+
+        rawColumns.forEach(selector -&gt;
+        {
+            if (null != selector.alias)
+                throw ire(&quot;Cannot use aliases when defining a materialized view (got %s)&quot;, selector);
+
+            if (!(selector.selectable instanceof Selectable.RawIdentifier))
+                throw ire(&quot;Can only select columns by name when defining a materialized view (got %s)&quot;, selector.selectable);
+
+            // will throw IRE if the column doesn't exist in the base table
+            Selectable.RawIdentifier rawIdentifier = (Selectable.RawIdentifier) selector.selectable;
+            ColumnMetadata column = rawIdentifier.columnMetadata(table);
+
+            selectedColumns.add(column.name);
+        });
+
+        selectedColumns.stream()
+                       .map(table::getColumn)
+                       .filter(ColumnMetadata::isStatic)
+                       .findAny()
+                       .ifPresent(c -&gt; { throw ire(&quot;Cannot include static column '%s' in materialized view '%s'&quot;, c, viewName); });
+
+        /*
+         * Process PRIMARY KEY columns and CLUSTERING ORDER BY clause
+         */
+
+        if (partitionKeyColumns.isEmpty())
+            throw ire(&quot;Must provide at least one partition key column for materialized view '%s'&quot;, viewName);
+
+        HashSet&lt;ColumnIdentifier&gt; primaryKeyColumns = new HashSet&lt;&gt;();
+
+        concat(partitionKeyColumns, clusteringColumns).forEach(name -&gt;
+        {
+            ColumnMetadata column = table.getColumn(name);
+            if (null == column || !selectedColumns.contains(name))
+                throw ire(&quot;Unknown column '%s' referenced in PRIMARY KEY for materialized view '%s'&quot;, name, viewName);
+
+            if (!primaryKeyColumns.add(name))
+                throw ire(&quot;Duplicate column '%s' in PRIMARY KEY clause for materialized view '%s'&quot;, name, viewName);
+
+            AbstractType&lt;?&gt; type = column.type;
+
+            if (type.isMultiCell())
+            {
+                if (type.isCollection())
+                    throw ire(&quot;Invalid non-frozen collection type '%s' for PRIMARY KEY column '%s'&quot;, type, name);
+                else
+                    throw ire(&quot;Invalid non-frozen user-defined type '%s' for PRIMARY KEY column '%s'&quot;, type, name);
+            }
+
+            if (type.isCounter())
+                throw ire(&quot;counter type is not supported for PRIMARY KEY column '%s'&quot;, name);
+
+            if (type.referencesDuration())
+                throw ire(&quot;duration type is not supported for PRIMARY KEY column '%s'&quot;, name);
+        });
+
+        // If we give a clustering order, we must explicitly do so for all aliases and in the order of the PK
+        if (!clusteringOrder.isEmpty() &amp;&amp; !clusteringColumns.equals(new ArrayList&lt;&gt;(clusteringOrder.keySet())))
+            throw ire(&quot;Clustering key columns must exactly match columns in CLUSTERING ORDER BY directive&quot;);
+
+        /*
+         * We need to include all of the primary key columns from the base table in order to make sure that we do not
+         * overwrite values in the view. We cannot support &quot;collapsing&quot; the base table into a smaller number of rows in
+         * the view because if we need to generate a tombstone, we have no way of knowing which value is currently being
+         * used in the view and whether or not to generate a tombstone. In order to not surprise our users, we require
+         * that they include all of the columns. We provide them with a list of all of the columns left to include.
+         */
+        List&lt;ColumnIdentifier&gt; missingPrimaryKeyColumns =
+            Lists.newArrayList(filter(transform(table.primaryKeyColumns(), c -&gt; c.name), c -&gt; !primaryKeyColumns.contains(c)));
+
+        if (!missingPrimaryKeyColumns.isEmpty())
+        {
+            throw ire(&quot;Cannot create materialized view '%s' without primary key columns %s from base table '%s'&quot;,
+                      viewName, join(&quot;, &quot;, transform(missingPrimaryKeyColumns, ColumnIdentifier::toString)), tableName);
+        }
+
+        Set&lt;ColumnIdentifier&gt; regularBaseTableColumnsInViewPrimaryKey = new HashSet&lt;&gt;(primaryKeyColumns);
+        transform(table.primaryKeyColumns(), c -&gt; c.name).forEach(regularBaseTableColumnsInViewPrimaryKey::remove);
+        if (regularBaseTableColumnsInViewPrimaryKey.size() &gt; 1)
+        {
+            throw ire(&quot;Cannot include more than one non-primary key column in materialized view primary key (got %s)&quot;,
+                      join(&quot;, &quot;, transform(regularBaseTableColumnsInViewPrimaryKey, ColumnIdentifier::toString)));
+        }
+
+        /*
+         * Process WHERE clause
+         */
+        if (whereClause.containsTokenRelations())
+            throw new InvalidRequestException(&quot;Cannot use token relation when defining a materialized view&quot;);
+
+        if (whereClause.containsCustomExpressions())
+            throw ire(&quot;WHERE clause for materialized view '%s' cannot contain custom index expressions&quot;, viewName);
+
+        StatementRestrictions restrictions =
+            new StatementRestrictions(state,
+                                      StatementType.SELECT,
+                                      table,
+                                      whereClause,
+                                      VariableSpecifications.empty(),
+                                      false,
+                                      false,
+                                      true,
+                                      true);
+
+        List&lt;ColumnIdentifier&gt; nonRestrictedPrimaryKeyColumns =
+            Lists.newArrayList(filter(primaryKeyColumns, name -&gt; !restrictions.isRestricted(table.getColumn(name))));
+
+        if (!nonRestrictedPrimaryKeyColumns.isEmpty())
+        {
+            throw ire(&quot;Primary key columns %s must be restricted with 'IS NOT NULL' or otherwise&quot;,
+                      join(&quot;, &quot;, transform(nonRestrictedPrimaryKeyColumns, ColumnIdentifier::toString)));
+        }
+
+        // See CASSANDRA-13798
+        Set&lt;ColumnMetadata&gt; restrictedNonPrimaryKeyColumns = restrictions.nonPKRestrictedColumns(false);
+        if (!restrictedNonPrimaryKeyColumns.isEmpty() &amp;&amp; !MV_ALLOW_FILTERING_NONKEY_COLUMNS_UNSAFE.getBoolean())
+        {
+            throw ire(&quot;Non-primary key columns can only be restricted with 'IS NOT NULL' (got: %s restricted illegally)&quot;,
+                      join(&quot;,&quot;, transform(restrictedNonPrimaryKeyColumns, ColumnMetadata::toString)));
+        }
+
+        /*
+         * Validate WITH params
+         */
+
+        attrs.validate();
+
+        if (attrs.hasOption(TableParams.Option.DEFAULT_TIME_TO_LIVE)
+            &amp;&amp; attrs.getInt(TableParams.Option.DEFAULT_TIME_TO_LIVE.toString(), 0) != 0)
+        {
+            throw ire(&quot;Cannot set default_time_to_live for a materialized view. &quot; +
+                      &quot;Data in a materialized view always expire at the same time than &quot; +
+                      &quot;the corresponding data in the parent table.&quot;);
+        }
+
+        /*
+         * Build the thing
+         */
+
+        TableMetadata.Builder builder = TableMetadata.builder(keyspaceName, viewName);
+
+        if (attrs.hasProperty(TableAttributes.ID))
+            builder.id(attrs.getId());
+
+        builder.params(attrs.asNewTableParams())
+               .kind(TableMetadata.Kind.VIEW);
+
+        partitionKeyColumns.stream()
+                           .map(table::getColumn)
+                           .forEach(column -&gt; builder.addPartitionKeyColumn(column.name, getType(column), column.getMask()));
+
+        clusteringColumns.stream()
+                         .map(table::getColumn)
+                         .forEach(column -&gt; builder.addClusteringColumn(column.name, getType(column), column.getMask()));
+
+        selectedColumns.stream()
+                       .filter(name -&gt; !primaryKeyColumns.contains(name))
+                       .map(table::getColumn)
+                       .forEach(column -&gt; builder.addRegularColumn(column.name, getType(column), column.getMask()));
+
+        ViewMetadata view = new ViewMetadata(table.id, table.name, rawColumns.isEmpty(), whereClause, builder.build());
+        view.metadata.validate();
+
+        return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.views.with(view)));
+    }
+
+    SchemaChange schemaChangeEvent(KeyspacesDiff diff)
+    {
+        return new SchemaChange(Change.CREATED, Target.TABLE, keyspaceName, viewName);
+    }
+
+    public void authorize(ClientState client)
+    {
+        client.ensureTablePermission(keyspaceName, tableName, Permission.ALTER);
+    }
+
+    private AbstractType&lt;?&gt; getType(ColumnMetadata column)
+    {
+        AbstractType&lt;?&gt; type = column.type;
+        if (clusteringOrder.containsKey(column.name))
+        {
+            boolean reverse = !clusteringOrder.get(column.name);
+
+            if (type.isReversed() &amp;&amp; !reverse)
+                return ((ReversedType&lt;?&gt;) type).baseType;
+
+            if (!type.isReversed() &amp;&amp; reverse)
+                return ReversedType.getInstance(type);
+        }
+        return type;
+    }
+
+    @Override
+    Set&lt;String&gt; clientWarnings(KeyspacesDiff diff)
+    {
+        return ImmutableSet.of(View.USAGE_WARNING);
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.CREATE_VIEW, keyspaceName, viewName);
+    }
+
+    public String toString()
+    {
+        return String.format(&quot;%s (%s, %s)&quot;, getClass().getSimpleName(), keyspaceName, viewName);
+    }
+
+    public final static class Raw extends CQLStatement.Raw
+    {
+        private final QualifiedName tableName;
+        private final QualifiedName viewName;
+        private final boolean ifNotExists;
+
+        private final List&lt;RawSelector&gt; rawColumns;
+<span class="nc" id="L399">        private final List&lt;ColumnIdentifier&gt; clusteringColumns = new ArrayList&lt;&gt;();</span>
+        private List&lt;ColumnIdentifier&gt; partitionKeyColumns;
+
+        private final WhereClause whereClause;
+
+<span class="nc" id="L404">        private final LinkedHashMap&lt;ColumnIdentifier, Boolean&gt; clusteringOrder = new LinkedHashMap&lt;&gt;();</span>
+<span class="nc" id="L405">        public final TableAttributes attrs = new TableAttributes();</span>
+
+        public Raw(QualifiedName tableName, QualifiedName viewName, List&lt;RawSelector&gt; rawColumns, WhereClause whereClause, boolean ifNotExists)
+<span class="nc" id="L408">        {</span>
+<span class="nc" id="L409">            this.tableName = tableName;</span>
+<span class="nc" id="L410">            this.viewName = viewName;</span>
+<span class="nc" id="L411">            this.rawColumns = rawColumns;</span>
+<span class="nc" id="L412">            this.whereClause = whereClause;</span>
+<span class="nc" id="L413">            this.ifNotExists = ifNotExists;</span>
+<span class="nc" id="L414">        }</span>
+
+        public CreateViewStatement prepare(ClientState state)
+        {
+<span class="nc bnc" id="L418" title="All 2 branches missed.">            String keyspaceName = viewName.hasKeyspace() ? viewName.getKeyspace() : state.getKeyspace();</span>
+
+<span class="nc bnc" id="L420" title="All 4 branches missed.">            if (tableName.hasKeyspace() &amp;&amp; !keyspaceName.equals(tableName.getKeyspace()))</span>
+<span class="nc" id="L421">                throw ire(&quot;Cannot create a materialized view on a table in a different keyspace&quot;);</span>
+
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (!bindVariables.isEmpty())</span>
+<span class="nc" id="L424">                throw ire(&quot;Bind variables are not allowed in CREATE MATERIALIZED VIEW statements&quot;);</span>
+
+<span class="nc bnc" id="L426" title="All 2 branches missed.">            if (null == partitionKeyColumns)</span>
+<span class="nc" id="L427">                throw ire(&quot;No PRIMARY KEY specifed for view '%s' (exactly one required)&quot;, viewName);</span>
+
+<span class="nc" id="L429">            return new CreateViewStatement(keyspaceName,</span>
+<span class="nc" id="L430">                                           tableName.getName(),</span>
+<span class="nc" id="L431">                                           viewName.getName(),</span>
+
+                                           rawColumns,
+                                           partitionKeyColumns,
+                                           clusteringColumns,
+
+                                           whereClause,
+
+                                           clusteringOrder,
+                                           attrs,
+
+                                           ifNotExists);
+        }
+
+        public void setPartitionKeyColumns(List&lt;ColumnIdentifier&gt; columns)
+        {
+<span class="nc" id="L447">            partitionKeyColumns = columns;</span>
+<span class="nc" id="L448">        }</span>
+
+        public void markClusteringColumn(ColumnIdentifier column)
+        {
+<span class="nc" id="L452">            clusteringColumns.add(column);</span>
+<span class="nc" id="L453">        }</span>
+
+        public void extendClusteringOrder(ColumnIdentifier column, boolean ascending)
+        {
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            if (null != clusteringOrder.put(column, ascending))</span>
+<span class="nc" id="L458">                throw ire(&quot;Duplicate column '%s' in CLUSTERING ORDER BY clause for view '%s'&quot;, column, viewName);</span>
+<span class="nc" id="L459">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

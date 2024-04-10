@@ -1,0 +1,466 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DecimalType.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.marshal</a> &gt; <span class="el_source">DecimalType.java</span></div><h1>DecimalType.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.marshal;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.MathContext;
+import java.math.RoundingMode;
+import java.nio.ByteBuffer;
+import java.util.Objects;
+
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.serializers.DecimalSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+
+import ch.obermuhlner.math.big.BigDecimalMath;
+
+public class DecimalType extends NumberType&lt;BigDecimal&gt;
+{
+<span class="fc" id="L45">    public static final DecimalType instance = new DecimalType();</span>
+
+<span class="fc" id="L47">    private static final ArgumentDeserializer ARGUMENT_DESERIALIZER = new DefaultArgumentDeserializer(instance);</span>
+
+<span class="fc" id="L49">    private static final ByteBuffer MASKED_VALUE = instance.decompose(BigDecimal.ZERO);</span>
+
+    private static final int MIN_SCALE = 32;
+    private static final int MIN_SIGNIFICANT_DIGITS = MIN_SCALE;
+    private static final int MAX_SCALE = 1000;
+<span class="fc" id="L54">    private static final MathContext MAX_PRECISION = new MathContext(10000);</span>
+
+    // Constants or escaping values needed to encode/decode variable-length floating point numbers (decimals) in our
+    // custom byte-ordered encoding scheme.
+    private static final int POSITIVE_DECIMAL_HEADER_MASK = 0x80;
+    private static final int NEGATIVE_DECIMAL_HEADER_MASK = 0x00;
+    private static final int DECIMAL_EXPONENT_LENGTH_HEADER_MASK = 0x40;
+    private static final byte DECIMAL_LAST_BYTE = (byte) 0x00;
+<span class="fc" id="L62">    private static final BigInteger HUNDRED = BigInteger.valueOf(100);</span>
+
+<span class="fc" id="L64">    private static final ByteBuffer ZERO_BUFFER = instance.decompose(BigDecimal.ZERO);</span>
+
+<span class="fc" id="L66">    DecimalType() {super(ComparisonType.CUSTOM);} // singleton</span>
+
+    public boolean isEmptyValueMeaningless()
+    {
+<span class="nc" id="L70">        return true;</span>
+    }
+
+    @Override
+    public boolean isFloatingPoint()
+    {
+<span class="fc" id="L76">        return true;</span>
+    }
+
+    public &lt;VL, VR&gt; int compareCustom(VL left, ValueAccessor&lt;VL&gt; accessorL, VR right, ValueAccessor&lt;VR&gt; accessorR)
+    {
+<span class="fc" id="L81">        return compareComposed(left, accessorL, right, accessorR, this);</span>
+    }
+
+    /**
+     * Constructs a byte-comparable representation.
+     * This is rather difficult and involves reconstructing the decimal.
+     *
+     * To compare, we need a normalized value, i.e. one with a sign, exponent and (0,1) mantissa. To avoid
+     * loss of precision, both exponent and mantissa need to be base-100.  We can't get this directly off the serialized
+     * bytes, as they have base-10 scale and base-256 unscaled part.
+     *
+     * We store:
+     *     - sign bit inverted * 0x80 + 0x40 + signed exponent length, where exponent is negated if value is negative
+     *     - zero or more exponent bytes (as given by length)
+     *     - 0x80 + first pair of decimal digits, negative if value is negative, rounded to -inf
+     *     - zero or more 0x80 + pair of decimal digits, always positive
+     *     - trailing 0x00
+     * Zero is special-cased as 0x80.
+     *
+     * Because the trailing 00 cannot be produced from a pair of decimal digits (positive or not), no value can be
+     * a prefix of another.
+     *
+     * Encoding examples:
+     *    1.1    as       c1 = 0x80 (positive number) + 0x40 + (positive exponent) 0x01 (exp length 1)
+     *                    01 = exponent 1 (100^1)
+     *                    81 = 0x80 + 01 (0.01)
+     *                    8a = 0x80 + 10 (....10)   0.0110e2
+     *                    00
+     *    -1     as       3f = 0x00 (negative number) + 0x40 - (negative exponent) 0x01 (exp length 1)
+     *                    ff = exponent -1. negative number, thus 100^1
+     *                    7f = 0x80 - 01 (-0.01)    -0.01e2
+     *                    00
+     *    -99.9  as       3f = 0x00 (negative number) + 0x40 - (negative exponent) 0x01 (exp length 1)
+     *                    ff = exponent -1. negative number, thus 100^1
+     *                    1c = 0x80 - 100 (-1.00)
+     *                    8a = 0x80 + 10  (+....10) -0.999e2
+     *                    00
+     *
+     */
+    @Override
+    public &lt;V&gt; ByteSource asComparableBytes(ValueAccessor&lt;V&gt; accessor, V data, ByteComparable.Version version)
+    {
+<span class="nc" id="L123">        BigDecimal value = compose(data, accessor);</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (value == null)</span>
+<span class="nc" id="L125">            return null;</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (value.compareTo(BigDecimal.ZERO) == 0)  // Note: 0.equals(0.0) returns false!</span>
+<span class="nc" id="L127">            return ByteSource.oneByte(POSITIVE_DECIMAL_HEADER_MASK);</span>
+
+<span class="nc" id="L129">        long scale = (((long) value.scale()) - value.precision()) &amp; ~1;</span>
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        boolean negative = value.signum() &lt; 0;</span>
+        // Make a base-100 exponent (this will always fit in an int).
+<span class="nc" id="L132">        int exponent = Math.toIntExact(-scale &gt;&gt; 1);</span>
+        // Flip the exponent sign for negative numbers, so that ones with larger magnitudes are propely treated as smaller.
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        final int modulatedExponent = negative ? -exponent : exponent;</span>
+        // We should never have scale &gt; Integer.MAX_VALUE, as we're always subtracting the non-negative precision of
+        // the encoded BigDecimal, and furthermore we're rounding to negative infinity.
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        assert scale &lt;= Integer.MAX_VALUE;</span>
+        // However, we may end up overflowing on the negative side.
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (scale &lt; Integer.MIN_VALUE)</span>
+        {
+            // As scaleByPowerOfTen needs an int scale, do the scaling in two steps.
+<span class="nc" id="L142">            int mv = Integer.MIN_VALUE;</span>
+<span class="nc" id="L143">            value = value.scaleByPowerOfTen(mv);</span>
+<span class="nc" id="L144">            scale -= mv;</span>
+        }
+<span class="nc" id="L146">        final BigDecimal mantissa = value.scaleByPowerOfTen(Ints.checkedCast(scale)).stripTrailingZeros();</span>
+        // We now have a smaller-than-one signed mantissa, and a signed and modulated base-100 exponent.
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        assert mantissa.abs().compareTo(BigDecimal.ONE) &lt; 0;</span>
+
+<span class="nc" id="L150">        return new ByteSource()</span>
+<span class="nc" id="L151">        {</span>
+            // Start with up to 5 bytes for sign + exponent.
+<span class="nc" id="L153">            int exponentBytesLeft = 5;</span>
+<span class="nc" id="L154">            BigDecimal current = mantissa;</span>
+
+            @Override
+            public int next()
+            {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                if (exponentBytesLeft &gt; 0)</span>
+                {
+<span class="nc" id="L161">                    --exponentBytesLeft;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">                    if (exponentBytesLeft == 4)</span>
+                    {
+                        // Skip leading zero bytes in the modulatedExponent.
+<span class="nc" id="L165">                        exponentBytesLeft -= Integer.numberOfLeadingZeros(Math.abs(modulatedExponent)) / 8;</span>
+                        // Now prepare the leading byte which includes the sign of the number plus the sign and length of the modulatedExponent.
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                        int explen = DECIMAL_EXPONENT_LENGTH_HEADER_MASK + (modulatedExponent &lt; 0 ? -exponentBytesLeft : exponentBytesLeft);</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                        return explen + (negative ? NEGATIVE_DECIMAL_HEADER_MASK : POSITIVE_DECIMAL_HEADER_MASK);</span>
+                    }
+                    else
+<span class="nc" id="L171">                        return (modulatedExponent &gt;&gt; (exponentBytesLeft * 8)) &amp; 0xFF;</span>
+                }
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                else if (current == null)</span>
+                {
+<span class="nc" id="L175">                    return END_OF_STREAM;</span>
+                }
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                else if (current.compareTo(BigDecimal.ZERO) == 0)</span>
+                {
+<span class="nc" id="L179">                    current = null;</span>
+<span class="nc" id="L180">                    return 0x00;</span>
+                }
+                else
+                {
+<span class="nc" id="L184">                    BigDecimal v = current.scaleByPowerOfTen(2);</span>
+<span class="nc" id="L185">                    BigDecimal floor = v.setScale(0, RoundingMode.FLOOR);</span>
+<span class="nc" id="L186">                    current = v.subtract(floor);</span>
+<span class="nc" id="L187">                    return floor.byteValueExact() + 0x80;</span>
+                }
+            }
+        };
+    }
+
+    @Override
+    public &lt;V&gt; V fromComparableBytes(ValueAccessor&lt;V&gt; accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (comparableBytes == null)</span>
+<span class="nc" id="L197">            return accessor.empty();</span>
+
+<span class="nc" id="L199">        int headerBits = comparableBytes.next();</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (headerBits == POSITIVE_DECIMAL_HEADER_MASK)</span>
+<span class="nc" id="L201">            return accessor.valueOf(ZERO_BUFFER);</span>
+
+        // I. Extract the exponent.
+        // The sign of the decimal, and the sign and the length (in bytes) of the decimal exponent, are all encoded in
+        // the first byte.
+        // Get the sign of the decimal...
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        boolean isNegative = headerBits &lt; POSITIVE_DECIMAL_HEADER_MASK;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        headerBits -= isNegative ? NEGATIVE_DECIMAL_HEADER_MASK : POSITIVE_DECIMAL_HEADER_MASK;</span>
+<span class="nc" id="L209">        headerBits -= DECIMAL_EXPONENT_LENGTH_HEADER_MASK;</span>
+        // Get the sign and the length of the exponent (the latter is encoded as its negative if the sign of the
+        // exponent is negative)...
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        boolean isExponentNegative = headerBits &lt; 0;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        headerBits = isExponentNegative ? -headerBits : headerBits;</span>
+        // Now consume the exponent bytes. If the exponent is negative and uses less than 4 bytes, the remaining bytes
+        // should be padded with 1s, in order for the constructed int to contain the correct (negative) exponent value.
+        // So, if the exponent is negative, we can just start with all bits set to 1 (i.e. we can start with -1).
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        int exponent = isExponentNegative ? -1 : 0;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        for (int i = 0; i &lt; headerBits; ++i)</span>
+<span class="nc" id="L219">            exponent = (exponent &lt;&lt; 8) | comparableBytes.next();</span>
+        // The encoded exponent also contains the decimal sign, in order to correctly compare exponents in case of
+        // negative decimals (e.g. x * 10^y &gt; x * 10^z if x &lt; 0 &amp;&amp; y &lt; z). After the decimal sign is &quot;removed&quot;, what's
+        // left is a base-100 exponent following BigDecimal's convention for the exponent sign.
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        exponent = isNegative ? -exponent : exponent;</span>
+
+        // II. Extract the mantissa as a BigInteger value. It was encoded as a BigDecimal value between 0 and 1, in
+        // order to be used for comparison (after the sign of the decimal and the sign and the value of the exponent),
+        // but when decoding we don't need that property on the transient mantissa value.
+<span class="nc" id="L228">        BigInteger mantissa = BigInteger.ZERO;</span>
+<span class="nc" id="L229">        int curr = comparableBytes.next();</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        while (curr != DECIMAL_LAST_BYTE)</span>
+        {
+            // The mantissa value is constructed by a standard positional notation value calculation.
+            // The value of the next digit is the next most-significant mantissa byte as an unsigned integer,
+            // offset by a predetermined value (in this case, 0x80)...
+<span class="nc" id="L235">            int currModified = curr - 0x80;</span>
+            // ...multiply the current value by the base (in this case, 100)...
+<span class="nc" id="L237">            mantissa = mantissa.multiply(HUNDRED);</span>
+            // ...then add the next digit to the modified current value...
+<span class="nc" id="L239">            mantissa = mantissa.add(BigInteger.valueOf(currModified));</span>
+            // ...and finally, adjust the base-100, BigDecimal format exponent accordingly.
+<span class="nc" id="L241">            --exponent;</span>
+<span class="nc" id="L242">            curr = comparableBytes.next();</span>
+<span class="nc" id="L243">        }</span>
+
+        // III. Construct the final BigDecimal value, by combining the mantissa and the exponent, guarding against
+        // underflow or overflow when exponents are close to their boundary values.
+<span class="nc" id="L247">        long base10NonBigDecimalFormatExp = 2L * exponent;</span>
+        // When expressing a sufficiently big decimal, BigDecimal's internal scale value will be negative with very
+        // big absolute value. To compute the encoded exponent, this internal scale has the number of digits of the
+        // unscaled value subtracted from it, after which it's divided by 2, rounding down to negative infinity
+        // (before accounting for the decimal sign). When decoding, this exponent is converted to a base-10 exponent in
+        // non-BigDecimal format, which means that it can very well overflow Integer.MAX_VALUE.
+        // For example, see how &lt;code&gt;new BigDecimal(BigInteger.TEN, Integer.MIN_VALUE)&lt;/code&gt; is encoded and decoded.
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        if (base10NonBigDecimalFormatExp &gt; Integer.MAX_VALUE)</span>
+        {
+            // If the base-10 exponent will result in an overflow, some of its powers of 10 need to be absorbed by the
+            // mantissa. How much exactly? As little as needed, in order to avoid complex BigInteger operations, which
+            // means exactly as much as to have a scale of -Integer.MAX_VALUE.
+<span class="nc" id="L259">            int exponentReduction = (int) (base10NonBigDecimalFormatExp - Integer.MAX_VALUE);</span>
+<span class="nc" id="L260">            mantissa = mantissa.multiply(BigInteger.TEN.pow(exponentReduction));</span>
+<span class="nc" id="L261">            base10NonBigDecimalFormatExp = Integer.MAX_VALUE;</span>
+        }
+<span class="nc bnc" id="L263" title="All 4 branches missed.">        assert base10NonBigDecimalFormatExp &gt;= Integer.MIN_VALUE &amp;&amp; base10NonBigDecimalFormatExp &lt;= Integer.MAX_VALUE;</span>
+        // Here we negate the exponent, as we are not using BigDecimal.scaleByPowerOfTen, where a positive number means
+        // &quot;multiplying by a positive power of 10&quot;, but to BigDecimal's internal scale representation, where a positive
+        // number means &quot;dividing by a positive power of 10&quot;.
+<span class="nc" id="L267">        byte[] mantissaBytes = mantissa.toByteArray();</span>
+<span class="nc" id="L268">        V resultBuf = accessor.allocate(4 + mantissaBytes.length);</span>
+<span class="nc" id="L269">        accessor.putInt(resultBuf, 0, (int) -base10NonBigDecimalFormatExp);</span>
+<span class="nc" id="L270">        accessor.copyByteArrayTo(mantissaBytes, 0, resultBuf, 4, mantissaBytes.length);</span>
+<span class="nc" id="L271">        return resultBuf;</span>
+    }
+
+    public ByteBuffer fromString(String source) throws MarshalException
+    {
+        // Return an empty ByteBuffer for an empty string.
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">        if (source.isEmpty()) return ByteBufferUtil.EMPTY_BYTE_BUFFER;</span>
+
+        BigDecimal decimal;
+
+        try
+        {
+<span class="fc" id="L283">            decimal = new BigDecimal(source);</span>
+        }
+<span class="nc" id="L285">        catch (Exception e)</span>
+        {
+<span class="nc" id="L287">            throw new MarshalException(String.format(&quot;unable to make BigDecimal from '%s'&quot;, source), e);</span>
+<span class="fc" id="L288">        }</span>
+
+<span class="fc" id="L290">        return decompose(decimal);</span>
+    }
+
+    @Override
+    public Term fromJSONObject(Object parsed) throws MarshalException
+    {
+        try
+        {
+<span class="fc" id="L298">            return new Constants.Value(fromString(Objects.toString(parsed)));</span>
+        }
+<span class="nc" id="L300">        catch (NumberFormatException | MarshalException exc)</span>
+        {
+<span class="nc" id="L302">            throw new MarshalException(String.format(&quot;Value '%s' is not a valid representation of a decimal value&quot;, parsed));</span>
+        }
+    }
+
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+    {
+<span class="fc" id="L309">        return Objects.toString(getSerializer().deserialize(buffer), &quot;\&quot;\&quot;&quot;);</span>
+    }
+
+    public CQL3Type asCQL3Type()
+    {
+<span class="fc" id="L314">        return CQL3Type.Native.DECIMAL;</span>
+    }
+
+    public TypeSerializer&lt;BigDecimal&gt; getSerializer()
+    {
+<span class="fc" id="L319">        return DecimalSerializer.instance;</span>
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+<span class="nc" id="L325">        return ARGUMENT_DESERIALIZER;</span>
+    }
+
+    /**
+     * Converts the specified number into a {@link BigDecimal}.
+     *
+     * @param number the value to convert
+     * @return the converted value
+     */
+    protected BigDecimal toBigDecimal(Number number)
+    {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (number instanceof BigDecimal)</span>
+<span class="nc" id="L337">            return (BigDecimal) number;</span>
+
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (number instanceof BigInteger)</span>
+<span class="nc" id="L340">            return new BigDecimal((BigInteger) number);</span>
+
+<span class="nc" id="L342">        double d = number.doubleValue();</span>
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (Double.isNaN(d))</span>
+<span class="nc" id="L345">            throw new NumberFormatException(&quot;A NaN cannot be converted into a decimal&quot;);</span>
+
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if (Double.isInfinite(d))</span>
+<span class="nc" id="L348">            throw new NumberFormatException(&quot;An infinite number cannot be converted into a decimal&quot;);</span>
+
+<span class="nc" id="L350">        return BigDecimal.valueOf(d);</span>
+    }
+
+    @Override
+    public ByteBuffer add(Number left, Number right)
+    {
+<span class="nc" id="L356">        return decompose(toBigDecimal(left).add(toBigDecimal(right), MAX_PRECISION));</span>
+    }
+
+    @Override
+    public ByteBuffer substract(Number left, Number right)
+    {
+<span class="nc" id="L362">        return decompose(toBigDecimal(left).subtract(toBigDecimal(right), MAX_PRECISION));</span>
+    }
+
+    @Override
+    public ByteBuffer multiply(Number left, Number right)
+    {
+<span class="nc" id="L368">        return decompose(toBigDecimal(left).multiply(toBigDecimal(right), MAX_PRECISION));</span>
+    }
+
+    @Override
+    public ByteBuffer divide(Number left, Number right)
+    {
+<span class="nc" id="L374">        BigDecimal leftOperand = toBigDecimal(left);</span>
+<span class="nc" id="L375">        BigDecimal rightOperand = toBigDecimal(right);</span>
+
+        // Predict position of first significant digit in the quotient.
+        // Note: it is possible to improve prediction accuracy by comparing first significant digits in operands
+        // but it requires additional computations so this step is omitted
+<span class="nc" id="L380">        int quotientFirstDigitPos = (leftOperand.precision() - leftOperand.scale()) - (rightOperand.precision() - rightOperand.scale());</span>
+
+<span class="nc" id="L382">        int scale = MIN_SIGNIFICANT_DIGITS - quotientFirstDigitPos;</span>
+<span class="nc" id="L383">        scale = Math.max(scale, leftOperand.scale());</span>
+<span class="nc" id="L384">        scale = Math.max(scale, rightOperand.scale());</span>
+<span class="nc" id="L385">        scale = Math.max(scale, MIN_SCALE);</span>
+<span class="nc" id="L386">        scale = Math.min(scale, MAX_SCALE);</span>
+
+<span class="nc" id="L388">        return decompose(leftOperand.divide(rightOperand, scale, RoundingMode.HALF_UP).stripTrailingZeros());</span>
+    }
+
+    @Override
+    public ByteBuffer mod(Number left, Number right)
+    {
+<span class="nc" id="L394">        return decompose(toBigDecimal(left).remainder(toBigDecimal(right)));</span>
+    }
+
+    @Override
+    public ByteBuffer negate(Number input)
+    {
+<span class="nc" id="L400">        return decompose(toBigDecimal(input).negate());</span>
+    }
+
+    @Override
+    public ByteBuffer abs(Number input)
+    {
+<span class="nc" id="L406">        return decompose(toBigDecimal(input).abs());</span>
+    }
+
+    @Override
+    public ByteBuffer exp(Number input)
+    {
+<span class="nc" id="L412">        return decompose(exp(toBigDecimal(input)));</span>
+    }
+
+    protected BigDecimal exp(BigDecimal input)
+    {
+<span class="nc" id="L417">        int precision = input.precision();</span>
+<span class="nc" id="L418">        precision = Math.max(MIN_SIGNIFICANT_DIGITS, precision);</span>
+<span class="nc" id="L419">        precision = Math.min(MAX_PRECISION.getPrecision(), precision);</span>
+<span class="nc" id="L420">        return BigDecimalMath.exp(input, new MathContext(precision, RoundingMode.HALF_EVEN));</span>
+    }
+
+    @Override
+    public ByteBuffer log(Number input)
+    {
+<span class="nc" id="L426">        return decompose(log(toBigDecimal(input)));</span>
+    }
+
+    protected BigDecimal log(BigDecimal input)
+    {
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (input.compareTo(BigDecimal.ZERO) &lt;= 0) throw new ArithmeticException(&quot;Natural log of number zero or less&quot;);</span>
+<span class="nc" id="L432">        int precision = input.precision();</span>
+<span class="nc" id="L433">        precision = Math.max(MIN_SIGNIFICANT_DIGITS, precision);</span>
+<span class="nc" id="L434">        precision = Math.min(MAX_PRECISION.getPrecision(), precision);</span>
+<span class="nc" id="L435">        return BigDecimalMath.log(input, new MathContext(precision, RoundingMode.HALF_EVEN));</span>
+    }
+
+    @Override
+    public ByteBuffer log10(Number input)
+    {
+<span class="nc" id="L441">        return decompose(log10(toBigDecimal(input)));</span>
+    }
+
+    protected BigDecimal log10(BigDecimal input)
+    {
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (input.compareTo(BigDecimal.ZERO) &lt;= 0) throw new ArithmeticException(&quot;Log10 of number zero or less&quot;);</span>
+<span class="nc" id="L447">        int precision = input.precision();</span>
+<span class="nc" id="L448">        precision = Math.max(MIN_SIGNIFICANT_DIGITS, precision);</span>
+<span class="nc" id="L449">        precision = Math.min(MAX_PRECISION.getPrecision(), precision);</span>
+<span class="nc" id="L450">        return BigDecimalMath.log10(input, new MathContext(precision, RoundingMode.HALF_EVEN));</span>
+    }
+
+    @Override
+    public ByteBuffer round(Number input)
+    {
+<span class="nc" id="L456">        return DecimalType.instance.decompose(</span>
+<span class="nc" id="L457">        toBigDecimal(input).setScale(0, RoundingMode.HALF_UP));</span>
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+<span class="nc" id="L463">        return MASKED_VALUE;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

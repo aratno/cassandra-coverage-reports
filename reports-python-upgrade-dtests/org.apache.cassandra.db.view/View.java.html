@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>View.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">View.java</span></div><h1>View.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.view;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
+
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.selection.RawSelector;
+import org.apache.cassandra.cql3.selection.Selectable;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.schema.ViewMetadata;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.utils.FBUtilities;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A View copies data from a base table into a view table which can be queried independently from the
+ * base. Every update which targets the base table must be fed through the {@link ViewManager} to ensure
+ * that if a view needs to be updated, the updates are properly created and fed into the view.
+ */
+public class View
+{
+    public final static String USAGE_WARNING = &quot;Materialized views are experimental and are not recommended for production use.&quot;;
+
+<span class="fc" id="L52">    private static final Logger logger = LoggerFactory.getLogger(View.class);</span>
+
+    public final String name;
+    private volatile ViewMetadata definition;
+
+    private final ColumnFamilyStore baseCfs;
+
+    public volatile List&lt;ColumnMetadata&gt; baseNonPKColumnsInViewPK;
+    private ViewBuilder builder;
+
+    private SelectStatement select;
+    private ReadQuery query;
+
+    public View(ViewMetadata definition, ColumnFamilyStore baseCfs)
+<span class="fc" id="L66">    {</span>
+<span class="fc" id="L67">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L68">        this.name = definition.name();</span>
+
+<span class="fc" id="L70">        updateDefinition(definition);</span>
+<span class="fc" id="L71">    }</span>
+
+    public ViewMetadata getDefinition()
+    {
+<span class="fc" id="L75">        return definition;</span>
+    }
+
+    /**
+     * This updates the columns stored which are dependent on the base TableMetadata.
+     */
+    public void updateDefinition(ViewMetadata definition)
+    {
+<span class="fc" id="L83">        this.definition = definition;</span>
+<span class="fc" id="L84">        List&lt;ColumnMetadata&gt; nonPKDefPartOfViewPK = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L85" title="All 2 branches covered.">        for (ColumnMetadata baseColumn : baseCfs.metadata.get().columns())</span>
+        {
+<span class="fc" id="L87">            ColumnMetadata viewColumn = getViewColumn(baseColumn);</span>
+<span class="pc bpc" id="L88" title="2 of 6 branches missed.">            if (viewColumn != null &amp;&amp; !baseColumn.isPrimaryKeyColumn() &amp;&amp; viewColumn.isPrimaryKeyColumn())</span>
+<span class="fc" id="L89">                nonPKDefPartOfViewPK.add(baseColumn);</span>
+<span class="fc" id="L90">        }</span>
+<span class="fc" id="L91">        this.baseNonPKColumnsInViewPK = nonPKDefPartOfViewPK;</span>
+<span class="fc" id="L92">    }</span>
+
+    /**
+     * The view column corresponding to the provided base column. This &lt;b&gt;can&lt;/b&gt;
+     * return {@code null} if the column is denormalized in the view.
+     */
+    public ColumnMetadata getViewColumn(ColumnMetadata baseColumn)
+    {
+<span class="fc" id="L100">        return definition.metadata.getColumn(baseColumn.name);</span>
+    }
+
+    /**
+     * The base column corresponding to the provided view column. This should
+     * never return {@code null} since a view can't have its &quot;own&quot; columns.
+     */
+    public ColumnMetadata getBaseColumn(ColumnMetadata viewColumn)
+    {
+<span class="nc" id="L109">        ColumnMetadata baseColumn = baseCfs.metadata().getColumn(viewColumn.name);</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        assert baseColumn != null;</span>
+<span class="nc" id="L111">        return baseColumn;</span>
+    }
+
+    /**
+     * Whether the view might be affected by the provided update.
+     * &lt;p&gt;
+     * Note that having this method return {@code true} is not an absolute guarantee that the view will be
+     * updated, just that it most likely will, but a {@code false} return guarantees it won't be affected).
+     *
+     * @param partitionKey the partition key that is updated.
+     * @param update the update being applied.
+     * @return {@code false} if we can guarantee that inserting {@code update} for key {@code partitionKey}
+     * won't affect the view in any way, {@code true} otherwise.
+     */
+    public boolean mayBeAffectedBy(DecoratedKey partitionKey, Row update)
+    {
+        // We can guarantee that the view won't be affected if:
+        //  - the clustering is excluded by the view filter (note that this isn't true of the filter on regular columns:
+        //    even if an update don't match a view condition on a regular column, that update can still invalidate an pre-existing
+        //    entry).
+        //  - or the update don't modify any of the columns impacting the view (where &quot;impacting&quot; the view means that column is
+        //    neither included in the view, nor used by the view filter).
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (!getReadQuery().selectsClustering(partitionKey, update.clustering()))</span>
+<span class="nc" id="L134">            return false;</span>
+<span class="nc" id="L135">        return true;</span>
+    }
+
+    /**
+     * Whether a given base row matches the view filter (and thus if is should have a corresponding entry).
+     * &lt;p&gt;
+     * Note that this differs from {@link #mayBeAffectedBy} in that the provide row &lt;b&gt;must&lt;/b&gt; be the current
+     * state of the base row, not just some updates to it. This method also has no false positive: a base
+     * row either do or don't match the view filter.
+     *
+     * @param partitionKey the partition key that is updated.
+     * @param baseRow the current state of a particular base row.
+     * @param nowInSec the current time in seconds (to decide what is live and what isn't).
+     * @return {@code true} if {@code baseRow} matches the view filters, {@code false} otherwise.
+     */
+    public boolean matchesViewFilter(DecoratedKey partitionKey, Row baseRow, long nowInSec)
+    {
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        return getReadQuery().selectsClustering(partitionKey, baseRow.clustering())</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            &amp;&amp; getSelectStatement().rowFilterForInternalCalls().isSatisfiedBy(baseCfs.metadata(), partitionKey, baseRow, nowInSec);</span>
+    }
+
+    /**
+     * Returns the SelectStatement used to populate and filter this view.  Internal users should access the select
+     * statement this way to ensure it has been prepared.
+     */
+    SelectStatement getSelectStatement()
+    {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (null == select)</span>
+        {
+<span class="nc" id="L164">            SelectStatement.Parameters parameters =</span>
+<span class="nc" id="L165">                new SelectStatement.Parameters(Collections.emptyMap(),</span>
+<span class="nc" id="L166">                                               Collections.emptyList(),</span>
+                                               false,
+                                               true,
+                                               false);
+
+<span class="nc" id="L171">            SelectStatement.RawStatement rawSelect =</span>
+<span class="nc" id="L172">                new SelectStatement.RawStatement(new QualifiedName(baseCfs.getKeyspaceName(), baseCfs.name),</span>
+                                                 parameters,
+<span class="nc" id="L174">                                                 selectClause(),</span>
+                                                 definition.whereClause,
+                                                 null,
+                                                 null);
+
+<span class="nc" id="L179">            rawSelect.setBindVariables(Collections.emptyList());</span>
+
+<span class="nc" id="L181">            select = rawSelect.prepare(ClientState.forInternalCalls(), true);</span>
+        }
+
+<span class="nc" id="L184">        return select;</span>
+    }
+
+    private List&lt;RawSelector&gt; selectClause()
+    {
+<span class="nc" id="L189">        return definition.metadata</span>
+<span class="nc" id="L190">                         .columns()</span>
+<span class="nc" id="L191">                         .stream()</span>
+<span class="nc" id="L192">                         .map(c -&gt; c.name.toString())</span>
+<span class="nc" id="L193">                         .map(Selectable.RawIdentifier::forQuoted)</span>
+<span class="nc" id="L194">                         .map(c -&gt; new RawSelector(c, null))</span>
+<span class="nc" id="L195">                         .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * Returns the ReadQuery used to filter this view.  Internal users should access the query this way to ensure it
+     * has been prepared.
+     */
+    ReadQuery getReadQuery()
+    {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        if (query == null)</span>
+<span class="nc" id="L205">            query = getSelectStatement().getQuery(QueryOptions.forInternalCalls(Collections.emptyList()), FBUtilities.nowInSeconds());</span>
+
+<span class="nc" id="L207">        return query;</span>
+    }
+
+    public synchronized void build()
+    {
+<span class="nc" id="L212">        stopBuild();</span>
+<span class="nc" id="L213">        builder = new ViewBuilder(baseCfs, this);</span>
+<span class="nc" id="L214">        builder.start();</span>
+<span class="nc" id="L215">    }</span>
+
+    /**
+     * Stops the building of this view, no-op if it isn't building.
+     */
+    synchronized void stopBuild()
+    {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (builder != null)</span>
+        {
+<span class="nc" id="L224">            logger.debug(&quot;Stopping current view builder due to schema change or truncate&quot;);</span>
+<span class="nc" id="L225">            builder.stop();</span>
+<span class="nc" id="L226">            builder = null;</span>
+        }
+<span class="nc" id="L228">    }</span>
+
+    @Nullable
+    public static TableMetadataRef findBaseTable(String keyspace, String viewName)
+    {
+<span class="fc" id="L233">        ViewMetadata view = Schema.instance.getView(keyspace, viewName);</span>
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">        return (view == null) ? null : Schema.instance.getTableMetadataRef(view.baseTableId);</span>
+    }
+
+    // TODO: REMOVE
+    public static Iterable&lt;ViewMetadata&gt; findAll(String keyspace, String baseTable)
+    {
+<span class="fc" id="L240">        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(keyspace);</span>
+<span class="pc" id="L241">        return Iterables.filter(ksm.views, view -&gt; view.baseTableName.equals(baseTable));</span>
+    }
+
+    public boolean hasSamePrimaryKeyColumnsAsBaseTable()
+    {
+<span class="nc" id="L246">        return baseNonPKColumnsInViewPK.isEmpty();</span>
+    }
+
+    /**
+     * When views contains a primary key column that is not part
+     * of the base table primary key, we use that column liveness
+     * info as the view PK, to ensure that whenever that column
+     * is not live in the base, the row is not live in the view.
+     *
+     * This is done to prevent cells other than the view PK from
+     * making the view row alive when the view PK column is not
+     * live in the base. So in this case we tie the row liveness,
+     * to the primary key liveness.
+     *
+     * See CASSANDRA-11500 for context.
+     */
+    public boolean enforceStrictLiveness()
+    {
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">        return !baseNonPKColumnsInViewPK.isEmpty();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

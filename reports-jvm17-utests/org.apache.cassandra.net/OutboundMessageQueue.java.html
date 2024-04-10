@@ -1,0 +1,531 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundMessageQueue.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundMessageQueue.java</span></div><h1>OutboundMessageQueue.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.util.IdentityHashMap;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.utils.MonotonicClock;
+
+import static java.lang.Long.MAX_VALUE;
+import static java.lang.Math.min;
+import static java.util.Collections.newSetFromMap;
+import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
+
+/**
+ * A composite queue holding messages to be delivered by an {@link OutboundConnection}.
+ *
+ * Contains two queues:
+ *  1. An external MPSC {@link ManyToOneConcurrentLinkedQueue} for producers to enqueue messages onto
+ *  2. An internal intermediate {@link PrunableArrayQueue} into which the external queue is
+ *     drained with exclusive access and from which actual deliveries happen
+ * The second, intermediate queue exists to enable efficient in-place pruning of expired messages.
+ *
+ * Said pruning will be attempted in several scenarios:
+ *  1. By callers invoking {@link #add(Message)} - if metadata indicates presence of expired messages
+ *     in the queue, and if exclusive access can be immediately obtained (non-blockingly)
+ *  2. By {@link OutboundConnection}, periodically, while disconnected
+ *  3. As an optimisation, in an attempt to free up endpoint capacity on {@link OutboundConnection#enqueue(Message)}
+ *     if current endpoint reserve was insufficient
+ */
+class OutboundMessageQueue
+{
+<span class="fc" id="L59">    private static final Logger logger = LoggerFactory.getLogger(OutboundMessageQueue.class);</span>
+
+    interface MessageConsumer&lt;Produces extends Throwable&gt;
+    {
+        boolean accept(Message&lt;?&gt; message) throws Produces;
+    }
+
+    private final MonotonicClock clock;
+    private final MessageConsumer&lt;RuntimeException&gt; onExpired;
+
+<span class="fc" id="L69">    private final ManyToOneConcurrentLinkedQueue&lt;Message&lt;?&gt;&gt; externalQueue = new ManyToOneConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L70">    private final PrunableArrayQueue&lt;Message&lt;?&gt;&gt; internalQueue = new PrunableArrayQueue&lt;&gt;(256);</span>
+
+<span class="fc" id="L72">    private volatile long earliestExpiresAt = Long.MAX_VALUE;</span>
+<span class="fc" id="L73">    private volatile long nextExpirationDeadline = Long.MAX_VALUE;</span>
+<span class="fc" id="L74">    private static final AtomicLongFieldUpdater&lt;OutboundMessageQueue&gt; earliestExpiresAtUpdater =</span>
+<span class="fc" id="L75">        AtomicLongFieldUpdater.newUpdater(OutboundMessageQueue.class, &quot;earliestExpiresAt&quot;);</span>
+<span class="fc" id="L76">    private static final AtomicLongFieldUpdater&lt;OutboundMessageQueue&gt; nextExpirationDeadlineUpdater =</span>
+<span class="fc" id="L77">        AtomicLongFieldUpdater.newUpdater(OutboundMessageQueue.class, &quot;nextExpirationDeadline&quot;);</span>
+
+    OutboundMessageQueue(MonotonicClock clock, MessageConsumer&lt;RuntimeException&gt; onExpired)
+<span class="fc" id="L80">    {</span>
+<span class="fc" id="L81">        this.clock = clock;</span>
+<span class="fc" id="L82">        this.onExpired = onExpired;</span>
+<span class="fc" id="L83">    }</span>
+
+    /**
+     * Add the provided message to the queue. Always succeeds.
+     */
+    void add(Message&lt;?&gt; m)
+    {
+<span class="fc" id="L90">        maybePruneExpired();</span>
+<span class="fc" id="L91">        externalQueue.offer(m);</span>
+        // Known race here. See CASSANDRAi-15958
+<span class="fc" id="L93">        nextExpirationDeadlineUpdater.accumulateAndGet(this,</span>
+<span class="fc" id="L94">                                                       maybeUpdateEarliestExpiresAt(clock.now(), m.expiresAtNanos()),</span>
+                                                       Math::min);
+<span class="fc" id="L96">    }</span>
+
+    /**
+     * Try to obtain the lock; if this fails, a callback will be registered to be invoked when
+     * the lock is relinquished.
+     *
+     * This callback will run WITHOUT ownership of the lock, so must re-obtain the lock.
+     *
+     * @return null if failed to obtain the lock
+     */
+    WithLock lockOrCallback(long nowNanos, Runnable callbackIfDeferred)
+    {
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        if (!lockOrCallback(callbackIfDeferred))</span>
+<span class="nc" id="L109">            return null;</span>
+
+<span class="fc" id="L111">        return new WithLock(nowNanos);</span>
+    }
+
+    /**
+     * Try to obtain the lock. If successful, invoke the provided consumer immediately, otherwise
+     * register it to be invoked when the lock is relinquished.
+     */
+    void runEventually(Consumer&lt;WithLock&gt; runEventually)
+    {
+<span class="pc" id="L120">        try (WithLock withLock = lockOrCallback(clock.now(), () -&gt; runEventually(runEventually)))</span>
+        {
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">            if (withLock != null)</span>
+<span class="fc" id="L123">                runEventually.accept(withLock);</span>
+        }
+<span class="fc" id="L125">    }</span>
+
+    /**
+     * If succeeds to obtain the lock, polls the queue, otherwise registers the provided callback
+     * to be invoked when the lock is relinquished.
+     *
+     * May return null when the queue is non-empty - if the lock could not be acquired.
+     */
+    Message&lt;?&gt; tryPoll(long nowNanos, Runnable elseIfDeferred)
+    {
+<span class="fc" id="L135">        try (WithLock withLock = lockOrCallback(nowNanos, elseIfDeferred))</span>
+        {
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (withLock == null)</span>
+<span class="nc" id="L138">                return null;</span>
+
+<span class="fc" id="L140">            return withLock.poll();</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        }</span>
+    }
+
+<span class="fc" id="L144">    class WithLock implements AutoCloseable</span>
+    {
+        private final long nowNanos;
+
+        private WithLock(long nowNanos)
+<span class="fc" id="L149">        {</span>
+<span class="fc" id="L150">            this.nowNanos = nowNanos;</span>
+<span class="fc" id="L151">            externalQueue.drain(internalQueue::offer);</span>
+<span class="fc" id="L152">        }</span>
+
+        Message&lt;?&gt; poll()
+        {
+            Message&lt;?&gt; m;
+<span class="fc bfc" id="L157" title="All 2 branches covered.">            while (null != (m = internalQueue.poll()))</span>
+            {
+<span class="fc bfc" id="L159" title="All 2 branches covered.">                if (shouldSend(m, clock, nowNanos))</span>
+<span class="fc" id="L160">                    break;</span>
+
+<span class="fc" id="L162">                onExpired.accept(m);</span>
+            }
+
+<span class="fc" id="L165">            return m;</span>
+        }
+
+        void removeHead(Message&lt;?&gt; expectHead)
+        {
+<span class="pc bpc" id="L170" title="1 of 2 branches missed.">            assert expectHead == internalQueue.peek();</span>
+<span class="fc" id="L171">            internalQueue.poll();</span>
+<span class="fc" id="L172">        }</span>
+
+        Message&lt;?&gt; peek()
+        {
+            Message&lt;?&gt; m;
+<span class="fc bfc" id="L177" title="All 2 branches covered.">            while (null != (m = internalQueue.peek()))</span>
+            {
+<span class="fc bfc" id="L179" title="All 2 branches covered.">                if (shouldSend(m, clock, nowNanos))</span>
+<span class="fc" id="L180">                    break;</span>
+
+<span class="fc" id="L182">                internalQueue.poll();</span>
+<span class="fc" id="L183">                onExpired.accept(m);</span>
+            }
+
+<span class="fc" id="L186">            return m;</span>
+        }
+
+        void consume(Consumer&lt;Message&lt;?&gt;&gt; consumer)
+        {
+            Message&lt;?&gt; m;
+<span class="fc bfc" id="L192" title="All 2 branches covered.">            while (null != (m = poll()))</span>
+<span class="fc" id="L193">                consumer.accept(m);</span>
+<span class="fc" id="L194">        }</span>
+
+        @Override
+        public void close()
+        {
+<span class="fc bfc" id="L199" title="All 2 branches covered.">            if (clock.isAfter(nowNanos, nextExpirationDeadline))</span>
+<span class="fc" id="L200">                pruneInternalQueueWithLock(nowNanos);</span>
+
+<span class="fc" id="L202">            unlock();</span>
+<span class="fc" id="L203">        }</span>
+    }
+
+    /**
+     * Call periodically if cannot expect to promptly invoke consume()
+     */
+    boolean maybePruneExpired()
+    {
+<span class="fc" id="L211">        return maybePruneExpired(clock.now());</span>
+    }
+
+    private boolean maybePruneExpired(long nowNanos)
+    {
+<span class="fc bfc" id="L216" title="All 2 branches covered.">        if (clock.isAfter(nowNanos, nextExpirationDeadline))</span>
+<span class="fc" id="L217">            return tryRun(() -&gt; pruneWithLock(nowNanos));</span>
+
+<span class="fc" id="L219">        return false;</span>
+    }
+
+    /**
+     * Update {@code earliestExpiresAt} with the given {@code candidateTime} if less than the current value OR
+     * if the current value is past the current {@code nowNanos} time: this last condition is needed to make sure we keep
+     * tracking the earliest expiry time even while we prune previous values, so that at the end of the pruning task,
+     * we can reconcile between the earliest expiry time recorded at pruning and the one recorded at insert time.
+     */
+    private long maybeUpdateEarliestExpiresAt(long nowNanos, long candidateTime)
+    {
+<span class="fc" id="L230">        return earliestExpiresAtUpdater.accumulateAndGet(this, candidateTime, (oldTime, newTime) -&gt; {</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">            if (clock.isAfter(nowNanos, oldTime))</span>
+<span class="fc" id="L232">                return newTime;</span>
+            else
+<span class="fc" id="L234">                return min(oldTime, newTime);</span>
+        });
+    }
+
+    /**
+     * Update {@code nextExpirationDeadline} with the given {@code candidateDeadline} if less than the current
+     * deadline, unless the current deadline is passed in relation to {@code nowNanos}: this is needed
+     * to resolve a race where both {@link #add(org.apache.cassandra.net.Message) } and {@link #pruneInternalQueueWithLock(long) }
+     * try to update the expiration deadline.
+     */
+    private long maybeUpdateNextExpirationDeadline(long nowNanos, long candidateDeadline)
+    {
+<span class="fc" id="L246">        return nextExpirationDeadlineUpdater.accumulateAndGet(this, candidateDeadline, (oldDeadline, newDeadline) -&gt; {</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">            if (clock.isAfter(nowNanos, oldDeadline))</span>
+<span class="fc" id="L248">                return newDeadline;</span>
+            else
+<span class="fc" id="L250">                return min(oldDeadline, newDeadline);</span>
+        });
+    }
+
+    /*
+     * Drain external queue into the internal one and prune the latter in-place.
+     */
+    private void pruneWithLock(long nowNanos)
+    {
+<span class="fc" id="L259">        externalQueue.drain(internalQueue::offer);</span>
+<span class="fc" id="L260">        pruneInternalQueueWithLock(nowNanos);</span>
+<span class="fc" id="L261">    }</span>
+
+    /*
+     * Prune the internal queue in-place.
+     */
+    private void pruneInternalQueueWithLock(long nowNanos)
+    {
+<span class="fc" id="L268">        class Pruner implements PrunableArrayQueue.Pruner&lt;Message&lt;?&gt;&gt;</span>
+        {
+<span class="fc" id="L270">            private long earliestExpiresAt = Long.MAX_VALUE;</span>
+
+            public boolean shouldPrune(Message&lt;?&gt; message)
+            {
+<span class="fc bfc" id="L274" title="All 2 branches covered.">                return !shouldSend(message, clock, nowNanos);</span>
+            }
+
+            public void onPruned(Message&lt;?&gt; message)
+            {
+<span class="fc" id="L279">                onExpired.accept(message);</span>
+<span class="fc" id="L280">            }</span>
+
+            public void onKept(Message&lt;?&gt; message)
+            {
+<span class="fc" id="L284">                earliestExpiresAt = min(message.expiresAtNanos(), earliestExpiresAt);</span>
+<span class="fc" id="L285">            }</span>
+        }
+
+<span class="fc" id="L288">        Pruner pruner = new Pruner();</span>
+<span class="fc" id="L289">        internalQueue.prune(pruner);</span>
+
+<span class="fc" id="L291">        maybeUpdateNextExpirationDeadline(nowNanos, maybeUpdateEarliestExpiresAt(nowNanos, pruner.earliestExpiresAt));</span>
+<span class="fc" id="L292">    }</span>
+
+    @VisibleForTesting
+    long nextExpirationIn(long nowNanos, TimeUnit unit)
+    {
+<span class="fc" id="L297">        return unit.convert(nextExpirationDeadline - nowNanos, TimeUnit.NANOSECONDS);</span>
+    }
+
+    private static class Locked implements Runnable
+    {
+        final Runnable run;
+        final Locked next;
+        private Locked(Runnable run, Locked next)
+<span class="fc" id="L305">        {</span>
+<span class="fc" id="L306">            this.run = run;</span>
+<span class="fc" id="L307">            this.next = next;</span>
+<span class="fc" id="L308">        }</span>
+
+        Locked andThen(Runnable next)
+        {
+<span class="fc" id="L312">            return new Locked(next, this);</span>
+        }
+
+        public void run()
+        {
+<span class="fc" id="L317">            Locked cur = this;</span>
+<span class="fc bfc" id="L318" title="All 2 branches covered.">            while (cur != null)</span>
+            {
+                try
+                {
+<span class="fc" id="L322">                    cur.run.run();</span>
+                }
+<span class="nc" id="L324">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L326">                    logger.error(&quot;Unexpected error when executing deferred lock-intending functions&quot;, t);</span>
+<span class="fc" id="L327">                }</span>
+<span class="fc" id="L328">                cur = cur.next;</span>
+            }
+<span class="fc" id="L330">        }</span>
+    }
+
+<span class="fc" id="L333">    private static final Locked LOCKED = new Locked(() -&gt; {}, null);</span>
+
+<span class="fc" id="L335">    private volatile Locked locked = null;</span>
+<span class="fc" id="L336">    private static final AtomicReferenceFieldUpdater&lt;OutboundMessageQueue, Locked&gt; lockedUpdater =</span>
+<span class="fc" id="L337">        AtomicReferenceFieldUpdater.newUpdater(OutboundMessageQueue.class, Locked.class, &quot;locked&quot;);</span>
+
+    /**
+     * Run runOnceLocked either immediately in the calling thread if we can obtain the lock, or ask the lock's current
+     * owner attempt to run it when the lock is released.  This may be passed between a sequence of owners, as the present
+     * owner releases the lock before trying to acquire it again and execute the task.
+     */
+    private void runEventually(Runnable runEventually)
+    {
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        if (!lockOrCallback(() -&gt; runEventually(runEventually)))</span>
+<span class="fc" id="L347">            return;</span>
+
+        try
+        {
+<span class="fc" id="L351">            runEventually.run();</span>
+        }
+        finally
+        {
+<span class="fc" id="L355">            unlock();</span>
+        }
+<span class="fc" id="L357">    }</span>
+
+    /**
+     * If we can immediately obtain the lock, execute runIfLocked and return true;
+     * otherwise do nothing and return false.
+     */
+    private boolean tryRun(Runnable runIfAvailable)
+    {
+<span class="fc bfc" id="L365" title="All 2 branches covered.">        if (!tryLock())</span>
+<span class="fc" id="L366">            return false;</span>
+
+        try
+        {
+<span class="fc" id="L370">            runIfAvailable.run();</span>
+<span class="fc" id="L371">            return true;</span>
+        }
+        finally
+        {
+<span class="fc" id="L375">            unlock();</span>
+        }
+    }
+
+    /**
+     * @return true iff the caller now owns the lock
+     */
+    private boolean tryLock()
+    {
+<span class="pc bpc" id="L384" title="1 of 4 branches missed.">        return locked == null &amp;&amp; lockedUpdater.compareAndSet(this, null, LOCKED);</span>
+    }
+
+    /**
+     * Try to obtain the lock; if this fails, a callback will be registered to be invoked when the lock is relinquished.
+     * This callback will run WITHOUT ownership of the lock, so must re-obtain the lock.
+     *
+     * @return true iff the caller now owns the lock
+     */
+    private boolean lockOrCallback(Runnable callbackWhenAvailable)
+    {
+<span class="fc bfc" id="L395" title="All 2 branches covered.">        if (callbackWhenAvailable == null)</span>
+<span class="fc" id="L396">            return tryLock();</span>
+
+        while (true)
+        {
+<span class="fc" id="L400">            Locked current = locked;</span>
+<span class="pc bpc" id="L401" title="1 of 4 branches missed.">            if (current == null &amp;&amp; lockedUpdater.compareAndSet(this, null, LOCKED))</span>
+<span class="fc" id="L402">                return true;</span>
+<span class="pc bpc" id="L403" title="2 of 4 branches missed.">            else if (current != null &amp;&amp; lockedUpdater.compareAndSet(this, current, current.andThen(callbackWhenAvailable)))</span>
+<span class="fc" id="L404">                return false;</span>
+<span class="nc" id="L405">        }</span>
+    }
+
+    private void unlock()
+    {
+<span class="fc" id="L410">        Locked locked = lockedUpdater.getAndSet(this, null);</span>
+<span class="fc" id="L411">        locked.run();</span>
+<span class="fc" id="L412">    }</span>
+
+
+    /**
+     * While removal happens extremely infrequently, it seems possible for many to still interleave with a connection
+     * being closed, as experimentally we have encountered enough pending removes to overflow the Locked call stack
+     * (prior to making its evaluation iterative).
+     *
+     * While the stack can no longer be exhausted, this suggests a high potential cost for evaluating all removals,
+     * so to ensure system stability we aggregate all pending removes into a single shared object that evaluate
+     * together with only a single lock acquisition.
+     */
+<span class="fc" id="L424">    private volatile RemoveRunner removeRunner = null;</span>
+<span class="fc" id="L425">    private static final AtomicReferenceFieldUpdater&lt;OutboundMessageQueue, RemoveRunner&gt; removeRunnerUpdater =</span>
+<span class="fc" id="L426">        AtomicReferenceFieldUpdater.newUpdater(OutboundMessageQueue.class, RemoveRunner.class, &quot;removeRunner&quot;);</span>
+
+    static class Remove
+    {
+        final Message&lt;?&gt; message;
+        final Remove next;
+
+        Remove(Message&lt;?&gt; message, Remove next)
+<span class="fc" id="L434">        {</span>
+<span class="fc" id="L435">            this.message = message;</span>
+<span class="fc" id="L436">            this.next = next;</span>
+<span class="fc" id="L437">        }</span>
+    }
+
+    private class RemoveRunner extends AtomicReference&lt;Remove&gt; implements Runnable
+    {
+<span class="fc" id="L442">        final CountDownLatch done = newCountDownLatch(1);</span>
+<span class="fc" id="L443">        final Set&lt;Message&lt;?&gt;&gt; removed = newSetFromMap(new IdentityHashMap&lt;&gt;());</span>
+
+<span class="fc" id="L445">        RemoveRunner() { super(new Remove(null, null)); }</span>
+
+        boolean undo(Message&lt;?&gt; message)
+        {
+<span class="pc bpc" id="L449" title="2 of 4 branches missed.">            return null != updateAndGet(prev -&gt; prev == null ? null : new Remove(message, prev));</span>
+        }
+
+        public void run()
+        {
+<span class="fc" id="L454">            Set&lt;Message&lt;?&gt;&gt; remove = newSetFromMap(new IdentityHashMap&lt;&gt;());</span>
+<span class="fc" id="L455">            removeRunner = null;</span>
+<span class="fc" id="L456">            Remove undo = getAndSet(null);</span>
+<span class="fc bfc" id="L457" title="All 2 branches covered.">            while (undo.message != null)</span>
+            {
+<span class="fc" id="L459">                remove.add(undo.message);</span>
+<span class="fc" id="L460">                undo = undo.next;</span>
+            }
+
+<span class="fc" id="L463">            class Remover implements PrunableArrayQueue.Pruner&lt;Message&lt;?&gt;&gt;</span>
+            {
+<span class="fc" id="L465">                private long earliestExpiresAt = MAX_VALUE;</span>
+
+                @Override
+                public boolean shouldPrune(Message&lt;?&gt; message)
+                {
+<span class="fc" id="L470">                    return remove.contains(message);</span>
+                }
+
+                @Override
+                public void onPruned(Message&lt;?&gt; message)
+                {
+<span class="fc" id="L476">                    removed.add(message);</span>
+<span class="fc" id="L477">                }</span>
+
+                @Override
+                public void onKept(Message&lt;?&gt; message)
+                {
+<span class="fc" id="L482">                    earliestExpiresAt = min(message.expiresAtNanos(), earliestExpiresAt);</span>
+<span class="fc" id="L483">                }</span>
+            }
+
+<span class="fc" id="L486">            Remover remover = new Remover();</span>
+<span class="fc" id="L487">            externalQueue.drain(internalQueue::offer);</span>
+<span class="fc" id="L488">            internalQueue.prune(remover);</span>
+
+<span class="fc" id="L490">            long nowNanos = clock.now();</span>
+<span class="fc" id="L491">            maybeUpdateNextExpirationDeadline(nowNanos, maybeUpdateEarliestExpiresAt(nowNanos, remover.earliestExpiresAt));</span>
+
+<span class="fc" id="L493">            done.decrement();</span>
+<span class="fc" id="L494">        }</span>
+    }
+
+    /**
+     * Remove the provided Message from the queue, if present.
+     *
+     * WARNING: This is a blocking call.
+     */
+    boolean remove(Message&lt;?&gt; remove)
+    {
+<span class="pc bpc" id="L504" title="1 of 2 branches missed.">        if (remove == null)</span>
+<span class="nc" id="L505">            throw new NullPointerException();</span>
+
+        RemoveRunner runner;
+        while (true)
+        {
+<span class="fc" id="L510">            runner = removeRunner;</span>
+<span class="pc bpc" id="L511" title="1 of 4 branches missed.">            if (runner != null &amp;&amp; runner.undo(remove))</span>
+<span class="fc" id="L512">                break;</span>
+
+<span class="pc bpc" id="L514" title="2 of 4 branches missed.">            if (runner == null &amp;&amp; removeRunnerUpdater.compareAndSet(this, null, runner = new RemoveRunner()))</span>
+            {
+<span class="fc" id="L516">                runner.undo(remove);</span>
+<span class="fc" id="L517">                runEventually(runner);</span>
+<span class="fc" id="L518">                break;</span>
+            }
+        }
+
+<span class="fc" id="L522">        runner.done.awaitUninterruptibly();</span>
+<span class="fc" id="L523">        return runner.removed.contains(remove);</span>
+    }
+
+    private static boolean shouldSend(Message&lt;?&gt; m, MonotonicClock clock, long nowNanos)
+    {
+<span class="fc bfc" id="L528" title="All 2 branches covered.">        return !clock.isAfter(nowNanos, m.expiresAtNanos());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

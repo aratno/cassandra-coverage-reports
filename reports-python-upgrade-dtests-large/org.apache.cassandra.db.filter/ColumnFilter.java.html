@@ -1,0 +1,990 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ColumnFilter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.filter</a> &gt; <span class="el_source">ColumnFilter.java</span></div><h1>ColumnFilter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.filter;
+
+import java.io.IOException;
+import java.util.*;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.SortedSetMultimap;
+import com.google.common.collect.TreeMultimap;
+
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+
+/**
+ * Represents which (non-PK) columns (and optionally which sub-part of a column for complex columns) are selected
+ * by a query.
+ *
+ * We distinguish 2 sets of columns in practice: the _fetched_ columns, which are the columns that we (may, see
+ * below) need to fetch internally, and the _queried_ columns, which are the columns that the user has selected
+ * in its request.
+ *
+ * The reason for distinguishing those 2 sets is that due to the CQL semantic (see #6588 for more details), we
+ * often need to internally fetch all regular columns or all columns for the queried table, but can still do some
+ * optimizations for those columns that are not directly queried by the user (see #10657 for more details).
+ *
+ * Note that in practice:
+ *   - the _queried_ columns set is always included in the _fetched_ one.
+ *   - whenever those sets are different, the _fetched_ columns can contain either all the regular columns and
+ *     the static columns queried by the user or all the regular and static columns. If the query is a partition level
+ *     query (no restrictions on clustering or regular columns) all the static columns will need to be fetched as
+ *     some data will need to be returned to the user if the partition has no row but some static data. For all the
+ *     other scenarios only the regular columns are required.
+ *   - in the special case of a {@code SELECT *} query, we want to query all columns, and _fetched_ == _queried.
+ *     As this is a common case, we special case it by using a specific subclass for it.
+ *
+ * For complex columns, this class optionally allows to specify a subset of the cells to query for each column.
+ * We can either select individual cells by path name, or a slice of them. Note that this is a sub-selection of
+ * _queried_ cells, so if _fetched_ != _queried_, then the cell selected by this sub-selection are considered
+ * queried and the other ones are considered fetched (and if a column has some sub-selection, it must be a queried
+ * column, which is actually enforced by the Builder below).
+ */
+<span class="fc" id="L65">public abstract class ColumnFilter</span>
+{
+
+<span class="fc" id="L68">    public static final ColumnFilter NONE = selection(RegularAndStaticColumns.NONE);</span>
+
+<span class="fc" id="L70">    public static final Serializer serializer = new Serializer();</span>
+
+    /**
+     * The fetching strategy for the different queries.
+     */
+<span class="fc" id="L75">    private enum FetchingStrategy</span>
+    {
+        /**
+         * This strategy will fetch all the regular and static columns.
+         *
+         * &lt;p&gt;According to the CQL semantic a partition exists if it has at least one row or one of its static columns is not null.
+         * For queries that have no restrictions on the clustering or regular columns, C* will return some data for
+         * the partition even if it does not contains any row as long as one of the static columns contains data.
+         * To be able to ensure those queries all columns need to be fetched.&lt;/p&gt;
+         */
+<span class="fc" id="L85">        ALL_COLUMNS</span>
+        {
+            @Override
+            boolean fetchesAllColumns(boolean isStatic)
+            {
+<span class="fc" id="L90">                return true;</span>
+            }
+
+            @Override
+            RegularAndStaticColumns getFetchedColumns(TableMetadata metadata, RegularAndStaticColumns queried)
+            {
+<span class="fc" id="L96">                return metadata.regularAndStaticColumns();</span>
+            }
+        },
+
+        /**
+         * This strategy will fetch all the regular and selected static columns.
+         *
+         * &lt;p&gt;According to the CQL semantic a row exists if at least one of its columns is not null.
+         * To ensure that we need to fetch all regular columns.&lt;/p&gt;
+         */
+<span class="fc" id="L106">        ALL_REGULARS_AND_QUERIED_STATICS_COLUMNS</span>
+        {
+            @Override
+            boolean fetchesAllColumns(boolean isStatic)
+            {
+<span class="fc bfc" id="L111" title="All 2 branches covered.">                return !isStatic;</span>
+            }
+
+            @Override
+            RegularAndStaticColumns getFetchedColumns(TableMetadata metadata, RegularAndStaticColumns queried)
+            {
+<span class="fc" id="L117">                return new RegularAndStaticColumns(queried.statics, metadata.regularColumns());</span>
+            }
+        },
+
+        /**
+         * Fetch only the columns that have been selected.
+         *
+         * &lt;p&gt;With this strategy _queried_ == _fetched_. This strategy is only used for internal queries.&lt;/p&gt;
+         */
+<span class="fc" id="L126">        ONLY_QUERIED_COLUMNS</span>
+        {
+            @Override
+            boolean fetchesAllColumns(boolean isStatic)
+            {
+<span class="fc" id="L131">                return false;</span>
+            }
+
+            @Override
+            boolean areAllFetchedColumnsQueried()
+            {
+<span class="fc" id="L137">                return true;</span>
+            }
+
+            @Override
+            RegularAndStaticColumns getFetchedColumns(TableMetadata metadata, RegularAndStaticColumns queried)
+            {
+<span class="fc" id="L143">                return queried;</span>
+            }
+        };
+
+        /**
+         * Checks if the strategy fetch all the specified columns
+         *
+         * @param isStatic {@code true} is the check is for static columns, {@code false} otherwise
+         * @return {@code true} if the strategy fetch all the static columns, {@code false} otherwise.
+         */
+        abstract boolean fetchesAllColumns(boolean isStatic);
+
+        /**
+         * Checks if all the fetched columns are guaranteed to be queried
+         *
+         * @return {@code true} if all the fetched columns are guaranteed to be queried, {@code false} otherwise.
+         */
+        boolean areAllFetchedColumnsQueried()
+        {
+<span class="fc" id="L162">            return false;</span>
+        }
+
+        /**
+         * Returns the columns that must be fetched to answer the query.
+         *
+         * @param metadata the table metadata
+         * @param queried the queried columns
+         * @return the columns that must be fetched
+         */
+        abstract RegularAndStaticColumns getFetchedColumns(TableMetadata metadata, RegularAndStaticColumns queried);
+    }
+
+    /**
+     * A filter that includes all columns for the provided table.
+     */
+    public static ColumnFilter all(TableMetadata metadata)
+    {
+<span class="fc" id="L180">        return new WildCardColumnFilter(metadata.regularAndStaticColumns());</span>
+    }
+
+    /**
+     * A filter that only fetches/queries the provided columns.
+     * &lt;p&gt;
+     * Note that this shouldn't be used for CQL queries in general as all columns should be queried to
+     * preserve CQL semantic (see class javadoc). This is ok for some internal queries however (and
+     * for #6588 if/when we implement it).
+     */
+    public static ColumnFilter selection(RegularAndStaticColumns columns)
+    {
+<span class="fc" id="L192">        return SelectionColumnFilter.newInstance(FetchingStrategy.ONLY_QUERIED_COLUMNS, null, columns, null);</span>
+    }
+
+    /**
+     * A filter that fetches all columns for the provided table, but returns
+     * only the queried ones.
+     */
+    @VisibleForTesting
+    public static ColumnFilter selection(TableMetadata metadata,
+                                         RegularAndStaticColumns queried,
+                                         boolean returnStaticContentOnPartitionWithNoRows)
+    {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        if (!returnStaticContentOnPartitionWithNoRows)</span>
+<span class="nc" id="L205">            return SelectionColumnFilter.newInstance(FetchingStrategy.ALL_REGULARS_AND_QUERIED_STATICS_COLUMNS, metadata, queried, null);</span>
+
+<span class="nc" id="L207">        return SelectionColumnFilter.newInstance(FetchingStrategy.ALL_COLUMNS, metadata, queried, null);</span>
+    }
+
+    /**
+     * The columns that needs to be fetched internally for this filter.
+     *
+     * @return the columns to fetch for this filter.
+     */
+    public abstract RegularAndStaticColumns fetchedColumns();
+
+    /**
+     * The columns actually queried by the user.
+     * &lt;p&gt;
+     * Note that this is in general not all the columns that are fetched internally (see {@link #fetchedColumns}).
+     */
+    public abstract RegularAndStaticColumns queriedColumns();
+
+    /**
+     * Whether all the (regular or static) columns are fetched by this filter.
+     * &lt;p&gt;
+     * Note that this method is meant as an optimization but a negative return
+     * shouldn't be relied upon strongly: this can return {@code false} but
+     * still have all the columns fetches if those were manually selected by the
+     * user. The goal here is to cheaply avoid filtering things on wildcard
+     * queries, as those are common.
+     *
+     * @param isStatic whether to check for static columns or not. If {@code true},
+     * the method returns if all static columns are fetched, otherwise it checks
+     * regular columns.
+     */
+    public abstract boolean fetchesAllColumns(boolean isStatic);
+
+    /**
+     * Whether _fetched_ == _queried_ for this filter, and so if the {@code isQueried()} methods
+     * can return {@code false} for some column/cell.
+     */
+    public abstract boolean allFetchedColumnsAreQueried();
+
+    /**
+     * Whether the provided column is fetched by this filter.
+     */
+    public abstract boolean fetches(ColumnMetadata column);
+
+    /**
+     * Whether the provided column, which is assumed to be _fetched_ by this filter (so the caller must guarantee
+     * that {@code fetches(column) == true}, is also _queried_ by the user.
+     *
+     * !WARNING! please be sure to understand the difference between _fetched_ and _queried_
+     * columns that this class made before using this method. If unsure, you probably want
+     * to use the {@link #fetches} method.
+     */
+    public abstract boolean fetchedColumnIsQueried(ColumnMetadata column);
+
+    /**
+     * Whether the provided complex cell (identified by its column and path), which is assumed to be _fetched_ by
+     * this filter, is also _queried_ by the user.
+     *
+     * !WARNING! please be sure to understand the difference between _fetched_ and _queried_
+     * columns that this class made before using this method. If unsure, you probably want
+     * to use the {@link #fetches} method.
+     */
+    public abstract boolean fetchedCellIsQueried(ColumnMetadata column, CellPath path);
+
+    /**
+     * Creates a new {@code Tester} to efficiently test the inclusion of cells of complex column
+     * {@code column}.
+     *
+     * @param column for complex column for which to create a tester.
+     * @return the created tester or {@code null} if all the cells from the provided column
+     * are queried.
+     */
+    @Nullable
+    public abstract Tester newTester(ColumnMetadata column);
+
+    /**
+     * Checks if this {@code ColumnFilter} is for a wildcard query.
+     *
+     * @return {@code true} if this {@code ColumnFilter} is for a wildcard query, {@code false} otherwise.
+     */
+    public boolean isWildcard()
+    {
+<span class="fc" id="L288">        return false;</span>
+    }
+
+    /**
+     * Returns the CQL string corresponding to this {@code ColumnFilter}.
+     *
+     * @return the CQL string corresponding to this {@code ColumnFilter}.
+     */
+    public abstract String toCQLString();
+
+    /**
+     * Returns the sub-selections or {@code null} if there are none.
+     *
+     * @return the sub-selections or {@code null} if there are none
+     */
+    protected abstract SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections();
+
+    /**
+     * Returns a {@code ColumnFilter} builder that fetches all regular columns or all columns (and queries the columns
+     * added to the builder, or everything if no column is added).
+     *
+     * @param metadata the table metadata
+     * @param returnStaticContentOnPartitionWithNoRows {@code true} if the query must return static contents if the partition has no row,
+     * {@code false} otherwise.
+     */
+    public static Builder allRegularColumnsBuilder(TableMetadata metadata, boolean returnStaticContentOnPartitionWithNoRows)
+    {
+<span class="fc" id="L315">        return new Builder(metadata, returnStaticContentOnPartitionWithNoRows);</span>
+    }
+
+    /**
+     * Returns a {@code ColumnFilter} builder that only fetches the columns/cells added to the builder.
+     */
+    public static Builder selectionBuilder()
+    {
+<span class="fc" id="L323">        return new Builder(null, false);</span>
+    }
+
+    public static class Tester
+    {
+        private final boolean isFetched;
+        private ColumnSubselection current;
+        private final Iterator&lt;ColumnSubselection&gt; iterator;
+
+        private Tester(boolean isFetched, Iterator&lt;ColumnSubselection&gt; iterator)
+<span class="nc" id="L333">        {</span>
+<span class="nc" id="L334">            this.isFetched = isFetched;</span>
+<span class="nc" id="L335">            this.iterator = iterator;</span>
+<span class="nc" id="L336">        }</span>
+
+        public boolean fetches(CellPath path)
+        {
+<span class="nc bnc" id="L340" title="All 4 branches missed.">            return isFetched || hasSubselection(path);</span>
+        }
+
+        /**
+         * Must only be called if {@code fetches(path) == true}.
+         */
+        public boolean fetchedCellIsQueried(CellPath path)
+        {
+<span class="nc bnc" id="L348" title="All 4 branches missed.">            return !isFetched || hasSubselection(path);</span>
+        }
+
+        private boolean hasSubselection(CellPath path)
+        {
+<span class="nc bnc" id="L353" title="All 4 branches missed.">            while (current != null || iterator.hasNext())</span>
+            {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                if (current == null)</span>
+<span class="nc" id="L356">                    current = iterator.next();</span>
+
+<span class="nc" id="L358">                int cmp = current.compareInclusionOf(path);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                if (cmp == 0) // The path is included</span>
+<span class="nc" id="L360">                    return true;</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                else if (cmp &lt; 0) // The path is before this sub-selection, it's not included by any</span>
+<span class="nc" id="L362">                    return false;</span>
+
+                // the path is after this sub-selection, we need to check the next one.
+<span class="nc" id="L365">                current = null;</span>
+<span class="nc" id="L366">            }</span>
+<span class="nc" id="L367">            return false;</span>
+        }
+    }
+
+    /**
+     * A builder for a {@code ColumnFilter} object.
+     *
+     * Note that the columns added to this build are the _queried_ column. Whether or not all columns
+     * are _fetched_ depends on which constructor you've used to obtained this builder, allRegularColumnsBuilder (all
+     * columns are fetched) or selectionBuilder (only the queried columns are fetched).
+     *
+     * Note that for a allRegularColumnsBuilder, if no queried columns are added, this is interpreted as querying
+     * all columns, not querying none (but if you know you want to query all columns, prefer
+     * {@link ColumnFilter#all(TableMetadata)}. For selectionBuilder, adding no queried columns means no column will be
+     * fetched (so the builder will return {@code PartitionColumns.NONE}).
+     *
+     * Also, if only a sub-selection of a complex column should be queried, then only the corresponding
+     * sub-selection method of the builder ({@link #slice} or {@link #select}) should be called for the
+     * column, but {@link #add} shouldn't. if {@link #add} is also called, the whole column will be
+     * queried and the sub-selection(s) will be ignored. This is done for correctness of CQL where
+     * if you do &quot;SELECT m, m[2..5]&quot;, you are really querying the whole collection.
+     */
+<span class="fc" id="L389">    public static class Builder</span>
+    {
+        private final TableMetadata metadata; // null if we don't fetch all columns
+
+        /**
+         * {@code true} if the query must return static contents if the partition has no row, {@code false} otherwise.
+         */
+        private final boolean returnStaticContentOnPartitionWithNoRows;
+
+        private RegularAndStaticColumns.Builder queriedBuilder;
+
+        private List&lt;ColumnSubselection&gt; subSelections;
+
+        private Set&lt;ColumnMetadata&gt; fullySelectedComplexColumns;
+
+        private Builder(TableMetadata metadata, boolean returnStaticContentOnPartitionWithNoRows)
+<span class="fc" id="L405">        {</span>
+<span class="fc" id="L406">            this.metadata = metadata;</span>
+<span class="fc" id="L407">            this.returnStaticContentOnPartitionWithNoRows = returnStaticContentOnPartitionWithNoRows;</span>
+<span class="fc" id="L408">        }</span>
+
+        public Builder add(ColumnMetadata c)
+        {
+<span class="pc bpc" id="L412" title="1 of 4 branches missed.">            if (c.isComplex() &amp;&amp; c.type.isMultiCell())</span>
+            {
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">                if (fullySelectedComplexColumns == null)</span>
+<span class="fc" id="L415">                    fullySelectedComplexColumns = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L416">                fullySelectedComplexColumns.add(c);</span>
+            }
+<span class="fc" id="L418">            return addInternal(c);</span>
+        }
+
+        public Builder addAll(Iterable&lt;ColumnMetadata&gt; columns)
+        {
+<span class="fc bfc" id="L423" title="All 2 branches covered.">            for (ColumnMetadata column : columns)</span>
+<span class="fc" id="L424">                add(column);</span>
+<span class="fc" id="L425">            return this;</span>
+        }
+
+        private Builder addInternal(ColumnMetadata c)
+        {
+<span class="fc bfc" id="L430" title="All 2 branches covered.">            if (c.isPrimaryKeyColumn())</span>
+<span class="fc" id="L431">                return this;</span>
+
+<span class="fc bfc" id="L433" title="All 2 branches covered.">            if (queriedBuilder == null)</span>
+<span class="fc" id="L434">                queriedBuilder = RegularAndStaticColumns.builder();</span>
+<span class="fc" id="L435">            queriedBuilder.add(c);</span>
+<span class="fc" id="L436">            return this;</span>
+        }
+
+        private Builder addSubSelection(ColumnSubselection subSelection)
+        {
+<span class="nc" id="L441">            ColumnMetadata column = subSelection.column();</span>
+<span class="nc bnc" id="L442" title="All 4 branches missed.">            assert column.isComplex() &amp;&amp; column.type.isMultiCell();</span>
+<span class="nc" id="L443">            addInternal(column);</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if (subSelections == null)</span>
+<span class="nc" id="L445">                subSelections = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L446">            subSelections.add(subSelection);</span>
+<span class="nc" id="L447">            return this;</span>
+        }
+
+        public Builder slice(ColumnMetadata c, CellPath from, CellPath to)
+        {
+<span class="nc" id="L452">            return addSubSelection(ColumnSubselection.slice(c, from, to));</span>
+        }
+
+        public Builder select(ColumnMetadata c, CellPath elt)
+        {
+<span class="nc" id="L457">            return addSubSelection(ColumnSubselection.element(c, elt));</span>
+        }
+
+        public ColumnFilter build()
+        {
+<span class="fc bfc" id="L462" title="All 2 branches covered.">            boolean isFetchAllRegulars = metadata != null;</span>
+
+<span class="fc bfc" id="L464" title="All 2 branches covered.">            RegularAndStaticColumns queried = queriedBuilder == null ? null : queriedBuilder.build();</span>
+
+            // It's only ok to have queried == null in ColumnFilter if isFetchAllRegulars. So deal with the case of a selectionBuilder
+            // with nothing selected (we can at least happen on some backward compatible queries - CASSANDRA-10471).
+<span class="pc bpc" id="L468" title="1 of 4 branches missed.">            if (!isFetchAllRegulars &amp;&amp; queried == null)</span>
+<span class="nc" id="L469">                queried = RegularAndStaticColumns.NONE;</span>
+
+<span class="fc" id="L471">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; s = buildSubSelections();</span>
+
+<span class="fc bfc" id="L473" title="All 2 branches covered.">            if (isFetchAllRegulars)</span>
+            {
+                // there is no way to convert the filter with fetchAll and queried != null so all columns are queried
+                //   see CASSANDRA-10657, CASSANDRA-15833, CASSANDRA-16415
+<span class="fc bfc" id="L477" title="All 2 branches covered.">                if (queried == null)</span>
+<span class="fc" id="L478">                    return new WildCardColumnFilter(metadata.regularAndStaticColumns());</span>
+
+<span class="fc bfc" id="L480" title="All 2 branches covered.">                if (!returnStaticContentOnPartitionWithNoRows)</span>
+<span class="fc" id="L481">                    return SelectionColumnFilter.newInstance(FetchingStrategy.ALL_REGULARS_AND_QUERIED_STATICS_COLUMNS, metadata, queried, s);</span>
+
+<span class="fc" id="L483">                return SelectionColumnFilter.newInstance(FetchingStrategy.ALL_COLUMNS, metadata, queried, s);</span>
+            }
+
+<span class="fc" id="L486">            return SelectionColumnFilter.newInstance(FetchingStrategy.ONLY_QUERIED_COLUMNS, (TableMetadata) null, queried, s);</span>
+        }
+
+        private SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; buildSubSelections()
+        {
+<span class="pc bpc" id="L491" title="1 of 2 branches missed.">            if (subSelections == null)</span>
+<span class="fc" id="L492">                return null;</span>
+
+<span class="nc" id="L494">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; s = TreeMultimap.create(Comparator.naturalOrder(), Comparator.naturalOrder());</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">            for (ColumnSubselection subSelection : subSelections)</span>
+            {
+<span class="nc bnc" id="L497" title="All 4 branches missed.">                if (fullySelectedComplexColumns == null || !fullySelectedComplexColumns.contains(subSelection.column()))</span>
+<span class="nc" id="L498">                    s.put(subSelection.column().name, subSelection);</span>
+<span class="nc" id="L499">            }</span>
+
+<span class="nc" id="L501">            return s;</span>
+        }
+    }
+
+    /**
+     * {@code ColumnFilter} sub-class for wildcard queries.
+     *
+     * &lt;p&gt;The class does not rely on TableMetadata and expects a fix set of columns to prevent issues
+     * with Schema race propagation. See CASSANDRA-15899.&lt;/p&gt;
+     */
+    public static class WildCardColumnFilter extends ColumnFilter
+    {
+        /**
+         * The queried and fetched columns.
+         */
+        private final RegularAndStaticColumns fetchedAndQueried;
+
+        /**
+         * Creates a {@code ColumnFilter} for wildcard queries.
+         *
+         * &lt;p&gt;The class does not rely on TableMetadata and expects a fix set of columns to prevent issues
+         * with Schema race propagation. See CASSANDRA-15899.&lt;/p&gt;
+         *
+         * @param fetchedAndQueried the fetched and queried columns
+         */
+        private WildCardColumnFilter(RegularAndStaticColumns fetchedAndQueried)
+<span class="fc" id="L527">        {</span>
+<span class="fc" id="L528">            this.fetchedAndQueried = fetchedAndQueried;</span>
+<span class="fc" id="L529">        }</span>
+
+        @Override
+        public RegularAndStaticColumns fetchedColumns()
+        {
+<span class="fc" id="L534">            return fetchedAndQueried;</span>
+        }
+
+        @Override
+        public RegularAndStaticColumns queriedColumns()
+        {
+<span class="fc" id="L540">            return fetchedAndQueried;</span>
+        }
+
+        @Override
+        public boolean fetchesAllColumns(boolean isStatic)
+        {
+<span class="fc" id="L546">            return true;</span>
+        }
+
+        @Override
+        public boolean allFetchedColumnsAreQueried()
+        {
+<span class="fc" id="L552">            return true;</span>
+        }
+
+        @Override
+        public boolean fetches(ColumnMetadata column)
+        {
+<span class="fc" id="L558">            return true;</span>
+        }
+
+        @Override
+        public boolean fetchedColumnIsQueried(ColumnMetadata column)
+        {
+<span class="fc" id="L564">            return true;</span>
+        }
+
+        @Override
+        public boolean fetchedCellIsQueried(ColumnMetadata column, CellPath path)
+        {
+<span class="nc" id="L570">            return true;</span>
+        }
+
+        @Override
+        public Tester newTester(ColumnMetadata column)
+        {
+<span class="fc" id="L576">            return null;</span>
+        }
+
+        @Override
+        public boolean equals(Object other)
+        {
+<span class="nc bnc" id="L582" title="All 2 branches missed.">            if (other == this)</span>
+<span class="nc" id="L583">                return true;</span>
+
+<span class="nc bnc" id="L585" title="All 2 branches missed.">            if (!(other instanceof WildCardColumnFilter))</span>
+<span class="nc" id="L586">                return false;</span>
+
+<span class="nc" id="L588">            WildCardColumnFilter w = (WildCardColumnFilter) other;</span>
+
+<span class="nc" id="L590">            return fetchedAndQueried.equals(w.fetchedAndQueried);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L596">            return Objects.hash(fetchedAndQueried);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="fc" id="L602">            return &quot;*/*&quot;;</span>
+        }
+
+        public String toCQLString()
+        {
+<span class="fc" id="L607">            return &quot;*&quot;;</span>
+        }
+
+        @Override
+        public boolean isWildcard()
+        {
+<span class="fc" id="L613">            return true;</span>
+        }
+
+        @Override
+        protected SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections()
+        {
+<span class="fc" id="L619">            return null;</span>
+        }
+    }
+
+    /**
+     * {@code ColumnFilter} sub-class for queries with selected columns.
+     *
+     * &lt;p&gt;The class  does not rely on TableMetadata and expect a fix set of fetched columns to prevent issues
+     * with Schema race propagation. See CASSANDRA-15899.&lt;/p&gt;
+     */
+<span class="fc" id="L629">    public static class SelectionColumnFilter extends ColumnFilter</span>
+    {
+        public final FetchingStrategy fetchingStrategy;
+
+        /**
+         * The selected columns
+         */
+        private final RegularAndStaticColumns queried;
+
+        /**
+         * The columns that need to be fetched to be able
+         */
+        private final RegularAndStaticColumns fetched;
+
+        private final SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections; // can be null
+
+        public static SelectionColumnFilter newInstance(FetchingStrategy fetchingStrategy,
+                                                        TableMetadata metadata,
+                                                        RegularAndStaticColumns queried,
+                                                        SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections)
+        {
+<span class="pc bpc" id="L650" title="1 of 4 branches missed.">            assert fetchingStrategy != FetchingStrategy.ONLY_QUERIED_COLUMNS || metadata == null;</span>
+<span class="pc bpc" id="L651" title="1 of 2 branches missed.">            assert queried != null;</span>
+
+<span class="fc" id="L653">            return new SelectionColumnFilter(fetchingStrategy,</span>
+                                             queried,
+<span class="fc" id="L655">                                             fetchingStrategy.getFetchedColumns(metadata, queried),</span>
+                                             subSelections);
+        }
+
+        /**
+         * Creates a {@code ColumnFilter} for queries with selected columns.
+         *
+         * &lt;p&gt;The class  does not rely on TableMetadata and expect a fix set of columns to prevent issues
+         * with Schema race propagation. See CASSANDRA-15899.&lt;/p&gt;
+         *
+         * @param fetchingStrategy the strategy used to select the fetched columns
+         * @param fetched the columns that must be fetched
+         * @param queried the queried columns
+         * @param subSelections the columns sub-selections
+         */
+        public SelectionColumnFilter(FetchingStrategy fetchingStrategy,
+                                     RegularAndStaticColumns queried,
+                                     RegularAndStaticColumns fetched,
+                                     SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections)
+<span class="fc" id="L674">        {</span>
+<span class="pc bpc" id="L675" title="1 of 2 branches missed.">            assert queried != null;</span>
+<span class="pc bpc" id="L676" title="1 of 2 branches missed.">            assert fetched.includes(queried);</span>
+
+<span class="fc" id="L678">            this.fetchingStrategy = fetchingStrategy;</span>
+<span class="fc" id="L679">            this.queried = queried;</span>
+<span class="fc" id="L680">            this.fetched = fetched;</span>
+<span class="fc" id="L681">            this.subSelections = subSelections;</span>
+<span class="fc" id="L682">        }</span>
+
+        @Override
+        public RegularAndStaticColumns fetchedColumns()
+        {
+<span class="fc" id="L687">            return fetched;</span>
+        }
+
+        @Override
+        public RegularAndStaticColumns queriedColumns()
+        {
+<span class="fc" id="L693">            return queried;</span>
+        }
+
+        @Override
+        public boolean fetchesAllColumns(boolean isStatic)
+        {
+<span class="fc" id="L699">            return fetchingStrategy.fetchesAllColumns(isStatic);</span>
+        }
+
+        @Override
+        public boolean allFetchedColumnsAreQueried()
+        {
+<span class="fc" id="L705">            return fetchingStrategy.areAllFetchedColumnsQueried();</span>
+        }
+
+        @Override
+        public boolean fetches(ColumnMetadata column)
+        {
+<span class="pc bpc" id="L711" title="3 of 4 branches missed.">            return fetchingStrategy.fetchesAllColumns(column.isStatic()) || fetched.contains(column);</span>
+        }
+
+        /**
+         * Whether the provided complex cell (identified by its column and path), which is assumed to be _fetched_ by
+         * this filter, is also _queried_ by the user.
+         *
+         * !WARNING! please be sure to understand the difference between _fetched_ and _queried_
+         * columns that this class made before using this method. If unsure, you probably want
+         * to use the {@link #fetches} method.
+         */
+        @Override
+        public boolean fetchedColumnIsQueried(ColumnMetadata column)
+        {
+<span class="fc bfc" id="L725" title="All 4 branches covered.">            return fetchingStrategy.areAllFetchedColumnsQueried() || queried.contains(column);</span>
+        }
+
+        @Override
+        public boolean fetchedCellIsQueried(ColumnMetadata column, CellPath path)
+        {
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            assert path != null;</span>
+
+            // first verify that the column to which the cell belongs is queried
+<span class="nc bnc" id="L734" title="All 2 branches missed.">            if (!fetchedColumnIsQueried(column))</span>
+<span class="nc" id="L735">                return false;</span>
+
+<span class="nc bnc" id="L737" title="All 2 branches missed.">            if (subSelections == null)</span>
+<span class="nc" id="L738">                return true;</span>
+
+<span class="nc" id="L740">            SortedSet&lt;ColumnSubselection&gt; s = subSelections.get(column.name);</span>
+            // No subsection for this column means everything is queried
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            if (s.isEmpty())</span>
+<span class="nc" id="L743">                return true;</span>
+
+<span class="nc bnc" id="L745" title="All 2 branches missed.">            for (ColumnSubselection subSel : s)</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                if (subSel.compareInclusionOf(path) == 0)</span>
+<span class="nc" id="L747">                    return true;</span>
+
+<span class="nc" id="L749">            return false;</span>
+        }
+
+        @Override
+        public Tester newTester(ColumnMetadata column)
+        {
+<span class="pc bpc" id="L755" title="3 of 4 branches missed.">            if (subSelections == null || !column.isComplex())</span>
+<span class="fc" id="L756">                return null;</span>
+
+<span class="nc" id="L758">            SortedSet&lt;ColumnSubselection&gt; s = subSelections.get(column.name);</span>
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            if (s.isEmpty())</span>
+<span class="nc" id="L760">                return null;</span>
+
+<span class="nc" id="L762">            return new Tester(fetchingStrategy.fetchesAllColumns(column.isStatic()), s.iterator());</span>
+        }
+
+        @Override
+        protected SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections()
+        {
+<span class="fc" id="L768">            return subSelections;</span>
+        }
+
+        @Override
+        public boolean equals(Object other)
+        {
+<span class="nc bnc" id="L774" title="All 2 branches missed.">            if (other == this)</span>
+<span class="nc" id="L775">                return true;</span>
+
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            if (!(other instanceof SelectionColumnFilter))</span>
+<span class="nc" id="L778">                return false;</span>
+
+<span class="nc" id="L780">            SelectionColumnFilter otherCf = (SelectionColumnFilter) other;</span>
+
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            return otherCf.fetchingStrategy == this.fetchingStrategy &amp;&amp;</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">                   Objects.equals(otherCf.queried, this.queried) &amp;&amp;</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">                   Objects.equals(otherCf.fetched, this.fetched) &amp;&amp;</span>
+<span class="nc bnc" id="L785" title="All 2 branches missed.">                   Objects.equals(otherCf.subSelections, this.subSelections);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L791">            return Objects.hash(fetchingStrategy, queried, fetched, subSelections);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L797">            String prefix = &quot;&quot;;</span>
+
+<span class="nc bnc" id="L799" title="All 2 branches missed.">            if (fetchingStrategy.fetchesAllColumns(true))</span>
+<span class="nc" id="L800">                prefix = &quot;*/&quot;;</span>
+
+<span class="nc bnc" id="L802" title="All 2 branches missed.">            if (fetchingStrategy == FetchingStrategy.ALL_REGULARS_AND_QUERIED_STATICS_COLUMNS)</span>
+            {
+<span class="nc bnc" id="L804" title="All 2 branches missed.">                prefix = queried.statics.isEmpty()</span>
+<span class="nc" id="L805">                       ? &quot;&lt;all regulars&gt;/&quot;</span>
+<span class="nc" id="L806">                       : String.format(&quot;&lt;all regulars&gt;+%s/&quot;, toString(queried.statics.selectOrderIterator(), false));</span>
+            }
+
+<span class="nc" id="L809">            return prefix + toString(queried.selectOrderIterator(), false);</span>
+        }
+
+        @Override
+        public String toCQLString()
+        {
+<span class="pc bpc" id="L815" title="1 of 2 branches missed.">            return queried.isEmpty() ? &quot;*&quot; : toString(queried.selectOrderIterator(), true);</span>
+        }
+
+        private String toString(Iterator&lt;ColumnMetadata&gt; columns, boolean cql)
+        {
+<span class="pc bpc" id="L820" title="1 of 2 branches missed.">            StringJoiner joiner = cql ? new StringJoiner(&quot;, &quot;) : new StringJoiner(&quot;, &quot;, &quot;[&quot;, &quot;]&quot;);</span>
+
+<span class="fc bfc" id="L822" title="All 2 branches covered.">            while (columns.hasNext())</span>
+            {
+<span class="fc" id="L824">                ColumnMetadata column = columns.next();</span>
+<span class="pc bpc" id="L825" title="1 of 2 branches missed.">                String columnName = cql ? column.name.toCQLString() : String.valueOf(column.name);</span>
+
+<span class="pc bpc" id="L827" title="1 of 2 branches missed.">                SortedSet&lt;ColumnSubselection&gt; s = subSelections != null</span>
+<span class="nc" id="L828">                                                ? subSelections.get(column.name)</span>
+<span class="fc" id="L829">                                                : Collections.emptySortedSet();</span>
+
+<span class="pc bpc" id="L831" title="1 of 2 branches missed.">                if (s.isEmpty())</span>
+<span class="fc" id="L832">                    joiner.add(columnName);</span>
+                else
+<span class="nc" id="L834">                    s.forEach(subSel -&gt; joiner.add(String.format(&quot;%s%s&quot;, columnName, subSel.toString(cql))));</span>
+<span class="fc" id="L835">            }</span>
+<span class="fc" id="L836">            return joiner.toString();</span>
+        }
+    }
+
+<span class="fc" id="L840">    public static class Serializer</span>
+    {
+        // fetch all regular columns and queried static columns
+        private static final int FETCH_ALL_REGULARS_MASK = 0x01;
+        private static final int HAS_QUERIED_MASK = 0x02;
+        private static final int HAS_SUB_SELECTIONS_MASK = 0x04;
+        // The FETCH_ALL_STATICS flag was added in CASSANDRA-16686 to allow 4.0 to handle queries that required
+        // to return static data for empty partitions
+        private static final int FETCH_ALL_STATICS_MASK = 0x08;
+
+        private static int makeHeaderByte(ColumnFilter selection)
+        {
+<span class="pc bpc" id="L852" title="1 of 2 branches missed.">            return (selection.fetchesAllColumns(false) ? FETCH_ALL_REGULARS_MASK : 0)</span>
+<span class="fc bfc" id="L853" title="All 2 branches covered.">                   | (!selection.isWildcard() ? HAS_QUERIED_MASK : 0)</span>
+<span class="pc bpc" id="L854" title="1 of 2 branches missed.">                   | (selection.subSelections() != null ? HAS_SUB_SELECTIONS_MASK : 0)</span>
+<span class="fc bfc" id="L855" title="All 2 branches covered.">                   | (selection.fetchesAllColumns(true) ? FETCH_ALL_STATICS_MASK : 0);</span>
+        }
+
+        public void serialize(ColumnFilter selection, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L860">            out.writeByte(makeHeaderByte(selection));</span>
+
+<span class="pc bpc" id="L862" title="1 of 2 branches missed.">            if (selection.fetchesAllColumns(false))</span>
+            {
+<span class="fc" id="L864">                serializeRegularAndStaticColumns(selection.fetchedColumns(), out);</span>
+            }
+
+<span class="fc bfc" id="L867" title="All 2 branches covered.">            if (!selection.isWildcard())</span>
+            {
+<span class="fc" id="L869">                serializeRegularAndStaticColumns(selection.queriedColumns(), out);</span>
+            }
+
+<span class="fc" id="L872">            serializeSubSelections(selection.subSelections(), out, version);</span>
+<span class="fc" id="L873">        }</span>
+
+        private void serializeSubSelections(SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections,
+                                            DataOutputPlus out,
+                                            int version) throws IOException
+        {
+<span class="pc bpc" id="L879" title="1 of 2 branches missed.">            if (subSelections != null)</span>
+            {
+<span class="nc" id="L881">                out.writeUnsignedVInt32(subSelections.size());</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">                for (ColumnSubselection subSel : subSelections.values())</span>
+<span class="nc" id="L883">                    ColumnSubselection.serializer.serialize(subSel, out, version);</span>
+            }
+<span class="fc" id="L885">        }</span>
+
+        private void serializeRegularAndStaticColumns(RegularAndStaticColumns regularAndStaticColumns,
+                                                      DataOutputPlus out) throws IOException
+        {
+<span class="fc" id="L890">            Columns.serializer.serialize(regularAndStaticColumns.statics, out);</span>
+<span class="fc" id="L891">            Columns.serializer.serialize(regularAndStaticColumns.regulars, out);</span>
+<span class="fc" id="L892">        }</span>
+
+        public ColumnFilter deserialize(DataInputPlus in, int version, TableMetadata metadata) throws IOException
+        {
+<span class="fc" id="L896">            int header = in.readUnsignedByte();</span>
+<span class="pc bpc" id="L897" title="1 of 2 branches missed.">            boolean isFetchAllRegulars = (header &amp; FETCH_ALL_REGULARS_MASK) != 0;</span>
+<span class="fc bfc" id="L898" title="All 2 branches covered.">            boolean hasQueried = (header &amp; HAS_QUERIED_MASK) != 0;</span>
+<span class="pc bpc" id="L899" title="1 of 2 branches missed.">            boolean hasSubSelections = (header &amp; HAS_SUB_SELECTIONS_MASK) != 0;</span>
+<span class="fc bfc" id="L900" title="All 2 branches covered.">            boolean isFetchAllStatics = (header &amp; FETCH_ALL_STATICS_MASK) != 0;</span>
+
+<span class="fc" id="L902">            RegularAndStaticColumns fetched = null;</span>
+<span class="fc" id="L903">            RegularAndStaticColumns queried = null;</span>
+
+<span class="pc bpc" id="L905" title="1 of 2 branches missed.">            if (isFetchAllRegulars)</span>
+<span class="fc" id="L906">                fetched = deserializeRegularAndStaticColumns(in, metadata);</span>
+
+<span class="fc bfc" id="L908" title="All 2 branches covered.">            if (hasQueried)</span>
+<span class="fc" id="L909">                queried = deserializeRegularAndStaticColumns(in, metadata);</span>
+
+<span class="fc" id="L911">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections = null;</span>
+<span class="pc bpc" id="L912" title="1 of 2 branches missed.">            if (hasSubSelections)</span>
+<span class="nc" id="L913">                subSelections = deserializeSubSelection(in, version, metadata);</span>
+
+<span class="pc bpc" id="L915" title="1 of 2 branches missed.">            if (isFetchAllRegulars)</span>
+            {
+<span class="fc bfc" id="L917" title="All 2 branches covered.">                if (!hasQueried)</span>
+<span class="fc" id="L918">                    return new WildCardColumnFilter(fetched);</span>
+
+<span class="fc bfc" id="L920" title="All 2 branches covered.">                if (!isFetchAllStatics)</span>
+<span class="fc" id="L921">                    return new SelectionColumnFilter(FetchingStrategy.ALL_REGULARS_AND_QUERIED_STATICS_COLUMNS, queried, fetched, subSelections);</span>
+
+<span class="fc" id="L923">                return new SelectionColumnFilter(FetchingStrategy.ALL_COLUMNS, queried, fetched, subSelections);</span>
+            }
+
+<span class="nc" id="L926">            return new SelectionColumnFilter(FetchingStrategy.ONLY_QUERIED_COLUMNS, queried, queried, subSelections);</span>
+        }
+
+        private RegularAndStaticColumns deserializeRegularAndStaticColumns(DataInputPlus in,
+                                                                           TableMetadata metadata) throws IOException
+        {
+<span class="fc" id="L932">            Columns statics = Columns.serializer.deserialize(in, metadata);</span>
+<span class="fc" id="L933">            Columns regulars = Columns.serializer.deserialize(in, metadata);</span>
+<span class="fc" id="L934">            return new RegularAndStaticColumns(statics, regulars);</span>
+        }
+
+        private SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; deserializeSubSelection(DataInputPlus in,
+                                                                                                int version,
+                                                                                                TableMetadata metadata) throws IOException
+        {
+<span class="nc" id="L941">            SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections = TreeMultimap.create(Comparator.naturalOrder(), Comparator.naturalOrder());</span>
+<span class="nc" id="L942">            int size = in.readUnsignedVInt32();</span>
+<span class="nc bnc" id="L943" title="All 2 branches missed.">            for (int i = 0; i &lt; size; i++)</span>
+            {
+<span class="nc" id="L945">                ColumnSubselection subSel = ColumnSubselection.serializer.deserialize(in, version, metadata);</span>
+<span class="nc" id="L946">                subSelections.put(subSel.column().name, subSel);</span>
+            }
+<span class="nc" id="L948">            return subSelections;</span>
+        }
+
+        public long serializedSize(ColumnFilter selection, int version)
+        {
+<span class="fc" id="L953">            long size = 1; // header byte</span>
+
+<span class="pc bpc" id="L955" title="1 of 2 branches missed.">            if (selection.fetchesAllColumns(false))</span>
+            {
+<span class="fc" id="L957">                size += regularAndStaticColumnsSerializedSize(selection.fetchedColumns());</span>
+            }
+
+<span class="fc bfc" id="L960" title="All 2 branches covered.">            if (!selection.isWildcard())</span>
+            {
+<span class="fc" id="L962">                size += regularAndStaticColumnsSerializedSize(selection.queriedColumns());</span>
+            }
+
+<span class="fc" id="L965">            size += subSelectionsSerializedSize(selection.subSelections(), version);</span>
+
+<span class="fc" id="L967">            return size;</span>
+        }
+
+        private long regularAndStaticColumnsSerializedSize(RegularAndStaticColumns columns)
+        {
+<span class="fc" id="L972">            return Columns.serializer.serializedSize(columns.statics)</span>
+<span class="fc" id="L973">                    + Columns.serializer.serializedSize(columns.regulars);</span>
+        }
+
+        private long subSelectionsSerializedSize(SortedSetMultimap&lt;ColumnIdentifier, ColumnSubselection&gt; subSelections,
+                                                 int version)
+        {
+<span class="pc bpc" id="L979" title="1 of 2 branches missed.">            if (subSelections == null)</span>
+<span class="fc" id="L980">                return 0;</span>
+
+<span class="nc" id="L982">            int size = TypeSizes.sizeofUnsignedVInt(subSelections.size());</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            for (ColumnSubselection subSel : subSelections.values())</span>
+<span class="nc" id="L984">                size += ColumnSubselection.serializer.serializedSize(subSel, version);</span>
+
+<span class="nc" id="L986">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

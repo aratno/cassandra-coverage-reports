@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TimeWindowCompactionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">TimeWindowCompactionStrategy.java</span></div><h1>TimeWindowCompactionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.Objects;
+import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.utils.Pair;
+
+import static com.google.common.collect.Iterables.filter;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+public class TimeWindowCompactionStrategy extends AbstractCompactionStrategy
+{
+<span class="fc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(TimeWindowCompactionStrategy.class);</span>
+
+    private final TimeWindowCompactionStrategyOptions options;
+    protected volatile int estimatedRemainingTasks;
+<span class="fc" id="L58">    private final Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();</span>
+    private long lastExpiredCheck;
+    private long highestWindowSeen;
+
+    // This is accessed in both the threading context of compaction / repair and also JMX
+<span class="fc" id="L63">    private volatile Map&lt;Long, Integer&gt; sstableCountByBuckets = Collections.emptyMap();</span>
+
+    public TimeWindowCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options)
+    {
+<span class="fc" id="L67">        super(cfs, options);</span>
+<span class="fc" id="L68">        this.estimatedRemainingTasks = 0;</span>
+<span class="fc" id="L69">        this.options = new TimeWindowCompactionStrategyOptions(options);</span>
+<span class="fc" id="L70">        String[] tsOpts = { UNCHECKED_TOMBSTONE_COMPACTION_OPTION, TOMBSTONE_COMPACTION_INTERVAL_OPTION, TOMBSTONE_THRESHOLD_OPTION };</span>
+<span class="pc bpc" id="L71" title="3 of 4 branches missed.">        if (Arrays.stream(tsOpts).map(o -&gt; options.get(o)).filter(Objects::nonNull).anyMatch(v -&gt; !v.equals(&quot;false&quot;)))</span>
+        {
+<span class="nc" id="L73">            logger.debug(&quot;Enabling tombstone compactions for TWCS&quot;);</span>
+        }
+        else
+        {
+<span class="fc" id="L77">            logger.debug(&quot;Disabling tombstone compactions for TWCS&quot;);</span>
+<span class="fc" id="L78">            disableTombstoneCompactions = true;</span>
+        }
+<span class="fc" id="L80">    }</span>
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;) // transaction is closed by AbstractCompactionTask::execute
+    public AbstractCompactionTask getNextBackgroundTask(long gcBefore)
+    {
+<span class="fc" id="L86">        List&lt;SSTableReader&gt; previousCandidate = null;</span>
+        while (true)
+        {
+<span class="fc" id="L89">            List&lt;SSTableReader&gt; latestBucket = getNextBackgroundSSTables(gcBefore);</span>
+
+<span class="fc bfc" id="L91" title="All 2 branches covered.">            if (latestBucket.isEmpty())</span>
+<span class="fc" id="L92">                return null;</span>
+
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">            if (latestBucket.equals(previousCandidate))</span>
+            {
+<span class="nc" id="L98">                logger.warn(&quot;Could not acquire references for compacting SSTables {} which is not a problem per se,&quot; +</span>
+                            &quot;unless it happens frequently, in which case it must be reported. Will retry later.&quot;,
+                            latestBucket);
+<span class="nc" id="L101">                return null;</span>
+            }
+
+<span class="fc" id="L104">            LifecycleTransaction modifier = cfs.getTracker().tryModify(latestBucket, OperationType.COMPACTION);</span>
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">            if (modifier != null)</span>
+<span class="fc" id="L106">                return new TimeWindowCompactionTask(cfs, modifier, gcBefore, options.ignoreOverlaps);</span>
+<span class="nc" id="L107">            previousCandidate = latestBucket;</span>
+<span class="nc" id="L108">        }</span>
+    }
+
+    /**
+     *
+     * @param gcBefore
+     * @return
+     */
+    private synchronized List&lt;SSTableReader&gt; getNextBackgroundSSTables(final long gcBefore)
+    {
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        if (Iterables.isEmpty(cfs.getSSTables(SSTableSet.LIVE)))</span>
+<span class="nc" id="L119">            return Collections.emptyList();</span>
+
+<span class="fc" id="L121">        Set&lt;SSTableReader&gt; uncompacting = ImmutableSet.copyOf(filter(cfs.getUncompactingSSTables(), sstables::contains));</span>
+
+        // Find fully expired SSTables. Those will be included no matter what.
+<span class="fc" id="L124">        Set&lt;SSTableReader&gt; expired = Collections.emptySet();</span>
+
+<span class="fc bfc" id="L126" title="All 2 branches covered.">        if (currentTimeMillis() - lastExpiredCheck &gt; options.expiredSSTableCheckFrequency)</span>
+        {
+<span class="fc" id="L128">            logger.debug(&quot;TWCS expired check sufficiently far in the past, checking for fully expired SSTables&quot;);</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">            expired = CompactionController.getFullyExpiredSSTables(cfs, uncompacting, options.ignoreOverlaps ? Collections.emptySet() : cfs.getOverlappingLiveSSTables(uncompacting),</span>
+                                                                   gcBefore, options.ignoreOverlaps);
+<span class="fc" id="L131">            lastExpiredCheck = currentTimeMillis();</span>
+        }
+        else
+        {
+<span class="fc" id="L135">            logger.debug(&quot;TWCS skipping check for fully expired SSTables&quot;);</span>
+        }
+
+<span class="fc" id="L138">        Set&lt;SSTableReader&gt; candidates = Sets.newHashSet(filterSuspectSSTables(uncompacting));</span>
+
+<span class="fc" id="L140">        List&lt;SSTableReader&gt; compactionCandidates = new ArrayList&lt;&gt;(getNextNonExpiredSSTables(Sets.difference(candidates, expired), gcBefore));</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        if (!expired.isEmpty())</span>
+        {
+<span class="nc" id="L143">            logger.debug(&quot;Including expired sstables: {}&quot;, expired);</span>
+<span class="nc" id="L144">            compactionCandidates.addAll(expired);</span>
+        }
+
+<span class="fc" id="L147">        return compactionCandidates;</span>
+    }
+
+    private List&lt;SSTableReader&gt; getNextNonExpiredSSTables(Iterable&lt;SSTableReader&gt; nonExpiringSSTables, final long gcBefore)
+    {
+<span class="fc" id="L152">        List&lt;SSTableReader&gt; mostInteresting = getCompactionCandidates(nonExpiringSSTables);</span>
+
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        if (mostInteresting != null)</span>
+        {
+<span class="fc" id="L156">            return mostInteresting;</span>
+        }
+
+        // if there is no sstable to compact in standard way, try compacting single sstable whose droppable tombstone
+        // ratio is greater than threshold.
+<span class="fc" id="L161">        List&lt;SSTableReader&gt; sstablesWithTombstones = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L162" title="All 2 branches covered.">        for (SSTableReader sstable : nonExpiringSSTables)</span>
+        {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">            if (worthDroppingTombstones(sstable, gcBefore))</span>
+<span class="nc" id="L165">                sstablesWithTombstones.add(sstable);</span>
+<span class="fc" id="L166">        }</span>
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (sstablesWithTombstones.isEmpty())</span>
+<span class="fc" id="L168">            return Collections.emptyList();</span>
+
+<span class="nc" id="L170">        return Collections.singletonList(Collections.min(sstablesWithTombstones, SSTableReader.sizeComparator));</span>
+    }
+
+    private List&lt;SSTableReader&gt; getCompactionCandidates(Iterable&lt;SSTableReader&gt; candidateSSTables)
+    {
+<span class="fc" id="L175">        Pair&lt;HashMultimap&lt;Long, SSTableReader&gt;, Long&gt; buckets = getBuckets(candidateSSTables, options.sstableWindowUnit, options.sstableWindowSize, options.timestampResolution);</span>
+        // Update the highest window seen, if necessary
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        if(buckets.right &gt; this.highestWindowSeen)</span>
+<span class="fc" id="L178">            this.highestWindowSeen = buckets.right;</span>
+
+<span class="fc" id="L180">        NewestBucket mostInteresting = newestBucket(buckets.left,</span>
+<span class="fc" id="L181">                cfs.getMinimumCompactionThreshold(),</span>
+<span class="fc" id="L182">                cfs.getMaximumCompactionThreshold(),</span>
+                options.stcsOptions,
+                this.highestWindowSeen);
+
+<span class="fc" id="L186">        this.estimatedRemainingTasks = mostInteresting.estimatedRemainingTasks;</span>
+<span class="fc" id="L187">        this.sstableCountByBuckets = buckets.left.keySet().stream().collect(Collectors.toMap(Function.identity(), k -&gt; buckets.left.get(k).size()));</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        if (!mostInteresting.sstables.isEmpty())</span>
+<span class="fc" id="L189">            return mostInteresting.sstables;</span>
+<span class="fc" id="L190">        return null;</span>
+    }
+
+    @Override
+    public synchronized void addSSTable(SSTableReader sstable)
+    {
+<span class="fc" id="L196">        sstables.add(sstable);</span>
+<span class="fc" id="L197">    }</span>
+
+    @Override
+    public synchronized void removeSSTable(SSTableReader sstable)
+    {
+<span class="fc" id="L202">        sstables.remove(sstable);</span>
+<span class="fc" id="L203">    }</span>
+
+    @Override
+    protected synchronized Set&lt;SSTableReader&gt; getSSTables()
+    {
+<span class="nc" id="L208">        return ImmutableSet.copyOf(sstables);</span>
+    }
+
+    /**
+     * Find the lowest and highest timestamps in a given timestamp/unit pair
+     * Returns milliseconds, caller should adjust accordingly
+     */
+    public static Pair&lt;Long,Long&gt; getWindowBoundsInMillis(TimeUnit windowTimeUnit, int windowTimeSize, long timestampInMillis)
+    {
+        long lowerTimestamp;
+        long upperTimestamp;
+<span class="fc" id="L219">        long timestampInSeconds = TimeUnit.SECONDS.convert(timestampInMillis, TimeUnit.MILLISECONDS);</span>
+
+<span class="pc bpc" id="L221" title="2 of 3 branches missed.">        switch(windowTimeUnit)</span>
+        {
+            case MINUTES:
+<span class="nc" id="L224">                lowerTimestamp = timestampInSeconds - ((timestampInSeconds) % (60L * windowTimeSize));</span>
+<span class="nc" id="L225">                upperTimestamp = (lowerTimestamp + (60L * (windowTimeSize - 1L))) + 59L;</span>
+<span class="nc" id="L226">                break;</span>
+            case HOURS:
+<span class="nc" id="L228">                lowerTimestamp = timestampInSeconds - ((timestampInSeconds) % (3600L * windowTimeSize));</span>
+<span class="nc" id="L229">                upperTimestamp = (lowerTimestamp + (3600L * (windowTimeSize - 1L))) + 3599L;</span>
+<span class="nc" id="L230">                break;</span>
+            case DAYS:
+            default:
+<span class="fc" id="L233">                lowerTimestamp = timestampInSeconds - ((timestampInSeconds) % (86400L * windowTimeSize));</span>
+<span class="fc" id="L234">                upperTimestamp = (lowerTimestamp + (86400L * (windowTimeSize - 1L))) + 86399L;</span>
+                break;
+        }
+
+<span class="fc" id="L238">        return Pair.create(TimeUnit.MILLISECONDS.convert(lowerTimestamp, TimeUnit.SECONDS),</span>
+<span class="fc" id="L239">                           TimeUnit.MILLISECONDS.convert(upperTimestamp, TimeUnit.SECONDS));</span>
+
+    }
+
+    /**
+     * Group files with similar max timestamp into buckets.
+     *
+     * @param files pairs consisting of a file and its min timestamp
+     * @param sstableWindowUnit
+     * @param sstableWindowSize
+     * @param timestampResolution
+     * @return A pair, where the left element is the bucket representation (map of timestamp to sstablereader), and the right is the highest timestamp seen
+     */
+    @VisibleForTesting
+    static Pair&lt;HashMultimap&lt;Long, SSTableReader&gt;, Long&gt; getBuckets(Iterable&lt;SSTableReader&gt; files, TimeUnit sstableWindowUnit, int sstableWindowSize, TimeUnit timestampResolution)
+    {
+<span class="fc" id="L255">        HashMultimap&lt;Long, SSTableReader&gt; buckets = HashMultimap.create();</span>
+
+<span class="fc" id="L257">        long maxTimestamp = 0;</span>
+        // Create hash map to represent buckets
+        // For each sstable, add sstable to the time bucket
+        // Where the bucket is the file's max timestamp rounded to the nearest window bucket
+<span class="fc bfc" id="L261" title="All 2 branches covered.">        for (SSTableReader f : files)</span>
+        {
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">            assert TimeWindowCompactionStrategyOptions.validTimestampTimeUnits.contains(timestampResolution);</span>
+<span class="fc" id="L264">            long tStamp = TimeUnit.MILLISECONDS.convert(f.getMaxTimestamp(), timestampResolution);</span>
+<span class="fc" id="L265">            Pair&lt;Long,Long&gt; bounds = getWindowBoundsInMillis(sstableWindowUnit, sstableWindowSize, tStamp);</span>
+<span class="fc" id="L266">            buckets.put(bounds.left, f);</span>
+<span class="fc bfc" id="L267" title="All 2 branches covered.">            if (bounds.left &gt; maxTimestamp)</span>
+<span class="fc" id="L268">                maxTimestamp = bounds.left;</span>
+<span class="fc" id="L269">        }</span>
+
+<span class="fc" id="L271">        logger.trace(&quot;buckets {}, max timestamp {}&quot;, buckets, maxTimestamp);</span>
+<span class="fc" id="L272">        return Pair.create(buckets, maxTimestamp);</span>
+    }
+
+    static final class NewestBucket
+    {
+        /** The sstables that should be compacted next */
+        final List&lt;SSTableReader&gt; sstables;
+
+        /** The number of tasks estimated */
+        final int estimatedRemainingTasks;
+
+        NewestBucket(List&lt;SSTableReader&gt; sstables, int estimatedRemainingTasks)
+<span class="fc" id="L284">        {</span>
+<span class="fc" id="L285">            this.sstables = sstables;</span>
+<span class="fc" id="L286">            this.estimatedRemainingTasks = estimatedRemainingTasks;</span>
+<span class="fc" id="L287">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L292">            return String.format(&quot;sstables: %s, estimated remaining tasks: %d&quot;, sstables, estimatedRemainingTasks);</span>
+        }
+    }
+
+
+    /**
+     * @param buckets list of buckets, sorted from newest to oldest, from which to return the newest bucket within thresholds.
+     * @param minThreshold minimum number of sstables in a bucket to qualify.
+     * @param maxThreshold maximum number of sstables to compact at once (the returned bucket will be trimmed down to this).
+     * @return a bucket (list) of sstables to compact.
+     */
+    @VisibleForTesting
+    static NewestBucket newestBucket(HashMultimap&lt;Long, SSTableReader&gt; buckets, int minThreshold, int maxThreshold, SizeTieredCompactionStrategyOptions stcsOptions, long now)
+    {
+        // If the current bucket has at least minThreshold SSTables, choose that one.
+        // For any other bucket, at least 2 SSTables is enough.
+        // In any case, limit to maxThreshold SSTables.
+
+<span class="fc" id="L310">        List&lt;SSTableReader&gt; sstables = Collections.emptyList();</span>
+<span class="fc" id="L311">        int estimatedRemainingTasks = 0;</span>
+
+<span class="fc" id="L313">        TreeSet&lt;Long&gt; allKeys = new TreeSet&lt;&gt;(buckets.keySet());</span>
+
+<span class="fc" id="L315">        Iterator&lt;Long&gt; it = allKeys.descendingIterator();</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">        while(it.hasNext())</span>
+        {
+<span class="fc" id="L318">            Long key = it.next();</span>
+<span class="fc" id="L319">            Set&lt;SSTableReader&gt; bucket = buckets.get(key);</span>
+<span class="fc" id="L320">            logger.trace(&quot;Key {}, now {}&quot;, key, now);</span>
+<span class="pc bpc" id="L321" title="1 of 4 branches missed.">            if (bucket.size() &gt;= minThreshold &amp;&amp; key &gt;= now)</span>
+            {
+                // If we're in the newest bucket, we'll use STCS to prioritize sstables
+<span class="fc" id="L324">                List&lt;Pair&lt;SSTableReader,Long&gt;&gt; pairs = SizeTieredCompactionStrategy.createSSTableAndLengthPairs(bucket);</span>
+<span class="fc" id="L325">                List&lt;List&lt;SSTableReader&gt;&gt; stcsBuckets = SizeTieredCompactionStrategy.getBuckets(pairs, stcsOptions.bucketHigh, stcsOptions.bucketLow, stcsOptions.minSSTableSize);</span>
+<span class="fc" id="L326">                List&lt;SSTableReader&gt; stcsInterestingBucket = SizeTieredCompactionStrategy.mostInterestingBucket(stcsBuckets, minThreshold, maxThreshold);</span>
+
+                // If the tables in the current bucket aren't eligible in the STCS strategy, we'll skip it and look for other buckets
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">                if (!stcsInterestingBucket.isEmpty())</span>
+                {
+<span class="fc" id="L331">                    double remaining = bucket.size() - maxThreshold;</span>
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">                    estimatedRemainingTasks +=  1 + (remaining &gt; minThreshold ? Math.ceil(remaining / maxThreshold) : 0);</span>
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">                    if (sstables.isEmpty())</span>
+                    {
+<span class="fc" id="L335">                        logger.debug(&quot;Using STCS compaction for first window of bucket: data files {} , options {}&quot;, pairs, stcsOptions);</span>
+<span class="fc" id="L336">                        sstables = stcsInterestingBucket;</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L340">                        logger.trace(&quot;First window of bucket is eligible but not selected: data files {} , options {}&quot;, pairs, stcsOptions);</span>
+                    }
+                }
+<span class="fc" id="L343">            }</span>
+<span class="pc bpc" id="L344" title="1 of 4 branches missed.">            else if (bucket.size() &gt;= 2 &amp;&amp; key &lt; now)</span>
+            {
+<span class="nc" id="L346">                double remaining = bucket.size() - maxThreshold;</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">                estimatedRemainingTasks +=  1 + (remaining &gt; minThreshold ? Math.ceil(remaining / maxThreshold) : 0);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                if (sstables.isEmpty())</span>
+                {
+<span class="nc" id="L350">                    logger.debug(&quot;bucket size {} &gt;= 2 and not in current bucket, compacting what's here: {}&quot;, bucket.size(), bucket);</span>
+<span class="nc" id="L351">                    sstables = trimToThreshold(bucket, maxThreshold);</span>
+                }
+                else
+                {
+<span class="nc" id="L355">                    logger.trace(&quot;bucket size {} &gt;= 2 and not in current bucket, eligible but not selected: {}&quot;, bucket.size(), bucket);</span>
+                }
+<span class="nc" id="L357">            }</span>
+            else
+            {
+<span class="fc" id="L360">                logger.trace(&quot;No compaction necessary for bucket size {} , key {}, now {}&quot;, bucket.size(), key, now);</span>
+            }
+<span class="fc" id="L362">        }</span>
+<span class="fc" id="L363">        return new NewestBucket(sstables, estimatedRemainingTasks);</span>
+    }
+
+    /**
+     * @param bucket set of sstables
+     * @param maxThreshold maximum number of sstables in a single compaction task.
+     * @return A bucket trimmed to the maxThreshold newest sstables.
+     */
+    @VisibleForTesting
+    static List&lt;SSTableReader&gt; trimToThreshold(Set&lt;SSTableReader&gt; bucket, int maxThreshold)
+    {
+<span class="nc" id="L374">        List&lt;SSTableReader&gt; ssTableReaders = new ArrayList&lt;&gt;(bucket);</span>
+
+        // Trim the largest sstables off the end to meet the maxThreshold
+<span class="nc" id="L377">        Collections.sort(ssTableReaders, SSTableReader.sizeComparator);</span>
+
+<span class="nc" id="L379">        return ImmutableList.copyOf(Iterables.limit(ssTableReaders, maxThreshold));</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;) // transaction is closed by AbstractCompactionTask::execute
+    public synchronized Collection&lt;AbstractCompactionTask&gt; getMaximalTask(long gcBefore, boolean splitOutput)
+    {
+<span class="fc" id="L386">        Iterable&lt;SSTableReader&gt; filteredSSTables = filterSuspectSSTables(sstables);</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">        if (Iterables.isEmpty(filteredSSTables))</span>
+<span class="fc" id="L388">            return null;</span>
+<span class="fc" id="L389">        LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);</span>
+<span class="pc bpc" id="L390" title="1 of 2 branches missed.">        if (txn == null)</span>
+<span class="nc" id="L391">            return null;</span>
+<span class="fc" id="L392">        return Collections.singleton(new TimeWindowCompactionTask(cfs, txn, gcBefore, options.ignoreOverlaps));</span>
+    }
+
+    /**
+     * TWCS should not group sstables for anticompaction - this can mix new and old data
+     */
+    @Override
+    public Collection&lt;Collection&lt;SSTableReader&gt;&gt; groupSSTablesForAntiCompaction(Collection&lt;SSTableReader&gt; sstablesToGroup)
+    {
+<span class="nc" id="L401">        Collection&lt;Collection&lt;SSTableReader&gt;&gt; groups = new ArrayList&lt;&gt;(sstablesToGroup.size());</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">        for (SSTableReader sstable : sstablesToGroup)</span>
+        {
+<span class="nc" id="L404">            groups.add(Collections.singleton(sstable));</span>
+<span class="nc" id="L405">        }</span>
+<span class="nc" id="L406">        return groups;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;) // transaction is closed by AbstractCompactionTask::execute
+    public synchronized AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, long gcBefore)
+    {
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        assert !sstables.isEmpty(); // checked for by CM.submitUserDefined</span>
+
+<span class="nc" id="L415">        LifecycleTransaction modifier = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">        if (modifier == null)</span>
+        {
+<span class="nc" id="L418">            logger.debug(&quot;Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem&quot;, sstables);</span>
+<span class="nc" id="L419">            return null;</span>
+        }
+
+<span class="nc" id="L422">        return new TimeWindowCompactionTask(cfs, modifier, gcBefore, options.ignoreOverlaps).setUserDefined(true);</span>
+    }
+
+    public int getEstimatedRemainingTasks()
+    {
+<span class="fc" id="L427">        return this.estimatedRemainingTasks;</span>
+    }
+
+    public long getMaxSSTableBytes()
+    {
+<span class="fc" id="L432">        return Long.MAX_VALUE;</span>
+    }
+
+    public Map&lt;Long, Integer&gt; getSSTableCountByBuckets()
+    {
+<span class="fc" id="L437">        return sstableCountByBuckets;</span>
+    }
+
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options) throws ConfigurationException
+    {
+<span class="fc" id="L442">        Map&lt;String, String&gt; uncheckedOptions = AbstractCompactionStrategy.validateOptions(options);</span>
+<span class="fc" id="L443">        uncheckedOptions = TimeWindowCompactionStrategyOptions.validateOptions(options, uncheckedOptions);</span>
+
+<span class="fc" id="L445">        uncheckedOptions.remove(CompactionParams.Option.MIN_THRESHOLD.toString());</span>
+<span class="fc" id="L446">        uncheckedOptions.remove(CompactionParams.Option.MAX_THRESHOLD.toString());</span>
+
+<span class="fc" id="L448">        return uncheckedOptions;</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L453">        return String.format(&quot;TimeWindowCompactionStrategy[%s/%s]&quot;,</span>
+<span class="nc" id="L454">                cfs.getMinimumCompactionThreshold(),</span>
+<span class="nc" id="L455">                cfs.getMaximumCompactionThreshold());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

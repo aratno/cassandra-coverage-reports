@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SerializingCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cache</a> &gt; <span class="el_source">SerializingCache.java</span></div><h1>SerializingCache.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cache;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Weigher;
+
+import org.apache.cassandra.concurrent.ImmediateExecutor;
+import org.apache.cassandra.io.ISerializer;
+import org.apache.cassandra.io.util.MemoryInputStream;
+import org.apache.cassandra.io.util.MemoryOutputStream;
+import org.apache.cassandra.io.util.WrappedDataOutputStreamPlus;
+import org.apache.cassandra.utils.FBUtilities;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.Iterator;
+
+/**
+ * Serializes cache values off-heap.
+ */
+public class SerializingCache&lt;K, V&gt; implements ICache&lt;K, V&gt;
+{
+<span class="nc" id="L41">    private static final Logger logger = LoggerFactory.getLogger(SerializingCache.class);</span>
+
+    private final Cache&lt;K, RefCountedMemory&gt; cache;
+    private final ISerializer&lt;V&gt; serializer;
+
+    private SerializingCache(long capacity, Weigher&lt;K, RefCountedMemory&gt; weigher, ISerializer&lt;V&gt; serializer)
+<span class="nc" id="L47">    {</span>
+<span class="nc" id="L48">        this.serializer = serializer;</span>
+
+<span class="nc" id="L50">        this.cache = Caffeine.newBuilder()</span>
+<span class="nc" id="L51">                   .weigher(weigher)</span>
+<span class="nc" id="L52">                   .maximumWeight(capacity)</span>
+<span class="nc" id="L53">                   .executor(ImmediateExecutor.INSTANCE)</span>
+<span class="nc" id="L54">                   .removalListener((key, mem, cause) -&gt; {</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">                       if (cause.wasEvicted()) {</span>
+<span class="nc" id="L56">                           mem.unreference();</span>
+                       }
+<span class="nc" id="L58">                   })</span>
+<span class="nc" id="L59">                   .build();</span>
+<span class="nc" id="L60">    }</span>
+
+    public static &lt;K, V&gt; SerializingCache&lt;K, V&gt; create(long weightedCapacity, Weigher&lt;K, RefCountedMemory&gt; weigher, ISerializer&lt;V&gt; serializer)
+    {
+<span class="nc" id="L64">        return new SerializingCache&lt;&gt;(weightedCapacity, weigher, serializer);</span>
+    }
+
+    public static &lt;K, V&gt; SerializingCache&lt;K, V&gt; create(long weightedCapacity, ISerializer&lt;V&gt; serializer)
+    {
+<span class="nc" id="L69">        return create(weightedCapacity, (key, value) -&gt; {</span>
+<span class="nc" id="L70">            long size = value.size();</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">            if (size &gt; Integer.MAX_VALUE) {</span>
+<span class="nc" id="L72">                throw new IllegalArgumentException(&quot;Serialized size must not be more than 2GiB&quot;);</span>
+            }
+<span class="nc" id="L74">            return (int) size;</span>
+        }, serializer);
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private V deserialize(RefCountedMemory mem)
+    {
+        try
+        {
+<span class="nc" id="L83">            return serializer.deserialize(new MemoryInputStream(mem));</span>
+        }
+<span class="nc" id="L85">        catch (IOException e)</span>
+        {
+<span class="nc" id="L87">            logger.trace(&quot;Cannot fetch in memory data, we will fallback to read from disk &quot;, e);</span>
+<span class="nc" id="L88">            return null;</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private RefCountedMemory serialize(V value)
+    {
+<span class="nc" id="L95">        long serializedSize = serializer.serializedSize(value);</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">        if (serializedSize &gt; Integer.MAX_VALUE)</span>
+<span class="nc" id="L97">            throw new IllegalArgumentException(String.format(&quot;Unable to allocate %s&quot;, FBUtilities.prettyPrintMemory(serializedSize)));</span>
+
+        RefCountedMemory freeableMemory;
+        try
+        {
+<span class="nc" id="L102">            freeableMemory = new RefCountedMemory(serializedSize);</span>
+        }
+<span class="nc" id="L104">        catch (OutOfMemoryError e)</span>
+        {
+<span class="nc" id="L106">            return null;</span>
+<span class="nc" id="L107">        }</span>
+
+        try
+        {
+<span class="nc" id="L111">            serializer.serialize(value, new WrappedDataOutputStreamPlus(new MemoryOutputStream(freeableMemory)));</span>
+        }
+<span class="nc" id="L113">        catch (IOException e)</span>
+        {
+<span class="nc" id="L115">            freeableMemory.unreference();</span>
+<span class="nc" id="L116">            throw new RuntimeException(e);</span>
+<span class="nc" id="L117">        }</span>
+<span class="nc" id="L118">        return freeableMemory;</span>
+    }
+
+    public long capacity()
+    {
+<span class="nc" id="L123">        return cache.policy().eviction().get().getMaximum();</span>
+    }
+
+    public void setCapacity(long capacity)
+    {
+<span class="nc" id="L128">        cache.policy().eviction().get().setMaximum(capacity);</span>
+<span class="nc" id="L129">    }</span>
+
+    public boolean isEmpty()
+    {
+<span class="nc" id="L133">        return cache.asMap().isEmpty();</span>
+    }
+
+    public int size()
+    {
+<span class="nc" id="L138">        return cache.asMap().size();</span>
+    }
+
+    public long weightedSize()
+    {
+<span class="nc" id="L143">        return cache.policy().eviction().get().weightedSize().getAsLong();</span>
+    }
+
+    public void clear()
+    {
+<span class="nc" id="L148">        cache.invalidateAll();</span>
+<span class="nc" id="L149">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public V get(K key)
+    {
+<span class="nc" id="L154">        RefCountedMemory mem = cache.getIfPresent(key);</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (mem == null)</span>
+<span class="nc" id="L156">            return null;</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (!mem.reference())</span>
+<span class="nc" id="L158">            return null;</span>
+        try
+        {
+<span class="nc" id="L161">            return deserialize(mem);</span>
+        }
+        finally
+        {
+<span class="nc" id="L165">            mem.unreference();</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public void put(K key, V value)
+    {
+<span class="nc" id="L172">        RefCountedMemory mem = serialize(value);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (mem == null)</span>
+<span class="nc" id="L174">            return; // out of memory.  never mind.</span>
+
+        RefCountedMemory old;
+        try
+        {
+<span class="nc" id="L179">            old = cache.asMap().put(key, mem);</span>
+        }
+<span class="nc" id="L181">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L183">            mem.unreference();</span>
+<span class="nc" id="L184">            throw t;</span>
+<span class="nc" id="L185">        }</span>
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (old != null)</span>
+<span class="nc" id="L188">            old.unreference();</span>
+<span class="nc" id="L189">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public boolean putIfAbsent(K key, V value)
+    {
+<span class="nc" id="L194">        RefCountedMemory mem = serialize(value);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (mem == null)</span>
+<span class="nc" id="L196">            return false; // out of memory.  never mind.</span>
+
+        RefCountedMemory old;
+        try
+        {
+<span class="nc" id="L201">            old = cache.asMap().putIfAbsent(key, mem);</span>
+        }
+<span class="nc" id="L203">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L205">            mem.unreference();</span>
+<span class="nc" id="L206">            throw t;</span>
+<span class="nc" id="L207">        }</span>
+
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (old != null)</span>
+            // the new value was not put, we've uselessly allocated some memory, free it
+<span class="nc" id="L211">            mem.unreference();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        return old == null;</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public boolean replace(K key, V oldToReplace, V value)
+    {
+        // if there is no old value in our cache, we fail
+<span class="nc" id="L219">        RefCountedMemory old = cache.getIfPresent(key);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (old == null)</span>
+<span class="nc" id="L221">            return false;</span>
+
+        V oldValue;
+        // reference old guy before de-serializing
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (!old.reference())</span>
+<span class="nc" id="L226">            return false; // we have already freed hence noop.</span>
+
+<span class="nc" id="L228">        oldValue = deserialize(old);</span>
+<span class="nc" id="L229">        old.unreference();</span>
+
+<span class="nc bnc" id="L231" title="All 2 branches missed.">        if (!oldValue.equals(oldToReplace))</span>
+<span class="nc" id="L232">            return false;</span>
+
+        // see if the old value matches the one we want to replace
+<span class="nc" id="L235">        RefCountedMemory mem = serialize(value);</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if (mem == null)</span>
+<span class="nc" id="L237">            return false; // out of memory.  never mind.</span>
+
+        boolean success;
+        try
+        {
+<span class="nc" id="L242">            success = cache.asMap().replace(key, old, mem);</span>
+        }
+<span class="nc" id="L244">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L246">            mem.unreference();</span>
+<span class="nc" id="L247">            throw t;</span>
+<span class="nc" id="L248">        }</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (success)</span>
+<span class="nc" id="L251">            old.unreference(); // so it will be eventually be cleaned</span>
+        else
+<span class="nc" id="L253">            mem.unreference();</span>
+<span class="nc" id="L254">        return success;</span>
+    }
+
+    public void remove(K key)
+    {
+        @SuppressWarnings(&quot;resource&quot;)
+<span class="nc" id="L260">        RefCountedMemory mem = cache.asMap().remove(key);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (mem != null)</span>
+<span class="nc" id="L262">            mem.unreference();</span>
+<span class="nc" id="L263">    }</span>
+
+    public Iterator&lt;K&gt; keyIterator()
+    {
+<span class="nc" id="L267">        return cache.asMap().keySet().iterator();</span>
+    }
+
+    public Iterator&lt;K&gt; hotKeyIterator(int n)
+    {
+<span class="nc" id="L272">        return cache.policy().eviction().get().hottest(n).keySet().iterator();</span>
+    }
+
+    public boolean containsKey(K key)
+    {
+<span class="nc" id="L277">        return cache.asMap().containsKey(key);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

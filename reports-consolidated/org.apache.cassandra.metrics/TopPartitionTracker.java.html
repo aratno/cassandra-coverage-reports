@@ -1,0 +1,407 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TopPartitionTracker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.metrics</a> &gt; <span class="el_source">TopPartitionTracker.java</span></div><h1>TopPartitionTracker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.metrics;
+
+import java.io.Closeable;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.TreeSet;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+/**
+ * Tracks top partitions, currently by size and by tombstone count
+ *
+ * Collects during full and preview (-vd) repair since then we read the full partition
+ *
+ * Note that since we can run sub range repair there might be windows where the top partitions are not correct -
+ * for example, assume we track the top 2 partitions for this node:
+ *
+ * tokens with size:
+ * (a, 100); (b, 40); (c, 10); (d, 100); (e, 50); (f, 10)
+ * - top2: a, d
+ * now a is deleted and we run a repair for keys [a, c]
+ * - top2: b, d
+ * and when we repair [d, f]
+ * - top2: d, e
+ *
+ */
+public class TopPartitionTracker implements Closeable
+{
+    private final static String SIZES = &quot;SIZES&quot;;
+    private final static String TOMBSTONES = &quot;TOMBSTONES&quot;;
+
+<span class="fc" id="L75">    private final AtomicReference&lt;TopHolder&gt; topSizes = new AtomicReference&lt;&gt;();</span>
+<span class="fc" id="L76">    private final AtomicReference&lt;TopHolder&gt; topTombstones = new AtomicReference&lt;&gt;();</span>
+    private final TableMetadata metadata;
+    private final Future&lt;?&gt; scheduledSave;
+<span class="fc" id="L79">    private long lastTombstoneSave = 0;</span>
+<span class="fc" id="L80">    private long lastSizeSave = 0;</span>
+
+    public TopPartitionTracker(TableMetadata metadata)
+<span class="fc" id="L83">    {</span>
+<span class="fc" id="L84">        this.metadata = metadata;</span>
+<span class="fc" id="L85">        topSizes.set(new TopHolder(SystemKeyspace.getTopPartitions(metadata, SIZES),</span>
+<span class="fc" id="L86">                                   DatabaseDescriptor.getMaxTopSizePartitionCount(),</span>
+<span class="fc" id="L87">                                   DatabaseDescriptor.getMinTrackedPartitionSizeInBytes().toBytes()));</span>
+<span class="fc" id="L88">        topTombstones.set(new TopHolder(SystemKeyspace.getTopPartitions(metadata, TOMBSTONES),</span>
+<span class="fc" id="L89">                                        DatabaseDescriptor.getMaxTopTombstonePartitionCount(),</span>
+<span class="fc" id="L90">                                        DatabaseDescriptor.getMinTrackedPartitionTombstoneCount()));</span>
+<span class="fc" id="L91">        scheduledSave = ScheduledExecutors.optionalTasks.scheduleAtFixedRate(this::save, 60, 60, TimeUnit.MINUTES);</span>
+<span class="fc" id="L92">    }</span>
+
+    public void close()
+    {
+<span class="fc" id="L96">        scheduledSave.cancel(true);</span>
+<span class="fc" id="L97">    }</span>
+
+    @VisibleForTesting
+    public void save()
+    {
+<span class="fc" id="L102">        TopHolder sizes = topSizes.get();</span>
+<span class="pc bpc" id="L103" title="2 of 4 branches missed.">        if (!sizes.top.isEmpty() &amp;&amp; sizes.lastUpdate &gt; lastSizeSave)</span>
+        {
+<span class="fc" id="L105">            SystemKeyspace.saveTopPartitions(metadata, SIZES, sizes.top, sizes.lastUpdate);</span>
+<span class="fc" id="L106">            lastSizeSave = sizes.lastUpdate;</span>
+        }
+
+<span class="fc" id="L109">        TopHolder tombstones = topTombstones.get();</span>
+<span class="pc bpc" id="L110" title="2 of 4 branches missed.">        if (!tombstones.top.isEmpty() &amp;&amp; tombstones.lastUpdate &gt; lastTombstoneSave)</span>
+        {
+<span class="fc" id="L112">            SystemKeyspace.saveTopPartitions(metadata, TOMBSTONES, tombstones.top, tombstones.lastUpdate);</span>
+<span class="fc" id="L113">            lastTombstoneSave = tombstones.lastUpdate;</span>
+        }
+<span class="fc" id="L115">    }</span>
+
+    public void merge(Collector collector)
+    {
+        while (true)
+        {
+<span class="fc" id="L121">            TopHolder cur = topSizes.get();</span>
+<span class="fc" id="L122">            TopHolder newSizes = cur.merge(collector.sizes, StorageService.instance.getLocalReplicas(metadata.keyspace).ranges());</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            if (topSizes.compareAndSet(cur, newSizes))</span>
+<span class="fc" id="L124">                break;</span>
+<span class="nc" id="L125">        }</span>
+
+        while (true)
+        {
+<span class="fc" id="L129">            TopHolder cur = topTombstones.get();</span>
+<span class="fc" id="L130">            TopHolder newTombstones = cur.merge(collector.tombstones, StorageService.instance.getLocalReplicas(metadata.keyspace).ranges());</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">            if (topTombstones.compareAndSet(cur, newTombstones))</span>
+<span class="fc" id="L132">                break;</span>
+<span class="nc" id="L133">        }</span>
+<span class="fc" id="L134">    }</span>
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L139">        return &quot;TopPartitionTracker:\n&quot; +</span>
+<span class="nc" id="L140">               &quot;topSizes:\n&quot; + topSizes.get() + '\n' +</span>
+<span class="nc" id="L141">               &quot;topTombstones:\n&quot; + topTombstones.get() + '\n';</span>
+    }
+
+    public Map&lt;String, Long&gt; getTopTombstonePartitionMap()
+    {
+<span class="fc" id="L146">        return topTombstones.get().toMap(metadata);</span>
+    }
+
+    public Map&lt;String, Long&gt; getTopSizePartitionMap()
+    {
+<span class="fc" id="L151">        return topSizes.get().toMap(metadata);</span>
+    }
+
+    @VisibleForTesting
+    public TopHolder topSizes()
+    {
+<span class="fc" id="L157">        return topSizes.get();</span>
+    }
+
+    @VisibleForTesting
+    public TopHolder topTombstones()
+    {
+<span class="fc" id="L163">        return topTombstones.get();</span>
+    }
+
+    public static class Collector
+    {
+        private final TopHolder tombstones;
+        private final TopHolder sizes;
+
+        public Collector(Collection&lt;Range&lt;Token&gt;&gt; ranges)
+<span class="fc" id="L172">        {</span>
+<span class="fc" id="L173">            this.tombstones = new TopHolder(DatabaseDescriptor.getMaxTopTombstonePartitionCount(),</span>
+<span class="fc" id="L174">                                            DatabaseDescriptor.getMinTrackedPartitionTombstoneCount(),</span>
+                                            ranges);
+<span class="fc" id="L176">            this.sizes = new TopHolder(DatabaseDescriptor.getMaxTopSizePartitionCount(),</span>
+<span class="fc" id="L177">                                       DatabaseDescriptor.getMinTrackedPartitionSizeInBytes().toBytes(),</span>
+                                       ranges);
+<span class="fc" id="L179">        }</span>
+
+        public void trackTombstoneCount(DecoratedKey key, long count)
+        {
+<span class="fc" id="L183">            tombstones.track(key, count);</span>
+<span class="fc" id="L184">        }</span>
+
+        public void trackPartitionSize(DecoratedKey key, long size)
+        {
+<span class="fc" id="L188">            sizes.track(key, size);</span>
+<span class="fc" id="L189">        }</span>
+
+        public String toString()
+        {
+<span class="nc" id="L193">            return &quot;tombstones:\n&quot;+tombstones+&quot;\nsizes:\n&quot;+sizes;</span>
+        }
+    }
+
+    public static class TopHolder
+    {
+        public final NavigableSet&lt;TopPartition&gt; top;
+        private final int maxTopPartitionCount;
+        private final long minTrackedValue;
+        private final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+<span class="fc" id="L203">        private long currentMinValue = Long.MAX_VALUE;</span>
+        public final long lastUpdate;
+
+        private TopHolder(int maxTopPartitionCount, long minTrackedValue, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+        {
+<span class="fc" id="L208">            this(maxTopPartitionCount, minTrackedValue, new TreeSet&lt;&gt;(), ranges, 0);</span>
+<span class="fc" id="L209">        }</span>
+
+        private TopHolder(int maxTopPartitionCount, long minTrackedValue, NavigableSet&lt;TopPartition&gt; top, Collection&lt;Range&lt;Token&gt;&gt; ranges, long lastUpdate)
+<span class="fc" id="L212">        {</span>
+<span class="fc" id="L213">            this.maxTopPartitionCount = maxTopPartitionCount;</span>
+<span class="fc" id="L214">            this.minTrackedValue = minTrackedValue;</span>
+<span class="fc" id="L215">            this.top = top;</span>
+<span class="fc" id="L216">            this.ranges = ranges;</span>
+<span class="fc" id="L217">            this.lastUpdate = lastUpdate;</span>
+<span class="fc" id="L218">        }</span>
+
+        private TopHolder(StoredTopPartitions storedTopPartitions,
+                          int maxTopPartitionCount,
+                          long minTrackedValue)
+<span class="fc" id="L223">        {</span>
+<span class="fc" id="L224">            this.maxTopPartitionCount = maxTopPartitionCount;</span>
+<span class="fc" id="L225">            this.minTrackedValue = minTrackedValue;</span>
+<span class="fc" id="L226">            top = new TreeSet&lt;&gt;();</span>
+<span class="fc" id="L227">            this.ranges = null;</span>
+<span class="fc" id="L228">            this.lastUpdate = storedTopPartitions.lastUpdated;</span>
+
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            for (TopPartition topPartition : storedTopPartitions.topPartitions)</span>
+<span class="fc" id="L231">                track(topPartition);</span>
+<span class="fc" id="L232">        }</span>
+
+        public void track(DecoratedKey key, long value)
+        {
+<span class="fc bfc" id="L236" title="All 2 branches covered.">            if (value &lt; minTrackedValue)</span>
+<span class="fc" id="L237">                return;</span>
+
+<span class="fc bfc" id="L239" title="All 4 branches covered.">            if (top.size() &lt; maxTopPartitionCount || value &gt; currentMinValue)</span>
+<span class="fc" id="L240">                track(new TopPartition(key.retainable(), value));</span>
+<span class="fc" id="L241">        }</span>
+
+        private void track(TopPartition tp)
+        {
+<span class="fc" id="L245">            top.add(tp);</span>
+<span class="fc bfc" id="L246" title="All 2 branches covered.">            while (top.size() &gt; maxTopPartitionCount)</span>
+            {
+<span class="fc" id="L248">                top.pollLast();</span>
+<span class="fc" id="L249">                currentMinValue = top.last().value;</span>
+            }
+<span class="fc" id="L251">            currentMinValue = Math.min(tp.value, currentMinValue);</span>
+<span class="fc" id="L252">        }</span>
+
+        /**
+         * we merge any pre-existing top partitions on to the ones we just collected if they are outside of the
+         * range collected.
+         *
+         * This means that if a large partition is deleted it will disappear from the top partitions
+         *
+         * @param holder the newly collected holder - this will get copied and any existing token outside of the collected ranges will get added to the copy
+         * @param ownedRanges the ranges this node owns - any existing token outside of these ranges will get dropped
+         */
+        public TopHolder merge(TopHolder holder, Collection&lt;Range&lt;Token&gt;&gt; ownedRanges)
+        {
+<span class="fc" id="L265">            TopHolder mergedHolder = holder.cloneForMerging(currentTimeMillis());</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">            for (TopPartition existingTop : top)</span>
+            {
+<span class="fc bfc" id="L268" title="All 2 branches covered.">                if (!Range.isInRanges(existingTop.key.getToken(), mergedHolder.ranges) &amp;&amp;</span>
+<span class="pc bpc" id="L269" title="1 of 4 branches missed.">                    (ownedRanges.isEmpty() || Range.isInRanges(existingTop.key.getToken(), ownedRanges))) // make sure we drop any tokens that we don't own anymore</span>
+<span class="fc" id="L270">                    mergedHolder.track(existingTop);</span>
+<span class="fc" id="L271">            }</span>
+<span class="fc" id="L272">            return mergedHolder;</span>
+        }
+
+        private TopHolder cloneForMerging(long lastUpdate)
+        {
+<span class="fc" id="L277">            return new TopHolder(maxTopPartitionCount, minTrackedValue, new TreeSet&lt;&gt;(top), ranges, lastUpdate);</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L282">            int i = 0;</span>
+<span class="nc" id="L283">            Iterator&lt;TopPartition&gt; it = top.iterator();</span>
+<span class="nc" id="L284">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            while (it.hasNext())</span>
+            {
+<span class="nc" id="L287">                i++;</span>
+<span class="nc" id="L288">                sb.append(i).append(':').append(it.next()).append(System.lineSeparator());</span>
+            }
+<span class="nc" id="L290">            return sb.toString();</span>
+        }
+
+        public Map&lt;String, Long&gt; toMap(TableMetadata metadata)
+        {
+<span class="fc" id="L295">            Map&lt;String, Long&gt; topPartitionsMap = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            for (TopPartitionTracker.TopPartition topPartition : top)</span>
+            {
+<span class="fc" id="L298">                String key = metadata.partitionKeyType.getString(topPartition.key.getKey());</span>
+<span class="fc" id="L299">                topPartitionsMap.put(key, topPartition.value);</span>
+<span class="fc" id="L300">            }</span>
+<span class="fc" id="L301">            return topPartitionsMap;</span>
+        }
+    }
+
+<span class="fc" id="L305">    private static final Comparator&lt;TopPartition&gt; comparator = (o1, o2) -&gt; {</span>
+<span class="fc" id="L306">        int cmp = -Long.compare(o1.value, o2.value);</span>
+<span class="fc bfc" id="L307" title="All 2 branches covered.">        if (cmp != 0) return cmp;</span>
+<span class="fc" id="L308">        return o1.key.compareTo(o2.key);</span>
+    };
+
+    public static class TopPartition implements Comparable&lt;TopPartition&gt;
+    {
+        public final DecoratedKey key;
+        public final long value;
+
+        public TopPartition(DecoratedKey key, long value)
+<span class="fc" id="L317">        {</span>
+<span class="fc" id="L318">            this.key = key;</span>
+<span class="fc" id="L319">            this.value = value;</span>
+<span class="fc" id="L320">        }</span>
+
+        @Override
+        public int compareTo(TopPartition o)
+        {
+<span class="fc" id="L325">            return comparator.compare(this, o);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L331">            return &quot;TopPartition{&quot; +</span>
+                   &quot;key=&quot; + key +
+                   &quot;, value=&quot; + value +
+                   '}';
+        }
+    }
+
+    public static class TombstoneCounter extends Transformation&lt;UnfilteredRowIterator&gt;
+    {
+        private final TopPartitionTracker.Collector collector;
+        private final long nowInSec;
+<span class="fc" id="L342">        private long tombstoneCount = 0;</span>
+<span class="fc" id="L343">        private DecoratedKey key = null;</span>
+
+        public TombstoneCounter(TopPartitionTracker.Collector collector, long nowInSec)
+<span class="fc" id="L346">        {</span>
+<span class="fc" id="L347">            this.collector = collector;</span>
+<span class="fc" id="L348">            this.nowInSec = nowInSec;</span>
+<span class="fc" id="L349">        }</span>
+
+        @Override
+        public Row applyToRow(Row row)
+        {
+<span class="fc bfc" id="L354" title="All 2 branches covered.">            if (!row.deletion().isLive())</span>
+<span class="fc" id="L355">                tombstoneCount++;</span>
+<span class="fc bfc" id="L356" title="All 2 branches covered.">            if (row.hasDeletion(nowInSec))</span>
+            {
+<span class="fc bfc" id="L358" title="All 2 branches covered.">                for (Cell&lt;?&gt; c : row.cells())</span>
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">                    if (c.isTombstone())</span>
+<span class="fc" id="L360">                        tombstoneCount++;</span>
+            }
+<span class="fc" id="L362">            return row;</span>
+        }
+
+        @Override
+        public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+        {
+<span class="fc" id="L368">            tombstoneCount++;</span>
+<span class="fc" id="L369">            return marker;</span>
+        }
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+<span class="fc" id="L375">            reset(partition.partitionKey());</span>
+<span class="fc bfc" id="L376" title="All 2 branches covered.">            if (!partition.partitionLevelDeletion().isLive())</span>
+<span class="fc" id="L377">                tombstoneCount++;</span>
+<span class="fc" id="L378">            return Transformation.apply(partition, this);</span>
+        }
+
+        private void reset(DecoratedKey key)
+        {
+<span class="fc" id="L383">            tombstoneCount = 0;</span>
+<span class="fc" id="L384">            this.key = key;</span>
+<span class="fc" id="L385">        }</span>
+
+        @Override
+        public void onPartitionClose()
+        {
+<span class="fc" id="L390">            collector.trackTombstoneCount(key, tombstoneCount);</span>
+<span class="fc" id="L391">        }</span>
+    }
+
+    public static class StoredTopPartitions
+    {
+<span class="fc" id="L396">        public static StoredTopPartitions EMPTY = new StoredTopPartitions(Collections.emptyList(), 0);</span>
+        public final List&lt;TopPartition&gt; topPartitions;
+        public final long lastUpdated;
+
+        public StoredTopPartitions(List&lt;TopPartition&gt; topPartitions, long lastUpdated)
+<span class="fc" id="L401">        {</span>
+<span class="fc" id="L402">            this.topPartitions = topPartitions;</span>
+<span class="fc" id="L403">            this.lastUpdated = lastUpdated;</span>
+<span class="fc" id="L404">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

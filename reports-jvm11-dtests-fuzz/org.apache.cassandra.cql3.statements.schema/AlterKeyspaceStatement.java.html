@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AlterKeyspaceStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements.schema</a> &gt; <span class="el_source">AlterKeyspaceStatement.java</span></div><h1>AlterKeyspaceStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements.schema;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.LocalStrategy;
+import org.apache.cassandra.locator.ReplicationFactor;
+import org.apache.cassandra.locator.SimpleStrategy;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata.KeyspaceDiff;
+import org.apache.cassandra.schema.Keyspaces;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.Event.SchemaChange;
+import org.apache.cassandra.transport.Event.SchemaChange.Change;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.ALLOW_ALTER_RF_DURING_RANGE_MOVEMENT;
+import static org.apache.cassandra.config.CassandraRelevantProperties.ALLOW_UNSAFE_TRANSIENT_CHANGES;
+
+public final class AlterKeyspaceStatement extends AlterSchemaStatement
+{
+    private static final boolean allow_alter_rf_during_range_movement = ALLOW_ALTER_RF_DURING_RANGE_MOVEMENT.getBoolean();
+    private static final boolean allow_unsafe_transient_changes = ALLOW_UNSAFE_TRANSIENT_CHANGES.getBoolean();
+    private final HashSet&lt;String&gt; clientWarnings = new HashSet&lt;&gt;();
+
+    private final KeyspaceAttributes attrs;
+    private final boolean ifExists;
+
+    public AlterKeyspaceStatement(String keyspaceName, KeyspaceAttributes attrs, boolean ifExists)
+    {
+        super(keyspaceName);
+        this.attrs = attrs;
+        this.ifExists = ifExists;
+    }
+
+    public Keyspaces apply(Keyspaces schema)
+    {
+        attrs.validate();
+
+        KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
+        if (null == keyspace)
+        {
+            if (!ifExists)
+                throw ire(&quot;Keyspace '%s' doesn't exist&quot;, keyspaceName);
+            return schema;
+        }
+
+        KeyspaceMetadata newKeyspace = keyspace.withSwapped(attrs.asAlteredKeyspaceParams(keyspace.params));
+
+        if (attrs.getReplicationStrategyClass() != null &amp;&amp; attrs.getReplicationStrategyClass().equals(SimpleStrategy.class.getSimpleName()))
+            Guardrails.simpleStrategyEnabled.ensureEnabled(state);
+
+        if (newKeyspace.params.replication.klass.equals(LocalStrategy.class))
+            throw ire(&quot;Unable to use given strategy class: LocalStrategy is reserved for internal use.&quot;);
+
+        newKeyspace.params.validate(keyspaceName, state);
+
+        validateNoRangeMovements();
+        validateTransientReplication(keyspace.createReplicationStrategy(), newKeyspace.createReplicationStrategy());
+
+        Keyspaces res = schema.withAddedOrUpdated(newKeyspace);
+
+        return res;
+    }
+
+    SchemaChange schemaChangeEvent(KeyspacesDiff diff)
+    {
+        return new SchemaChange(Change.UPDATED, keyspaceName);
+    }
+
+    public void authorize(ClientState client)
+    {
+        client.ensureKeyspacePermission(keyspaceName, Permission.ALTER);
+    }
+
+    @Override
+    Set&lt;String&gt; clientWarnings(KeyspacesDiff diff)
+    {
+        if (diff.isEmpty())
+            return clientWarnings;
+
+        KeyspaceDiff keyspaceDiff = diff.altered.get(0);
+
+        AbstractReplicationStrategy before = keyspaceDiff.before.createReplicationStrategy();
+        AbstractReplicationStrategy after = keyspaceDiff.after.createReplicationStrategy();
+
+        if (before.getReplicationFactor().fullReplicas &lt; after.getReplicationFactor().fullReplicas)
+            clientWarnings.add(&quot;When increasing replication factor you need to run a full (-full) repair to distribute the data.&quot;);
+
+        return clientWarnings;
+    }
+
+    private void validateNoRangeMovements()
+    {
+        if (allow_alter_rf_during_range_movement)
+            return;
+
+        Stream&lt;InetAddressAndPort&gt; unreachableNotAdministrativelyInactive =
+            Gossiper.instance.getUnreachableMembers().stream().filter(endpoint -&gt; !FBUtilities.getBroadcastAddressAndPort().equals(endpoint) &amp;&amp;
+                                                                      !Gossiper.instance.isAdministrativelyInactiveState(endpoint));
+        Stream&lt;InetAddressAndPort&gt; endpoints = Stream.concat(Gossiper.instance.getLiveMembers().stream(),
+                                                             unreachableNotAdministrativelyInactive);
+        List&lt;InetAddressAndPort&gt; notNormalEndpoints = endpoints.filter(endpoint -&gt; !FBUtilities.getBroadcastAddressAndPort().equals(endpoint) &amp;&amp;
+                                                                                   !Gossiper.instance.getEndpointStateForEndpoint(endpoint).isNormalState())
+                                                               .collect(Collectors.toList());
+        if (!notNormalEndpoints.isEmpty())
+        {
+            throw new ConfigurationException(&quot;Cannot alter RF while some endpoints are not in normal state (no range movements): &quot; + notNormalEndpoints);
+        }
+    }
+
+    private void validateTransientReplication(AbstractReplicationStrategy oldStrategy, AbstractReplicationStrategy newStrategy)
+    {
+        //If there is no read traffic there are some extra alterations you can safely make, but this is so atypical
+        //that a good default is to not allow unsafe changes
+        if (allow_unsafe_transient_changes)
+            return;
+
+        ReplicationFactor oldRF = oldStrategy.getReplicationFactor();
+        ReplicationFactor newRF = newStrategy.getReplicationFactor();
+
+        int oldTrans = oldRF.transientReplicas();
+        int oldFull = oldRF.fullReplicas;
+        int newTrans = newRF.transientReplicas();
+        int newFull = newRF.fullReplicas;
+
+        if (newTrans &gt; 0)
+        {
+            if (DatabaseDescriptor.getNumTokens() &gt; 1)
+                throw new ConfigurationException(String.format(&quot;Transient replication is not supported with vnodes yet&quot;));
+
+            Keyspace ks = Keyspace.open(keyspaceName);
+            for (ColumnFamilyStore cfs : ks.getColumnFamilyStores())
+            {
+                if (cfs.viewManager.hasViews())
+                {
+                    throw new ConfigurationException(&quot;Cannot use transient replication on keyspaces using materialized views&quot;);
+                }
+
+                if (cfs.indexManager.hasIndexes())
+                {
+                    throw new ConfigurationException(&quot;Cannot use transient replication on keyspaces using secondary indexes&quot;);
+                }
+            }
+        }
+
+        //This is true right now because the transition from transient -&gt; full lacks the pending state
+        //necessary for correctness. What would happen if we allowed this is that we would attempt
+        //to read from a transient replica as if it were a full replica.
+        if (oldFull &gt; newFull &amp;&amp; oldTrans &gt; 0)
+            throw new ConfigurationException(&quot;Can't add full replicas if there are any transient replicas. You must first remove all transient replicas, then change the # of full replicas, then add back the transient replicas&quot;);
+
+        //Don't increase transient replication factor by more than one at a time if changing number of replicas
+        //Just like with changing full replicas it's not safe to do this as you could read from too many replicas
+        //that don't have the necessary data. W/O transient replication this alteration was allowed and it's not clear
+        //if it should be.
+        //This is structured so you can convert as many full replicas to transient replicas as you want.
+        boolean numReplicasChanged = oldTrans + oldFull != newTrans + newFull;
+        if (numReplicasChanged &amp;&amp; (newTrans &gt; oldTrans &amp;&amp; newTrans != oldTrans + 1))
+            throw new ConfigurationException(&quot;Can only safely increase number of transients one at a time with incremental repair run in between each time&quot;);
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+        return new AuditLogContext(AuditLogEntryType.ALTER_KEYSPACE, keyspaceName);
+    }
+
+    public String toString()
+    {
+        return String.format(&quot;%s (%s)&quot;, getClass().getSimpleName(), keyspaceName);
+    }
+
+    public static final class Raw extends CQLStatement.Raw
+    {
+        private final String keyspaceName;
+        private final KeyspaceAttributes attrs;
+        private final boolean ifExists;
+
+        public Raw(String keyspaceName, KeyspaceAttributes attrs, boolean ifExists)
+<span class="nc" id="L214">        {</span>
+<span class="nc" id="L215">            this.keyspaceName = keyspaceName;</span>
+<span class="nc" id="L216">            this.attrs = attrs;</span>
+<span class="nc" id="L217">            this.ifExists = ifExists;</span>
+<span class="nc" id="L218">        }</span>
+
+        public AlterKeyspaceStatement prepare(ClientState state)
+        {
+<span class="nc" id="L222">            return new AlterKeyspaceStatement(keyspaceName, attrs, ifExists);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

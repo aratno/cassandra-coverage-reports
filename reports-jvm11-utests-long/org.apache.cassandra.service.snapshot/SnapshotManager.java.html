@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SnapshotManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.snapshot</a> &gt; <span class="el_source">SnapshotManager.java</span></div><h1>SnapshotManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service.snapshot;
+
+
+import java.util.Collection;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Directories;
+
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.ExecutorUtils;
+
+import static java.util.Comparator.comparing;
+import static java.util.stream.Collectors.toList;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.utils.FBUtilities.now;
+
+public class SnapshotManager {
+
+<span class="fc" id="L50">    private static final ScheduledExecutorPlus executor = executorFactory().scheduled(false, &quot;SnapshotCleanup&quot;);</span>
+
+<span class="fc" id="L52">    private static final Logger logger = LoggerFactory.getLogger(SnapshotManager.class);</span>
+
+    private final long initialDelaySeconds;
+    private final long cleanupPeriodSeconds;
+    private final SnapshotLoader snapshotLoader;
+
+    @VisibleForTesting
+    protected volatile ScheduledFuture&lt;?&gt; cleanupTaskFuture;
+
+    /**
+     * Expiring snapshots ordered by expiration date, to allow only iterating over snapshots
+     * that need to be removed on {@link this#clearExpiredSnapshots()}
+     */
+<span class="fc" id="L65">    private final PriorityQueue&lt;TableSnapshot&gt; expiringSnapshots = new PriorityQueue&lt;&gt;(comparing(TableSnapshot::getExpiresAt));</span>
+
+    public SnapshotManager()
+    {
+<span class="fc" id="L69">        this(CassandraRelevantProperties.SNAPSHOT_CLEANUP_INITIAL_DELAY_SECONDS.getInt(),</span>
+<span class="fc" id="L70">             CassandraRelevantProperties.SNAPSHOT_CLEANUP_PERIOD_SECONDS.getInt());</span>
+<span class="fc" id="L71">    }</span>
+
+    @VisibleForTesting
+    protected SnapshotManager(long initialDelaySeconds, long cleanupPeriodSeconds)
+<span class="fc" id="L75">    {</span>
+<span class="fc" id="L76">        this.initialDelaySeconds = initialDelaySeconds;</span>
+<span class="fc" id="L77">        this.cleanupPeriodSeconds = cleanupPeriodSeconds;</span>
+<span class="fc" id="L78">        snapshotLoader = new SnapshotLoader(DatabaseDescriptor.getAllDataFileLocations());</span>
+<span class="fc" id="L79">    }</span>
+
+    public Collection&lt;TableSnapshot&gt; getExpiringSnapshots()
+    {
+<span class="nc" id="L83">        return expiringSnapshots;</span>
+    }
+
+    public synchronized void start()
+    {
+<span class="fc" id="L88">        addSnapshots(loadSnapshots());</span>
+<span class="fc" id="L89">        resumeSnapshotCleanup();</span>
+<span class="fc" id="L90">    }</span>
+
+    public synchronized void stop() throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L94">        expiringSnapshots.clear();</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        if (cleanupTaskFuture != null)</span>
+        {
+<span class="nc" id="L97">            cleanupTaskFuture.cancel(false);</span>
+<span class="nc" id="L98">            cleanupTaskFuture = null;</span>
+        }
+<span class="nc" id="L100">    }</span>
+
+    public synchronized void addSnapshot(TableSnapshot snapshot)
+    {
+        // We currently only care about expiring snapshots
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">        if (snapshot.isExpiring())</span>
+        {
+<span class="nc" id="L107">            logger.debug(&quot;Adding expiring snapshot {}&quot;, snapshot);</span>
+<span class="nc" id="L108">            expiringSnapshots.add(snapshot);</span>
+        }
+<span class="fc" id="L110">    }</span>
+
+    public synchronized Set&lt;TableSnapshot&gt; loadSnapshots(String keyspace)
+    {
+<span class="nc" id="L114">        return snapshotLoader.loadSnapshots(keyspace);</span>
+    }
+
+    public synchronized Set&lt;TableSnapshot&gt; loadSnapshots()
+    {
+<span class="fc" id="L119">        return snapshotLoader.loadSnapshots();</span>
+    }
+
+    @VisibleForTesting
+    protected synchronized void addSnapshots(Collection&lt;TableSnapshot&gt; snapshots)
+    {
+<span class="fc" id="L125">        logger.debug(&quot;Adding snapshots: {}.&quot;, Joiner.on(&quot;, &quot;).join(snapshots.stream().map(TableSnapshot::getId).collect(toList())));</span>
+<span class="fc" id="L126">        snapshots.forEach(this::addSnapshot);</span>
+<span class="fc" id="L127">    }</span>
+
+    // TODO: Support pausing snapshot cleanup
+    @VisibleForTesting
+    synchronized void resumeSnapshotCleanup()
+    {
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">        if (cleanupTaskFuture == null)</span>
+        {
+<span class="fc" id="L135">            logger.info(&quot;Scheduling expired snapshot cleanup with initialDelaySeconds={} and cleanupPeriodSeconds={}&quot;,</span>
+<span class="fc" id="L136">                        initialDelaySeconds, cleanupPeriodSeconds);</span>
+<span class="fc" id="L137">            cleanupTaskFuture = executor.scheduleWithFixedDelay(this::clearExpiredSnapshots, initialDelaySeconds,</span>
+                                                                cleanupPeriodSeconds, TimeUnit.SECONDS);
+        }
+<span class="fc" id="L140">    }</span>
+
+    @VisibleForTesting
+    protected synchronized void clearExpiredSnapshots()
+    {
+        TableSnapshot expiredSnapshot;
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        while ((expiredSnapshot = expiringSnapshots.peek()) != null)</span>
+        {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (!expiredSnapshot.isExpired(now()))</span>
+<span class="nc" id="L149">                break; // the earliest expiring snapshot is not expired yet, so there is no more expired snapshots to remove</span>
+
+<span class="nc" id="L151">            logger.debug(&quot;Removing expired snapshot {}.&quot;, expiredSnapshot);</span>
+<span class="nc" id="L152">            clearSnapshot(expiredSnapshot);</span>
+        }
+<span class="fc" id="L154">    }</span>
+
+    /**
+     * Deletes snapshot and remove it from manager
+     */
+    public synchronized void clearSnapshot(TableSnapshot snapshot)
+    {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        for (File snapshotDir : snapshot.getDirectories())</span>
+<span class="nc" id="L162">            Directories.removeSnapshotDirectory(DatabaseDescriptor.getSnapshotRateLimiter(), snapshotDir);</span>
+
+<span class="nc" id="L164">        expiringSnapshots.remove(snapshot);</span>
+<span class="nc" id="L165">    }</span>
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L170">        ExecutorUtils.shutdownNowAndWait(timeout, unit, executor);</span>
+<span class="nc" id="L171">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

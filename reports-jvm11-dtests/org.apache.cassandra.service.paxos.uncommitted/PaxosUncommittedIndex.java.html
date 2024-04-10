@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosUncommittedIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.uncommitted</a> &gt; <span class="el_source">PaxosUncommittedIndex.java</span></div><h1>PaxosUncommittedIndex.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.uncommitted;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.stream.Collectors;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.Callables;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DataRange;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteContext;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Indexes;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.CloseableIterator;
+
+import static java.util.Collections.singletonList;
+import static org.apache.cassandra.schema.SchemaConstants.SYSTEM_KEYSPACE_NAME;
+import static org.apache.cassandra.service.paxos.PaxosState.ballotTracker;
+import static org.apache.cassandra.service.paxos.PaxosState.uncommittedTracker;
+
+/**
+ * A 2i implementation made specifically for system.paxos that listens for changes to paxos state by interpreting
+ * mutations against system.paxos and updates the uncommitted tracker accordingly.
+ *
+ * No read expressions are supported by the index.
+ *
+ * This is implemented as a 2i so it can piggy back off the commit log and paxos table flushes, and avoid worrying
+ * about implementing a parallel log/flush system for the tracker and potential bugs there. It also means we don't
+ * have to worry about cases where the tracker can become out of sync with the paxos table due to failure/edge cases
+ * outside of the PaxosTableState class itself.
+ */
+public class PaxosUncommittedIndex implements Index, PaxosUncommittedTracker.UpdateSupplier
+{
+    public final ColumnFamilyStore baseCfs;
+    protected IndexMetadata metadata;
+
+<span class="fc" id="L88">    private static final DataRange FULL_RANGE = DataRange.allData(DatabaseDescriptor.getPartitioner());</span>
+    private final ColumnFilter memtableColumnFilter;
+
+    public PaxosUncommittedIndex(ColumnFamilyStore baseTable, IndexMetadata metadata)
+<span class="fc" id="L92">    {</span>
+<span class="fc" id="L93">        Preconditions.checkState(baseTable.metadata.keyspace.equals(SYSTEM_KEYSPACE_NAME));</span>
+<span class="fc" id="L94">        Preconditions.checkState(baseTable.metadata.name.equals(SystemKeyspace.PAXOS));</span>
+
+<span class="fc" id="L96">        this.baseCfs = baseTable;</span>
+<span class="fc" id="L97">        this.metadata = metadata;</span>
+
+<span class="fc" id="L99">        this.memtableColumnFilter = ColumnFilter.all(baseTable.metadata.get());</span>
+<span class="fc" id="L100">        PaxosUncommittedTracker.unsafSetUpdateSupplier(this);</span>
+<span class="fc" id="L101">    }</span>
+
+    public static IndexMetadata indexMetadata()
+    {
+<span class="fc" id="L105">        Map&lt;String, String&gt; options = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L106">        options.put(&quot;class_name&quot;, PaxosUncommittedIndex.class.getName());</span>
+<span class="fc" id="L107">        options.put(&quot;target&quot;, &quot;&quot;);</span>
+<span class="fc" id="L108">        return IndexMetadata.fromSchemaMetadata(&quot;PaxosUncommittedIndex&quot;, IndexMetadata.Kind.CUSTOM, options);</span>
+    }
+
+    public static Indexes indexes()
+    {
+<span class="fc" id="L113">        return Indexes.builder().add(indexMetadata()).build();</span>
+    }
+
+    public Callable&lt;?&gt; getInitializationTask()
+    {
+<span class="fc" id="L118">        return Callables.returning(null);</span>
+    }
+
+    public IndexMetadata getIndexMetadata()
+    {
+<span class="fc" id="L123">        return metadata;</span>
+    }
+
+    public Callable&lt;?&gt; getMetadataReloadTask(IndexMetadata indexMetadata)
+    {
+<span class="nc" id="L128">        return Callables.returning(null);</span>
+    }
+
+    public void register(IndexRegistry registry)
+    {
+<span class="fc" id="L133">        registry.registerIndex(this);</span>
+<span class="fc" id="L134">    }</span>
+
+    public Optional&lt;ColumnFamilyStore&gt; getBackingTable()
+    {
+<span class="fc" id="L138">        return Optional.empty();</span>
+    }
+
+    private CloseableIterator&lt;PaxosKeyState&gt; getPaxosUpdates(List&lt;UnfilteredPartitionIterator&gt; iterators, TableId filterByTableId, boolean materializeLazily)
+    {
+<span class="pc bpc" id="L143" title="1 of 4 branches missed.">        Preconditions.checkArgument((filterByTableId == null) == materializeLazily);</span>
+
+<span class="fc" id="L145">        return PaxosRows.toIterator(UnfilteredPartitionIterators.merge(iterators, UnfilteredPartitionIterators.MergeListener.NOOP), filterByTableId, materializeLazily);</span>
+    }
+
+    public CloseableIterator&lt;PaxosKeyState&gt; repairIterator(TableId tableId, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="fc" id="L150">        Preconditions.checkNotNull(tableId);</span>
+
+<span class="fc" id="L152">        View view = baseCfs.getTracker().getView();</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">        List&lt;Memtable&gt; memtables = view.flushingMemtables.isEmpty()</span>
+<span class="fc" id="L154">                                   ? view.liveMemtables</span>
+<span class="pc" id="L155">                                   : ImmutableList.&lt;Memtable&gt;builder().addAll(view.flushingMemtables).addAll(view.liveMemtables).build();</span>
+
+<span class="fc" id="L157">        List&lt;DataRange&gt; dataRanges = ranges.stream().map(DataRange::forTokenRange).collect(Collectors.toList());</span>
+<span class="fc" id="L158">        List&lt;UnfilteredPartitionIterator&gt; iters = new ArrayList&lt;&gt;(memtables.size() * ranges.size());</span>
+
+<span class="fc bfc" id="L160" title="All 2 branches covered.">        for (int j=0, jsize=dataRanges.size(); j&lt;jsize; j++)</span>
+        {
+<span class="fc bfc" id="L162" title="All 2 branches covered.">            for (int i=0, isize=memtables.size(); i&lt;isize; i++)</span>
+<span class="fc" id="L163">                iters.add(memtables.get(i).partitionIterator(memtableColumnFilter, dataRanges.get(j), SSTableReadsListener.NOOP_LISTENER));</span>
+        }
+
+<span class="fc" id="L166">        return getPaxosUpdates(iters, tableId, false);</span>
+    }
+
+    public CloseableIterator&lt;PaxosKeyState&gt; flushIterator(Memtable flushing)
+    {
+<span class="fc" id="L171">        List&lt;UnfilteredPartitionIterator&gt; iters = singletonList(flushing.partitionIterator(memtableColumnFilter, FULL_RANGE, SSTableReadsListener.NOOP_LISTENER));</span>
+<span class="fc" id="L172">        return getPaxosUpdates(iters, null, true);</span>
+    }
+
+    public Callable&lt;?&gt; getBlockingFlushTask()
+    {
+<span class="nc" id="L177">        return (Callable&lt;Object&gt;) () -&gt; {</span>
+<span class="nc" id="L178">            ballotTracker().flush();</span>
+<span class="nc" id="L179">            return null;</span>
+        };
+    }
+
+    public Callable&lt;?&gt; getBlockingFlushTask(Memtable paxos)
+    {
+<span class="fc" id="L185">        return (Callable&lt;Object&gt;) () -&gt; {</span>
+<span class="fc" id="L186">            uncommittedTracker().flushUpdates(paxos);</span>
+<span class="fc" id="L187">            ballotTracker().flush();</span>
+<span class="fc" id="L188">            return null;</span>
+        };
+    }
+
+    public Callable&lt;?&gt; getInvalidateTask()
+    {
+<span class="nc" id="L194">        return (Callable&lt;Object&gt;) () -&gt; {</span>
+<span class="nc" id="L195">            uncommittedTracker().truncate();</span>
+<span class="nc" id="L196">            ballotTracker().truncate();</span>
+<span class="nc" id="L197">            return null;</span>
+        };
+    }
+
+    public Callable&lt;?&gt; getTruncateTask(long truncatedAt)
+    {
+<span class="nc" id="L203">        return (Callable&lt;Object&gt;) () -&gt; {</span>
+<span class="nc" id="L204">            uncommittedTracker().truncate();</span>
+<span class="nc" id="L205">            ballotTracker().truncate();</span>
+<span class="nc" id="L206">            return null;</span>
+        };
+    }
+
+    public boolean shouldBuildBlocking()
+    {
+<span class="nc" id="L212">        return false;</span>
+    }
+
+    public boolean dependsOn(ColumnMetadata column)
+    {
+<span class="nc" id="L217">        return false;</span>
+    }
+
+    public boolean supportsExpression(ColumnMetadata column, Operator operator)
+    {
+        // should prevent this from ever being used
+<span class="fc" id="L223">        return false;</span>
+    }
+
+    public AbstractType&lt;?&gt; customExpressionValueType()
+    {
+<span class="nc" id="L228">        return null;</span>
+    }
+
+    public RowFilter getPostIndexQueryFilter(RowFilter filter)
+    {
+<span class="nc" id="L233">        return null;</span>
+    }
+
+    public long getEstimatedResultRows()
+    {
+<span class="nc" id="L238">        return 0;</span>
+    }
+
+    public void validate(PartitionUpdate update) throws InvalidRequestException
+    {
+
+<span class="fc" id="L244">    }</span>
+
+    public Indexer indexerFor(DecoratedKey key, RegularAndStaticColumns columns, long nowInSec, WriteContext ctx, IndexTransaction.Type transactionType, Memtable memtable)
+    {
+<span class="fc" id="L248">        return indexer;</span>
+    }
+
+    public Searcher searcherFor(ReadCommand command)
+    {
+<span class="nc" id="L253">        throw new UnsupportedOperationException();</span>
+    }
+
+<span class="fc" id="L256">    private final Indexer indexer = new Indexer()</span>
+<span class="fc" id="L257">    {</span>
+<span class="fc" id="L258">        public void begin() {}</span>
+<span class="nc" id="L259">        public void partitionDelete(DeletionTime deletionTime) {}</span>
+<span class="nc" id="L260">        public void rangeTombstone(RangeTombstone tombstone) {}</span>
+
+        public void insertRow(Row row)
+        {
+<span class="fc" id="L264">            ballotTracker().onUpdate(row);</span>
+<span class="fc" id="L265">        }</span>
+
+        public void updateRow(Row oldRowData, Row newRowData)
+        {
+<span class="fc" id="L269">            ballotTracker().onUpdate(newRowData);</span>
+<span class="fc" id="L270">        }</span>
+
+<span class="fc" id="L272">        public void removeRow(Row row) {}</span>
+<span class="fc" id="L273">        public void finish() {}</span>
+    };
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

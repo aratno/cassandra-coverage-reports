@@ -1,0 +1,379 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Flusher.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">Flusher.java</span></div><h1>Flusher.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.transport;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.EventLoop;
+import org.apache.cassandra.net.FrameEncoder;
+import org.apache.cassandra.net.FrameEncoderCrc;
+import org.apache.cassandra.net.FrameEncoderLZ4;
+import org.apache.cassandra.transport.Message.Response;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.memory.BufferPool;
+
+import static org.apache.cassandra.transport.CQLMessageHandler.envelopeSize;
+
+abstract class Flusher implements Runnable
+{
+<span class="fc" id="L46">    private static final Logger logger = LoggerFactory.getLogger(Flusher.class);</span>
+    @VisibleForTesting
+<span class="fc" id="L48">    public static final int MAX_FRAMED_PAYLOAD_SIZE =</span>
+<span class="fc" id="L49">        Math.min(BufferPool.NORMAL_CHUNK_SIZE,</span>
+<span class="fc" id="L50">                 FrameEncoder.Payload.MAX_SIZE - Math.max(FrameEncoderCrc.HEADER_AND_TRAILER_LENGTH, FrameEncoderLZ4.HEADER_AND_TRAILER_LENGTH));</span>
+
+    static class FlushItem&lt;T&gt;
+    {
+<span class="fc" id="L54">        enum Kind {FRAMED, UNFRAMED}</span>
+
+        final Kind kind;
+        final Channel channel;
+        final T response;
+        final Envelope request;
+        final Consumer&lt;FlushItem&lt;T&gt;&gt; tidy;
+
+        FlushItem(Kind kind, Channel channel, T response, Envelope request, Consumer&lt;FlushItem&lt;T&gt;&gt; tidy)
+<span class="fc" id="L63">        {</span>
+<span class="fc" id="L64">            this.kind = kind;</span>
+<span class="fc" id="L65">            this.channel = channel;</span>
+<span class="fc" id="L66">            this.request = request;</span>
+<span class="fc" id="L67">            this.response = response;</span>
+<span class="fc" id="L68">            this.tidy = tidy;</span>
+<span class="fc" id="L69">        }</span>
+
+        void release()
+        {
+<span class="fc" id="L73">            tidy.accept(this);</span>
+<span class="fc" id="L74">        }</span>
+
+        static class Framed extends FlushItem&lt;Envelope&gt;
+        {
+            final FrameEncoder.PayloadAllocator allocator;
+            Framed(Channel channel,
+                   Envelope response,
+                   Envelope request,
+                   FrameEncoder.PayloadAllocator allocator,
+                   Consumer&lt;FlushItem&lt;Envelope&gt;&gt; tidy)
+            {
+<span class="fc" id="L85">                super(Kind.FRAMED, channel, response, request, tidy);</span>
+<span class="fc" id="L86">                this.allocator = allocator;</span>
+<span class="fc" id="L87">            }</span>
+        }
+
+        static class Unframed extends FlushItem&lt;Response&gt;
+        {
+            Unframed(Channel channel, Response response, Envelope request, Consumer&lt;FlushItem&lt;Response&gt;&gt; tidy)
+            {
+<span class="nc" id="L94">                super(Kind.UNFRAMED, channel, response, request, tidy);</span>
+<span class="nc" id="L95">            }</span>
+        }
+    }
+
+    static Flusher legacy(EventLoop loop)
+    {
+<span class="nc" id="L101">       return new LegacyFlusher(loop);</span>
+    }
+
+    static Flusher immediate(EventLoop loop)
+    {
+<span class="fc" id="L106">        return new ImmediateFlusher(loop);</span>
+    }
+
+    protected final EventLoop eventLoop;
+<span class="fc" id="L110">    private final ConcurrentLinkedQueue&lt;FlushItem&lt;?&gt;&gt; queued = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L111">    protected final AtomicBoolean scheduled = new AtomicBoolean(false);</span>
+<span class="fc" id="L112">    protected final List&lt;FlushItem&lt;?&gt;&gt; processed = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L113">    private final HashSet&lt;Channel&gt; channels = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L114">    private final Map&lt;Channel, FlushBuffer&gt; payloads = new HashMap&lt;&gt;();</span>
+
+    void start()
+    {
+<span class="fc bfc" id="L118" title="All 4 branches covered.">        if (!scheduled.get() &amp;&amp; scheduled.compareAndSet(false, true))</span>
+        {
+<span class="fc" id="L120">            this.eventLoop.execute(this);</span>
+        }
+<span class="fc" id="L122">    }</span>
+
+    private Flusher(EventLoop eventLoop)
+<span class="fc" id="L125">    {</span>
+<span class="fc" id="L126">        this.eventLoop = eventLoop;</span>
+<span class="fc" id="L127">    }</span>
+
+    void enqueue(FlushItem&lt;?&gt; item)
+    {
+<span class="fc" id="L131">       queued.add(item);</span>
+<span class="fc" id="L132">    }</span>
+
+    FlushItem&lt;?&gt; poll()
+    {
+<span class="fc" id="L136">        return queued.poll();</span>
+    }
+
+    boolean isEmpty()
+    {
+<span class="nc" id="L141">        return queued.isEmpty();</span>
+    }
+
+    private void processUnframedResponse(FlushItem.Unframed flush)
+    {
+<span class="nc" id="L146">        flush.channel.write(flush.response, flush.channel.voidPromise());</span>
+<span class="nc" id="L147">        channels.add(flush.channel);</span>
+<span class="nc" id="L148">    }</span>
+
+    private void processFramedResponse(FlushItem.Framed flush)
+    {
+<span class="fc" id="L152">        Envelope outbound = flush.response;</span>
+<span class="fc bfc" id="L153" title="All 2 branches covered.">        if (envelopeSize(outbound.header) &gt;= MAX_FRAMED_PAYLOAD_SIZE)</span>
+        {
+<span class="fc" id="L155">            flushLargeMessage(flush.channel, outbound, flush.allocator);</span>
+        }
+        else
+        {
+<span class="fc" id="L159">            payloads.computeIfAbsent(flush.channel, channel -&gt; new FlushBuffer(channel, flush.allocator, 5))</span>
+<span class="fc" id="L160">                    .add(flush.response);</span>
+        }
+<span class="fc" id="L162">    }</span>
+
+    private void flushLargeMessage(Channel channel, Envelope outbound, FrameEncoder.PayloadAllocator allocator)
+    {
+        FrameEncoder.Payload payload;
+        ByteBuffer buf;
+<span class="fc" id="L168">        ByteBuf body = outbound.body;</span>
+<span class="fc" id="L169">        boolean firstFrame = true;</span>
+        // Highly unlikely that the body of a large message would be empty, but the check is cheap
+<span class="pc bpc" id="L171" title="1 of 4 branches missed.">        while (body.readableBytes() &gt; 0 || firstFrame)</span>
+        {
+<span class="fc" id="L173">            int payloadSize = Math.min(body.readableBytes(), MAX_FRAMED_PAYLOAD_SIZE);</span>
+<span class="fc" id="L174">            payload = allocator.allocate(false, payloadSize);</span>
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+            {
+<span class="nc" id="L177">                logger.trace(&quot;Allocated initial buffer of {} for 1 large item&quot;,</span>
+<span class="nc" id="L178">                             FBUtilities.prettyPrintMemory(payload.buffer.capacity()));</span>
+            }
+
+<span class="fc" id="L181">            buf = payload.buffer;</span>
+            // BufferPool may give us a buffer larger than we asked for.
+            // FrameEncoder may object if buffer.remaining is &gt;= MAX_SIZE.
+<span class="fc bfc" id="L184" title="All 2 branches covered.">            if (payloadSize &gt;= MAX_FRAMED_PAYLOAD_SIZE)</span>
+<span class="fc" id="L185">                buf.limit(MAX_FRAMED_PAYLOAD_SIZE);</span>
+
+<span class="fc bfc" id="L187" title="All 2 branches covered.">            if (firstFrame)</span>
+            {
+<span class="fc" id="L189">                outbound.encodeHeaderInto(buf);</span>
+<span class="fc" id="L190">                firstFrame = false;</span>
+            }
+
+<span class="fc" id="L193">            int remaining = Math.min(buf.remaining(), body.readableBytes());</span>
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">            if (remaining &gt; 0)</span>
+<span class="fc" id="L195">                buf.put(body.slice(body.readerIndex(), remaining).nioBuffer());</span>
+
+<span class="fc" id="L197">            body.readerIndex(body.readerIndex() + remaining);</span>
+<span class="fc" id="L198">            writeAndFlush(channel, payload);</span>
+<span class="fc" id="L199">        }</span>
+<span class="fc" id="L200">    }</span>
+
+    private void writeAndFlush(Channel channel, FrameEncoder.Payload payload)
+    {
+        // we finish, but not &quot;release&quot; here since we're passing the buffer ownership to FrameEncoder#encode
+<span class="fc" id="L205">        payload.finish();</span>
+<span class="fc" id="L206">        channel.writeAndFlush(payload, channel.voidPromise());</span>
+<span class="fc" id="L207">    }</span>
+
+    protected boolean processQueue()
+    {
+<span class="fc" id="L211">        boolean doneWork = false;</span>
+        FlushItem&lt;?&gt; flush;
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        while ((flush = poll()) != null)</span>
+        {
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">            if (flush.kind == FlushItem.Kind.FRAMED)</span>
+<span class="fc" id="L216">                processFramedResponse((FlushItem.Framed) flush);</span>
+            else
+<span class="nc" id="L218">                processUnframedResponse((FlushItem.Unframed) flush);</span>
+
+<span class="fc" id="L220">            processed.add(flush);</span>
+<span class="fc" id="L221">            doneWork = true;</span>
+        }
+<span class="fc" id="L223">        return doneWork;</span>
+    }
+
+    protected void flushWrittenChannels()
+    {
+        // flush the channels pre-V5 to which messages were written in writeSingleResponse
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        for (Channel channel : channels)</span>
+<span class="nc" id="L230">            channel.flush();</span>
+
+        // Framed messages (V5) are grouped by channel, now encode them into payloads, write and flush
+<span class="fc bfc" id="L233" title="All 2 branches covered.">        for (FlushBuffer buffer : payloads.values())</span>
+<span class="fc" id="L234">            buffer.finish();</span>
+
+        // Ultimately, this passes the flush item to the Consumer&lt;FlushItem&gt; configured in
+        // whichever Dispatcher.FlushItemConverter implementation created it. Due to the quite
+        // different ways in which resource allocation is handled in protocol V5 and later
+        // there are distinct implementations for V5 and pre-V5 connections:
+        //   * o.a.c.t.CQLMessageHandler::toFlushItem for V5, which relates to FlushItem.Framed.
+        //   * o.a.c.t.PreV5Handlers.LegacyDispatchHandler::toFlushItem, relating to FlushItem.Unframed
+        // In both cases, the Consumer releases the buffers for the source envelope and returns the
+        // capacity claimed for message processing back to the global and per-endpoint reserves.
+        // Those reserves are used to determine if capacity is available for any inbound message
+        // or whether we should attempt to shed load or apply backpressure.
+        // The response buffers are handled differently though. In V5, CQL message envelopes are
+        // collated into frames, and so their buffers can be released immediately after flushing.
+        // In V4 however, the buffers containing each CQL envelope are emitted from Envelope.Encoder
+        // and so releasing them is handled by Netty internally.
+<span class="fc bfc" id="L250" title="All 2 branches covered.">        for (FlushItem&lt;?&gt; item : processed)</span>
+<span class="fc" id="L251">            item.release();</span>
+
+<span class="fc" id="L253">        payloads.clear();</span>
+<span class="fc" id="L254">        channels.clear();</span>
+<span class="fc" id="L255">        processed.clear();</span>
+<span class="fc" id="L256">    }</span>
+
+    private class FlushBuffer extends ArrayList&lt;Envelope&gt;
+    {
+        private final Channel channel;
+        private final FrameEncoder.PayloadAllocator allocator;
+<span class="fc" id="L262">        private int sizeInBytes = 0;</span>
+
+        FlushBuffer(Channel channel, FrameEncoder.PayloadAllocator allocator, int initialCapacity)
+<span class="fc" id="L265">        {</span>
+<span class="fc" id="L266">            super(initialCapacity);</span>
+<span class="fc" id="L267">            this.channel = channel;</span>
+<span class="fc" id="L268">            this.allocator = allocator;</span>
+<span class="fc" id="L269">        }</span>
+
+        public boolean add(Envelope toFlush)
+        {
+<span class="fc" id="L273">            sizeInBytes += envelopeSize(toFlush.header);</span>
+<span class="fc" id="L274">            return super.add(toFlush);</span>
+        }
+
+        private FrameEncoder.Payload allocate(int requiredBytes, int maxItems)
+        {
+<span class="fc" id="L279">            int bufferSize = Math.min(requiredBytes, MAX_FRAMED_PAYLOAD_SIZE);</span>
+<span class="fc" id="L280">            FrameEncoder.Payload payload = allocator.allocate(true, bufferSize);</span>
+            // BufferPool may give us a buffer larger than we asked for.
+            // FrameEncoder may object if buffer.remaining is &gt;= MAX_SIZE.
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">            if (payload.remaining() &gt;= MAX_FRAMED_PAYLOAD_SIZE)</span>
+<span class="nc" id="L284">                payload.buffer.limit(payload.buffer.position() + bufferSize);</span>
+
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+            {
+<span class="nc" id="L288">                logger.trace(&quot;Allocated initial buffer of {} for up to {} items&quot;,</span>
+<span class="nc" id="L289">                             FBUtilities.prettyPrintMemory(payload.buffer.capacity()),</span>
+<span class="nc" id="L290">                             maxItems);</span>
+            }
+<span class="fc" id="L292">            return payload;</span>
+        }
+
+        public void finish()
+        {
+            int messageSize;
+<span class="fc" id="L298">            int writtenBytes = 0;</span>
+<span class="fc" id="L299">            int messagesToWrite = this.size();</span>
+<span class="fc" id="L300">            FrameEncoder.Payload sending = allocate(sizeInBytes, messagesToWrite);</span>
+<span class="fc bfc" id="L301" title="All 2 branches covered.">            for (Envelope f : this)</span>
+            {
+<span class="fc" id="L303">                messageSize = envelopeSize(f.header);</span>
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">                if (sending.remaining() &lt; messageSize)</span>
+                {
+<span class="nc" id="L306">                    writeAndFlush(channel, sending);</span>
+<span class="nc" id="L307">                    sending = allocate(sizeInBytes - writtenBytes, messagesToWrite);</span>
+                }
+
+<span class="fc" id="L310">                f.encodeInto(sending.buffer);</span>
+<span class="fc" id="L311">                writtenBytes += messageSize;</span>
+<span class="fc" id="L312">                messagesToWrite--;</span>
+<span class="fc" id="L313">            }</span>
+<span class="fc" id="L314">            writeAndFlush(channel, sending);</span>
+<span class="fc" id="L315">        }</span>
+    }
+
+    private static final class LegacyFlusher extends Flusher
+    {
+<span class="nc" id="L320">        int runsSinceFlush = 0;</span>
+<span class="nc" id="L321">        int runsWithNoWork = 0;</span>
+
+        private LegacyFlusher(EventLoop eventLoop)
+        {
+<span class="nc" id="L325">            super(eventLoop);</span>
+<span class="nc" id="L326">        }</span>
+
+        public void run()
+        {
+<span class="nc" id="L330">            boolean doneWork = processQueue();</span>
+<span class="nc" id="L331">            runsSinceFlush++;</span>
+
+<span class="nc bnc" id="L333" title="All 6 branches missed.">            if (!doneWork || runsSinceFlush &gt; 2 || processed.size() &gt; 50)</span>
+            {
+<span class="nc" id="L335">                flushWrittenChannels();</span>
+<span class="nc" id="L336">                runsSinceFlush = 0;</span>
+            }
+
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            if (doneWork)</span>
+            {
+<span class="nc" id="L341">                runsWithNoWork = 0;</span>
+            }
+            else
+            {
+                // either reschedule or cancel
+<span class="nc bnc" id="L346" title="All 2 branches missed.">                if (++runsWithNoWork &gt; 5)</span>
+                {
+<span class="nc" id="L348">                    scheduled.set(false);</span>
+<span class="nc bnc" id="L349" title="All 4 branches missed.">                    if (isEmpty() || !scheduled.compareAndSet(false, true))</span>
+<span class="nc" id="L350">                        return;</span>
+                }
+            }
+
+<span class="nc" id="L354">            eventLoop.schedule(this, 10000, TimeUnit.NANOSECONDS);</span>
+<span class="nc" id="L355">        }</span>
+    }
+
+    private static final class ImmediateFlusher extends Flusher
+    {
+        private ImmediateFlusher(EventLoop eventLoop)
+        {
+<span class="fc" id="L362">            super(eventLoop);</span>
+<span class="fc" id="L363">        }</span>
+
+        public void run()
+        {
+<span class="fc" id="L367">            scheduled.set(false);</span>
+            try
+            {
+<span class="fc" id="L370">                processQueue();</span>
+            }
+            finally
+            {
+<span class="fc" id="L374">                flushWrittenChannels();</span>
+            }
+<span class="fc" id="L376">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

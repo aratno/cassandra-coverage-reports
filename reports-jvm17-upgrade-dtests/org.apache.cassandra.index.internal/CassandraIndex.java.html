@@ -1,0 +1,803 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraIndex.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.internal</a> &gt; <span class="el_source">CassandraIndex.java</span></div><h1>CassandraIndex.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+package org.apache.cassandra.index.internal;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+import com.google.common.collect.ImmutableSet;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CollectionType;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.dht.LocalPartitioner;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.*;
+import org.apache.cassandra.index.internal.composites.CompositesSearcher;
+import org.apache.cassandra.index.internal.keys.KeysSearcher;
+import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.ReducingKeyIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+
+/**
+ * Index implementation which indexes the values for a single column in the base
+ * table and which stores its index data in a local, hidden table.
+ */
+public abstract class CassandraIndex implements Index
+{
+    public static final String NAME = &quot;legacy_local_table&quot;;
+    
+<span class="fc" id="L74">    private static final Logger logger = LoggerFactory.getLogger(CassandraIndex.class);</span>
+
+    public final ColumnFamilyStore baseCfs;
+    protected IndexMetadata metadata;
+    protected ColumnFamilyStore indexCfs;
+    protected ColumnMetadata indexedColumn;
+    protected CassandraIndexFunctions functions;
+
+    protected CassandraIndex(ColumnFamilyStore baseCfs, IndexMetadata indexDef)
+<span class="fc" id="L83">    {</span>
+<span class="fc" id="L84">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L85">        setMetadata(indexDef);</span>
+<span class="fc" id="L86">    }</span>
+
+    /**
+     * Returns true if an index of this type can support search predicates of the form [column] OPERATOR [value]
+     * @param indexedColumn
+     * @param operator
+     * @return
+     */
+    protected boolean supportsOperator(ColumnMetadata indexedColumn, Operator operator)
+    {
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">        return operator == Operator.EQ;</span>
+    }
+
+    /**
+     * Used to construct an the clustering for an entry in the index table based on values from the base data.
+     * The clustering columns in the index table encode the values required to retrieve the correct data from the base
+     * table and varies depending on the kind of the indexed column. See indexCfsMetadata for more details
+     * Used whenever a row in the index table is written or deleted.
+     * @param partitionKey from the base data being indexed
+     * @param prefix from the base data being indexed
+     * @param path from the base data being indexed
+     * @return a clustering prefix to be used to insert into the index table
+     */
+    protected abstract &lt;T&gt; CBuilder buildIndexClusteringPrefix(ByteBuffer partitionKey,
+                                                           ClusteringPrefix&lt;T&gt; prefix,
+                                                           CellPath path);
+
+    /**
+     * Used at search time to convert a row in the index table into a simple struct containing the values required
+     * to retrieve the corresponding row from the base table.
+     * @param indexedValue the partition key of the indexed table (i.e. the value that was indexed)
+     * @param indexEntry a row from the index table
+     * @return
+     */
+    public abstract IndexEntry decodeEntry(DecoratedKey indexedValue,
+                                           Row indexEntry);
+
+    /**
+     * Check whether a value retrieved from an index is still valid by comparing it to current row from the base table.
+     * Used at read time to identify out of date index entries so that they can be excluded from search results and
+     * repaired
+     * @param row the current row from the primary data table
+     * @param indexValue the value we retrieved from the index
+     * @param nowInSec
+     * @return true if the index is out of date and the entry should be dropped
+     */
+    public abstract boolean isStale(Row row, ByteBuffer indexValue, long nowInSec);
+
+    /**
+     * Extract the value to be inserted into the index from the components of the base data
+     * @param partitionKey from the primary data
+     * @param clustering from the primary data
+     * @param path from the primary data
+     * @param cellValue from the primary data
+     * @return a ByteBuffer containing the value to be inserted in the index. This will be used to make the partition
+     * key in the index table
+     */
+    protected abstract ByteBuffer getIndexedValue(ByteBuffer partitionKey,
+                                                  Clustering&lt;?&gt; clustering,
+                                                  CellPath path,
+                                                  ByteBuffer cellValue);
+
+    public ColumnMetadata getIndexedColumn()
+    {
+<span class="fc" id="L150">        return indexedColumn;</span>
+    }
+
+    public ClusteringComparator getIndexComparator()
+    {
+<span class="fc" id="L155">        return indexCfs.metadata().comparator;</span>
+    }
+
+    public ColumnFamilyStore getIndexCfs()
+    {
+<span class="nc" id="L160">        return indexCfs;</span>
+    }
+
+    public void register(IndexRegistry registry)
+    {
+<span class="fc" id="L165">        registry.registerIndex(this);</span>
+<span class="fc" id="L166">    }</span>
+
+    public Callable&lt;?&gt; getInitializationTask()
+    {
+        // if we're just linking in the index on an already-built index post-restart or if the base
+        // table is empty we've nothing to do. Otherwise, submit for building via SecondaryIndexBuilder
+<span class="pc bpc" id="L172" title="3 of 4 branches missed.">        return isBuilt() || baseCfs.isEmpty() ? null : getBuildIndexTask();</span>
+    }
+
+    public IndexMetadata getIndexMetadata()
+    {
+<span class="fc" id="L177">        return metadata;</span>
+    }
+
+    public Optional&lt;ColumnFamilyStore&gt; getBackingTable()
+    {
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        return indexCfs == null ? Optional.empty() : Optional.of(indexCfs);</span>
+    }
+
+    public Callable&lt;Void&gt; getBlockingFlushTask()
+    {
+<span class="nc" id="L187">        return () -&gt; {</span>
+<span class="nc" id="L188">            indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_TABLE_FLUSH);</span>
+<span class="nc" id="L189">            return null;</span>
+        };
+    }
+
+    public Callable&lt;?&gt; getInvalidateTask()
+    {
+<span class="nc" id="L195">        return () -&gt; {</span>
+<span class="nc" id="L196">            invalidate();</span>
+<span class="nc" id="L197">            return null;</span>
+        };
+    }
+
+    public Callable&lt;?&gt; getMetadataReloadTask(IndexMetadata indexDef)
+    {
+<span class="nc" id="L203">        return () -&gt; {</span>
+<span class="nc" id="L204">            indexCfs.reload();</span>
+<span class="nc" id="L205">            return null;</span>
+        };
+    }
+
+    @Override
+    public void validate(ReadCommand command) throws InvalidRequestException
+    {
+<span class="fc" id="L212">        Optional&lt;RowFilter.Expression&gt; target = getTargetExpression(command.rowFilter().getExpressions());</span>
+
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">        if (target.isPresent())</span>
+        {
+<span class="fc" id="L216">            ByteBuffer indexValue = target.get().getIndexValue();</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            checkFalse(indexValue.remaining() &gt; FBUtilities.MAX_UNSIGNED_SHORT,</span>
+                       &quot;Index expression values may not be larger than 64K&quot;);
+        }
+<span class="fc" id="L220">    }</span>
+
+    private void setMetadata(IndexMetadata indexDef)
+    {
+<span class="fc" id="L224">        metadata = indexDef;</span>
+<span class="fc" id="L225">        Pair&lt;ColumnMetadata, IndexTarget.Type&gt; target = TargetParser.parse(baseCfs.metadata(), indexDef);</span>
+<span class="fc" id="L226">        functions = getFunctions(indexDef, target);</span>
+<span class="fc" id="L227">        TableMetadataRef tableRef = TableMetadataRef.forOfflineTools(indexCfsMetadata(baseCfs.metadata(), indexDef));</span>
+<span class="fc" id="L228">        indexCfs = ColumnFamilyStore.createColumnFamilyStore(baseCfs.keyspace,</span>
+                                                             tableRef.name,
+                                                             tableRef,
+<span class="fc" id="L231">                                                             baseCfs.getTracker().loadsstables);</span>
+<span class="fc" id="L232">        indexedColumn = target.left;</span>
+<span class="fc" id="L233">    }</span>
+
+    public Callable&lt;?&gt; getTruncateTask(final long truncatedAt)
+    {
+<span class="nc" id="L237">        return () -&gt; {</span>
+<span class="nc" id="L238">            indexCfs.discardSSTables(truncatedAt);</span>
+<span class="nc" id="L239">            return null;</span>
+        };
+    }
+
+    public boolean shouldBuildBlocking()
+    {
+        // built-in indexes are always included in builds initiated from SecondaryIndexManager
+<span class="nc" id="L246">        return true;</span>
+    }
+
+    public boolean dependsOn(ColumnMetadata column)
+    {
+<span class="nc" id="L251">        return indexedColumn.name.equals(column.name);</span>
+    }
+
+    public boolean supportsExpression(ColumnMetadata column, Operator operator)
+    {
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">        return indexedColumn.name.equals(column.name)</span>
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">               &amp;&amp; supportsOperator(indexedColumn, operator);</span>
+    }
+
+    private boolean supportsExpression(RowFilter.Expression expression)
+    {
+<span class="fc" id="L262">        return supportsExpression(expression.column(), expression.operator());</span>
+    }
+
+    public AbstractType&lt;?&gt; customExpressionValueType()
+    {
+<span class="nc" id="L267">        return null;</span>
+    }
+
+    public long getEstimatedResultRows()
+    {
+<span class="fc" id="L272">        return indexCfs.getMeanRowCount();</span>
+    }
+
+    public RowFilter getPostIndexQueryFilter(RowFilter filter)
+    {
+<span class="fc" id="L277">        return getTargetExpression(filter.getExpressions()).map(filter::without)</span>
+<span class="fc" id="L278">                                                           .orElse(filter);</span>
+    }
+
+    private Optional&lt;RowFilter.Expression&gt; getTargetExpression(List&lt;RowFilter.Expression&gt; expressions)
+    {
+<span class="fc" id="L283">        return expressions.stream().filter(this::supportsExpression).findFirst();</span>
+    }
+
+    public Index.Searcher searcherFor(ReadCommand command)
+    {
+<span class="fc" id="L288">        Optional&lt;RowFilter.Expression&gt; target = getTargetExpression(command.rowFilter().getExpressions());</span>
+
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">        if (target.isPresent())</span>
+        {
+<span class="pc bpc" id="L292" title="2 of 3 branches missed.">            switch (getIndexMetadata().kind)</span>
+            {
+                case COMPOSITES:
+<span class="fc" id="L295">                    return new CompositesSearcher(command, target.get(), this);</span>
+                case KEYS:
+<span class="nc" id="L297">                    return new KeysSearcher(command, target.get(), this);</span>
+
+                default:
+<span class="nc" id="L300">                    throw new IllegalStateException(String.format(&quot;Unsupported index type %s for index %s on %s&quot;,</span>
+                                                                  metadata.kind,
+                                                                  metadata.name,
+<span class="nc" id="L303">                                                                  indexedColumn.name.toString()));</span>
+            }
+        }
+
+<span class="nc" id="L307">        return null;</span>
+
+    }
+
+    public void validate(PartitionUpdate update) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L313" title="All 5 branches missed.">        switch (indexedColumn.kind)</span>
+        {
+            case PARTITION_KEY:
+<span class="nc" id="L316">                validatePartitionKey(update.partitionKey());</span>
+<span class="nc" id="L317">                break;</span>
+            case CLUSTERING:
+<span class="nc" id="L319">                validateClusterings(update);</span>
+<span class="nc" id="L320">                break;</span>
+            case REGULAR:
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                if (update.columns().regulars.contains(indexedColumn))</span>
+<span class="nc" id="L323">                    validateRows(update);</span>
+                break;
+            case STATIC:
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                if (update.columns().statics.contains(indexedColumn))</span>
+<span class="nc" id="L327">                    validateRows(Collections.singleton(update.staticRow()));</span>
+                break;
+        }
+<span class="nc" id="L330">    }</span>
+
+    public Indexer indexerFor(final DecoratedKey key,
+                              final RegularAndStaticColumns columns,
+                              final long nowInSec,
+                              final WriteContext ctx,
+                              final IndexTransaction.Type transactionType,
+                              Memtable memtable)
+    {
+        /*
+         * Indexes on regular and static columns (the non primary-key ones) only care about updates with live
+         * data for the column they index. In particular, they don't care about having just row or range deletions
+         * as they don't know how to update the index table unless they know exactly the value that is deleted.
+         *
+         * Note that in practice this means that those indexes are only purged of stale entries on compaction,
+         * when we resolve both the deletion and the prior data it deletes. Of course, such stale entries are also
+         * filtered on read.
+         */
+<span class="pc bpc" id="L348" title="2 of 4 branches missed.">        if (!isPrimaryKeyIndex() &amp;&amp; !columns.contains(indexedColumn))</span>
+<span class="nc" id="L349">            return null;</span>
+
+<span class="fc" id="L351">        return new Indexer()</span>
+<span class="fc" id="L352">        {</span>
+            public void begin()
+            {
+<span class="fc" id="L355">            }</span>
+
+            public void partitionDelete(DeletionTime deletionTime)
+            {
+<span class="nc" id="L359">            }</span>
+
+            public void rangeTombstone(RangeTombstone tombstone)
+            {
+<span class="nc" id="L363">            }</span>
+
+            public void insertRow(Row row)
+            {
+<span class="pc bpc" id="L367" title="5 of 6 branches missed.">                if (row.isStatic() &amp;&amp; !indexedColumn.isStatic() &amp;&amp; !indexedColumn.isPartitionKey())</span>
+<span class="nc" id="L368">                    return;</span>
+
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">                if (isPrimaryKeyIndex())</span>
+                {
+<span class="nc" id="L372">                    indexPrimaryKey(row.clustering(),</span>
+<span class="nc" id="L373">                                    getPrimaryKeyIndexLiveness(row),</span>
+<span class="nc" id="L374">                                    row.deletion());</span>
+                }
+                else
+                {
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">                    if (indexedColumn.isComplex())</span>
+<span class="nc" id="L379">                        indexCells(row.clustering(), row.getComplexColumnData(indexedColumn));</span>
+                    else
+<span class="fc" id="L381">                        indexCell(row.clustering(), row.getCell(indexedColumn));</span>
+                }
+<span class="fc" id="L383">            }</span>
+
+            public void removeRow(Row row)
+            {
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                if (isPrimaryKeyIndex())</span>
+<span class="nc" id="L388">                    return;</span>
+
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                if (indexedColumn.isComplex())</span>
+<span class="nc" id="L391">                    removeCells(row.clustering(), row.getComplexColumnData(indexedColumn));</span>
+                else
+<span class="nc" id="L393">                    removeCell(row.clustering(), row.getCell(indexedColumn));</span>
+<span class="nc" id="L394">            }</span>
+
+            public void updateRow(Row oldRow, Row newRow)
+            {
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">                assert oldRow.isStatic() == newRow.isStatic();</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">                if (newRow.isStatic() != indexedColumn.isStatic())</span>
+<span class="nc" id="L400">                    return;</span>
+
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">                if (isPrimaryKeyIndex())</span>
+<span class="nc" id="L403">                    indexPrimaryKey(newRow.clustering(),</span>
+<span class="nc" id="L404">                                    getPrimaryKeyIndexLiveness(newRow),</span>
+<span class="nc" id="L405">                                    newRow.deletion());</span>
+
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">                if (indexedColumn.isComplex())</span>
+                {
+<span class="nc" id="L409">                    indexCells(newRow.clustering(), newRow.getComplexColumnData(indexedColumn));</span>
+<span class="nc" id="L410">                    removeCells(oldRow.clustering(), oldRow.getComplexColumnData(indexedColumn));</span>
+                }
+                else
+                {
+<span class="fc" id="L414">                    indexCell(newRow.clustering(), newRow.getCell(indexedColumn));</span>
+<span class="fc" id="L415">                    removeCell(oldRow.clustering(), oldRow.getCell(indexedColumn));</span>
+                }
+<span class="fc" id="L417">            }</span>
+
+            public void finish()
+            {
+<span class="fc" id="L421">            }</span>
+
+            private void indexCells(Clustering&lt;?&gt; clustering, Iterable&lt;Cell&lt;?&gt;&gt; cells)
+            {
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                if (cells == null)</span>
+<span class="nc" id="L426">                    return;</span>
+
+<span class="nc bnc" id="L428" title="All 2 branches missed.">                for (Cell&lt;?&gt; cell : cells)</span>
+<span class="nc" id="L429">                    indexCell(clustering, cell);</span>
+<span class="nc" id="L430">            }</span>
+
+            private void indexCell(Clustering&lt;?&gt; clustering, Cell&lt;?&gt; cell)
+            {
+<span class="pc bpc" id="L434" title="2 of 4 branches missed.">                if (cell == null || !cell.isLive(nowInSec))</span>
+<span class="nc" id="L435">                    return;</span>
+
+<span class="fc" id="L437">                insert(key.getKey(),</span>
+                       clustering,
+                       cell,
+<span class="fc" id="L440">                       LivenessInfo.withExpirationTime(cell.timestamp(), cell.ttl(), cell.localDeletionTime()),</span>
+                       ctx);
+<span class="fc" id="L442">            }</span>
+
+            private void removeCells(Clustering&lt;?&gt; clustering, Iterable&lt;Cell&lt;?&gt;&gt; cells)
+            {
+<span class="nc bnc" id="L446" title="All 2 branches missed.">                if (cells == null)</span>
+<span class="nc" id="L447">                    return;</span>
+
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                for (Cell&lt;?&gt; cell : cells)</span>
+<span class="nc" id="L450">                    removeCell(clustering, cell);</span>
+<span class="nc" id="L451">            }</span>
+
+            private void removeCell(Clustering&lt;?&gt; clustering, Cell&lt;?&gt; cell)
+            {
+<span class="pc bpc" id="L455" title="2 of 4 branches missed.">                if (cell == null || !cell.isLive(nowInSec))</span>
+<span class="nc" id="L456">                    return;</span>
+
+<span class="fc" id="L458">                delete(key.getKey(), clustering, cell, ctx, nowInSec);</span>
+<span class="fc" id="L459">            }</span>
+
+            private void indexPrimaryKey(final Clustering&lt;?&gt; clustering,
+                                         final LivenessInfo liveness,
+                                         final Row.Deletion deletion)
+            {
+<span class="nc bnc" id="L465" title="All 2 branches missed.">                if (liveness.timestamp() != LivenessInfo.NO_TIMESTAMP)</span>
+<span class="nc" id="L466">                    insert(key.getKey(), clustering, null, liveness, ctx);</span>
+
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                if (!deletion.isLive())</span>
+<span class="nc" id="L469">                    delete(key.getKey(), clustering, deletion.time(), ctx);</span>
+<span class="nc" id="L470">            }</span>
+
+            private LivenessInfo getPrimaryKeyIndexLiveness(Row row)
+            {
+<span class="nc" id="L474">                long timestamp = row.primaryKeyLivenessInfo().timestamp();</span>
+<span class="nc" id="L475">                int ttl = row.primaryKeyLivenessInfo().ttl();</span>
+<span class="nc bnc" id="L476" title="All 2 branches missed.">                for (Cell&lt;?&gt; cell : row.cells())</span>
+                {
+<span class="nc" id="L478">                    long cellTimestamp = cell.timestamp();</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">                    if (cell.isLive(nowInSec))</span>
+                    {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">                        if (cellTimestamp &gt; timestamp)</span>
+<span class="nc" id="L482">                            timestamp = cellTimestamp;</span>
+                    }
+<span class="nc" id="L484">                }</span>
+<span class="nc" id="L485">                return LivenessInfo.create(timestamp, ttl, nowInSec);</span>
+            }
+        };
+    }
+
+    /**
+     * Specific to internal indexes, this is called by a
+     * searcher when it encounters a stale entry in the index
+     * @param indexKey the partition key in the index table
+     * @param indexClustering the clustering in the index table
+     * @param deletion deletion timestamp etc
+     * @param ctx the write context under which to perform the deletion
+     */
+    public void deleteStaleEntry(DecoratedKey indexKey,
+                                 Clustering&lt;?&gt; indexClustering,
+                                 DeletionTime deletion,
+                                 WriteContext ctx)
+    {
+<span class="nc" id="L503">        doDelete(indexKey, indexClustering, deletion, ctx);</span>
+<span class="nc" id="L504">        logger.trace(&quot;Removed index entry for stale value {}&quot;, indexKey);</span>
+<span class="nc" id="L505">    }</span>
+
+    /**
+     * Called when adding a new entry to the index
+     */
+    private void insert(ByteBuffer rowKey,
+                        Clustering&lt;?&gt; clustering,
+                        Cell&lt;?&gt; cell,
+                        LivenessInfo info,
+                        WriteContext ctx)
+    {
+<span class="fc" id="L516">        DecoratedKey valueKey = getIndexKeyFor(getIndexedValue(rowKey,</span>
+                                                               clustering,
+                                                               cell));
+<span class="fc" id="L519">        Row row = BTreeRow.noCellLiveRow(buildIndexClustering(rowKey, clustering, cell), info);</span>
+<span class="fc" id="L520">        PartitionUpdate upd = partitionUpdate(valueKey, row);</span>
+<span class="fc" id="L521">        indexCfs.getWriteHandler().write(upd, ctx, false);</span>
+<span class="fc" id="L522">        logger.trace(&quot;Inserted entry into index for value {}&quot;, valueKey);</span>
+<span class="fc" id="L523">    }</span>
+
+    /**
+     * Called when deleting entries on non-primary key columns
+     */
+    private void delete(ByteBuffer rowKey,
+                        Clustering&lt;?&gt; clustering,
+                        Cell&lt;?&gt; cell,
+                        WriteContext ctx,
+                        long nowInSec)
+    {
+<span class="nc" id="L534">        DecoratedKey valueKey = getIndexKeyFor(getIndexedValue(rowKey,</span>
+                                                               clustering,
+                                                               cell));
+<span class="nc" id="L537">        doDelete(valueKey,</span>
+<span class="nc" id="L538">                 buildIndexClustering(rowKey, clustering, cell),</span>
+<span class="nc" id="L539">                 DeletionTime.build(cell.timestamp(), nowInSec),</span>
+                 ctx);
+<span class="nc" id="L541">    }</span>
+
+    /**
+     * Called when deleting entries from indexes on primary key columns
+     */
+    private void delete(ByteBuffer rowKey,
+                        Clustering&lt;?&gt; clustering,
+                        DeletionTime deletion,
+                        WriteContext ctx)
+    {
+<span class="nc" id="L551">        DecoratedKey valueKey = getIndexKeyFor(getIndexedValue(rowKey,</span>
+                                                               clustering,
+                                                               null));
+<span class="nc" id="L554">        doDelete(valueKey,</span>
+<span class="nc" id="L555">                 buildIndexClustering(rowKey, clustering, null),</span>
+                 deletion,
+                 ctx);
+<span class="nc" id="L558">    }</span>
+
+    private void doDelete(DecoratedKey indexKey,
+                          Clustering&lt;?&gt; indexClustering,
+                          DeletionTime deletion,
+                          WriteContext ctx)
+    {
+<span class="nc" id="L565">        Row row = BTreeRow.emptyDeletedRow(indexClustering, Row.Deletion.regular(deletion));</span>
+<span class="nc" id="L566">        PartitionUpdate upd = partitionUpdate(indexKey, row);</span>
+<span class="nc" id="L567">        indexCfs.getWriteHandler().write(upd, ctx, false);</span>
+<span class="nc" id="L568">        logger.trace(&quot;Removed index entry for value {}&quot;, indexKey);</span>
+<span class="nc" id="L569">    }</span>
+
+    private void validatePartitionKey(DecoratedKey partitionKey) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L573" title="All 2 branches missed.">        assert indexedColumn.isPartitionKey();</span>
+<span class="nc" id="L574">        validateIndexedValue(getIndexedValue(partitionKey.getKey(), null, null));</span>
+<span class="nc" id="L575">    }</span>
+
+    private void validateClusterings(PartitionUpdate update) throws InvalidRequestException
+    {
+<span class="nc bnc" id="L579" title="All 2 branches missed.">        assert indexedColumn.isClusteringColumn();</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        for (Row row : update)</span>
+<span class="nc" id="L581">            validateIndexedValue(getIndexedValue(null, row.clustering(), null));</span>
+<span class="nc" id="L582">    }</span>
+
+    private void validateRows(Iterable&lt;Row&gt; rows)
+    {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        assert !indexedColumn.isPrimaryKeyColumn();</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">        for (Row row : rows)</span>
+        {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            if (indexedColumn.isComplex())</span>
+            {
+<span class="nc" id="L591">                ComplexColumnData data = row.getComplexColumnData(indexedColumn);</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                if (data != null)</span>
+                {
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                    for (Cell&lt;?&gt; cell : data)</span>
+                    {
+<span class="nc" id="L596">                        validateIndexedValue(getIndexedValue(null, null, cell.path(), cell.buffer()));</span>
+<span class="nc" id="L597">                    }</span>
+                }
+<span class="nc" id="L599">            }</span>
+            else
+            {
+<span class="nc" id="L602">                validateIndexedValue(getIndexedValue(null, null, row.getCell(indexedColumn)));</span>
+            }
+<span class="nc" id="L604">        }</span>
+<span class="nc" id="L605">    }</span>
+
+    private void validateIndexedValue(ByteBuffer value)
+    {
+<span class="nc bnc" id="L609" title="All 4 branches missed.">        if (value != null &amp;&amp; value.remaining() &gt;= FBUtilities.MAX_UNSIGNED_SHORT)</span>
+<span class="nc" id="L610">            throw new InvalidRequestException(String.format(</span>
+                                                           &quot;Cannot index value of size %d for index %s on %s(%s) (maximum allowed size=%d)&quot;,
+<span class="nc" id="L612">                                                           value.remaining(),</span>
+                                                           metadata.name,
+                                                           baseCfs.metadata,
+<span class="nc" id="L615">                                                           indexedColumn.name.toString(),</span>
+<span class="nc" id="L616">                                                           FBUtilities.MAX_UNSIGNED_SHORT));</span>
+<span class="nc" id="L617">    }</span>
+
+    private ByteBuffer getIndexedValue(ByteBuffer rowKey,
+                                       Clustering&lt;?&gt; clustering,
+                                       Cell&lt;?&gt; cell)
+    {
+<span class="fc" id="L623">        return getIndexedValue(rowKey,</span>
+                               clustering,
+<span class="pc bpc" id="L625" title="1 of 2 branches missed.">                               cell == null ? null : cell.path(),</span>
+<span class="pc bpc" id="L626" title="1 of 2 branches missed.">                               cell == null ? null : cell.buffer()</span>
+        );
+    }
+
+    private Clustering&lt;?&gt; buildIndexClustering(ByteBuffer rowKey,
+                                            Clustering&lt;?&gt; clustering,
+                                            Cell&lt;?&gt; cell)
+    {
+<span class="fc" id="L634">        return buildIndexClusteringPrefix(rowKey,</span>
+                                          clustering,
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">                                          cell == null ? null : cell.path()).build();</span>
+    }
+
+    private DecoratedKey getIndexKeyFor(ByteBuffer value)
+    {
+<span class="fc" id="L641">        return indexCfs.decorateKey(value);</span>
+    }
+
+    private PartitionUpdate partitionUpdate(DecoratedKey valueKey, Row row)
+    {
+<span class="fc" id="L646">        return PartitionUpdate.singleRowUpdate(indexCfs.metadata(), valueKey, row);</span>
+    }
+
+    private void invalidate()
+    {
+        // interrupt in-progress compactions
+<span class="nc" id="L652">        Collection&lt;ColumnFamilyStore&gt; cfss = Collections.singleton(indexCfs);</span>
+<span class="nc" id="L653">        CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -&gt; true, true);</span>
+<span class="nc" id="L654">        CompactionManager.instance.waitForCessation(cfss, (sstable) -&gt; true);</span>
+<span class="nc" id="L655">        Keyspace.writeOrder.awaitNewBarrier();</span>
+<span class="nc" id="L656">        indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_REMOVED);</span>
+<span class="nc" id="L657">        indexCfs.readOrdering.awaitNewBarrier();</span>
+<span class="nc" id="L658">        indexCfs.invalidate();</span>
+<span class="nc" id="L659">    }</span>
+
+    private boolean isBuilt()
+    {
+<span class="fc" id="L663">        return SystemKeyspace.isIndexBuilt(baseCfs.getKeyspaceName(), metadata.name);</span>
+    }
+
+    private boolean isPrimaryKeyIndex()
+    {
+<span class="fc" id="L668">        return indexedColumn.isPrimaryKeyColumn();</span>
+    }
+
+    private Callable&lt;?&gt; getBuildIndexTask()
+    {
+<span class="nc" id="L673">        return () -&gt; {</span>
+<span class="nc" id="L674">            buildBlocking();</span>
+<span class="nc" id="L675">            return null;</span>
+        };
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private void buildBlocking()
+    {
+<span class="nc" id="L682">        baseCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_BUILD_STARTED);</span>
+
+<span class="nc" id="L684">        try (ColumnFamilyStore.RefViewFragment viewFragment = baseCfs.selectAndReference(View.selectFunction(SSTableSet.CANONICAL));</span>
+<span class="nc" id="L685">             Refs&lt;SSTableReader&gt; sstables = viewFragment.refs)</span>
+        {
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (sstables.isEmpty())</span>
+            {
+<span class="nc" id="L689">                logger.info(&quot;No SSTable data for {}.{} to build index {} from, marking empty index as built&quot;,</span>
+                            baseCfs.metadata.keyspace,
+                            baseCfs.metadata.name,
+                            metadata.name);
+<span class="nc" id="L693">                return;</span>
+            }
+
+<span class="nc" id="L696">            logger.info(&quot;Submitting index build of {} for data in {}&quot;,</span>
+                        metadata.name,
+<span class="nc" id="L698">                        getSSTableNames(sstables));</span>
+
+<span class="nc" id="L700">            SecondaryIndexBuilder builder = new CollatedViewIndexBuilder(baseCfs,</span>
+<span class="nc" id="L701">                                                                         Collections.singleton(this),</span>
+                                                                         new ReducingKeyIterator(sstables),
+<span class="nc" id="L703">                                                                         ImmutableSet.copyOf(sstables));</span>
+<span class="nc" id="L704">            Future&lt;?&gt; future = CompactionManager.instance.submitIndexBuild(builder);</span>
+<span class="nc" id="L705">            FBUtilities.waitOnFuture(future);</span>
+<span class="nc" id="L706">            indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_BUILD_COMPLETED);</span>
+<span class="nc bnc" id="L707" title="All 4 branches missed.">        }</span>
+<span class="nc" id="L708">        logger.info(&quot;Index build of {} complete&quot;, metadata.name);</span>
+<span class="nc" id="L709">    }</span>
+
+    private static String getSSTableNames(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L713">        return StreamSupport.stream(sstables.spliterator(), false)</span>
+<span class="nc" id="L714">                            .map(SSTableReader::toString)</span>
+<span class="nc" id="L715">                            .collect(Collectors.joining(&quot;, &quot;));</span>
+    }
+
+    /**
+     * Construct the TableMetadata for an index table, the clustering columns in the index table
+     * vary dependent on the kind of the indexed value.
+     * @param baseCfsMetadata
+     * @param indexMetadata
+     * @return
+     */
+    public static TableMetadata indexCfsMetadata(TableMetadata baseCfsMetadata, IndexMetadata indexMetadata)
+    {
+<span class="fc" id="L727">        Pair&lt;ColumnMetadata, IndexTarget.Type&gt; target = TargetParser.parse(baseCfsMetadata, indexMetadata);</span>
+<span class="fc" id="L728">        CassandraIndexFunctions utils = getFunctions(indexMetadata, target);</span>
+<span class="fc" id="L729">        ColumnMetadata indexedColumn = target.left;</span>
+<span class="fc" id="L730">        AbstractType&lt;?&gt; indexedValueType = utils.getIndexedValueType(indexedColumn);</span>
+
+        // if Cassandra's major version is before 5, use the old behaviour
+<span class="fc" id="L733">        boolean isCompatible = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5);</span>
+<span class="fc" id="L734">        AbstractType&lt;?&gt; indexedTablePartitionKeyType = baseCfsMetadata.partitioner.partitionOrdering(baseCfsMetadata.partitionKeyType);</span>
+<span class="fc" id="L735">        TableMetadata.Builder builder =</span>
+<span class="fc" id="L736">            TableMetadata.builder(baseCfsMetadata.keyspace, baseCfsMetadata.indexTableName(indexMetadata), baseCfsMetadata.id)</span>
+<span class="fc" id="L737">                         .kind(TableMetadata.Kind.INDEX)</span>
+<span class="fc" id="L738">                         .partitioner(new LocalPartitioner(indexedValueType))</span>
+<span class="pc bpc" id="L739" title="1 of 2 branches missed.">                         .addPartitionKeyColumn(indexedColumn.name, isCompatible ? indexedColumn.type : utils.getIndexedPartitionKeyType(indexedColumn))</span>
+<span class="pc bpc" id="L740" title="1 of 2 branches missed.">                         .addClusteringColumn(&quot;partition_key&quot;, isCompatible ? baseCfsMetadata.partitioner.partitionOrdering() : indexedTablePartitionKeyType);</span>
+
+        // Adding clustering columns, which depends on the index type.
+<span class="fc" id="L743">        builder = utils.addIndexClusteringColumns(builder, baseCfsMetadata, indexedColumn);</span>
+
+<span class="fc" id="L745">        return builder.build().updateIndexTableMetadata(baseCfsMetadata.params);</span>
+    }
+
+    /**
+     * Factory method for new CassandraIndex instances
+     * @param baseCfs
+     * @param indexMetadata
+     * @return
+     */
+    public static CassandraIndex newIndex(ColumnFamilyStore baseCfs, IndexMetadata indexMetadata)
+    {
+<span class="fc" id="L756">        return getFunctions(indexMetadata, TargetParser.parse(baseCfs.metadata(), indexMetadata)).newIndexInstance(baseCfs, indexMetadata);</span>
+    }
+
+    static CassandraIndexFunctions getFunctions(IndexMetadata indexDef,
+                                                Pair&lt;ColumnMetadata, IndexTarget.Type&gt; target)
+    {
+<span class="pc bpc" id="L762" title="1 of 2 branches missed.">        if (indexDef.isKeys())</span>
+<span class="nc" id="L763">            return CassandraIndexFunctions.KEYS_INDEX_FUNCTIONS;</span>
+
+<span class="fc" id="L765">        ColumnMetadata indexedColumn = target.left;</span>
+<span class="pc bpc" id="L766" title="3 of 4 branches missed.">        if (indexedColumn.type.isCollection() &amp;&amp; indexedColumn.type.isMultiCell())</span>
+        {
+<span class="nc bnc" id="L768" title="All 4 branches missed.">            switch (((CollectionType)indexedColumn.type).kind)</span>
+            {
+                case LIST:
+<span class="nc" id="L771">                    return CassandraIndexFunctions.COLLECTION_VALUE_INDEX_FUNCTIONS;</span>
+                case SET:
+<span class="nc" id="L773">                    return CassandraIndexFunctions.COLLECTION_KEY_INDEX_FUNCTIONS;</span>
+                case MAP:
+<span class="nc bnc" id="L775" title="All 4 branches missed.">                    switch (target.right)</span>
+                    {
+                        case KEYS:
+<span class="nc" id="L778">                            return CassandraIndexFunctions.COLLECTION_KEY_INDEX_FUNCTIONS;</span>
+                        case KEYS_AND_VALUES:
+<span class="nc" id="L780">                            return CassandraIndexFunctions.COLLECTION_ENTRY_INDEX_FUNCTIONS;</span>
+                        case VALUES:
+<span class="nc" id="L782">                            return CassandraIndexFunctions.COLLECTION_VALUE_INDEX_FUNCTIONS;</span>
+                    }
+<span class="nc" id="L784">                    throw new AssertionError();</span>
+            }
+        }
+
+<span class="pc bpc" id="L788" title="3 of 4 branches missed.">        switch (indexedColumn.kind)</span>
+        {
+            case CLUSTERING:
+<span class="nc" id="L791">                return CassandraIndexFunctions.CLUSTERING_COLUMN_INDEX_FUNCTIONS;</span>
+            case REGULAR:
+            case STATIC:
+<span class="fc" id="L794">                return CassandraIndexFunctions.REGULAR_COLUMN_INDEX_FUNCTIONS;</span>
+            case PARTITION_KEY:
+<span class="nc" id="L796">                return CassandraIndexFunctions.PARTITION_KEY_INDEX_FUNCTIONS;</span>
+            //case COMPACT_VALUE:
+            //    return new CompositesIndexOnCompactValue();
+        }
+<span class="nc" id="L800">        throw new AssertionError();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

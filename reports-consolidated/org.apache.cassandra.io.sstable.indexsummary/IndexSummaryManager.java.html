@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IndexSummaryManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.indexsummary</a> &gt; <span class="el_source">IndexSummaryManager.java</span></div><h1>IndexSummaryManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.indexsummary;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.codahale.metrics.Timer;
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.View;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.WrappedRunnable;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+/**
+ * Manages the fixed-size memory pool for index summaries, periodically resizing them
+ * in order to give more memory to hot sstables and less memory to cold sstables.
+ */
+public class IndexSummaryManager&lt;T extends SSTableReader &amp; IndexSummarySupport&lt;T&gt;&gt; implements IndexSummaryManagerMBean
+{
+<span class="fc" id="L63">    private static final Logger logger = LoggerFactory.getLogger(IndexSummaryManager.class);</span>
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.db:type=IndexSummaries&quot;;
+    public static final IndexSummaryManager&lt;?&gt; instance;
+
+    private long memoryPoolBytes;
+
+    private final ScheduledExecutorPlus executor;
+
+    // our next scheduled resizing run
+    private ScheduledFuture future;
+
+    private final Supplier&lt;List&lt;T&gt;&gt; indexSummariesProvider;
+
+    private static &lt;T extends SSTableReader &amp; IndexSummarySupport&lt;T&gt;&gt; List&lt;T&gt; getAllSupportedReaders() {
+<span class="fc" id="L77">        List&lt;T&gt; readers = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L78" title="All 2 branches covered.">        for (Keyspace keyspace : Keyspace.all())</span>
+<span class="fc bfc" id="L79" title="All 2 branches covered.">            for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())</span>
+<span class="fc bfc" id="L80" title="All 2 branches covered.">                for (SSTableReader sstr : cfs.getLiveSSTables())</span>
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">                    if (sstr instanceof IndexSummarySupport)</span>
+<span class="fc" id="L82">                        readers.add(((T) sstr));</span>
+<span class="fc" id="L83">        return readers;</span>
+    }
+
+    static
+    {
+<span class="fc" id="L88">        instance = newInstance();</span>
+<span class="fc" id="L89">        MBeanWrapper.instance.registerMBean(instance, MBEAN_NAME);</span>
+<span class="fc" id="L90">    }</span>
+
+    private static &lt;T extends SSTableReader &amp; IndexSummarySupport&lt;T&gt;&gt; IndexSummaryManager&lt;T&gt; newInstance()
+    {
+<span class="fc" id="L94">        return new IndexSummaryManager&lt;&gt;(IndexSummaryManager::getAllSupportedReaders);</span>
+    }
+
+    private IndexSummaryManager(Supplier&lt;List&lt;T&gt;&gt; indexSummariesProvider)
+<span class="fc" id="L98">    {</span>
+<span class="fc" id="L99">        this.indexSummariesProvider = indexSummariesProvider;</span>
+
+<span class="fc" id="L101">        executor = executorFactory().scheduled(false, &quot;IndexSummaryManager&quot;, Thread.MIN_PRIORITY);</span>
+
+<span class="fc" id="L103">        long indexSummarySizeInMB = DatabaseDescriptor.getIndexSummaryCapacityInMiB();</span>
+<span class="fc" id="L104">        int interval = DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes();</span>
+<span class="fc" id="L105">        logger.info(&quot;Initializing index summary manager with a memory pool size of {} MB and a resize interval of {} minutes&quot;,</span>
+<span class="fc" id="L106">                    indexSummarySizeInMB, interval);</span>
+
+<span class="fc" id="L108">        setMemoryPoolCapacityInMB(DatabaseDescriptor.getIndexSummaryCapacityInMiB());</span>
+<span class="fc" id="L109">        setResizeIntervalInMinutes(DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes());</span>
+<span class="fc" id="L110">    }</span>
+
+    public int getResizeIntervalInMinutes()
+    {
+<span class="fc" id="L114">        return DatabaseDescriptor.getIndexSummaryResizeIntervalInMinutes();</span>
+    }
+
+    public void setResizeIntervalInMinutes(int resizeIntervalInMinutes)
+    {
+<span class="fc" id="L119">        int oldInterval = getResizeIntervalInMinutes();</span>
+<span class="fc" id="L120">        DatabaseDescriptor.setIndexSummaryResizeIntervalInMinutes(resizeIntervalInMinutes);</span>
+
+        long initialDelay;
+<span class="fc bfc" id="L123" title="All 2 branches covered.">        if (future != null)</span>
+        {
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">            initialDelay = oldInterval &lt; 0</span>
+<span class="nc" id="L126">                           ? resizeIntervalInMinutes</span>
+<span class="fc" id="L127">                           : Math.max(0, resizeIntervalInMinutes - (oldInterval - future.getDelay(TimeUnit.MINUTES)));</span>
+<span class="fc" id="L128">            future.cancel(false);</span>
+        }
+        else
+        {
+<span class="fc" id="L132">            initialDelay = resizeIntervalInMinutes;</span>
+        }
+
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        if (resizeIntervalInMinutes &lt; 0)</span>
+        {
+<span class="fc" id="L137">            future = null;</span>
+<span class="fc" id="L138">            return;</span>
+        }
+
+<span class="fc" id="L141">        future = executor.scheduleWithFixedDelay(new WrappedRunnable()</span>
+<span class="fc" id="L142">        {</span>
+            protected void runMayThrow() throws Exception
+            {
+<span class="nc" id="L145">                redistributeSummaries();</span>
+<span class="nc" id="L146">            }</span>
+        }, initialDelay, resizeIntervalInMinutes, TimeUnit.MINUTES);
+<span class="fc" id="L148">    }</span>
+
+    // for testing only
+    @VisibleForTesting
+    Long getTimeToNextResize(TimeUnit timeUnit)
+    {
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        if (future == null)</span>
+<span class="fc" id="L155">            return null;</span>
+
+<span class="fc" id="L157">        return future.getDelay(timeUnit);</span>
+    }
+
+    public long getMemoryPoolCapacityInMB()
+    {
+<span class="fc" id="L162">        return memoryPoolBytes / 1024L / 1024L;</span>
+    }
+
+    public Map&lt;String, Integer&gt; getIndexIntervals()
+    {
+<span class="fc" id="L167">        List&lt;T&gt; summaryProviders = indexSummariesProvider.get();</span>
+<span class="fc" id="L168">        Map&lt;String, Integer&gt; intervals = new HashMap&lt;&gt;(summaryProviders.size());</span>
+<span class="fc bfc" id="L169" title="All 2 branches covered.">        for (T summaryProvider : summaryProviders)</span>
+<span class="fc" id="L170">            intervals.put(summaryProvider.getFilename(), (int) Math.round(summaryProvider.getIndexSummary().getEffectiveIndexInterval()));</span>
+
+<span class="fc" id="L172">        return intervals;</span>
+    }
+
+    public double getAverageIndexInterval()
+    {
+<span class="fc" id="L177">        List&lt;T&gt; summaryProviders = indexSummariesProvider.get();</span>
+<span class="fc" id="L178">        double total = 0.0;</span>
+<span class="fc bfc" id="L179" title="All 2 branches covered.">        for (IndexSummarySupport summaryProvider : summaryProviders)</span>
+<span class="fc" id="L180">            total += summaryProvider.getIndexSummary().getEffectiveIndexInterval();</span>
+<span class="fc" id="L181">        return total / summaryProviders.size();</span>
+    }
+
+    public void setMemoryPoolCapacityInMB(long memoryPoolCapacityInMB)
+    {
+<span class="fc" id="L186">        this.memoryPoolBytes = memoryPoolCapacityInMB * 1024L * 1024L;</span>
+<span class="fc" id="L187">    }</span>
+
+    /**
+     * Returns the actual space consumed by index summaries for all sstables.
+     * @return space currently used in MB
+     */
+    public double getMemoryPoolSizeInMB()
+    {
+<span class="fc" id="L195">        long total = 0;</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        for (IndexSummarySupport summaryProvider : indexSummariesProvider.get())</span>
+<span class="fc" id="L197">            total += summaryProvider.getIndexSummary().getOffHeapSize();</span>
+<span class="fc" id="L198">        return total / 1024.0 / 1024.0;</span>
+    }
+
+    /**
+     * Marks the non-compacting sstables as compacting for index summary redistribution for all keyspaces/tables.
+     *
+     * @return Pair containing:
+     *          left: total size of the off heap index summaries for the sstables we were unable to mark compacting (they were involved in other compactions)
+     *          right: the transactions, keyed by table id.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    private Pair&lt;Long, Map&lt;TableId, LifecycleTransaction&gt;&gt; getRestributionTransactions()
+    {
+<span class="fc" id="L211">        List&lt;SSTableReader&gt; allCompacting = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L212">        Map&lt;TableId, LifecycleTransaction&gt; allNonCompacting = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        for (Keyspace ks : Keyspace.all())</span>
+        {
+<span class="fc bfc" id="L215" title="All 2 branches covered.">            for (ColumnFamilyStore cfStore: ks.getColumnFamilyStores())</span>
+            {
+                Set&lt;SSTableReader&gt; nonCompacting, allSSTables;
+                LifecycleTransaction txn;
+                do
+                {
+<span class="fc" id="L221">                    View view = cfStore.getTracker().getView();</span>
+<span class="fc" id="L222">                    allSSTables = ImmutableSet.copyOf(view.select(SSTableSet.CANONICAL));</span>
+<span class="fc" id="L223">                    nonCompacting = ImmutableSet.copyOf(view.getUncompacting(allSSTables));</span>
+                }
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">                while (null == (txn = cfStore.getTracker().tryModify(nonCompacting, OperationType.INDEX_SUMMARY)));</span>
+
+<span class="fc" id="L227">                allNonCompacting.put(cfStore.metadata.id, txn);</span>
+<span class="fc" id="L228">                allCompacting.addAll(Sets.difference(allSSTables, nonCompacting));</span>
+<span class="fc" id="L229">            }</span>
+<span class="fc" id="L230">        }</span>
+<span class="fc" id="L231">        long nonRedistributingOffHeapSize = allCompacting.stream()</span>
+<span class="fc" id="L232">                                                         .filter(IndexSummarySupport.class::isInstance)</span>
+<span class="fc" id="L233">                                                         .map(IndexSummarySupport.class::cast)</span>
+<span class="fc" id="L234">                                                         .map(IndexSummarySupport::getIndexSummary)</span>
+<span class="fc" id="L235">                                                         .mapToLong(IndexSummary::getOffHeapSize)</span>
+<span class="fc" id="L236">                                                         .sum();</span>
+<span class="fc" id="L237">        return Pair.create(nonRedistributingOffHeapSize, allNonCompacting);</span>
+    }
+
+    public void redistributeSummaries() throws IOException
+    {
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        if (CompactionManager.instance.isGlobalCompactionPaused())</span>
+<span class="nc" id="L243">            return;</span>
+<span class="fc" id="L244">        Pair&lt;Long, Map&lt;TableId, LifecycleTransaction&gt;&gt; redistributionTransactionInfo = getRestributionTransactions();</span>
+<span class="fc" id="L245">        Map&lt;TableId, LifecycleTransaction&gt; transactions = redistributionTransactionInfo.right;</span>
+<span class="fc" id="L246">        long nonRedistributingOffHeapSize = redistributionTransactionInfo.left;</span>
+<span class="fc" id="L247">        try (Timer.Context ctx = CompactionManager.instance.getMetrics().indexSummaryRedistributionTime.time())</span>
+        {
+<span class="fc" id="L249">            redistributeSummaries(new IndexSummaryRedistribution(transactions,</span>
+                                                                 nonRedistributingOffHeapSize,
+                                                                 this.memoryPoolBytes));
+        }
+<span class="nc" id="L253">        catch (Exception e)</span>
+        {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (e instanceof CompactionInterruptedException)</span>
+            {
+<span class="nc" id="L257">                logger.info(&quot;Index summary interrupted: {}&quot;, e.getMessage());</span>
+            }
+            else
+            {
+<span class="nc" id="L261">                logger.error(&quot;Got exception during index summary redistribution&quot;, e);</span>
+<span class="nc" id="L262">                throw e;</span>
+            }
+        }
+        finally
+        {
+            try
+            {
+<span class="fc" id="L269">                FBUtilities.closeAll(transactions.values());</span>
+            }
+<span class="nc" id="L271">            catch (Exception e)</span>
+            {
+<span class="nc" id="L273">                throw new RuntimeException(e);</span>
+<span class="fc" id="L274">            }</span>
+        }
+<span class="fc" id="L276">    }</span>
+
+    /**
+     * Attempts to fairly distribute a fixed pool of memory for index summaries across a set of SSTables based on
+     * their recent read rates.
+     * @param redistribution encapsulating the transactions containing the sstables we are to redistribute the
+     *                       memory pool across and a size (in bytes) that the total index summary space usage
+     *                       should stay close to or under, if possible
+     * @return a list of new SSTableReader instances
+     */
+    @VisibleForTesting
+    public static &lt;T extends SSTableReader &amp; IndexSummarySupport&gt; List&lt;T&gt; redistributeSummaries(IndexSummaryRedistribution redistribution) throws IOException
+    {
+<span class="fc" id="L289">        return (List&lt;T&gt;) CompactionManager.instance.runAsActiveCompaction(redistribution, redistribution::redistributeSummaries);</span>
+    }
+
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="fc bfc" id="L295" title="All 2 branches covered.">        if (future != null)</span>
+        {
+<span class="fc" id="L297">            future.cancel(false);</span>
+<span class="fc" id="L298">            future = null;</span>
+        }
+<span class="fc" id="L300">        ExecutorUtils.shutdownAndWait(timeout, unit, executor);</span>
+<span class="fc" id="L301">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

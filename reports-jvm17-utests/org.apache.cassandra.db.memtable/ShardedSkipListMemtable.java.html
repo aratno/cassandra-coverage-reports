@@ -1,0 +1,543 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ShardedSkipListMemtable.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.memtable</a> &gt; <span class="el_source">ShardedSkipListMemtable.java</span></div><h1>ShardedSkipListMemtable.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.memtable;
+
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterators;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DataRange;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.AtomicBTreePartition;
+import org.apache.cassandra.db.partitions.BTreePartitionUpdater;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IncludingExcludingBounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.Cloner;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.github.jamm.Unmetered;
+
+/**
+ * A proof-of-concept sharded memtable implementation. This implementation splits the partition skip-list into several
+ * independent skip-lists each covering a roughly equal part of the token space served by this node. This reduces
+ * congestion of the skip-list from concurrent writes and can lead to improved write throughput.
+ *
+ * The implementation takes two parameters:
+ * - shards: the number of shards to split into.
+ * - serialize_writes: if false, each shard may serve multiple writes in parallel; if true, writes to each shard are
+ *   synchronized.
+ *
+ * Also see Memtable_API.md.
+ */
+public class ShardedSkipListMemtable extends AbstractShardedMemtable
+{
+<span class="fc" id="L76">    private static final Logger logger = LoggerFactory.getLogger(ShardedSkipListMemtable.class);</span>
+
+    public static final String LOCKING_OPTION = &quot;serialize_writes&quot;;
+
+    /**
+     * Sharded memtable sections. Each is responsible for a contiguous range of the token space (between boundaries[i]
+     * and boundaries[i+1]) and is written to by one thread at a time, while reads are carried out concurrently
+     * (including with any write).
+     */
+    final MemtableShard[] shards;
+
+    ShardedSkipListMemtable(AtomicReference&lt;CommitLogPosition&gt; commitLogLowerBound,
+                            TableMetadataRef metadataRef,
+                            Owner owner,
+                            Integer shardCountOption)
+    {
+<span class="fc" id="L92">        super(commitLogLowerBound, metadataRef, owner, shardCountOption);</span>
+<span class="fc" id="L93">        this.shards = generatePartitionShards(boundaries.shardCount(), allocator, metadataRef);</span>
+<span class="fc" id="L94">    }</span>
+
+    private static MemtableShard[] generatePartitionShards(int splits,
+                                                           MemtableAllocator allocator,
+                                                           TableMetadataRef metadata)
+    {
+<span class="fc" id="L100">        MemtableShard[] partitionMapContainer = new MemtableShard[splits];</span>
+<span class="fc bfc" id="L101" title="All 2 branches covered.">        for (int i = 0; i &lt; splits; i++)</span>
+<span class="fc" id="L102">            partitionMapContainer[i] = new MemtableShard(metadata, allocator);</span>
+
+<span class="fc" id="L104">        return partitionMapContainer;</span>
+    }
+
+    public boolean isClean()
+    {
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc bfc" id="L110" title="All 2 branches covered.">            if (!shard.isClean())</span>
+<span class="fc" id="L111">                return false;</span>
+<span class="fc" id="L112">        return true;</span>
+    }
+
+    /**
+     * Should only be called by ColumnFamilyStore.apply via Keyspace.apply, which supplies the appropriate
+     * OpOrdering.
+     *
+     * commitLogSegmentPosition should only be null if this is a secondary index, in which case it is *expected* to be null
+     */
+    public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+    {
+<span class="fc" id="L123">        DecoratedKey key = update.partitionKey();</span>
+<span class="fc" id="L124">        MemtableShard shard = shards[boundaries.getShardForKey(key)];</span>
+<span class="fc" id="L125">        return shard.put(key, update, indexer, opGroup);</span>
+    }
+
+    /**
+     * Technically we should scatter gather on all the core threads because the size in following calls are not
+     * using volatile variables, but for metrics purpose this should be good enough.
+     */
+    @Override
+    public long getLiveDataSize()
+    {
+<span class="fc" id="L135">        long total = 0L;</span>
+<span class="fc bfc" id="L136" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L137">            total += shard.liveDataSize();</span>
+<span class="fc" id="L138">        return total;</span>
+    }
+
+    @Override
+    public long operationCount()
+    {
+<span class="fc" id="L144">        long total = 0L;</span>
+<span class="fc bfc" id="L145" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L146">            total += shard.currentOperations();</span>
+<span class="fc" id="L147">        return total;</span>
+    }
+
+    @Override
+    public long partitionCount()
+    {
+<span class="nc" id="L153">        int total = 0;</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        for (MemtableShard shard : shards)</span>
+<span class="nc" id="L155">            total += shard.size();</span>
+<span class="nc" id="L156">        return total;</span>
+    }
+
+    /**
+     * Returns the minTS if one available, otherwise NO_MIN_TIMESTAMP.
+     *
+     * EncodingStats uses a synthetic epoch TS at 2015. We don't want to leak that (CASSANDRA-18118) so we return NO_MIN_TIMESTAMP instead.
+     *
+     * @return The minTS or NO_MIN_TIMESTAMP if none available
+     */
+    @Override
+    public long getMinTimestamp()
+    {
+<span class="fc" id="L169">        long min = Long.MAX_VALUE;</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L171">            min =  Long.min(min, shard.minTimestamp());</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">        return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;</span>
+    }
+
+    @Override
+    public long getMinLocalDeletionTime()
+    {
+<span class="fc" id="L178">        long min = Long.MAX_VALUE;</span>
+<span class="fc bfc" id="L179" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L180">            min = Long.min(min, shard.minLocalDeletionTime());</span>
+<span class="fc" id="L181">        return min;</span>
+    }
+
+    @Override
+    RegularAndStaticColumns columns()
+    {
+<span class="fc bfc" id="L187" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L188">            columnsCollector.update(shard.columnsCollector);</span>
+<span class="fc" id="L189">        return columnsCollector.get();</span>
+    }
+
+    @Override
+    EncodingStats encodingStats()
+    {
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        for (MemtableShard shard : shards)</span>
+<span class="fc" id="L196">            statsCollector.update(shard.statsCollector.get());</span>
+<span class="fc" id="L197">        return statsCollector.get();</span>
+    }
+
+    @Override
+    public MemtableUnfilteredPartitionIterator partitionIterator(final ColumnFilter columnFilter,
+                                                                 final DataRange dataRange,
+                                                                 SSTableReadsListener readsListener)
+    {
+<span class="fc" id="L205">        AbstractBounds&lt;PartitionPosition&gt; keyRange = dataRange.keyRange();</span>
+
+<span class="fc" id="L207">        PartitionPosition left = keyRange.left;</span>
+<span class="fc" id="L208">        PartitionPosition right = keyRange.right;</span>
+
+<span class="fc" id="L210">        boolean isBound = keyRange instanceof Bounds;</span>
+<span class="pc bpc" id="L211" title="2 of 4 branches missed.">        boolean includeStart = isBound || keyRange instanceof IncludingExcludingBounds;</span>
+<span class="pc bpc" id="L212" title="1 of 4 branches missed.">        boolean includeStop = isBound || keyRange instanceof Range;</span>
+
+<span class="fc" id="L214">        Iterator&lt;AtomicBTreePartition&gt; iterator = getPartitionIterator(left, includeStart, right, includeStop);</span>
+
+<span class="fc" id="L216">        return new MemtableUnfilteredPartitionIterator(metadata(), iterator, columnFilter, dataRange);</span>
+        // readsListener is ignored as it only accepts sstable signals
+    }
+
+    private Iterator&lt;AtomicBTreePartition&gt; getPartitionIterator(PartitionPosition left, boolean includeStart, PartitionPosition right, boolean includeStop)
+    {
+<span class="fc bfc" id="L222" title="All 4 branches covered.">        int leftShard = left != null &amp;&amp; !left.isMinimum() ? boundaries.getShardForKey(left) : 0;</span>
+<span class="fc bfc" id="L223" title="All 4 branches covered.">        int rightShard = right != null &amp;&amp; !right.isMinimum() ? boundaries.getShardForKey(right) : boundaries.shardCount() - 1;</span>
+        Iterator&lt;AtomicBTreePartition&gt; iterator;
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        if (leftShard == rightShard)</span>
+<span class="fc" id="L226">            iterator = shards[leftShard].getPartitionsSubMap(left, includeStart, right, includeStop).values().iterator();</span>
+        else
+        {
+<span class="fc" id="L229">            Iterator&lt;AtomicBTreePartition&gt;[] iters = new Iterator[rightShard - leftShard + 1];</span>
+<span class="fc" id="L230">            int i = leftShard;</span>
+<span class="fc" id="L231">            iters[0] = shards[leftShard].getPartitionsSubMap(left, includeStart, null, true).values().iterator();</span>
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">            for (++i; i &lt; rightShard; ++i)</span>
+<span class="nc" id="L233">                iters[i - leftShard] = shards[i].partitions.values().iterator();</span>
+<span class="fc" id="L234">            iters[i - leftShard] = shards[i].getPartitionsSubMap(null, true, right, includeStop).values().iterator();</span>
+<span class="fc" id="L235">            iterator = Iterators.concat(iters);</span>
+        }
+<span class="fc" id="L237">        return iterator;</span>
+    }
+
+    private Partition getPartition(DecoratedKey key)
+    {
+<span class="fc" id="L242">        int shardIndex = boundaries.getShardForKey(key);</span>
+<span class="fc" id="L243">        return shards[shardIndex].partitions.get(key);</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator rowIterator(DecoratedKey key, Slices slices, ColumnFilter selectedColumns, boolean reversed, SSTableReadsListener listener)
+    {
+<span class="fc" id="L249">        Partition p = getPartition(key);</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">        if (p == null)</span>
+<span class="fc" id="L251">            return null;</span>
+        else
+<span class="fc" id="L253">            return p.unfilteredIterator(selectedColumns, slices, reversed);</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator rowIterator(DecoratedKey key)
+    {
+<span class="nc" id="L259">        Partition p = getPartition(key);</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        return p != null ? p.unfilteredIterator() : null;</span>
+    }
+
+    public FlushablePartitionSet&lt;AtomicBTreePartition&gt; getFlushSet(PartitionPosition from, PartitionPosition to)
+    {
+<span class="fc" id="L265">        long keySize = 0;</span>
+<span class="fc" id="L266">        int keyCount = 0;</span>
+
+<span class="fc bfc" id="L268" title="All 2 branches covered.">        for (Iterator&lt;AtomicBTreePartition&gt; it = getPartitionIterator(from, true, to,false); it.hasNext();)</span>
+        {
+<span class="fc" id="L270">            AtomicBTreePartition en = it.next();</span>
+<span class="fc" id="L271">            keySize += en.partitionKey().getKey().remaining();</span>
+<span class="fc" id="L272">            keyCount++;</span>
+<span class="fc" id="L273">        }</span>
+<span class="fc" id="L274">        long partitionKeySize = keySize;</span>
+<span class="fc" id="L275">        int partitionCount = keyCount;</span>
+<span class="fc" id="L276">        Iterator&lt;AtomicBTreePartition&gt; toFlush = getPartitionIterator(from, true, to,false);</span>
+
+<span class="fc" id="L278">        return new AbstractFlushablePartitionSet&lt;AtomicBTreePartition&gt;()</span>
+<span class="fc" id="L279">        {</span>
+            public Memtable memtable()
+            {
+<span class="fc" id="L282">                return ShardedSkipListMemtable.this;</span>
+            }
+
+            public PartitionPosition from()
+            {
+<span class="fc" id="L287">                return from;</span>
+            }
+
+            public PartitionPosition to()
+            {
+<span class="fc" id="L292">                return to;</span>
+            }
+
+            public long partitionCount()
+            {
+<span class="fc" id="L297">                return partitionCount;</span>
+            }
+
+            public Iterator&lt;AtomicBTreePartition&gt; iterator()
+            {
+<span class="fc" id="L302">                return toFlush;</span>
+            }
+
+            public long partitionKeysSize()
+            {
+<span class="fc" id="L307">                return partitionKeySize;</span>
+            }
+        };
+    }
+
+    static class MemtableShard
+    {
+        // The following fields are volatile as we have to make sure that when we
+        // collect results from all sub-ranges, the thread accessing the value
+        // is guaranteed to see the changes to the values.
+
+        // The smallest timestamp for all partitions stored in this shard
+<span class="fc" id="L319">        private final AtomicLong minTimestamp = new AtomicLong(Long.MAX_VALUE);</span>
+<span class="fc" id="L320">        private final AtomicLong minLocalDeletionTime = new AtomicLong(Long.MAX_VALUE);</span>
+
+<span class="fc" id="L322">        private final AtomicLong liveDataSize = new AtomicLong(0);</span>
+
+<span class="fc" id="L324">        private final AtomicLong currentOperations = new AtomicLong(0);</span>
+
+        // We index the memtable by PartitionPosition only for the purpose of being able
+        // to select key range using Token.KeyBound. However put() ensures that we
+        // actually only store DecoratedKey.
+<span class="fc" id="L329">        private final ConcurrentNavigableMap&lt;PartitionPosition, AtomicBTreePartition&gt; partitions = new ConcurrentSkipListMap&lt;&gt;();</span>
+
+        private final ColumnsCollector columnsCollector;
+
+        private final StatsCollector statsCollector;
+
+        @Unmetered  // total pool size should not be included in memtable's deep size
+        private final MemtableAllocator allocator;
+
+        private final TableMetadataRef metadata;
+
+        @VisibleForTesting
+        MemtableShard(TableMetadataRef metadata, MemtableAllocator allocator)
+<span class="fc" id="L342">        {</span>
+<span class="fc" id="L343">            this.columnsCollector = new ColumnsCollector(metadata.get().regularAndStaticColumns());</span>
+<span class="fc" id="L344">            this.statsCollector = new StatsCollector();</span>
+<span class="fc" id="L345">            this.allocator = allocator;</span>
+<span class="fc" id="L346">            this.metadata = metadata;</span>
+<span class="fc" id="L347">        }</span>
+
+        public long put(DecoratedKey key, PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+        {
+<span class="fc" id="L351">            Cloner cloner = allocator.cloner(opGroup);</span>
+<span class="fc" id="L352">            AtomicBTreePartition previous = partitions.get(key);</span>
+
+<span class="fc" id="L354">            long initialSize = 0;</span>
+<span class="fc bfc" id="L355" title="All 2 branches covered.">            if (previous == null)</span>
+            {
+<span class="fc" id="L357">                final DecoratedKey cloneKey = cloner.clone(key);</span>
+<span class="fc" id="L358">                AtomicBTreePartition empty = new AtomicBTreePartition(metadata, cloneKey, allocator);</span>
+                // We'll add the columns later. This avoids wasting works if we get beaten in the putIfAbsent
+<span class="fc" id="L360">                previous = partitions.putIfAbsent(cloneKey, empty);</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">                if (previous == null)</span>
+                {
+<span class="fc" id="L363">                    previous = empty;</span>
+                    // allocate the row overhead after the fact; this saves over allocating and having to free after, but
+                    // means we can overshoot our declared limit.
+<span class="fc" id="L366">                    int overhead = (int) (cloneKey.getToken().getHeapSize() + SkipListMemtable.ROW_OVERHEAD_HEAP_SIZE);</span>
+<span class="fc" id="L367">                    allocator.onHeap().allocate(overhead, opGroup);</span>
+<span class="fc" id="L368">                    initialSize = 8;</span>
+                }
+            }
+
+<span class="fc" id="L372">            BTreePartitionUpdater updater = previous.addAll(update, cloner, opGroup, indexer);</span>
+<span class="fc" id="L373">            updateMin(minTimestamp, update.stats().minTimestamp);</span>
+<span class="fc" id="L374">            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);</span>
+<span class="fc" id="L375">            liveDataSize.addAndGet(initialSize + updater.dataSize);</span>
+<span class="fc" id="L376">            columnsCollector.update(update.columns());</span>
+<span class="fc" id="L377">            statsCollector.update(update.stats());</span>
+<span class="fc" id="L378">            currentOperations.addAndGet(update.operationCount());</span>
+<span class="fc" id="L379">            return updater.colUpdateTimeDelta;</span>
+        }
+
+        private Map&lt;PartitionPosition, AtomicBTreePartition&gt; getPartitionsSubMap(PartitionPosition left,
+                                                                                 boolean includeLeft,
+                                                                                 PartitionPosition right,
+                                                                                 boolean includeRight)
+        {
+<span class="fc bfc" id="L387" title="All 4 branches covered.">            if (left != null &amp;&amp; left.isMinimum())</span>
+<span class="fc" id="L388">                left = null;</span>
+<span class="fc bfc" id="L389" title="All 4 branches covered.">            if (right != null &amp;&amp; right.isMinimum())</span>
+<span class="fc" id="L390">                right = null;</span>
+
+            try
+            {
+<span class="fc bfc" id="L394" title="All 2 branches covered.">                if (left == null)</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">                    return right == null ? partitions : partitions.headMap(right, includeRight);</span>
+                else
+<span class="pc bpc" id="L397" title="1 of 2 branches missed.">                    return right == null</span>
+<span class="nc" id="L398">                           ? partitions.tailMap(left, includeLeft)</span>
+<span class="fc" id="L399">                           : partitions.subMap(left, includeLeft, right, includeRight);</span>
+            }
+<span class="nc" id="L401">            catch (IllegalArgumentException e)</span>
+            {
+<span class="nc" id="L403">                logger.error(&quot;Invalid range requested {} - {}&quot;, left, right);</span>
+<span class="nc" id="L404">                throw e;</span>
+            }
+        }
+
+        public boolean isClean()
+        {
+<span class="fc" id="L410">            return partitions.isEmpty();</span>
+        }
+
+        public int size()
+        {
+<span class="nc" id="L415">            return partitions.size();</span>
+        }
+
+        long minTimestamp()
+        {
+<span class="fc" id="L420">            return minTimestamp.get();</span>
+        }
+
+        long liveDataSize()
+        {
+<span class="fc" id="L425">            return liveDataSize.get();</span>
+        }
+
+        long currentOperations()
+        {
+<span class="fc" id="L430">            return currentOperations.get();</span>
+        }
+
+        public long minLocalDeletionTime()
+        {
+<span class="fc" id="L435">            return minLocalDeletionTime.get();</span>
+        }
+    }
+
+    public static class MemtableUnfilteredPartitionIterator extends AbstractUnfilteredPartitionIterator implements UnfilteredPartitionIterator
+    {
+        private final TableMetadata metadata;
+        private final Iterator&lt;AtomicBTreePartition&gt; iter;
+        private final ColumnFilter columnFilter;
+        private final DataRange dataRange;
+
+        public MemtableUnfilteredPartitionIterator(TableMetadata metadata, Iterator&lt;AtomicBTreePartition&gt; iterator, ColumnFilter columnFilter, DataRange dataRange)
+<span class="fc" id="L447">        {</span>
+<span class="fc" id="L448">            this.metadata = metadata;</span>
+<span class="fc" id="L449">            this.iter = iterator;</span>
+<span class="fc" id="L450">            this.columnFilter = columnFilter;</span>
+<span class="fc" id="L451">            this.dataRange = dataRange;</span>
+<span class="fc" id="L452">        }</span>
+
+        public TableMetadata metadata()
+        {
+<span class="fc" id="L456">            return metadata;</span>
+        }
+
+        public boolean hasNext()
+        {
+<span class="fc" id="L461">            return iter.hasNext();</span>
+        }
+
+        public UnfilteredRowIterator next()
+        {
+<span class="fc" id="L466">            AtomicBTreePartition entry = iter.next();</span>
+<span class="fc" id="L467">            DecoratedKey key = entry.partitionKey();</span>
+<span class="fc" id="L468">            ClusteringIndexFilter filter = dataRange.clusteringIndexFilter(key);</span>
+
+<span class="fc" id="L470">            return filter.getUnfilteredRowIterator(columnFilter, entry);</span>
+        }
+    }
+
+    static class Locking extends ShardedSkipListMemtable
+    {
+        Locking(AtomicReference&lt;CommitLogPosition&gt; commitLogLowerBound, TableMetadataRef metadataRef, Owner owner, Integer shardCountOption)
+        {
+<span class="fc" id="L478">            super(commitLogLowerBound, metadataRef, owner, shardCountOption);</span>
+<span class="fc" id="L479">        }</span>
+
+        /**
+         * Should only be called by ColumnFamilyStore.apply via Keyspace.apply, which supplies the appropriate
+         * OpOrdering.
+         *
+         * commitLogSegmentPosition should only be null if this is a secondary index, in which case it is *expected* to be null
+         */
+        public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+        {
+<span class="fc" id="L489">            DecoratedKey key = update.partitionKey();</span>
+<span class="fc" id="L490">            MemtableShard shard = shards[boundaries.getShardForKey(key)];</span>
+<span class="fc" id="L491">            synchronized (shard)</span>
+            {
+<span class="fc" id="L493">                return shard.put(key, update, indexer, opGroup);</span>
+            }
+        }
+
+    }
+
+    public static Factory factory(Map&lt;String, String&gt; optionsCopy)
+    {
+<span class="fc" id="L501">        String shardsString = optionsCopy.remove(SHARDS_OPTION);</span>
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">        Integer shardCount = shardsString != null ? Integer.parseInt(shardsString) : null;</span>
+<span class="fc" id="L503">        boolean isLocking = Boolean.parseBoolean(optionsCopy.remove(LOCKING_OPTION));</span>
+<span class="fc" id="L504">        return new Factory(shardCount, isLocking);</span>
+    }
+
+    static class Factory implements Memtable.Factory
+    {
+        final Integer shardCount;
+        final boolean isLocking;
+
+        Factory(Integer shardCount, boolean isLocking)
+<span class="fc" id="L513">        {</span>
+<span class="fc" id="L514">            this.shardCount = shardCount;</span>
+<span class="fc" id="L515">            this.isLocking = isLocking;</span>
+<span class="fc" id="L516">        }</span>
+
+        public Memtable create(AtomicReference&lt;CommitLogPosition&gt; commitLogLowerBound,
+                               TableMetadataRef metadataRef,
+                               Owner owner)
+        {
+<span class="fc bfc" id="L522" title="All 2 branches covered.">            return isLocking</span>
+<span class="fc" id="L523">                   ? new Locking(commitLogLowerBound, metadataRef, owner, shardCount)</span>
+<span class="fc" id="L524">                   : new ShardedSkipListMemtable(commitLogLowerBound, metadataRef, owner, shardCount);</span>
+        }
+
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (this == o)</span>
+<span class="nc" id="L530">                return true;</span>
+<span class="nc bnc" id="L531" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass())</span>
+<span class="nc" id="L532">                return false;</span>
+<span class="nc" id="L533">            Factory factory = (Factory) o;</span>
+<span class="nc" id="L534">            return Objects.equals(shardCount, factory.shardCount);</span>
+        }
+
+        public int hashCode()
+        {
+<span class="nc" id="L539">            return Objects.hash(shardCount);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

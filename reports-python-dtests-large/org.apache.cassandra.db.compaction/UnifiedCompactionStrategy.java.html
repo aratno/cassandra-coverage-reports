@@ -1,0 +1,892 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UnifiedCompactionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">UnifiedCompactionStrategy.java</span></div><h1>UnifiedCompactionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.commitlog.IntervalSet;
+import org.apache.cassandra.db.compaction.unified.Controller;
+import org.apache.cassandra.db.compaction.unified.ShardedMultiWriter;
+import org.apache.cassandra.db.compaction.unified.UnifiedCompactionTask;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Overlaps;
+import org.apache.cassandra.utils.TimeUUID;
+
+/**
+ * The design of the unified compaction strategy is described in the accompanying UnifiedCompactionStrategy.md.
+ *
+ * See CEP-26: https://cwiki.apache.org/confluence/display/CASSANDRA/CEP-26%3A+Unified+Compaction+Strategy
+ */
+public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
+{
+<span class="nc" id="L68">    private static final Logger logger = LoggerFactory.getLogger(UnifiedCompactionStrategy.class);</span>
+
+    static final int MAX_LEVELS = 32;   // This is enough for a few petabytes of data (with the worst case fan factor
+    // at W=0 this leaves room for 2^32 sstables, presumably of at least 1MB each).
+
+<span class="nc" id="L73">    private static final Pattern SCALING_PARAMETER_PATTERN = Pattern.compile(&quot;(N)|L(\\d+)|T(\\d+)|([+-]?\\d+)&quot;);</span>
+<span class="nc" id="L74">    private static final String SCALING_PARAMETER_PATTERN_SIMPLIFIED = SCALING_PARAMETER_PATTERN.pattern()</span>
+<span class="nc" id="L75">                                                                                                .replaceAll(&quot;[()]&quot;, &quot;&quot;)</span>
+<span class="nc" id="L76">                                                                                                .replace(&quot;\\d&quot;, &quot;[0-9]&quot;);</span>
+
+    private final Controller controller;
+
+    private volatile ShardManager shardManager;
+
+    private long lastExpiredCheck;
+
+    protected volatile int estimatedRemainingTasks;
+<span class="nc" id="L85">    @VisibleForTesting</span>
+    protected final Set&lt;SSTableReader&gt; sstables = new HashSet&lt;&gt;();
+
+    public UnifiedCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options)
+    {
+<span class="nc" id="L90">        this(cfs, options, Controller.fromOptions(cfs, options));</span>
+<span class="nc" id="L91">    }</span>
+
+    public UnifiedCompactionStrategy(ColumnFamilyStore cfs, Map&lt;String, String&gt; options, Controller controller)
+    {
+<span class="nc" id="L95">        super(cfs, options);</span>
+<span class="nc" id="L96">        this.controller = controller;</span>
+<span class="nc" id="L97">        estimatedRemainingTasks = 0;</span>
+<span class="nc" id="L98">    }</span>
+
+    public static Map&lt;String, String&gt; validateOptions(Map&lt;String, String&gt; options) throws ConfigurationException
+    {
+<span class="nc" id="L102">        return Controller.validateOptions(AbstractCompactionStrategy.validateOptions(options));</span>
+    }
+
+    public static int fanoutFromScalingParameter(int w)
+    {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        return w &lt; 0 ? 2 - w : 2 + w; // see formula in design doc</span>
+    }
+
+    public static int thresholdFromScalingParameter(int w)
+    {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        return w &lt;= 0 ? 2 : 2 + w; // see formula in design doc</span>
+    }
+
+    public static int parseScalingParameter(String value)
+    {
+<span class="nc" id="L117">        Matcher m = SCALING_PARAMETER_PATTERN.matcher(value);</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (!m.matches())</span>
+<span class="nc" id="L119">            throw new ConfigurationException(&quot;Scaling parameter &quot; + value + &quot; must match &quot; + SCALING_PARAMETER_PATTERN_SIMPLIFIED);</span>
+
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (m.group(1) != null)</span>
+<span class="nc" id="L122">            return 0;</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        else if (m.group(2) != null)</span>
+<span class="nc" id="L124">            return 2 - atLeast2(Integer.parseInt(m.group(2)), value);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        else if (m.group(3) != null)</span>
+<span class="nc" id="L126">            return atLeast2(Integer.parseInt(m.group(3)), value) - 2;</span>
+        else
+<span class="nc" id="L128">            return Integer.parseInt(m.group(4));</span>
+    }
+
+    private static int atLeast2(int value, String str)
+    {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (value &lt; 2)</span>
+<span class="nc" id="L134">            throw new ConfigurationException(&quot;Fan factor cannot be lower than 2 in &quot; + str);</span>
+<span class="nc" id="L135">        return value;</span>
+    }
+
+    public static String printScalingParameter(int w)
+    {
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (w &lt; 0)</span>
+<span class="nc" id="L141">            return &quot;L&quot; + Integer.toString(2 - w);</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        else if (w &gt; 0)</span>
+<span class="nc" id="L143">            return &quot;T&quot; + Integer.toString(w + 2);</span>
+        else
+<span class="nc" id="L145">            return &quot;N&quot;;</span>
+    }
+
+    @Override
+    public synchronized Collection&lt;AbstractCompactionTask&gt; getMaximalTask(long gcBefore, boolean splitOutput)
+    {
+<span class="nc" id="L151">        maybeUpdateShardManager();</span>
+        // The tasks are split by repair status and disk, as well as in non-overlapping sections to enable some
+        // parallelism (to the amount that L0 sstables are split, i.e. at least base_shard_count). The result will be
+        // split across shards according to its density. Depending on the parallelism, the operation may require up to
+        // 100% extra space to complete.
+<span class="nc" id="L156">        List&lt;AbstractCompactionTask&gt; tasks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L157">        List&lt;Set&lt;SSTableReader&gt;&gt; nonOverlapping = splitInNonOverlappingSets(filterSuspectSSTables(getSSTables()));</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        for (Set&lt;SSTableReader&gt; set : nonOverlapping)</span>
+        {
+            @SuppressWarnings(&quot;resource&quot;)   // closed by the returned task
+<span class="nc" id="L161">            LifecycleTransaction txn = cfs.getTracker().tryModify(set, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (txn != null)</span>
+<span class="nc" id="L163">                tasks.add(createCompactionTask(txn, gcBefore));</span>
+<span class="nc" id="L164">        }</span>
+<span class="nc" id="L165">        return tasks;</span>
+    }
+
+    private static List&lt;Set&lt;SSTableReader&gt;&gt; splitInNonOverlappingSets(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="nc" id="L170">        List&lt;Set&lt;SSTableReader&gt;&gt; overlapSets = Overlaps.constructOverlapSets(new ArrayList&lt;&gt;(sstables),</span>
+                                                                             UnifiedCompactionStrategy::startsAfter,
+                                                                             SSTableReader.firstKeyComparator,
+                                                                             SSTableReader.lastKeyComparator);
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (overlapSets.isEmpty())</span>
+<span class="nc" id="L175">            return overlapSets;</span>
+
+<span class="nc" id="L177">        Set&lt;SSTableReader&gt; group = overlapSets.get(0);</span>
+<span class="nc" id="L178">        List&lt;Set&lt;SSTableReader&gt;&gt; groups = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        for (int i = 1; i &lt; overlapSets.size(); ++i)</span>
+        {
+<span class="nc" id="L181">            Set&lt;SSTableReader&gt; current = overlapSets.get(i);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            if (Sets.intersection(current, group).isEmpty())</span>
+            {
+<span class="nc" id="L184">                groups.add(group);</span>
+<span class="nc" id="L185">                group = current;</span>
+            }
+            else
+            {
+<span class="nc" id="L189">                group.addAll(current);</span>
+            }
+        }
+<span class="nc" id="L192">        groups.add(group);</span>
+<span class="nc" id="L193">        return groups;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;)   // transaction closed by the returned task
+    public AbstractCompactionTask getUserDefinedTask(Collection&lt;SSTableReader&gt; sstables, final long gcBefore)
+    {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        assert !sstables.isEmpty(); // checked for by CM.submitUserDefined</span>
+
+<span class="nc" id="L202">        LifecycleTransaction transaction = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (transaction == null)</span>
+        {
+<span class="nc" id="L205">            logger.trace(&quot;Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem&quot;, sstables);</span>
+<span class="nc" id="L206">            return null;</span>
+        }
+
+<span class="nc" id="L209">        return createCompactionTask(transaction, gcBefore).setUserDefined(true);</span>
+    }
+
+    /**
+     * Returns a compaction task to run next.
+     *
+     * This method is synchronized because task creation is significantly more expensive in UCS; the strategy is
+     * stateless, therefore it has to compute the shard/bucket structure on each call.
+     *
+     * @param gcBefore throw away tombstones older than this
+     */
+    @Override
+    public synchronized UnifiedCompactionTask getNextBackgroundTask(long gcBefore)
+    {
+        while (true)
+        {
+<span class="nc" id="L225">            CompactionPick pick = getNextCompactionPick(gcBefore);</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (pick == null)</span>
+<span class="nc" id="L227">                return null;</span>
+<span class="nc" id="L228">            UnifiedCompactionTask task = createCompactionTask(pick, gcBefore);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if (task != null)</span>
+<span class="nc" id="L230">                return task;</span>
+<span class="nc" id="L231">        }</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)   // transaction closed by the returned task
+    private UnifiedCompactionTask createCompactionTask(CompactionPick pick, long gcBefore)
+    {
+<span class="nc" id="L237">        Preconditions.checkNotNull(pick);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        Preconditions.checkArgument(!pick.isEmpty());</span>
+
+<span class="nc" id="L240">        LifecycleTransaction transaction = cfs.getTracker().tryModify(pick,</span>
+                                                                      OperationType.COMPACTION);
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (transaction != null)</span>
+        {
+<span class="nc" id="L244">            return createCompactionTask(transaction, gcBefore);</span>
+        }
+        else
+        {
+            // This can happen e.g. due to a race with upgrade tasks.
+<span class="nc" id="L249">            logger.warn(&quot;Failed to submit compaction {} because a transaction could not be created. If this happens frequently, it should be reported&quot;, pick);</span>
+            // This may be an indication of an SSTableReader reference leak. See CASSANDRA-18342.
+<span class="nc" id="L251">            return null;</span>
+        }
+    }
+
+    /**
+     * Create the sstable writer used for flushing.
+     *
+     * @return an sstable writer that will split sstables into a number of shards as calculated by the controller for
+     *         the expected flush density.
+     */
+    @Override
+    public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
+                                                       long keyCount,
+                                                       long repairedAt,
+                                                       TimeUUID pendingRepair,
+                                                       boolean isTransient,
+                                                       IntervalSet&lt;CommitLogPosition&gt; commitLogPositions,
+                                                       int sstableLevel,
+                                                       SerializationHeader header,
+                                                       Collection&lt;Index.Group&gt; indexGroups,
+                                                       LifecycleNewTracker lifecycleNewTracker)
+    {
+<span class="nc" id="L273">        ShardManager shardManager = getShardManager();</span>
+<span class="nc" id="L274">        double flushDensity = cfs.metric.flushSizeOnDisk.get() * shardManager.shardSetCoverage() / shardManager.localSpaceCoverage();</span>
+<span class="nc" id="L275">        ShardTracker boundaries = shardManager.boundaries(controller.getNumShards(flushDensity));</span>
+<span class="nc" id="L276">        return new ShardedMultiWriter(cfs,</span>
+                                      descriptor,
+                                      keyCount,
+                                      repairedAt,
+                                      pendingRepair,
+                                      isTransient,
+                                      commitLogPositions,
+                                      header,
+                                      indexGroups,
+                                      lifecycleNewTracker,
+                                      boundaries);
+    }
+
+    /**
+     * Create the task that in turns creates the sstable writer used for compaction.
+     *
+     * @return a sharded compaction task that in turn will create a sharded compaction writer.
+     */
+    private UnifiedCompactionTask createCompactionTask(LifecycleTransaction transaction, long gcBefore)
+    {
+<span class="nc" id="L296">        return new UnifiedCompactionTask(cfs, this, transaction, gcBefore, getShardManager());</span>
+    }
+
+    private void maybeUpdateShardManager()
+    {
+<span class="nc bnc" id="L301" title="All 4 branches missed.">        if (shardManager != null &amp;&amp; !shardManager.isOutOfDate(StorageService.instance.getTokenMetadata().getRingVersion()))</span>
+<span class="nc" id="L302">            return; // the disk boundaries (and thus the local ranges too) have not changed since the last time we calculated</span>
+
+<span class="nc" id="L304">        synchronized (this)</span>
+        {
+            // Recheck after entering critical section, another thread may have beaten us to it.
+<span class="nc bnc" id="L307" title="All 4 branches missed.">            while (shardManager == null || shardManager.isOutOfDate(StorageService.instance.getTokenMetadata().getRingVersion()))</span>
+<span class="nc" id="L308">                shardManager = ShardManager.create(cfs);</span>
+            // Note: this can just as well be done without the synchronization (races would be benign, just doing some
+            // redundant work). For the current usages of this blocking is fine and expected to perform no worse.
+<span class="nc" id="L311">        }</span>
+<span class="nc" id="L312">    }</span>
+
+    @VisibleForTesting
+    ShardManager getShardManager()
+    {
+<span class="nc" id="L317">        maybeUpdateShardManager();</span>
+<span class="nc" id="L318">        return shardManager;</span>
+    }
+
+    /**
+     * Selects a compaction to run next.
+     */
+    @VisibleForTesting
+    CompactionPick getNextCompactionPick(long gcBefore)
+    {
+<span class="nc" id="L327">        SelectionContext context = new SelectionContext(controller);</span>
+<span class="nc" id="L328">        List&lt;SSTableReader&gt; suitable = getCompactableSSTables(getSSTables(), UnifiedCompactionStrategy::isSuitableForCompaction);</span>
+<span class="nc" id="L329">        Set&lt;SSTableReader&gt; expired = maybeGetExpiredSSTables(gcBefore, suitable);</span>
+<span class="nc" id="L330">        suitable.removeAll(expired);</span>
+
+<span class="nc" id="L332">        CompactionPick selected = chooseCompactionPick(suitable, context);</span>
+<span class="nc" id="L333">        estimatedRemainingTasks = context.estimatedRemainingTasks;</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if (selected == null)</span>
+        {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            if (expired.isEmpty())</span>
+<span class="nc" id="L337">                return null;</span>
+            else
+<span class="nc" id="L339">                return new CompactionPick(-1, -1, expired);</span>
+        }
+
+<span class="nc" id="L342">        selected.addAll(expired);</span>
+<span class="nc" id="L343">        return selected;</span>
+    }
+
+    private Set&lt;SSTableReader&gt; maybeGetExpiredSSTables(long gcBefore, List&lt;SSTableReader&gt; suitable)
+    {
+        Set&lt;SSTableReader&gt; expired;
+<span class="nc" id="L349">        long ts = Clock.Global.currentTimeMillis();</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (ts - lastExpiredCheck &gt; controller.getExpiredSSTableCheckFrequency())</span>
+        {
+<span class="nc" id="L352">            lastExpiredCheck = ts;</span>
+<span class="nc" id="L353">            expired = CompactionController.getFullyExpiredSSTables(cfs,</span>
+                                                                   suitable,
+<span class="nc" id="L355">                                                                   cfs.getOverlappingLiveSSTables(suitable),</span>
+                                                                   gcBefore,
+<span class="nc" id="L357">                                                                   controller.getIgnoreOverlapsInExpirationCheck());</span>
+<span class="nc bnc" id="L358" title="All 4 branches missed.">            if (logger.isTraceEnabled() &amp;&amp; !expired.isEmpty())</span>
+<span class="nc" id="L359">                logger.trace(&quot;Expiration check for {}.{} found {} fully expired SSTables&quot;,</span>
+<span class="nc" id="L360">                             cfs.getKeyspaceName(),</span>
+<span class="nc" id="L361">                             cfs.getTableName(),</span>
+<span class="nc" id="L362">                             expired.size());</span>
+        }
+        else
+<span class="nc" id="L365">            expired = Collections.emptySet();</span>
+<span class="nc" id="L366">        return expired;</span>
+    }
+
+    private CompactionPick chooseCompactionPick(List&lt;SSTableReader&gt; suitable, SelectionContext context)
+    {
+        // Select the level with the highest overlap; when multiple levels have the same overlap, prefer the lower one
+        // (i.e. reduction of RA for bigger token coverage).
+<span class="nc" id="L373">        int maxOverlap = -1;</span>
+<span class="nc" id="L374">        CompactionPick selected = null;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        for (Level level : formLevels(suitable))</span>
+        {
+<span class="nc" id="L377">            CompactionPick pick = level.getCompactionPick(context);</span>
+<span class="nc" id="L378">            int levelOverlap = level.maxOverlap;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (levelOverlap &gt; maxOverlap)</span>
+            {
+<span class="nc" id="L381">                maxOverlap = levelOverlap;</span>
+<span class="nc" id="L382">                selected = pick;</span>
+            }
+<span class="nc" id="L384">        }</span>
+<span class="nc bnc" id="L385" title="All 4 branches missed.">        if (logger.isDebugEnabled() &amp;&amp; selected != null)</span>
+<span class="nc" id="L386">            logger.debug(&quot;Selected compaction on level {} overlap {} sstables {}&quot;,</span>
+<span class="nc" id="L387">                         selected.level, selected.overlap, selected.size());</span>
+
+<span class="nc" id="L389">        return selected;</span>
+    }
+
+    @Override
+    public int getEstimatedRemainingTasks()
+    {
+<span class="nc" id="L395">        return estimatedRemainingTasks;</span>
+    }
+
+    @Override
+    public long getMaxSSTableBytes()
+    {
+<span class="nc" id="L401">        return Long.MAX_VALUE;</span>
+    }
+
+    @VisibleForTesting
+    public Controller getController()
+    {
+<span class="nc" id="L407">        return controller;</span>
+    }
+
+    public static boolean isSuitableForCompaction(SSTableReader rdr)
+    {
+<span class="nc bnc" id="L412" title="All 4 branches missed.">        return !rdr.isMarkedSuspect() &amp;&amp; rdr.openReason != SSTableReader.OpenReason.EARLY;</span>
+    }
+
+    @Override
+    public synchronized void addSSTable(SSTableReader added)
+    {
+<span class="nc" id="L418">        sstables.add(added);</span>
+<span class="nc" id="L419">    }</span>
+
+    @Override
+    public synchronized void removeSSTable(SSTableReader sstable)
+    {
+<span class="nc" id="L424">        sstables.remove(sstable);</span>
+<span class="nc" id="L425">    }</span>
+
+    @Override
+    protected synchronized Set&lt;SSTableReader&gt; getSSTables()
+    {
+        // Filter the set of sstables through the live set. This is to ensure no zombie sstables are picked for
+        // compaction (see CASSANDRA-18342).
+<span class="nc" id="L432">        return ImmutableSet.copyOf(Iterables.filter(cfs.getLiveSSTables(), sstables::contains));</span>
+    }
+
+    /**
+     * @return a list of the levels in the compaction hierarchy
+     */
+    @VisibleForTesting
+    List&lt;Level&gt; getLevels()
+    {
+<span class="nc" id="L441">        return getLevels(getSSTables(), UnifiedCompactionStrategy::isSuitableForCompaction);</span>
+    }
+
+    /**
+     * Groups the sstables passed in into levels. This is used by the strategy to determine
+     * new compactions, and by external tools to analyze the strategy decisions.
+     *
+     * @param sstables a collection of the sstables to be assigned to levels
+     * @param compactionFilter a filter to exclude CompactionSSTables,
+     *                         e.g., {@link #isSuitableForCompaction}
+     *
+     * @return a list of the levels in the compaction hierarchy
+     */
+    public List&lt;Level&gt; getLevels(Collection&lt;SSTableReader&gt; sstables,
+                                 Predicate&lt;SSTableReader&gt; compactionFilter)
+    {
+<span class="nc" id="L457">        List&lt;SSTableReader&gt; suitable = getCompactableSSTables(sstables, compactionFilter);</span>
+<span class="nc" id="L458">        return formLevels(suitable);</span>
+    }
+
+    private List&lt;Level&gt; formLevels(List&lt;SSTableReader&gt; suitable)
+    {
+<span class="nc" id="L463">        maybeUpdateShardManager();</span>
+<span class="nc" id="L464">        List&lt;Level&gt; levels = new ArrayList&lt;&gt;(MAX_LEVELS);</span>
+<span class="nc" id="L465">        suitable.sort(shardManager::compareByDensity);</span>
+
+<span class="nc" id="L467">        double maxDensity = controller.getMaxLevelDensity(0, controller.getBaseSstableSize(controller.getFanout(0)) / shardManager.localSpaceCoverage());</span>
+<span class="nc" id="L468">        int index = 0;</span>
+<span class="nc" id="L469">        Level level = new Level(controller, index, 0, maxDensity);</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        for (SSTableReader candidate : suitable)</span>
+        {
+<span class="nc" id="L472">            final double density = shardManager.density(candidate);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if (density &lt; level.max)</span>
+            {
+<span class="nc" id="L475">                level.add(candidate);</span>
+<span class="nc" id="L476">                continue;</span>
+            }
+
+<span class="nc" id="L479">            level.complete();</span>
+<span class="nc" id="L480">            levels.add(level); // add even if empty</span>
+
+            while (true)
+            {
+<span class="nc" id="L484">                ++index;</span>
+<span class="nc" id="L485">                double minDensity = maxDensity;</span>
+<span class="nc" id="L486">                maxDensity = controller.getMaxLevelDensity(index, minDensity);</span>
+<span class="nc" id="L487">                level = new Level(controller, index, minDensity, maxDensity);</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">                if (density &lt; level.max)</span>
+                {
+<span class="nc" id="L490">                    level.add(candidate);</span>
+<span class="nc" id="L491">                    break;</span>
+                }
+                else
+                {
+<span class="nc" id="L495">                    levels.add(level); // add the empty level</span>
+                }
+<span class="nc" id="L497">            }</span>
+<span class="nc" id="L498">        }</span>
+
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        if (!level.sstables.isEmpty())</span>
+        {
+<span class="nc" id="L502">            level.complete();</span>
+<span class="nc" id="L503">            levels.add(level);</span>
+        }
+
+<span class="nc" id="L506">        return levels;</span>
+    }
+
+    private List&lt;SSTableReader&gt; getCompactableSSTables(Collection&lt;SSTableReader&gt; sstables,
+                                                       Predicate&lt;SSTableReader&gt; compactionFilter)
+    {
+<span class="nc" id="L512">        Set&lt;SSTableReader&gt; compacting = cfs.getTracker().getCompacting();</span>
+<span class="nc" id="L513">        List&lt;SSTableReader&gt; suitable = new ArrayList&lt;&gt;(sstables.size());</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">        for (SSTableReader rdr : sstables)</span>
+        {
+<span class="nc bnc" id="L516" title="All 4 branches missed.">            if (compactionFilter.test(rdr) &amp;&amp; !compacting.contains(rdr))</span>
+<span class="nc" id="L517">                suitable.add(rdr);</span>
+<span class="nc" id="L518">        }</span>
+<span class="nc" id="L519">        return suitable;</span>
+    }
+
+    public TableMetadata getMetadata()
+    {
+<span class="nc" id="L524">        return cfs.metadata();</span>
+    }
+
+    private static boolean startsAfter(SSTableReader a, SSTableReader b)
+    {
+        // Strict comparison because the span is end-inclusive.
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        return a.getFirst().compareTo(b.getLast()) &gt; 0;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L536">        return String.format(&quot;Unified strategy %s&quot;, getMetadata());</span>
+    }
+
+    /**
+     * A level: index, sstables and some properties.
+     */
+<span class="nc" id="L542">    public static class Level</span>
+    {
+        final List&lt;SSTableReader&gt; sstables;
+        final int index;
+        final double survivalFactor;
+        final int scalingParameter; // scaling parameter used to calculate fanout and threshold
+        final int fanout; // fanout factor between levels
+        final int threshold; // number of SSTables that trigger a compaction
+        final double min; // min density of sstables for this level
+        final double max; // max density of sstables for this level
+<span class="nc" id="L552">        int maxOverlap = -1; // maximum number of overlapping sstables, i.e. maximum number of sstables that need</span>
+                             // to be queried on this level for any given key
+
+        Level(Controller controller, int index, double minSize, double maxSize)
+<span class="nc" id="L556">        {</span>
+<span class="nc" id="L557">            this.index = index;</span>
+<span class="nc" id="L558">            this.survivalFactor = controller.getSurvivalFactor(index);</span>
+<span class="nc" id="L559">            this.scalingParameter = controller.getScalingParameter(index);</span>
+<span class="nc" id="L560">            this.fanout = controller.getFanout(index);</span>
+<span class="nc" id="L561">            this.threshold = controller.getThreshold(index);</span>
+<span class="nc" id="L562">            this.sstables = new ArrayList&lt;&gt;(threshold);</span>
+<span class="nc" id="L563">            this.min = minSize;</span>
+<span class="nc" id="L564">            this.max = maxSize;</span>
+<span class="nc" id="L565">        }</span>
+
+        public Collection&lt;SSTableReader&gt; getSSTables()
+        {
+<span class="nc" id="L569">            return sstables;</span>
+        }
+
+        public int getIndex()
+        {
+<span class="nc" id="L574">            return index;</span>
+        }
+
+        void add(SSTableReader sstable)
+        {
+<span class="nc" id="L579">            this.sstables.add(sstable);</span>
+<span class="nc" id="L580">        }</span>
+
+        void complete()
+        {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L585">                logger.trace(&quot;Level: {}&quot;, this);</span>
+<span class="nc" id="L586">        }</span>
+
+        /**
+         * Return the compaction pick for this level.
+         * &lt;p&gt;
+         * This is done by splitting the level into buckets that we can treat as independent regions for compaction.
+         * We then use the maxOverlap value (i.e. the maximum number of sstables that can contain data for any covered
+         * key) of each bucket to determine if compactions are needed, and to prioritize the buckets that contribute
+         * most to the complexity of queries: if maxOverlap is below the level's threshold, no compaction is needed;
+         * otherwise, we choose one from the buckets that have the highest maxOverlap.
+         */
+        CompactionPick getCompactionPick(SelectionContext context)
+        {
+<span class="nc" id="L599">            List&lt;Bucket&gt; buckets = getBuckets(context);</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">            if (buckets == null)</span>
+            {
+<span class="nc bnc" id="L602" title="All 2 branches missed.">                if (logger.isDebugEnabled())</span>
+<span class="nc" id="L603">                    logger.debug(&quot;Level {} sstables {} max overlap {} buckets with compactions {} tasks {}&quot;,</span>
+<span class="nc" id="L604">                                 index, sstables.size(), maxOverlap, 0, 0);</span>
+<span class="nc" id="L605">                return null;    // nothing crosses the threshold in this level, nothing to do</span>
+            }
+
+<span class="nc" id="L608">            int estimatedRemainingTasks = 0;</span>
+<span class="nc" id="L609">            int overlapMatchingCount = 0;</span>
+<span class="nc" id="L610">            Bucket selectedBucket = null;</span>
+<span class="nc" id="L611">            Controller controller = context.controller;</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            for (Bucket bucket : buckets)</span>
+            {
+                // We can have just one pick in each level. Pick one bucket randomly out of the ones with
+                // the highest overlap.
+                // The random() part below implements reservoir sampling with size 1, giving us a uniformly random selection.
+<span class="nc bnc" id="L617" title="All 4 branches missed.">                if (bucket.maxOverlap == maxOverlap &amp;&amp; controller.random().nextInt(++overlapMatchingCount) == 0)</span>
+<span class="nc" id="L618">                    selectedBucket = bucket;</span>
+                // The estimated remaining tasks is a measure of the remaining amount of work, thus we prefer to
+                // calculate the number of tasks we would do in normal operation, even though we may compact in bigger
+                // chunks when we are late.
+<span class="nc" id="L622">                estimatedRemainingTasks += bucket.maxOverlap / threshold;</span>
+<span class="nc" id="L623">            }</span>
+<span class="nc" id="L624">            context.estimatedRemainingTasks += estimatedRemainingTasks;</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">            assert selectedBucket != null;</span>
+
+<span class="nc bnc" id="L627" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="nc" id="L628">                logger.debug(&quot;Level {} sstables {} max overlap {} buckets with compactions {} tasks {}&quot;,</span>
+<span class="nc" id="L629">                             index, sstables.size(), maxOverlap, buckets.size(), estimatedRemainingTasks);</span>
+
+<span class="nc" id="L631">            CompactionPick selected = selectedBucket.constructPick(controller);</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L634">                logger.trace(&quot;Returning compaction pick with selected compaction {}&quot;,</span>
+                             selected);
+<span class="nc" id="L636">            return selected;</span>
+        }
+
+        /**
+         * Group the sstables in this level into buckets.
+         * &lt;p&gt;
+         * The buckets are formed by grouping sstables that overlap at some key together, and then expanded to cover
+         * any overlapping sstable according to the overlap inclusion method. With the usual TRANSITIVE method this
+         * results into non-overlapping buckets that can't affect one another and can be compacted in parallel without
+         * any loss of efficiency.
+         * &lt;p&gt;
+         * Other overlap inclusion methods are provided to cover situations where we may be okay with compacting
+         * sstables partially and doing more than the strictly necessary amount of compaction to solve a problem: e.g.
+         * after an upgrade from LCS where transitive overlap may cause a complete level to be compacted together
+         * (creating an operation that will take a very long time to complete) and we want to make some progress as
+         * quickly as possible at the cost of redoing some work.
+         * &lt;p&gt;
+         * The number of sstables that overlap at some key defines the &quot;overlap&quot; of a set of sstables. The maximum such
+         * value in the bucket is its &quot;maxOverlap&quot;, i.e. the highest number of sstables we need to read to find the
+         * data associated with a given key.
+         */
+        @VisibleForTesting
+        List&lt;Bucket&gt; getBuckets(SelectionContext context)
+        {
+<span class="nc" id="L660">            List&lt;SSTableReader&gt; liveSet = sstables;</span>
+
+<span class="nc bnc" id="L662" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L663">                logger.trace(&quot;Creating compaction pick with live set {}&quot;, liveSet);</span>
+
+<span class="nc" id="L665">            List&lt;Set&lt;SSTableReader&gt;&gt; overlaps = Overlaps.constructOverlapSets(liveSet,</span>
+<span class="nc" id="L666">                                                                              UnifiedCompactionStrategy::startsAfter,</span>
+                                                                              SSTableReader.firstKeyComparator,
+                                                                              SSTableReader.lastKeyComparator);
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            for (Set&lt;SSTableReader&gt; overlap : overlaps)</span>
+<span class="nc" id="L670">                maxOverlap = Math.max(maxOverlap, overlap.size());</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">            if (maxOverlap &lt; threshold)</span>
+<span class="nc" id="L672">                return null;</span>
+
+<span class="nc" id="L674">            List&lt;Bucket&gt; buckets = Overlaps.assignOverlapsIntoBuckets(threshold,</span>
+<span class="nc" id="L675">                                                                      context.controller.overlapInclusionMethod(),</span>
+                                                                      overlaps,
+                                                                      this::makeBucket);
+<span class="nc" id="L678">            return buckets;</span>
+        }
+
+        private Bucket makeBucket(List&lt;Set&lt;SSTableReader&gt;&gt; overlaps, int startIndex, int endIndex)
+        {
+<span class="nc bnc" id="L683" title="All 2 branches missed.">            return endIndex == startIndex + 1</span>
+<span class="nc" id="L684">                   ? new SimpleBucket(this, overlaps.get(startIndex))</span>
+<span class="nc" id="L685">                   : new MultiSetBucket(this, overlaps.subList(startIndex, endIndex));</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L691">            return String.format(&quot;W: %d, T: %d, F: %d, index: %d, min: %s, max %s, %d sstables, overlap %s&quot;,</span>
+<span class="nc" id="L692">                                 scalingParameter,</span>
+<span class="nc" id="L693">                                 threshold,</span>
+<span class="nc" id="L694">                                 fanout,</span>
+<span class="nc" id="L695">                                 index,</span>
+<span class="nc" id="L696">                                 densityAsString(min),</span>
+<span class="nc" id="L697">                                 densityAsString(max),</span>
+<span class="nc" id="L698">                                 sstables.size(),</span>
+<span class="nc" id="L699">                                 maxOverlap);</span>
+        }
+
+        private String densityAsString(double density)
+        {
+<span class="nc" id="L704">            return FBUtilities.prettyPrintBinary(density, &quot;B&quot;, &quot; &quot;);</span>
+        }
+    }
+
+
+    /**
+     * A compaction bucket, i.e. a selection of overlapping sstables from which a compaction should be selected.
+     */
+<span class="nc" id="L712">    static abstract class Bucket</span>
+    {
+        final Level level;
+        final List&lt;SSTableReader&gt; allSSTablesSorted;
+        final int maxOverlap;
+
+        Bucket(Level level, Collection&lt;SSTableReader&gt; allSSTablesSorted, int maxOverlap)
+<span class="nc" id="L719">        {</span>
+            // single section
+<span class="nc" id="L721">            this.level = level;</span>
+<span class="nc" id="L722">            this.allSSTablesSorted = new ArrayList&lt;&gt;(allSSTablesSorted);</span>
+<span class="nc" id="L723">            this.allSSTablesSorted.sort(SSTableReader.maxTimestampDescending);  // we remove entries from the back</span>
+<span class="nc" id="L724">            this.maxOverlap = maxOverlap;</span>
+<span class="nc" id="L725">        }</span>
+
+        Bucket(Level level, List&lt;Set&lt;SSTableReader&gt;&gt; overlapSections)
+<span class="nc" id="L728">        {</span>
+            // multiple sections
+<span class="nc" id="L730">            this.level = level;</span>
+<span class="nc" id="L731">            int maxOverlap = 0;</span>
+<span class="nc" id="L732">            Set&lt;SSTableReader&gt; all = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">            for (Set&lt;SSTableReader&gt; section : overlapSections)</span>
+            {
+<span class="nc" id="L735">                maxOverlap = Math.max(maxOverlap, section.size());</span>
+<span class="nc" id="L736">                all.addAll(section);</span>
+<span class="nc" id="L737">            }</span>
+<span class="nc" id="L738">            this.allSSTablesSorted = new ArrayList&lt;&gt;(all);</span>
+<span class="nc" id="L739">            this.allSSTablesSorted.sort(SSTableReader.maxTimestampDescending);  // we remove entries from the back</span>
+<span class="nc" id="L740">            this.maxOverlap = maxOverlap;</span>
+<span class="nc" id="L741">        }</span>
+
+        /**
+         * Select compactions from this bucket. Normally this would form a compaction out of all sstables in the
+         * bucket, but if compaction is very late we may prefer to act more carefully:
+         * - we should not use more inputs than the permitted maximum
+         * - we should select SSTables in a way that preserves the structure of the compaction hierarchy
+         * These impose a limit on the size of a compaction; to make sure we always reduce the read amplification by
+         * this much, we treat this number as a limit on overlapping sstables, i.e. if A and B don't overlap with each
+         * other but both overlap with C and D, all four will be selected to form a limit-three compaction. A limit-two
+         * one may choose CD, ABC or ABD.
+         * Also, the subset is selected by max timestamp order, oldest first, to avoid violating sstable time order. In
+         * the example above, if B is oldest and C is older than D, the limit-two choice would be ABC (if A is older
+         * than D) or BC (if A is younger, avoiding combining C with A skipping D).
+         *
+         * @param controller The compaction controller.
+         * @return A compaction pick to execute next.
+         */
+        CompactionPick constructPick(Controller controller)
+        {
+<span class="nc" id="L761">            int count = maxOverlap;</span>
+<span class="nc" id="L762">            int threshold = level.threshold;</span>
+<span class="nc" id="L763">            int fanout = level.fanout;</span>
+<span class="nc" id="L764">            int index = level.index;</span>
+<span class="nc" id="L765">            int maxSSTablesToCompact = Math.max(fanout, controller.maxSSTablesToCompact());</span>
+
+<span class="nc bnc" id="L767" title="All 2 branches missed.">            assert count &gt;= threshold;</span>
+<span class="nc bnc" id="L768" title="All 2 branches missed.">            if (count &lt;= fanout)</span>
+            {
+                /**
+                 * Happy path. We are not late or (for levelled) we are only so late that a compaction now will
+                 * have the same effect as doing levelled compactions one by one. Compact all. We do not cap
+                 * this pick at maxSSTablesToCompact due to an assumption that maxSSTablesToCompact is much
+                 * greater than F. See {@link Controller#MAX_SSTABLES_TO_COMPACT_OPTION} for more details.
+                 */
+<span class="nc" id="L776">                return new CompactionPick(index, count, allSSTablesSorted);</span>
+            }
+<span class="nc bnc" id="L778" title="All 4 branches missed.">            else if (count &lt;= fanout * controller.getFanout(index + 1) || maxSSTablesToCompact == fanout)</span>
+            {
+                // Compaction is a bit late, but not enough to jump levels via layout compactions. We need a special
+                // case to cap compaction pick at maxSSTablesToCompact.
+<span class="nc bnc" id="L782" title="All 2 branches missed.">                if (count &lt;= maxSSTablesToCompact)</span>
+<span class="nc" id="L783">                    return new CompactionPick(index, count, allSSTablesSorted);</span>
+
+<span class="nc" id="L785">                return new CompactionPick(index, maxSSTablesToCompact, pullOldestSSTables(maxSSTablesToCompact));</span>
+            }
+            else
+            {
+                // We may, however, have accumulated a lot more than T if compaction is very late.
+                // In this case we pick a compaction in such a way that the result of doing it spreads the data in
+                // a similar way to how compaction would lay them if it was able to keep up. This means:
+                // - for tiered compaction (w &gt;= 0), compact in sets of as many as required to get to a level.
+                //   for example, for w=2 and 55 sstables, pick a compaction of 16 sstables (on the next calls, given no
+                //   new files, 2 more of 16, 1 of 4, and leaving the other 3 sstables alone).
+                // - for levelled compaction (w &lt; 0), compact all that would reach a level.
+                //   for w=-2 and 55, this means pick a compaction of 48 (on the next calls, given no new files, one of
+                //   4, and one of 3 sstables).
+<span class="nc" id="L798">                int pickSize = selectPickSize(controller, maxSSTablesToCompact);</span>
+<span class="nc" id="L799">                return new CompactionPick(index, pickSize, pullOldestSSTables(pickSize));</span>
+            }
+        }
+
+        private int selectPickSize(Controller controller, int maxSSTablesToCompact)
+        {
+            int pickSize;
+<span class="nc" id="L806">            int fanout = level.fanout;</span>
+<span class="nc" id="L807">            int nextStep = fanout;</span>
+<span class="nc" id="L808">            int index = level.index;</span>
+<span class="nc" id="L809">            int limit = Math.min(maxSSTablesToCompact, maxOverlap);</span>
+            do
+            {
+<span class="nc" id="L812">                pickSize = nextStep;</span>
+<span class="nc" id="L813">                fanout = controller.getFanout(++index);</span>
+<span class="nc" id="L814">                nextStep *= fanout;</span>
+            }
+<span class="nc bnc" id="L816" title="All 2 branches missed.">            while (nextStep &lt;= limit);</span>
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">            if (level.scalingParameter &lt; 0)</span>
+            {
+                // For levelled compaction all the sstables that would reach this level need to be compacted to one,
+                // so select the highest multiple of step that fits.
+<span class="nc" id="L822">                pickSize *= limit / pickSize;</span>
+<span class="nc bnc" id="L823" title="All 2 branches missed.">                assert pickSize &gt; 0;</span>
+            }
+<span class="nc" id="L825">            return pickSize;</span>
+        }
+
+        /**
+         * Pull the oldest sstables to get at most limit-many overlapping sstables to compact in each overlap section.
+         */
+        abstract Collection&lt;SSTableReader&gt; pullOldestSSTables(int overlapLimit);
+    }
+
+    public static class SimpleBucket extends Bucket
+    {
+        public SimpleBucket(Level level, Collection&lt;SSTableReader&gt; sstables)
+        {
+<span class="nc" id="L838">            super(level, sstables, sstables.size());</span>
+<span class="nc" id="L839">        }</span>
+
+        Collection&lt;SSTableReader&gt; pullOldestSSTables(int overlapLimit)
+        {
+<span class="nc bnc" id="L843" title="All 2 branches missed.">            if (allSSTablesSorted.size() &lt;= overlapLimit)</span>
+<span class="nc" id="L844">                return allSSTablesSorted;</span>
+<span class="nc" id="L845">            return Overlaps.pullLast(allSSTablesSorted, overlapLimit);</span>
+        }
+    }
+
+    public static class MultiSetBucket extends Bucket
+    {
+        final List&lt;Set&lt;SSTableReader&gt;&gt; overlapSets;
+
+        public MultiSetBucket(Level level, List&lt;Set&lt;SSTableReader&gt;&gt; overlapSets)
+        {
+<span class="nc" id="L855">            super(level, overlapSets);</span>
+<span class="nc" id="L856">            this.overlapSets = overlapSets;</span>
+<span class="nc" id="L857">        }</span>
+
+        Collection&lt;SSTableReader&gt; pullOldestSSTables(int overlapLimit)
+        {
+<span class="nc" id="L861">            return Overlaps.pullLastWithOverlapLimit(allSSTablesSorted, overlapSets, overlapLimit);</span>
+        }
+    }
+
+    /**
+     * Utility class holding a collection of sstables for compaction.
+     */
+    static class CompactionPick extends ArrayList&lt;SSTableReader&gt;
+    {
+        final int level;
+        final int overlap;
+
+        CompactionPick(int level, int overlap, Collection&lt;SSTableReader&gt; sstables)
+        {
+<span class="nc" id="L875">            super(sstables);</span>
+<span class="nc" id="L876">            this.level = level;</span>
+<span class="nc" id="L877">            this.overlap = overlap;</span>
+<span class="nc" id="L878">        }</span>
+    }
+
+    static class SelectionContext
+    {
+        final Controller controller;
+<span class="nc" id="L884">        int estimatedRemainingTasks = 0;</span>
+
+        SelectionContext(Controller controller)
+<span class="nc" id="L887">        {</span>
+<span class="nc" id="L888">            this.controller = controller;</span>
+<span class="nc" id="L889">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

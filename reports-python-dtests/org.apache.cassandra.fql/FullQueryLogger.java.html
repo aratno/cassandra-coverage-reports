@@ -1,0 +1,566 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FullQueryLogger.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.fql</a> &gt; <span class="el_source">FullQueryLogger.java</span></div><h1>FullQueryLogger.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.fql;
+
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+import javax.annotation.Nullable;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Sets;
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.io.util.File;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.buffer.ByteBuf;
+import net.openhft.chronicle.bytes.BytesStore;
+import net.openhft.chronicle.wire.ValueOut;
+import net.openhft.chronicle.wire.WireOut;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.QueryEvents;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.statements.BatchStatement;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.CBUtil;
+import org.apache.cassandra.transport.Message;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.binlog.BinLog;
+import org.apache.cassandra.utils.binlog.BinLogOptions;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+import org.apache.cassandra.utils.concurrent.WeightedQueue;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+
+/**
+ * A logger that logs entire query contents after the query finishes (or times out).
+ */
+<span class="fc" id="L59">public class FullQueryLogger implements QueryEvents.Listener</span>
+{
+<span class="fc" id="L61">    protected static final Logger logger = LoggerFactory.getLogger(FullQueryLogger.class);</span>
+
+    public static final long CURRENT_VERSION = 0; // encode a dummy version, to prevent pain in decoding in the future
+
+    public static final String VERSION = &quot;version&quot;;
+    public static final String TYPE = &quot;type&quot;;
+
+    public static final String PROTOCOL_VERSION = &quot;protocol-version&quot;;
+    public static final String QUERY_OPTIONS = &quot;query-options&quot;;
+    public static final String QUERY_START_TIME = &quot;query-start-time&quot;;
+
+    public static final String GENERATED_TIMESTAMP = &quot;generated-timestamp&quot;;
+    public static final String GENERATED_NOW_IN_SECONDS = &quot;generated-now-in-seconds&quot;;
+    public static final String KEYSPACE = &quot;keyspace&quot;;
+
+    public static final String BATCH = &quot;batch&quot;;
+    public static final String SINGLE_QUERY = &quot;single-query&quot;;
+
+    public static final String QUERY = &quot;query&quot;;
+    public static final String BATCH_TYPE = &quot;batch-type&quot;;
+    public static final String QUERIES = &quot;queries&quot;;
+    public static final String VALUES = &quot;values&quot;;
+
+<span class="fc" id="L84">    private static final int EMPTY_LIST_SIZE = Ints.checkedCast(ObjectSizes.measureDeep(new ArrayList&lt;&gt;(0)));</span>
+    private static final int EMPTY_BYTEBUF_SIZE;
+
+<span class="fc" id="L87">    public static final FullQueryLogger instance = new FullQueryLogger();</span>
+
+    volatile BinLog binLog;
+
+    public synchronized void enable(Path path, String rollCycle, boolean blocking, int maxQueueWeight, long maxLogSize, String archiveCommand, int maxArchiveRetries)
+    {
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        if (this.binLog != null)</span>
+<span class="nc" id="L94">            throw new IllegalStateException(&quot;Binlog is already configured&quot;);</span>
+<span class="nc" id="L95">        this.binLog = new BinLog.Builder().path(path)</span>
+<span class="nc" id="L96">                                          .rollCycle(rollCycle)</span>
+<span class="nc" id="L97">                                          .blocking(blocking)</span>
+<span class="nc" id="L98">                                          .maxQueueWeight(maxQueueWeight)</span>
+<span class="nc" id="L99">                                          .maxLogSize(maxLogSize)</span>
+<span class="nc" id="L100">                                          .archiveCommand(archiveCommand)</span>
+<span class="nc" id="L101">                                          .maxArchiveRetries(maxArchiveRetries)</span>
+<span class="nc" id="L102">                                          .build(true);</span>
+<span class="nc" id="L103">        QueryEvents.instance.registerListener(this);</span>
+<span class="nc" id="L104">    }</span>
+
+    public synchronized void enableWithoutClean(Path path, String rollCycle, boolean blocking, int maxQueueWeight, long maxLogSize, String archiveCommand, int maxArchiveRetries)
+    {
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        if (this.binLog != null)</span>
+<span class="nc" id="L109">            throw new IllegalStateException(&quot;Binlog is already configured&quot;);</span>
+<span class="fc" id="L110">        this.binLog = new BinLog.Builder().path(path)</span>
+<span class="fc" id="L111">                                          .rollCycle(rollCycle)</span>
+<span class="fc" id="L112">                                          .blocking(blocking)</span>
+<span class="fc" id="L113">                                          .maxQueueWeight(maxQueueWeight)</span>
+<span class="fc" id="L114">                                          .maxLogSize(maxLogSize)</span>
+<span class="fc" id="L115">                                          .archiveCommand(archiveCommand)</span>
+<span class="fc" id="L116">                                          .maxArchiveRetries(maxArchiveRetries)</span>
+<span class="fc" id="L117">                                          .build(false);</span>
+<span class="fc" id="L118">        QueryEvents.instance.registerListener(this);</span>
+<span class="fc" id="L119">    }</span>
+
+
+    static
+    {
+<span class="fc" id="L124">        ByteBuf buf = CBUtil.allocator.buffer(0, 0);</span>
+        try
+        {
+<span class="fc" id="L127">            EMPTY_BYTEBUF_SIZE = Ints.checkedCast(ObjectSizes.measure(buf));</span>
+        }
+        finally
+        {
+<span class="fc" id="L131">            buf.release();</span>
+        }
+<span class="fc" id="L133">    }</span>
+
+    public FullQueryLoggerOptions getFullQueryLoggerOptions()
+    {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (isEnabled())</span>
+        {
+<span class="nc" id="L139">            final FullQueryLoggerOptions options = new FullQueryLoggerOptions();</span>
+<span class="nc" id="L140">            final BinLogOptions binLogOptions = binLog.getBinLogOptions();</span>
+
+<span class="nc" id="L142">            options.archive_command = binLogOptions.archive_command;</span>
+<span class="nc" id="L143">            options.roll_cycle = binLogOptions.roll_cycle;</span>
+<span class="nc" id="L144">            options.block = binLogOptions.block;</span>
+<span class="nc" id="L145">            options.max_archive_retries = binLogOptions.max_archive_retries;</span>
+<span class="nc" id="L146">            options.max_queue_weight = binLogOptions.max_queue_weight;</span>
+<span class="nc" id="L147">            options.max_log_size = binLogOptions.max_log_size;</span>
+<span class="nc" id="L148">            options.log_dir = binLog.path.toString();</span>
+
+<span class="nc" id="L150">            return options;</span>
+        }
+        else
+        {
+            // otherwise get what database is configured with from cassandra.yaml
+<span class="nc" id="L155">            return DatabaseDescriptor.getFullQueryLogOptions();</span>
+        }
+    }
+
+    public synchronized void stop()
+    {
+        try
+        {
+<span class="fc" id="L163">            BinLog binLog = this.binLog;</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">            if (binLog != null)</span>
+            {
+<span class="fc" id="L166">                logger.info(&quot;Stopping full query logging to {}&quot;, binLog.path);</span>
+<span class="fc" id="L167">                binLog.stop();</span>
+            }
+            else
+            {
+<span class="nc" id="L171">                logger.info(&quot;Full query log already stopped&quot;);</span>
+            }
+        }
+<span class="nc" id="L174">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L176">            throw new UncheckedInterruptedException(e);</span>
+        }
+        finally
+        {
+<span class="fc" id="L180">            QueryEvents.instance.unregisterListener(this);</span>
+<span class="fc" id="L181">            this.binLog = null;</span>
+        }
+<span class="fc" id="L183">    }</span>
+
+    /**
+     * Need the path as a parameter as well because if the process is restarted the config file might be the only
+     * location for retrieving the path to the full query log files, but JMX also allows you to specify a path
+     * that isn't persisted anywhere so we have to clean that one as well.
+     */
+    public synchronized void reset(String fullQueryLogPath)
+    {
+        try
+        {
+<span class="nc" id="L194">            Set&lt;File&gt; pathsToClean = Sets.newHashSet();</span>
+
+            //First decide whether to clean the path configured in the YAML
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (fullQueryLogPath != null)</span>
+            {
+<span class="nc" id="L199">                File fullQueryLogPathFile = new File(fullQueryLogPath);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">                if (fullQueryLogPathFile.exists())</span>
+                {
+<span class="nc" id="L202">                    pathsToClean.add(fullQueryLogPathFile);</span>
+                }
+            }
+
+            //Then decide whether to clean the last used path, possibly configured by JMX
+<span class="nc bnc" id="L207" title="All 4 branches missed.">            if (binLog != null &amp;&amp; binLog.path != null)</span>
+            {
+<span class="nc" id="L209">                File pathFile = new File(binLog.path);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (pathFile.exists())</span>
+                {
+<span class="nc" id="L212">                    pathsToClean.add(pathFile);</span>
+                }
+            }
+
+<span class="nc" id="L216">            logger.info(&quot;Reset (and deactivation) of full query log requested.&quot;);</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">            if (binLog != null)</span>
+            {
+<span class="nc" id="L219">                logger.info(&quot;Stopping full query log. Cleaning {}.&quot;, pathsToClean);</span>
+<span class="nc" id="L220">                binLog.stop();</span>
+<span class="nc" id="L221">                binLog = null;</span>
+            }
+            else
+            {
+<span class="nc" id="L225">                logger.info(&quot;Full query log already deactivated. Cleaning {}.&quot;, pathsToClean);</span>
+            }
+
+<span class="nc" id="L228">            Throwable accumulate = null;</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            for (File f : pathsToClean)</span>
+            {
+<span class="nc" id="L231">                accumulate = BinLog.cleanDirectory(f, accumulate);</span>
+<span class="nc" id="L232">            }</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (accumulate != null)</span>
+            {
+<span class="nc" id="L235">                throw new RuntimeException(accumulate);</span>
+            }
+        }
+<span class="nc" id="L238">        catch (Exception e)</span>
+        {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            if (e instanceof RuntimeException)</span>
+            {
+<span class="nc" id="L242">                throw (RuntimeException)e;</span>
+            }
+<span class="nc" id="L244">            throw new RuntimeException(e);</span>
+        }
+        finally
+        {
+<span class="nc" id="L248">            QueryEvents.instance.unregisterListener(this);</span>
+        }
+<span class="nc" id="L250">    }</span>
+
+    public boolean isEnabled()
+    {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        return this.binLog != null;</span>
+    }
+
+    /**
+     * Log an invocation of a batch of queries
+     * @param type The type of the batch
+     * @param statements the prepared cql statements (unused here)
+     * @param queries CQL text of the queries
+     * @param values Values to bind to as parameters for the queries
+     * @param queryOptions Options associated with the query invocation
+     * @param queryState Timestamp state associated with the query invocation
+     * @param batchTimeMillis Approximate time in milliseconds since the epoch since the batch was invoked
+     * @param response the response from the batch query
+     */
+    public void batchSuccess(BatchStatement.Type type,
+                             List&lt;? extends CQLStatement&gt; statements,
+                             List&lt;String&gt; queries,
+                             List&lt;List&lt;ByteBuffer&gt;&gt; values,
+                             QueryOptions queryOptions,
+                             QueryState queryState,
+                             long batchTimeMillis,
+                             Message.Response response)
+    {
+<span class="nc" id="L277">        checkNotNull(type, &quot;type was null&quot;);</span>
+<span class="nc" id="L278">        checkNotNull(queries, &quot;queries was null&quot;);</span>
+<span class="nc" id="L279">        checkNotNull(values, &quot;value was null&quot;);</span>
+<span class="nc" id="L280">        checkNotNull(queryOptions, &quot;queryOptions was null&quot;);</span>
+<span class="nc" id="L281">        checkNotNull(queryState, &quot;queryState was null&quot;);</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        Preconditions.checkArgument(batchTimeMillis &gt; 0, &quot;batchTimeMillis must be &gt; 0&quot;);</span>
+
+        //Don't construct the wrapper if the log is disabled
+<span class="nc" id="L285">        BinLog binLog = this.binLog;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if (binLog == null)</span>
+        {
+<span class="nc" id="L288">            return;</span>
+        }
+
+<span class="nc" id="L291">        Batch wrappedBatch = new Batch(type, queries, values, queryOptions, queryState, batchTimeMillis);</span>
+<span class="nc" id="L292">        binLog.logRecord(wrappedBatch);</span>
+<span class="nc" id="L293">    }</span>
+
+    /**
+     * Log a single CQL query
+     * @param query CQL query text
+     * @param queryOptions Options associated with the query invocation
+     * @param queryState Timestamp state associated with the query invocation
+     * @param queryTimeMillis Approximate time in milliseconds since the epoch since the batch was invoked
+     * @param response the response from this query
+     */
+    public void querySuccess(CQLStatement statement,
+                             String query,
+                             QueryOptions queryOptions,
+                             QueryState queryState,
+                             long queryTimeMillis,
+                             Message.Response response)
+    {
+<span class="fc" id="L310">        checkNotNull(query, &quot;query was null&quot;);</span>
+<span class="fc" id="L311">        checkNotNull(queryOptions, &quot;queryOptions was null&quot;);</span>
+<span class="fc" id="L312">        checkNotNull(queryState, &quot;queryState was null&quot;);</span>
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">        Preconditions.checkArgument(queryTimeMillis &gt; 0, &quot;queryTimeMillis must be &gt; 0&quot;);</span>
+
+        //Don't construct the wrapper if the log is disabled
+<span class="fc" id="L316">        BinLog binLog = this.binLog;</span>
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (binLog == null)</span>
+<span class="nc" id="L318">            return;</span>
+
+<span class="fc" id="L320">        Query wrappedQuery = new Query(query, queryOptions, queryState, queryTimeMillis);</span>
+<span class="fc" id="L321">        binLog.logRecord(wrappedQuery);</span>
+<span class="fc" id="L322">    }</span>
+
+    public void executeSuccess(CQLStatement statement, String query, QueryOptions options, QueryState state, long queryTime, Message.Response response)
+    {
+<span class="fc" id="L326">        querySuccess(statement, query, options, state, queryTime, response);</span>
+<span class="fc" id="L327">    }</span>
+
+    public static class Query extends AbstractLogEntry
+    {
+        /**
+         * The shallow size of a {@code Query} object.
+         */
+<span class="fc" id="L334">        private static final long EMPTY_SIZE = ObjectSizes.measure(new Query());</span>
+
+        private final String query;
+
+        public Query(String query, QueryOptions queryOptions, QueryState queryState, long queryStartTime)
+        {
+<span class="fc" id="L340">            super(queryOptions, queryState, queryStartTime);</span>
+<span class="fc" id="L341">            this.query = query;</span>
+<span class="fc" id="L342">        }</span>
+
+        /**
+         * Constructor only use to compute this class shallow size.
+         */
+        private Query()
+<span class="fc" id="L348">        {</span>
+<span class="fc" id="L349">            this.query = null;</span>
+<span class="fc" id="L350">        }</span>
+
+        @Override
+        protected String type()
+        {
+<span class="fc" id="L355">            return SINGLE_QUERY;</span>
+        }
+
+        @Override
+        public void writeMarshallablePayload(WireOut wire)
+        {
+<span class="fc" id="L361">            super.writeMarshallablePayload(wire);</span>
+<span class="fc" id="L362">            wire.write(QUERY).text(query);</span>
+<span class="fc" id="L363">        }</span>
+
+        @Override
+        public int weight()
+        {
+            // Object deep size = Object' shallow size + query field deep size + deep size of the parent fields
+<span class="fc" id="L369">            return Ints.checkedCast(EMPTY_SIZE + ObjectSizes.sizeOf(query) + super.fieldsSize());</span>
+        }
+    }
+
+    public static class Batch extends AbstractLogEntry
+    {
+        /**
+         * The shallow size of a {@code Batch} object (which includes primitive fields).
+         */
+<span class="nc" id="L378">        private static final long EMPTY_SIZE = ObjectSizes.measure(new Batch());</span>
+
+        /**
+         * The weight is pre-computed in the constructor and represent the object deep size.
+         */
+        private final int weight;
+        private final BatchStatement.Type batchType;
+        private final List&lt;String&gt; queries;
+        private final List&lt;List&lt;ByteBuffer&gt;&gt; values;
+
+        public Batch(BatchStatement.Type batchType,
+                     List&lt;String&gt; queries,
+                     List&lt;List&lt;ByteBuffer&gt;&gt; values,
+                     QueryOptions queryOptions,
+                     QueryState queryState,
+                     long batchTimeMillis)
+        {
+<span class="nc" id="L395">            super(queryOptions, queryState, batchTimeMillis);</span>
+
+<span class="nc" id="L397">            this.queries = queries;</span>
+<span class="nc" id="L398">            this.values = values;</span>
+<span class="nc" id="L399">            this.batchType = batchType;</span>
+
+            // We assume that all the lists are ArrayLists and that the size of each underlying array is the one of the list 
+            // (which is obviously wrong but not worst than the previous computation that was ignoring part of the arrays size in the computation).
+<span class="nc" id="L403">            long queriesSize = EMPTY_LIST_SIZE + ObjectSizes.sizeOfReferenceArray(queries.size());</span>
+
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            for (String query : queries)</span>
+<span class="nc" id="L406">                queriesSize += ObjectSizes.sizeOf(checkNotNull(query));</span>
+
+<span class="nc" id="L408">            long valuesSize = EMPTY_LIST_SIZE + ObjectSizes.sizeOfReferenceArray(values.size());</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">            for (List&lt;ByteBuffer&gt; subValues : values)</span>
+            {
+<span class="nc" id="L411">                valuesSize += EMPTY_LIST_SIZE + ObjectSizes.sizeOfReferenceArray(subValues.size());</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">                for (ByteBuffer subValue : subValues)</span>
+<span class="nc" id="L413">                    valuesSize += ObjectSizes.sizeOnHeapOf(subValue);</span>
+<span class="nc" id="L414">            }</span>
+
+            // No need to add the batch type which is an enum.
+<span class="nc" id="L417">            this.weight = Ints.checkedCast(EMPTY_SIZE            // Shallow size object</span>
+<span class="nc" id="L418">                                            + super.fieldsSize() // deep size of the parent fields (non-primitives as they are included in the shallow size) </span>
+                                            + queriesSize        // deep size queries field
+                                            + valuesSize);       // deep size values field
+<span class="nc" id="L421">        }</span>
+
+        /**
+         * Constructor only use to compute this class shallow size.
+         */
+        private Batch()
+<span class="nc" id="L427">        {</span>
+<span class="nc" id="L428">            this.weight = 0;</span>
+<span class="nc" id="L429">            this.batchType = null;</span>
+<span class="nc" id="L430">            this.queries = null;</span>
+<span class="nc" id="L431">            this.values = null;</span>
+<span class="nc" id="L432">        }</span>
+
+        @Override
+        protected String type()
+        {
+<span class="nc" id="L437">            return BATCH;</span>
+        }
+
+        @Override
+        public void writeMarshallablePayload(WireOut wire)
+        {
+<span class="nc" id="L443">            super.writeMarshallablePayload(wire);</span>
+<span class="nc" id="L444">            wire.write(BATCH_TYPE).text(batchType.name());</span>
+<span class="nc" id="L445">            ValueOut valueOut = wire.write(QUERIES);</span>
+<span class="nc" id="L446">            valueOut.int32(queries.size());</span>
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            for (String query : queries)</span>
+            {
+<span class="nc" id="L449">                valueOut.text(query);</span>
+<span class="nc" id="L450">            }</span>
+<span class="nc" id="L451">            valueOut = wire.write(VALUES);</span>
+<span class="nc" id="L452">            valueOut.int32(values.size());</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">            for (List&lt;ByteBuffer&gt; subValues : values)</span>
+            {
+<span class="nc" id="L455">                valueOut.int32(subValues.size());</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                for (ByteBuffer value : subValues)</span>
+                {
+<span class="nc" id="L458">                    valueOut.bytes(BytesStore.wrap(value));</span>
+<span class="nc" id="L459">                }</span>
+<span class="nc" id="L460">            }</span>
+<span class="nc" id="L461">        }</span>
+
+        @Override
+        public int weight()
+        {
+<span class="nc" id="L466">            return weight;</span>
+        }
+    }
+
+    private static abstract class AbstractLogEntry extends BinLog.ReleaseableWriteMarshallable implements WeightedQueue.Weighable
+    {
+        private final long queryStartTime;
+        private final int protocolVersion;
+        private final ByteBuf queryOptionsBuffer;
+
+        private final long generatedTimestamp;
+        private final long generatedNowInSeconds;
+        @Nullable
+        private final String keyspace;
+
+        AbstractLogEntry(QueryOptions queryOptions, QueryState queryState, long queryStartTime)
+<span class="fc" id="L482">        {</span>
+<span class="fc" id="L483">            this.queryStartTime = queryStartTime;</span>
+
+<span class="fc" id="L485">            this.protocolVersion = queryOptions.getProtocolVersion().asInt();</span>
+<span class="fc" id="L486">            int optionsSize = QueryOptions.codec.encodedSize(queryOptions, queryOptions.getProtocolVersion());</span>
+<span class="fc" id="L487">            queryOptionsBuffer = CBUtil.allocator.buffer(optionsSize, optionsSize);</span>
+
+<span class="fc" id="L489">            this.generatedTimestamp = queryState.generatedTimestamp();</span>
+<span class="fc" id="L490">            this.generatedNowInSeconds = queryState.generatedNowInSeconds();</span>
+<span class="fc" id="L491">            this.keyspace = queryState.getClientState().getRawKeyspace();</span>
+
+            /*
+             * Struggled with what tradeoff to make in terms of query options which is potentially large and complicated
+             * There is tension between low garbage production (or allocator overhead), small working set size, and CPU overhead reserializing the
+             * query options into binary format.
+             *
+             * I went with the lowest risk most predictable option which is allocator overhead and CPU overhead
+             * rather then keep the original query message around so I could just serialize that as a memcpy. It's more
+             * instructions when turned on, but it doesn't change memory footprint quite as much and it's more pay for what you use
+             * in terms of query volume. The CPU overhead is spread out across producers so we should at least get
+             * some scaling.
+             *
+             */
+            try
+            {
+<span class="fc" id="L507">                QueryOptions.codec.encode(queryOptions, queryOptionsBuffer, queryOptions.getProtocolVersion());</span>
+            }
+<span class="nc" id="L509">            catch (Throwable e)</span>
+            {
+<span class="nc" id="L511">                queryOptionsBuffer.release();</span>
+<span class="nc" id="L512">                throw e;</span>
+<span class="fc" id="L513">            }</span>
+<span class="fc" id="L514">        }</span>
+
+        /**
+         * Constructor only use to compute sub-classes shallow size.
+         */
+        private AbstractLogEntry()
+<span class="fc" id="L520">        {</span>
+<span class="fc" id="L521">            this.queryStartTime = 0;</span>
+<span class="fc" id="L522">            this.protocolVersion = 0;</span>
+<span class="fc" id="L523">            this.queryOptionsBuffer = null;</span>
+<span class="fc" id="L524">            this.generatedTimestamp = 0;</span>
+<span class="fc" id="L525">            this.generatedNowInSeconds = 0;</span>
+<span class="fc" id="L526">            this.keyspace = null;</span>
+<span class="fc" id="L527">        }</span>
+
+        @Override
+        protected long version()
+        {
+<span class="fc" id="L532">            return CURRENT_VERSION;</span>
+        }
+
+        @Override
+        public void writeMarshallablePayload(WireOut wire)
+        {
+<span class="fc" id="L538">            wire.write(QUERY_START_TIME).int64(queryStartTime);</span>
+<span class="fc" id="L539">            wire.write(PROTOCOL_VERSION).int32(protocolVersion);</span>
+<span class="fc" id="L540">            wire.write(QUERY_OPTIONS).bytes(BytesStore.wrap(queryOptionsBuffer.nioBuffer()));</span>
+
+<span class="fc" id="L542">            wire.write(GENERATED_TIMESTAMP).int64(generatedTimestamp);</span>
+<span class="fc" id="L543">            wire.write(GENERATED_NOW_IN_SECONDS).int64(generatedNowInSeconds);</span>
+
+<span class="fc" id="L545">            wire.write(KEYSPACE).text(keyspace);</span>
+<span class="fc" id="L546">        }</span>
+
+        @Override
+        public void release()
+        {
+<span class="fc" id="L551">            queryOptionsBuffer.release();</span>
+<span class="fc" id="L552">        }</span>
+
+        /**
+         * Returns the sum of the non-primitive fields' deep sizes.
+         * @return the sum of the non-primitive fields' deep sizes.
+         */
+        protected long fieldsSize()
+        {
+<span class="fc" id="L560">            return EMPTY_BYTEBUF_SIZE + queryOptionsBuffer.capacity() // queryOptionsBuffer</span>
+<span class="fc" id="L561">                   + ObjectSizes.sizeOf(keyspace);                    // keyspace</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,325 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PostingsWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1.postings</a> &gt; <span class="el_source">PostingsWriter.java</span></div><h1>PostingsWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai.disk.v1.postings;
+
+
+import java.io.Closeable;
+import java.io.IOException;
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.agrona.collections.LongArrayList;
+import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.disk.ResettableByteBuffersIndexOutput;
+import org.apache.cassandra.index.sai.disk.format.IndexComponent;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
+import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
+import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.lucene.store.DataOutput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.packed.DirectWriter;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static java.lang.Math.max;
+
+/**
+ * Encodes, compresses and writes postings lists to disk.
+ * &lt;p&gt;
+ * All postings in the posting list are delta encoded, then deltas are divided into blocks for compression.
+ * The deltas are based on the final value of the previous block. For the first block in the posting list
+ * the first value in the block is written as a VLong prior to block delta encodings.
+ * &lt;p&gt;
+ * In packed blocks, longs are encoded with the same bit width (FoR compression). The block size (i.e. number of
+ * longs inside block) is fixed (currently 128). Additionally blocks that are all the same value are encoded in an
+ * optimized way.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * In VLong blocks, longs are compressed with {@link DataOutput#writeVLong}. The block size is variable.
+ * &lt;/p&gt;
+ *
+ * &lt;p&gt;
+ * Packed blocks are favoured, meaning when the postings are long enough, {@link PostingsWriter} will try
+ * to encode most data as a packed block. Take a term with 259 postings as an example, the first 256 postings are encoded
+ * as two packed blocks, while the remaining 3 are encoded as one VLong block.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Each posting list ends with a block summary containing metadata and a skip table, written right after all postings
+ * blocks. Skip interval is the same as block size, and each skip entry points to the end of each block.
+ * Skip table consist of block offsets and last values of each block, compressed as two FoR blocks.
+ * &lt;/p&gt;
+ *
+ * Visual representation of the disk format:
+ * &lt;pre&gt;
+ *
+ * +========+========================+=====+==============+===============+===============+=====+========================+========+
+ * | HEADER | POSTINGS LIST (TERM 1)                                                      | ... | POSTINGS LIST (TERM N) | FOOTER |
+ * +========+========================+=====+==============+===============+===============+=====+========================+========+
+ *          | FIRST VALUE| FOR BLOCK (1)| ... | FOR BLOCK (N)| BLOCK SUMMARY              |
+ *          +---------------------------+-----+--------------+---------------+------------+
+ *                                                           | BLOCK SIZE    |            |
+ *                                                           | LIST SIZE     | SKIP TABLE |
+ *                                                           +---------------+------------+
+ *                                                                           | BLOCKS POS.|
+ *                                                                           | MAX VALUES |
+ *                                                                           +------------+
+ *
+ *  &lt;/pre&gt;
+ */
+@NotThreadSafe
+public class PostingsWriter implements Closeable
+{
+<span class="fc" id="L90">    protected static final Logger logger = LoggerFactory.getLogger(PostingsWriter.class);</span>
+
+    // import static org.apache.lucene.codecs.lucene50.Lucene50PostingsFormat.BLOCK_SIZE;
+    private final static int BLOCK_SIZE = 128;
+
+    private static final String POSTINGS_MUST_BE_SORTED_ERROR_MSG = &quot;Postings must be sorted ascending, got [%s] after [%s]&quot;;
+
+    private final IndexOutput dataOutput;
+    private final int blockSize;
+    private final long[] deltaBuffer;
+<span class="fc" id="L100">    private final LongArrayList blockOffsets = new LongArrayList();</span>
+<span class="fc" id="L101">    private final LongArrayList blockMaximumPostings = new LongArrayList();</span>
+<span class="fc" id="L102">    private final ResettableByteBuffersIndexOutput inMemoryOutput = new ResettableByteBuffersIndexOutput(&quot;blockOffsets&quot;);</span>
+
+    private final long startOffset;
+
+    private int bufferUpto;
+<span class="fc" id="L107">    private long firstPosting = Long.MIN_VALUE;</span>
+<span class="fc" id="L108">    private long lastPosting = Long.MIN_VALUE;</span>
+    private long maxDelta;
+    private long totalPostings;
+
+    public PostingsWriter(IndexDescriptor indexDescriptor, IndexContext indexContext) throws IOException
+    {
+<span class="fc" id="L114">        this(indexDescriptor, indexContext, BLOCK_SIZE);</span>
+<span class="fc" id="L115">    }</span>
+
+    public PostingsWriter(IndexOutputWriter dataOutput) throws IOException
+    {
+<span class="fc" id="L119">        this(dataOutput, BLOCK_SIZE);</span>
+<span class="fc" id="L120">    }</span>
+
+    @VisibleForTesting
+    PostingsWriter(IndexDescriptor indexDescriptor, IndexContext indexContext, int blockSize) throws IOException
+    {
+<span class="fc" id="L125">        this(indexDescriptor.openPerIndexOutput(IndexComponent.POSTING_LISTS, indexContext, true), blockSize);</span>
+<span class="fc" id="L126">    }</span>
+
+    private PostingsWriter(IndexOutputWriter dataOutput, int blockSize) throws IOException
+<span class="fc" id="L129">    {</span>
+<span class="fc" id="L130">        this.blockSize = blockSize;</span>
+<span class="fc" id="L131">        this.dataOutput = dataOutput;</span>
+<span class="fc" id="L132">        startOffset = dataOutput.getFilePointer();</span>
+<span class="fc" id="L133">        deltaBuffer = new long[blockSize];</span>
+<span class="fc" id="L134">        SAICodecUtils.writeHeader(dataOutput);</span>
+<span class="fc" id="L135">    }</span>
+
+    /**
+     * @return current file pointer
+     */
+    public long getFilePointer()
+    {
+<span class="fc" id="L142">        return dataOutput.getFilePointer();</span>
+    }
+
+    /**
+     * @return file pointer where index structure begins (before header)
+     */
+    public long getStartOffset()
+    {
+<span class="fc" id="L150">        return startOffset;</span>
+    }
+
+    /**
+     * write footer to the postings
+     */
+    public void complete() throws IOException
+    {
+<span class="fc" id="L158">        SAICodecUtils.writeFooter(dataOutput);</span>
+<span class="fc" id="L159">    }</span>
+
+    @Override
+    public void close() throws IOException
+    {
+<span class="fc" id="L164">        dataOutput.close();</span>
+<span class="fc" id="L165">    }</span>
+
+    /**
+     * Encodes, compresses and flushes given posting list to disk.
+     *
+     * @param postings posting list to write to disk
+     *
+     * @return file offset to the summary block of this posting list
+     */
+    public long write(PostingList postings) throws IOException
+    {
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">        checkArgument(postings != null, &quot;Expected non-null posting list.&quot;);</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        checkArgument(postings.size() &gt; 0, &quot;Expected non-empty posting list.&quot;);</span>
+
+<span class="fc" id="L179">        lastPosting = Long.MIN_VALUE;</span>
+<span class="fc" id="L180">        resetBlockCounters();</span>
+<span class="fc" id="L181">        blockOffsets.clear();</span>
+<span class="fc" id="L182">        blockMaximumPostings.clear();</span>
+
+        long posting;
+        // When postings list are merged, we don't know exact size, just an upper bound.
+        // We need to count how many postings we added to the block ourselves.
+<span class="fc" id="L187">        int size = 0;</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        while ((posting = postings.nextPosting()) != PostingList.END_OF_STREAM)</span>
+        {
+<span class="fc" id="L190">            writePosting(posting);</span>
+<span class="fc" id="L191">            size++;</span>
+<span class="fc" id="L192">            totalPostings++;</span>
+        }
+
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">        assert size &gt; 0 : &quot;No postings were written&quot;;</span>
+
+<span class="fc" id="L197">        finish();</span>
+
+<span class="fc" id="L199">        final long summaryOffset = dataOutput.getFilePointer();</span>
+<span class="fc" id="L200">        writeSummary(size);</span>
+<span class="fc" id="L201">        return summaryOffset;</span>
+    }
+
+    public long getTotalPostings()
+    {
+<span class="fc" id="L206">        return totalPostings;</span>
+    }
+
+    private void writePosting(long posting) throws IOException
+    {
+<span class="fc bfc" id="L211" title="All 2 branches covered.">        if (lastPosting == Long.MIN_VALUE)</span>
+        {
+<span class="fc" id="L213">            firstPosting = posting;</span>
+<span class="fc" id="L214">            deltaBuffer[bufferUpto++] = 0;</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">            if (posting &lt; lastPosting)</span>
+<span class="nc" id="L219">                throw new IllegalArgumentException(String.format(POSTINGS_MUST_BE_SORTED_ERROR_MSG, posting, lastPosting));</span>
+<span class="fc" id="L220">            long delta = posting - lastPosting;</span>
+<span class="fc" id="L221">            maxDelta = max(maxDelta, delta);</span>
+<span class="fc" id="L222">            deltaBuffer[bufferUpto++] = delta;</span>
+        }
+<span class="fc" id="L224">        lastPosting = posting;</span>
+
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        if (bufferUpto == blockSize)</span>
+        {
+<span class="nc" id="L228">            addBlockToSkipTable();</span>
+<span class="nc" id="L229">            writePostingsBlock();</span>
+<span class="nc" id="L230">            resetBlockCounters();</span>
+        }
+<span class="fc" id="L232">    }</span>
+
+    private void finish() throws IOException
+    {
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">        if (bufferUpto &gt; 0)</span>
+        {
+<span class="fc" id="L238">            addBlockToSkipTable();</span>
+<span class="fc" id="L239">            writePostingsBlock();</span>
+        }
+<span class="fc" id="L241">    }</span>
+
+    private void resetBlockCounters()
+    {
+<span class="fc" id="L245">        firstPosting = Long.MIN_VALUE;</span>
+<span class="fc" id="L246">        bufferUpto = 0;</span>
+<span class="fc" id="L247">        maxDelta = 0;</span>
+<span class="fc" id="L248">    }</span>
+
+    private void addBlockToSkipTable()
+    {
+<span class="fc" id="L252">        blockOffsets.add(dataOutput.getFilePointer());</span>
+<span class="fc" id="L253">        blockMaximumPostings.add(lastPosting);</span>
+<span class="fc" id="L254">    }</span>
+
+    private void writeSummary(int exactSize) throws IOException
+    {
+<span class="fc" id="L258">        dataOutput.writeVInt(blockSize);</span>
+<span class="fc" id="L259">        dataOutput.writeVInt(exactSize);</span>
+<span class="fc" id="L260">        writeSkipTable();</span>
+<span class="fc" id="L261">    }</span>
+
+    private void writeSkipTable() throws IOException
+    {
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">        assert blockOffsets.size() == blockMaximumPostings.size();</span>
+<span class="fc" id="L266">        dataOutput.writeVInt(blockOffsets.size());</span>
+
+        // compressing offsets in memory first, to know the exact length (with padding)
+<span class="fc" id="L269">        inMemoryOutput.reset();</span>
+
+<span class="fc" id="L271">        writeSortedFoRBlock(blockOffsets, inMemoryOutput);</span>
+<span class="fc" id="L272">        dataOutput.writeVLong(inMemoryOutput.getFilePointer());</span>
+<span class="fc" id="L273">        inMemoryOutput.copyTo(dataOutput);</span>
+<span class="fc" id="L274">        writeSortedFoRBlock(blockMaximumPostings, dataOutput);</span>
+<span class="fc" id="L275">    }</span>
+
+    private void writePostingsBlock() throws IOException
+    {
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        final int bitsPerValue = maxDelta == 0 ? 0 : DirectWriter.unsignedBitsRequired(maxDelta);</span>
+
+        // If we have a first posting, indicating that this is the first block in the posting list
+        // then write it prior to the deltas.
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (firstPosting != Long.MIN_VALUE)</span>
+<span class="fc" id="L284">            dataOutput.writeVLong(firstPosting);</span>
+
+<span class="fc" id="L286">        dataOutput.writeByte((byte) bitsPerValue);</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">        if (bitsPerValue &gt; 0)</span>
+        {
+<span class="fc" id="L289">            final DirectWriter writer = DirectWriter.getInstance(dataOutput, blockSize, bitsPerValue);</span>
+<span class="fc bfc" id="L290" title="All 2 branches covered.">            for (int index = 0; index &lt; bufferUpto; ++index)</span>
+            {
+<span class="fc" id="L292">                writer.add(deltaBuffer[index]);</span>
+            }
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">            if (bufferUpto &lt; blockSize)</span>
+            {
+                // Pad the rest of the block with 0, so we don't write invalid
+                // values from previous blocks
+<span class="fc bfc" id="L298" title="All 2 branches covered.">                for (int index = bufferUpto; index &lt; blockSize; index++)</span>
+                {
+<span class="fc" id="L300">                    writer.add(0);</span>
+                }
+            }
+<span class="fc" id="L303">            writer.finish();</span>
+        }
+<span class="fc" id="L305">    }</span>
+
+    private void writeSortedFoRBlock(LongArrayList values, IndexOutput output) throws IOException
+    {
+<span class="fc" id="L309">        final long maxValue = values.getLong(values.size() - 1);</span>
+
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">        assert values.size() &gt; 0;</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">        final int bitsPerValue = maxValue == 0 ? 0 : DirectWriter.unsignedBitsRequired(maxValue);</span>
+<span class="fc" id="L313">        output.writeByte((byte) bitsPerValue);</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">        if (bitsPerValue &gt; 0)</span>
+        {
+<span class="fc" id="L316">            final DirectWriter writer = DirectWriter.getInstance(output, values.size(), bitsPerValue);</span>
+<span class="fc bfc" id="L317" title="All 2 branches covered.">            for (int i = 0; i &lt; values.size(); ++i)</span>
+            {
+<span class="fc" id="L319">                writer.add(values.getLong(i));</span>
+            }
+<span class="fc" id="L321">            writer.finish();</span>
+        }
+<span class="fc" id="L323">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

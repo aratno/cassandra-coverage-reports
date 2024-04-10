@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTable.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTable.java</span></div><h1>SSTable.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
+import com.google.common.collect.Collections2;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
+
+import org.apache.cassandra.cache.ChunkCache;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.format.TOCComponent;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.SharedCloseable;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR;
+import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
+
+/**
+ * This class represents an abstract sstable on disk whose keys and corresponding partitions are stored in
+ * a {@link SSTableFormat.Components#DATA} file in order as imposed by {@link DecoratedKey#comparator}.
+ */
+public abstract class SSTable
+{
+    public static final int TOMBSTONE_HISTOGRAM_BIN_SIZE = 100;
+    public static final int TOMBSTONE_HISTOGRAM_SPOOL_SIZE = 100000;
+<span class="fc" id="L71">    public static final int TOMBSTONE_HISTOGRAM_TTL_ROUND_SECONDS = CassandraRelevantProperties.STREAMING_HISTOGRAM_ROUND_SECONDS.getInt();</span>
+
+    public final Descriptor descriptor;
+    protected final Set&lt;Component&gt; components;
+    public final boolean compression;
+
+    protected final TableMetadataRef metadata;
+
+    public final ChunkCache chunkCache;
+    public final IOOptions ioOptions;
+
+    @Nullable
+    private final WeakReference&lt;Owner&gt; owner;
+
+    public SSTable(Builder&lt;?, ?&gt; builder, Owner owner)
+<span class="fc" id="L86">    {</span>
+<span class="fc" id="L87">        this.owner = new WeakReference&lt;&gt;(owner);</span>
+<span class="fc" id="L88">        checkNotNull(builder.descriptor);</span>
+<span class="fc" id="L89">        checkNotNull(builder.getComponents());</span>
+
+<span class="fc" id="L91">        this.descriptor = builder.descriptor;</span>
+<span class="fc" id="L92">        this.ioOptions = builder.getIOOptions();</span>
+<span class="fc" id="L93">        this.components = new CopyOnWriteArraySet&lt;&gt;(builder.getComponents());</span>
+<span class="fc" id="L94">        this.compression = components.contains(Components.COMPRESSION_INFO);</span>
+<span class="fc" id="L95">        this.metadata = builder.getTableMetadataRef();</span>
+<span class="fc" id="L96">        this.chunkCache = builder.getChunkCache();</span>
+<span class="fc" id="L97">    }</span>
+
+    public final Optional&lt;Owner&gt; owner()
+    {
+<span class="pc bpc" id="L101" title="1 of 2 branches missed.">        if (owner == null)</span>
+<span class="nc" id="L102">            return Optional.empty();</span>
+<span class="fc" id="L103">        return Optional.ofNullable(owner.get());</span>
+    }
+
+    public static void rename(Descriptor tmpdesc, Descriptor newdesc, Set&lt;Component&gt; components)
+    {
+<span class="fc" id="L108">        components.stream()</span>
+<span class="fc bfc" id="L109" title="All 2 branches covered.">                  .filter(c -&gt; !newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="fc bfc" id="L110" title="All 2 branches covered.">                  .filter(c -&gt; !c.equals(Components.DATA))</span>
+<span class="fc" id="L111">                  .forEach(c -&gt; tmpdesc.fileFor(c).move(newdesc.fileFor(c)));</span>
+
+        // do -Data last because -Data present should mean the sstable was completely renamed before crash
+<span class="fc" id="L114">        tmpdesc.fileFor(Components.DATA).move(newdesc.fileFor(Components.DATA));</span>
+
+        // rename it without confirmation because summary can be available for loadNewSSTables but not for closeAndOpenReader
+<span class="fc" id="L117">        components.stream()</span>
+<span class="fc" id="L118">                  .filter(c -&gt; newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="fc" id="L119">                  .forEach(c -&gt; tmpdesc.fileFor(c).tryMove(newdesc.fileFor(c)));</span>
+<span class="fc" id="L120">    }</span>
+
+    public static void copy(Descriptor tmpdesc, Descriptor newdesc, Set&lt;Component&gt; components)
+    {
+<span class="nc" id="L124">        components.stream()</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">                  .filter(c -&gt; !newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                  .filter(c -&gt; !c.equals(Components.DATA))</span>
+<span class="nc" id="L127">                  .forEach(c -&gt; FileUtils.copyWithConfirm(tmpdesc.fileFor(c), newdesc.fileFor(c)));</span>
+
+        // do -Data last because -Data present should mean the sstable was completely copied before crash
+<span class="nc" id="L130">        FileUtils.copyWithConfirm(tmpdesc.fileFor(Components.DATA), newdesc.fileFor(Components.DATA));</span>
+
+        // copy it without confirmation because summary can be available for loadNewSSTables but not for closeAndOpenReader
+<span class="nc" id="L133">        components.stream()</span>
+<span class="nc" id="L134">                  .filter(c -&gt; newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="nc" id="L135">                  .forEach(c -&gt; FileUtils.copyWithOutConfirm(tmpdesc.fileFor(c), newdesc.fileFor(c)));</span>
+<span class="nc" id="L136">    }</span>
+
+    public static void hardlink(Descriptor tmpdesc, Descriptor newdesc, Set&lt;Component&gt; components)
+    {
+<span class="fc" id="L140">        components.stream()</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">                  .filter(c -&gt; !newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">                  .filter(c -&gt; !c.equals(Components.DATA))</span>
+<span class="fc" id="L143">                  .forEach(c -&gt; FileUtils.createHardLinkWithConfirm(tmpdesc.fileFor(c), newdesc.fileFor(c)));</span>
+
+        // do -Data last because -Data present should mean the sstable was completely copied before crash
+<span class="fc" id="L146">        FileUtils.createHardLinkWithConfirm(tmpdesc.fileFor(Components.DATA), newdesc.fileFor(Components.DATA));</span>
+
+        // copy it without confirmation because summary can be available for loadNewSSTables but not for closeAndOpenReader
+<span class="fc" id="L149">        components.stream()</span>
+<span class="fc" id="L150">                  .filter(c -&gt; newdesc.getFormat().generatedOnLoadComponents().contains(c))</span>
+<span class="fc" id="L151">                  .forEach(c -&gt; FileUtils.createHardLinkWithoutConfirm(tmpdesc.fileFor(c), newdesc.fileFor(c)));</span>
+<span class="fc" id="L152">    }</span>
+
+    public abstract DecoratedKey getFirst();
+
+    public abstract DecoratedKey getLast();
+
+    public abstract AbstractBounds&lt;Token&gt; getBounds();
+
+    @VisibleForTesting
+    public Set&lt;Component&gt; getComponents()
+    {
+<span class="fc" id="L163">        return ImmutableSet.copyOf(components);</span>
+    }
+
+    /**
+     * Returns all SSTable components that should be streamed.
+     */
+    public Set&lt;Component&gt; getStreamingComponents()
+    {
+<span class="fc" id="L171">        return components.stream()</span>
+<span class="fc" id="L172">                         .filter(c -&gt; c.type.streamable)</span>
+<span class="fc" id="L173">                         .collect(Collectors.toSet());</span>
+    }
+
+    public TableMetadata metadata()
+    {
+<span class="fc" id="L178">        return metadata.get();</span>
+    }
+
+    public IPartitioner getPartitioner()
+    {
+<span class="fc" id="L183">        return metadata().partitioner;</span>
+    }
+
+    public DecoratedKey decorateKey(ByteBuffer key)
+    {
+<span class="fc" id="L188">        return getPartitioner().decorateKey(key);</span>
+    }
+
+    public String getFilename()
+    {
+<span class="fc" id="L193">        return descriptor.fileFor(Components.DATA).absolutePath();</span>
+    }
+
+    public String getColumnFamilyName()
+    {
+<span class="fc" id="L198">        return descriptor.cfname;</span>
+    }
+
+    public String getKeyspaceName()
+    {
+<span class="fc" id="L203">        return descriptor.ksname;</span>
+    }
+
+    public List&lt;String&gt; getAllFilePaths()
+    {
+<span class="fc" id="L208">        List&lt;String&gt; ret = new ArrayList&lt;&gt;(components.size());</span>
+<span class="fc bfc" id="L209" title="All 2 branches covered.">        for (Component component : components)</span>
+<span class="fc" id="L210">            ret.add(descriptor.fileFor(component).absolutePath());</span>
+<span class="fc" id="L211">        return ret;</span>
+    }
+
+    /**
+     * The method sets fields for this sstable representation on the provided {@link Builder}. The method is intended
+     * to be called from the overloaded {@code unbuildTo} method in subclasses.
+     *
+     * @param builder    the builder on which the fields should be set
+     * @param sharedCopy whether the {@link SharedCloseable} resources should be passed as shared copies or directly;
+     *                   note that the method will overwrite the fields representing {@link SharedCloseable} only if
+     *                   they are not set in the builder yet (the relevant fields in the builder are {@code null}).
+     *                   Although {@link SSTable} does not keep any references to resources, the parameters is added
+     *                   for the possible future fields and for consistency with the overloaded implementations in
+     *                   subclasses
+     * @return the same instance of builder as provided
+     */
+    protected final &lt;B extends Builder&lt;?, B&gt;&gt; B unbuildTo(B builder, boolean sharedCopy)
+    {
+<span class="fc" id="L229">        return builder.setTableMetadataRef(metadata)</span>
+<span class="fc" id="L230">                      .setComponents(components)</span>
+<span class="fc" id="L231">                      .setChunkCache(chunkCache)</span>
+<span class="fc" id="L232">                      .setIOOptions(ioOptions);</span>
+    }
+
+    /**
+     * Parse a sstable filename into both a {@link Descriptor} and {@code Component} object.
+     *
+     * @param file the filename to parse.
+     * @return a pair of the {@code Descriptor} and {@code Component} corresponding to {@code file} if it corresponds to
+     * a valid and supported sstable filename, {@code null} otherwise. Note that components of an unknown type will be
+     * returned as CUSTOM ones.
+     */
+    public static Pair&lt;Descriptor, Component&gt; tryComponentFromFilename(File file)
+    {
+        try
+        {
+<span class="fc" id="L247">            return Descriptor.fromFileWithComponent(file);</span>
+        }
+<span class="fc" id="L249">        catch (Throwable e)</span>
+        {
+<span class="fc" id="L251">            return null;</span>
+        }
+    }
+
+    /**
+     * Parse a sstable filename into both a {@link Descriptor} and {@code Component} object.
+     *
+     * @param file     the filename to parse.
+     * @param keyspace The keyspace name of the file.
+     * @param table    The table name of the file.
+     * @return a pair of the {@code Descriptor} and {@code Component} corresponding to {@code file} if it corresponds to
+     * a valid and supported sstable filename, {@code null} otherwise. Note that components of an unknown type will be
+     * returned as CUSTOM ones.
+     */
+    public static Pair&lt;Descriptor, Component&gt; tryComponentFromFilename(File file, String keyspace, String table)
+    {
+        try
+        {
+<span class="fc" id="L269">            return Descriptor.fromFileWithComponent(file, keyspace, table);</span>
+        }
+<span class="nc" id="L271">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L273">            return null;</span>
+        }
+    }
+
+    /**
+     * Parse a sstable filename into a {@link Descriptor} object.
+     * &lt;p&gt;
+     * Note that this method ignores the component part of the filename; if this is not what you want, use
+     * {@link #tryComponentFromFilename} instead.
+     *
+     * @param file the filename to parse.
+     * @return the {@code Descriptor} corresponding to {@code file} if it corresponds to a valid and supported sstable
+     * filename, {@code null} otherwise.
+     */
+    public static Descriptor tryDescriptorFromFile(File file)
+    {
+        try
+        {
+<span class="fc" id="L291">            return Descriptor.fromFile(file);</span>
+        }
+<span class="fc" id="L293">        catch (Throwable e)</span>
+        {
+<span class="fc" id="L295">            return null;</span>
+        }
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L302">        return String.format(&quot;%s:%s(path='%s')&quot;, getClass().getSimpleName(), descriptor.version.format.name(), getFilename());</span>
+    }
+
+    public static void validateRepairedMetadata(long repairedAt, TimeUUID pendingRepair, boolean isTransient)
+    {
+<span class="fc bfc" id="L307" title="All 4 branches covered.">        Preconditions.checkArgument((pendingRepair == NO_PENDING_REPAIR) || (repairedAt == UNREPAIRED_SSTABLE),</span>
+                                    &quot;pendingRepair cannot be set on a repaired sstable&quot;);
+<span class="fc bfc" id="L309" title="All 4 branches covered.">        Preconditions.checkArgument(!isTransient || (pendingRepair != NO_PENDING_REPAIR),</span>
+                                    &quot;isTransient can only be true for sstables pending repair&quot;);
+<span class="fc" id="L311">    }</span>
+
+    /**
+     * Registers new custom components. Used by custom compaction strategies.
+     * Adding a component for the second time is a no-op.
+     * Don't remove this - this method is a part of the public API, intended for use by custom compaction strategies.
+     *
+     * @param newComponents collection of components to be added
+     */
+    public synchronized void addComponents(Collection&lt;Component&gt; newComponents)
+    {
+<span class="fc" id="L322">        Collection&lt;Component&gt; componentsToAdd = Collections2.filter(newComponents, Predicates.not(Predicates.in(components)));</span>
+<span class="fc" id="L323">        TOCComponent.appendTOC(descriptor, componentsToAdd);</span>
+<span class="fc" id="L324">        components.addAll(componentsToAdd);</span>
+<span class="fc" id="L325">    }</span>
+
+    /**
+     * Registers new custom components into sstable and update size tracking
+     * @param newComponents collection of components to be added
+     * @param tracker used to update on-disk size metrics
+     */
+    public synchronized void registerComponents(Collection&lt;Component&gt; newComponents, Tracker tracker)
+    {
+<span class="fc bfc" id="L334" title="All 2 branches covered.">        Collection&lt;Component&gt; componentsToAdd = new HashSet&lt;&gt;(Collections2.filter(newComponents, x -&gt; !components.contains(x)));</span>
+<span class="fc" id="L335">        TOCComponent.appendTOC(descriptor, componentsToAdd);</span>
+<span class="fc" id="L336">        components.addAll(componentsToAdd);</span>
+
+<span class="fc bfc" id="L338" title="All 2 branches covered.">        for (Component component : componentsToAdd)</span>
+        {
+<span class="fc" id="L340">            File file = descriptor.fileFor(component);</span>
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">            if (file.exists())</span>
+<span class="fc" id="L342">                tracker.updateLiveDiskSpaceUsed(file.length());</span>
+<span class="fc" id="L343">        }</span>
+<span class="fc" id="L344">    }</span>
+
+    /**
+     * Unregisters custom components from sstable and update size tracking
+     * @param removeComponents collection of components to be remove
+     * @param tracker used to update on-disk size metrics
+     */
+    public synchronized void unregisterComponents(Collection&lt;Component&gt; removeComponents, Tracker tracker)
+    {
+<span class="fc" id="L353">        Collection&lt;Component&gt; componentsToRemove = new HashSet&lt;&gt;(Collections2.filter(removeComponents, components::contains));</span>
+<span class="fc" id="L354">        components.removeAll(componentsToRemove);</span>
+<span class="fc" id="L355">        TOCComponent.rewriteTOC(descriptor, components);</span>
+
+<span class="fc bfc" id="L357" title="All 2 branches covered.">        for (Component component : componentsToRemove)</span>
+        {
+<span class="fc" id="L359">            File file = descriptor.fileFor(component);</span>
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">            if (file.exists())</span>
+<span class="fc" id="L361">                tracker.updateLiveDiskSpaceUsed(-file.length());</span>
+<span class="fc" id="L362">        }</span>
+<span class="fc" id="L363">    }</span>
+
+    public interface Owner
+    {
+        Double getCrcCheckChance();
+
+        OpOrder.Barrier newReadOrderingBarrier();
+
+        TableMetrics getMetrics();
+    }
+
+    /**
+     * A builder of this sstable representation. It should be extended for each implementation with the specific fields.
+     *
+     * @param &lt;S&gt; type of the sstable representation to be build with this builder
+     * @param &lt;B&gt; type of this builder
+     */
+    public static class Builder&lt;S extends SSTable, B extends Builder&lt;S, B&gt;&gt;
+    {
+        public final Descriptor descriptor;
+
+        private Set&lt;Component&gt; components;
+        private TableMetadataRef tableMetadataRef;
+<span class="fc" id="L386">        private ChunkCache chunkCache = ChunkCache.instance;</span>
+<span class="fc" id="L387">        private IOOptions ioOptions = IOOptions.fromDatabaseDescriptor();</span>
+
+        public Builder(Descriptor descriptor)
+<span class="fc" id="L390">        {</span>
+<span class="fc" id="L391">            checkNotNull(descriptor);</span>
+<span class="fc" id="L392">            this.descriptor = descriptor;</span>
+<span class="fc" id="L393">        }</span>
+
+        public B setComponents(Collection&lt;Component&gt; components)
+        {
+<span class="fc bfc" id="L397" title="All 2 branches covered.">            if (components != null)</span>
+            {
+<span class="fc" id="L399">                components.forEach(c -&gt; Preconditions.checkState(c.isValidFor(descriptor), &quot;Invalid component type for sstable format &quot; + descriptor.version.format.name()));</span>
+<span class="fc" id="L400">                this.components = ImmutableSet.copyOf(components);</span>
+            }
+            else
+            {
+<span class="fc" id="L404">                this.components = null;</span>
+            }
+<span class="fc" id="L406">            return (B) this;</span>
+        }
+
+        public B addComponents(Collection&lt;Component&gt; components)
+        {
+<span class="pc bpc" id="L411" title="1 of 4 branches missed.">            if (components == null || components.isEmpty())</span>
+<span class="fc" id="L412">                return (B) this;</span>
+
+<span class="fc bfc" id="L414" title="All 2 branches covered.">            if (this.components == null)</span>
+<span class="fc" id="L415">                return setComponents(components);</span>
+
+<span class="fc" id="L417">            return setComponents(Sets.union(this.components, ImmutableSet.copyOf(components)));</span>
+        }
+
+        public B setTableMetadataRef(TableMetadataRef ref)
+        {
+<span class="fc" id="L422">            this.tableMetadataRef = ref;</span>
+<span class="fc" id="L423">            return (B) this;</span>
+        }
+
+        public B setChunkCache(ChunkCache chunkCache)
+        {
+<span class="fc" id="L428">            this.chunkCache = chunkCache;</span>
+<span class="fc" id="L429">            return (B) this;</span>
+        }
+
+        public B setIOOptions(IOOptions ioOptions)
+        {
+<span class="fc" id="L434">            this.ioOptions = ioOptions;</span>
+<span class="fc" id="L435">            return (B) this;</span>
+        }
+
+        public Descriptor getDescriptor()
+        {
+<span class="nc" id="L440">            return descriptor;</span>
+        }
+
+        public Set&lt;Component&gt; getComponents()
+        {
+<span class="fc" id="L445">            return components;</span>
+        }
+
+        public TableMetadataRef getTableMetadataRef()
+        {
+<span class="fc" id="L450">            return tableMetadataRef;</span>
+        }
+
+        public ChunkCache getChunkCache()
+        {
+<span class="fc" id="L455">            return chunkCache;</span>
+        }
+
+        public IOOptions getIOOptions()
+        {
+<span class="fc" id="L460">            return ioOptions;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

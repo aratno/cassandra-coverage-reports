@@ -1,0 +1,1055 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ModificationStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">ModificationStatement.java</span></div><h1>ModificationStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.HashMultiset;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaLayout;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.ViewMetadata;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.conditions.ColumnCondition;
+import org.apache.cassandra.cql3.conditions.ColumnConditions;
+import org.apache.cassandra.cql3.conditions.Conditions;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.selection.ResultSetBuilder;
+import org.apache.cassandra.cql3.selection.Selection;
+import org.apache.cassandra.cql3.selection.Selection.Selectors;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.metrics.ClientRequestSizeMetrics;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.disk.usage.DiskUsageBroadcaster;
+import org.apache.cassandra.service.paxos.Ballot;
+import org.apache.cassandra.service.paxos.BallotGenerator;
+import org.apache.cassandra.service.paxos.Commit.Proposal;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.triggers.TriggerExecutor;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MD5Digest;
+import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNull;
+import static org.apache.cassandra.service.paxos.Ballot.Flag.NONE;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+/*
+ * Abstract parent class of individual modifications, i.e. INSERT, UPDATE and DELETE.
+ */
+public abstract class ModificationStatement implements CQLStatement.SingleKeyspaceCqlStatement
+{
+<span class="fc" id="L78">    protected static final Logger logger = LoggerFactory.getLogger(ModificationStatement.class);</span>
+
+<span class="fc" id="L80">    private final static MD5Digest EMPTY_HASH = MD5Digest.wrap(new byte[] {});</span>
+
+    public static final String CUSTOM_EXPRESSIONS_NOT_ALLOWED =
+        &quot;Custom index expressions cannot be used in WHERE clauses for UPDATE or DELETE statements&quot;;
+
+<span class="fc" id="L85">    private static final ColumnIdentifier CAS_RESULT_COLUMN = new ColumnIdentifier(&quot;[applied]&quot;, false);</span>
+
+    protected final StatementType type;
+
+    protected final VariableSpecifications bindVariables;
+
+    public final TableMetadata metadata;
+    private final Attributes attrs;
+
+    private final StatementRestrictions restrictions;
+
+    private final Operations operations;
+
+    private final RegularAndStaticColumns updatedColumns;
+
+    private final Conditions conditions;
+
+    private final RegularAndStaticColumns conditionColumns;
+
+    private final RegularAndStaticColumns requiresRead;
+
+    public ModificationStatement(StatementType type,
+                                 VariableSpecifications bindVariables,
+                                 TableMetadata metadata,
+                                 Operations operations,
+                                 StatementRestrictions restrictions,
+                                 Conditions conditions,
+                                 Attributes attrs)
+<span class="fc" id="L113">    {</span>
+<span class="fc" id="L114">        this.type = type;</span>
+<span class="fc" id="L115">        this.bindVariables = bindVariables;</span>
+<span class="fc" id="L116">        this.metadata = metadata;</span>
+<span class="fc" id="L117">        this.restrictions = restrictions;</span>
+<span class="fc" id="L118">        this.operations = operations;</span>
+<span class="fc" id="L119">        this.conditions = conditions;</span>
+<span class="fc" id="L120">        this.attrs = attrs;</span>
+
+<span class="fc bfc" id="L122" title="All 2 branches covered.">        if (!conditions.isEmpty())</span>
+        {
+<span class="fc" id="L124">            checkFalse(metadata.isCounter(), &quot;Conditional updates are not supported on counter tables&quot;);</span>
+<span class="fc" id="L125">            checkFalse(attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+        }
+
+<span class="fc" id="L128">        RegularAndStaticColumns.Builder conditionColumnsBuilder = RegularAndStaticColumns.builder();</span>
+<span class="fc" id="L129">        Iterable&lt;ColumnMetadata&gt; columns = conditions.getColumns();</span>
+<span class="fc bfc" id="L130" title="All 2 branches covered.">        if (columns != null)</span>
+<span class="fc" id="L131">            conditionColumnsBuilder.addAll(columns);</span>
+
+<span class="fc" id="L133">        RegularAndStaticColumns.Builder updatedColumnsBuilder = RegularAndStaticColumns.builder();</span>
+<span class="fc" id="L134">        RegularAndStaticColumns.Builder requiresReadBuilder = RegularAndStaticColumns.builder();</span>
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        for (Operation operation : operations)</span>
+        {
+<span class="fc" id="L137">            updatedColumnsBuilder.add(operation.column);</span>
+            // If the operation requires a read-before-write and we're doing a conditional read, we want to read
+            // the affected column as part of the read-for-conditions paxos phase (see #7499).
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (operation.requiresRead())</span>
+            {
+<span class="fc" id="L142">                conditionColumnsBuilder.add(operation.column);</span>
+<span class="fc" id="L143">                requiresReadBuilder.add(operation.column);</span>
+            }
+<span class="fc" id="L145">        }</span>
+
+<span class="fc" id="L147">        RegularAndStaticColumns modifiedColumns = updatedColumnsBuilder.build();</span>
+
+        // Compact tables have not row marker. So if we don't actually update any particular column,
+        // this means that we're only updating the PK, which we allow if only those were declared in
+        // the definition. In that case however, we do went to write the compactValueColumn (since again
+        // we can't use a &quot;row marker&quot;) so add it automatically.
+<span class="fc bfc" id="L153" title="All 6 branches covered.">        if (metadata.isCompactTable() &amp;&amp; modifiedColumns.isEmpty() &amp;&amp; updatesRegularRows())</span>
+<span class="fc" id="L154">            modifiedColumns = metadata.regularAndStaticColumns();</span>
+
+<span class="fc" id="L156">        this.updatedColumns = modifiedColumns;</span>
+<span class="fc" id="L157">        this.conditionColumns = conditionColumnsBuilder.build();</span>
+<span class="fc" id="L158">        this.requiresRead = requiresReadBuilder.build();</span>
+<span class="fc" id="L159">    }</span>
+
+    @Override
+    public List&lt;ColumnSpecification&gt; getBindVariables()
+    {
+<span class="fc" id="L164">        return bindVariables.getBindVariables();</span>
+    }
+
+    @Override
+    public short[] getPartitionKeyBindVariableIndexes()
+    {
+<span class="fc" id="L170">        return bindVariables.getPartitionKeyBindVariableIndexes(metadata);</span>
+    }
+
+    @Override
+    public Iterable&lt;Function&gt; getFunctions()
+    {
+<span class="fc" id="L176">        List&lt;Function&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L177">        addFunctionsTo(functions);</span>
+<span class="fc" id="L178">        return functions;</span>
+    }
+
+    public void addFunctionsTo(List&lt;Function&gt; functions)
+    {
+<span class="fc" id="L183">        attrs.addFunctionsTo(functions);</span>
+<span class="fc" id="L184">        restrictions.addFunctionsTo(functions);</span>
+<span class="fc" id="L185">        operations.addFunctionsTo(functions);</span>
+<span class="fc" id="L186">        conditions.addFunctionsTo(functions);</span>
+<span class="fc" id="L187">    }</span>
+
+    public TableMetadata metadata()
+    {
+<span class="fc" id="L191">        return metadata;</span>
+    }
+
+    /*
+     * May be used by QueryHandler implementations
+     */
+    public StatementRestrictions getRestrictions()
+    {
+<span class="fc" id="L199">        return restrictions;</span>
+    }
+
+    public abstract void addUpdateForKey(PartitionUpdate.Builder updateBuilder, Clustering&lt;?&gt; clustering, UpdateParameters params);
+
+    public abstract void addUpdateForKey(PartitionUpdate.Builder updateBuilder, Slice slice, UpdateParameters params);
+
+    @Override
+    public String keyspace()
+    {
+<span class="fc" id="L209">        return metadata.keyspace;</span>
+    }
+
+    public String table()
+    {
+<span class="fc" id="L214">        return metadata.name;</span>
+    }
+
+    public boolean isCounter()
+    {
+<span class="fc" id="L219">        return metadata().isCounter();</span>
+    }
+
+    public boolean isView()
+    {
+<span class="fc" id="L224">        return metadata().isView();</span>
+    }
+
+    public boolean isVirtual()
+    {
+<span class="fc" id="L229">        return metadata().isVirtual();</span>
+    }
+
+    public long getTimestamp(long now, QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L234">        return attrs.getTimestamp(now, options);</span>
+    }
+
+    public boolean isTimestampSet()
+    {
+<span class="fc" id="L239">        return attrs.isTimestampSet();</span>
+    }
+
+    public int getTimeToLive(QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L244">        return attrs.getTimeToLive(options, metadata);</span>
+    }
+
+    public void authorize(ClientState state) throws InvalidRequestException, UnauthorizedException
+    {
+<span class="fc" id="L249">        state.ensureTablePermission(metadata, Permission.MODIFY);</span>
+
+        // CAS updates can be used to simulate a SELECT query, so should require Permission.SELECT as well.
+<span class="fc bfc" id="L252" title="All 2 branches covered.">        if (hasConditions())</span>
+<span class="fc" id="L253">            state.ensureTablePermission(metadata, Permission.SELECT);</span>
+
+        // MV updates need to get the current state from the table, and might update the views
+        // Require Permission.SELECT on the base table, and Permission.MODIFY on the views
+<span class="fc" id="L257">        Iterator&lt;ViewMetadata&gt; views = View.findAll(keyspace(), table()).iterator();</span>
+<span class="fc bfc" id="L258" title="All 2 branches covered.">        if (views.hasNext())</span>
+        {
+<span class="fc" id="L260">            state.ensureTablePermission(metadata, Permission.SELECT);</span>
+            do
+            {
+<span class="fc" id="L263">                state.ensureTablePermission(views.next().metadata, Permission.MODIFY);</span>
+<span class="fc bfc" id="L264" title="All 2 branches covered.">            } while (views.hasNext());</span>
+        }
+
+<span class="fc bfc" id="L267" title="All 2 branches covered.">        for (Function function : getFunctions())</span>
+<span class="fc" id="L268">            state.ensurePermission(Permission.EXECUTE, function);</span>
+<span class="fc" id="L269">    }</span>
+
+    public void validate(ClientState state) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L273" title="1 of 4 branches missed.">        checkFalse(hasConditions() &amp;&amp; attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+<span class="fc bfc" id="L274" title="All 4 branches covered.">        checkFalse(isCounter() &amp;&amp; attrs.isTimestampSet(), &quot;Cannot provide custom timestamp for counter updates&quot;);</span>
+<span class="pc bpc" id="L275" title="1 of 4 branches missed.">        checkFalse(isCounter() &amp;&amp; attrs.isTimeToLiveSet(), &quot;Cannot provide custom TTL for counter updates&quot;);</span>
+<span class="fc" id="L276">        checkFalse(isView(), &quot;Cannot directly modify a materialized view&quot;);</span>
+<span class="fc bfc" id="L277" title="All 4 branches covered.">        checkFalse(isVirtual() &amp;&amp; attrs.isTimestampSet(), &quot;Custom timestamp is not supported by virtual tables&quot;);</span>
+<span class="fc bfc" id="L278" title="All 4 branches covered.">        checkFalse(isVirtual() &amp;&amp; attrs.isTimeToLiveSet(), &quot;Expiring columns are not supported by virtual tables&quot;);</span>
+<span class="fc bfc" id="L279" title="All 4 branches covered.">        checkFalse(isVirtual() &amp;&amp; hasConditions(), &quot;Conditional updates are not supported by virtual tables&quot;);</span>
+
+<span class="fc bfc" id="L281" title="All 2 branches covered.">        if (attrs.isTimestampSet())</span>
+<span class="fc" id="L282">            Guardrails.userTimestampsEnabled.ensureEnabled(state);</span>
+<span class="fc" id="L283">    }</span>
+
+    public void validateDiskUsage(QueryOptions options, ClientState state)
+    {
+        // reject writes if any replica exceeds disk usage failure limit or warn if it exceeds warn limit
+<span class="fc bfc" id="L288" title="All 4 branches covered.">        if (Guardrails.replicaDiskUsage.enabled(state) &amp;&amp; DiskUsageBroadcaster.instance.hasStuffedOrFullNode())</span>
+        {
+<span class="fc" id="L290">            Keyspace keyspace = Keyspace.open(keyspace());</span>
+
+<span class="fc bfc" id="L292" title="All 2 branches covered.">            for (ByteBuffer key : buildPartitionKeyNames(options, state))</span>
+            {
+<span class="fc" id="L294">                Token token = metadata().partitioner.getToken(key);</span>
+
+<span class="fc bfc" id="L296" title="All 2 branches covered.">                for (Replica replica : ReplicaLayout.forTokenWriteLiveAndDown(keyspace, token).all())</span>
+                {
+<span class="fc" id="L298">                    Guardrails.replicaDiskUsage.guard(replica.endpoint(), state);</span>
+<span class="fc" id="L299">                }</span>
+<span class="fc" id="L300">            }</span>
+        }
+<span class="fc" id="L302">    }</span>
+
+    public void validateTimestamp(QueryState queryState, QueryOptions options)
+    {
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        if (!isTimestampSet())</span>
+<span class="fc" id="L307">            return;</span>
+
+<span class="fc" id="L309">        long ts = attrs.getTimestamp(options.getTimestamp(queryState), options);</span>
+<span class="fc" id="L310">        Guardrails.maximumAllowableTimestamp.guard(ts, table(), false, queryState.getClientState());</span>
+<span class="fc" id="L311">        Guardrails.minimumAllowableTimestamp.guard(ts, table(), false, queryState.getClientState());</span>
+<span class="fc" id="L312">    }</span>
+
+    public RegularAndStaticColumns updatedColumns()
+    {
+<span class="fc" id="L316">        return updatedColumns;</span>
+    }
+
+    public RegularAndStaticColumns conditionColumns()
+    {
+<span class="fc" id="L321">        return conditionColumns;</span>
+    }
+
+    public boolean updatesRegularRows()
+    {
+        // We're updating regular rows if all the clustering columns are provided.
+        // Note that the only case where we're allowed not to provide clustering
+        // columns is if we set some static columns, and in that case no clustering
+        // columns should be given. So in practice, it's enough to check if we have
+        // either the table has no clustering or if it has at least one of them set.
+<span class="fc bfc" id="L331" title="All 4 branches covered.">        return metadata().clusteringColumns().isEmpty() || restrictions.hasClusteringColumnsRestrictions();</span>
+    }
+
+    public boolean updatesStaticRow()
+    {
+<span class="fc" id="L336">        return operations.appliesToStaticColumns();</span>
+    }
+
+    public List&lt;Operation&gt; getRegularOperations()
+    {
+<span class="fc" id="L341">        return operations.regularOperations();</span>
+    }
+
+    public List&lt;Operation&gt; getStaticOperations()
+    {
+<span class="fc" id="L346">        return operations.staticOperations();</span>
+    }
+
+    public Iterable&lt;Operation&gt; allOperations()
+    {
+<span class="nc" id="L351">        return operations;</span>
+    }
+
+    public Iterable&lt;ColumnMetadata&gt; getColumnsWithConditions()
+    {
+<span class="fc" id="L356">         return conditions.getColumns();</span>
+    }
+
+    public boolean hasIfNotExistCondition()
+    {
+<span class="fc" id="L361">        return conditions.isIfNotExists();</span>
+    }
+
+    public boolean hasIfExistCondition()
+    {
+<span class="fc" id="L366">        return conditions.isIfExists();</span>
+    }
+
+    public List&lt;ByteBuffer&gt; buildPartitionKeyNames(QueryOptions options, ClientState state)
+    throws InvalidRequestException
+    {
+<span class="fc" id="L372">        List&lt;ByteBuffer&gt; partitionKeys = restrictions.getPartitionKeys(options, state);</span>
+<span class="fc bfc" id="L373" title="All 2 branches covered.">        for (ByteBuffer key : partitionKeys)</span>
+<span class="fc" id="L374">            QueryProcessor.validateKey(key);</span>
+
+<span class="fc" id="L376">        return partitionKeys;</span>
+    }
+
+    public NavigableSet&lt;Clustering&lt;?&gt;&gt; createClustering(QueryOptions options, ClientState state)
+    throws InvalidRequestException
+    {
+<span class="fc bfc" id="L382" title="All 4 branches covered.">        if (appliesOnlyToStaticColumns() &amp;&amp; !restrictions.hasClusteringColumnsRestrictions())</span>
+<span class="fc" id="L383">            return FBUtilities.singleton(CBuilder.STATIC_BUILDER.build(), metadata().comparator);</span>
+
+<span class="fc" id="L385">        return restrictions.getClusteringColumns(options, state);</span>
+    }
+
+    /**
+     * Checks that the modification only apply to static columns.
+     * @return &lt;code&gt;true&lt;/code&gt; if the modification only apply to static columns, &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    private boolean appliesOnlyToStaticColumns()
+    {
+<span class="fc" id="L394">        return appliesOnlyToStaticColumns(operations, conditions);</span>
+    }
+
+    /**
+     * Checks that the specified operations and conditions only apply to static columns.
+     * @return &lt;code&gt;true&lt;/code&gt; if the specified operations and conditions only apply to static columns,
+     * &lt;code&gt;false&lt;/code&gt; otherwise.
+     */
+    public static boolean appliesOnlyToStaticColumns(Operations operation, Conditions conditions)
+    {
+<span class="fc bfc" id="L404" title="All 4 branches covered.">        return !operation.appliesToRegularColumns() &amp;&amp; !conditions.appliesToRegularColumns()</span>
+<span class="pc bpc" id="L405" title="1 of 4 branches missed.">                &amp;&amp; (operation.appliesToStaticColumns() || conditions.appliesToStaticColumns());</span>
+    }
+
+    public boolean requiresRead()
+    {
+        // A subset of operations require a read before write:
+        // * Setting list element by index
+        // * Deleting list element by index
+        // * Deleting list element by value
+        // * Performing addition on a StringType (i.e. concatenation, only supported for CAS operations)
+        // * Performing addition on a NumberType, again only supported for CAS operations.
+<span class="fc bfc" id="L416" title="All 2 branches covered.">        return !requiresRead.isEmpty();</span>
+    }
+
+    private Map&lt;DecoratedKey, Partition&gt; readRequiredLists(Collection&lt;ByteBuffer&gt; partitionKeys,
+                                                           ClusteringIndexFilter filter,
+                                                           DataLimits limits,
+                                                           boolean local,
+                                                           ConsistencyLevel cl,
+                                                           long nowInSeconds,
+                                                           long queryStartNanoTime)
+    {
+<span class="fc bfc" id="L427" title="All 2 branches covered.">        if (!requiresRead())</span>
+<span class="fc" id="L428">            return null;</span>
+
+        try
+        {
+<span class="fc" id="L432">            cl.validateForRead();</span>
+        }
+<span class="nc" id="L434">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L436">            throw new InvalidRequestException(String.format(&quot;Write operation require a read but consistency %s is not supported on reads&quot;, cl));</span>
+<span class="fc" id="L437">        }</span>
+
+<span class="fc" id="L439">        List&lt;SinglePartitionReadCommand&gt; commands = new ArrayList&lt;&gt;(partitionKeys.size());</span>
+<span class="fc bfc" id="L440" title="All 2 branches covered.">        for (ByteBuffer key : partitionKeys)</span>
+<span class="fc" id="L441">            commands.add(SinglePartitionReadCommand.create(metadata(),</span>
+                                                           nowInSeconds,
+<span class="fc" id="L443">                                                           ColumnFilter.selection(this.requiresRead),</span>
+<span class="fc" id="L444">                                                           RowFilter.none(),</span>
+                                                           limits,
+<span class="fc" id="L446">                                                           metadata().partitioner.decorateKey(key),</span>
+                                                           filter));
+
+<span class="fc" id="L449">        SinglePartitionReadCommand.Group group = SinglePartitionReadCommand.Group.create(commands, DataLimits.NONE);</span>
+
+<span class="fc bfc" id="L451" title="All 2 branches covered.">        if (local)</span>
+        {
+<span class="fc" id="L453">            try (ReadExecutionController executionController = group.executionController();</span>
+<span class="fc" id="L454">                 PartitionIterator iter = group.executeInternal(executionController))</span>
+            {
+<span class="fc" id="L456">                return asMaterializedMap(iter);</span>
+            }
+        }
+
+<span class="fc" id="L460">        try (PartitionIterator iter = group.execute(cl, null, queryStartNanoTime))</span>
+        {
+<span class="fc" id="L462">            return asMaterializedMap(iter);</span>
+        }
+    }
+
+    private Map&lt;DecoratedKey, Partition&gt; asMaterializedMap(PartitionIterator iterator)
+    {
+<span class="fc" id="L468">        Map&lt;DecoratedKey, Partition&gt; map = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L469" title="All 2 branches covered.">        while (iterator.hasNext())</span>
+        {
+<span class="fc" id="L471">            try (RowIterator partition = iterator.next())</span>
+            {
+<span class="fc" id="L473">                map.put(partition.partitionKey(), FilteredPartition.create(partition));</span>
+            }
+        }
+<span class="fc" id="L476">        return map;</span>
+    }
+
+    public boolean hasConditions()
+    {
+<span class="fc bfc" id="L481" title="All 2 branches covered.">        return !conditions.isEmpty();</span>
+    }
+
+    public boolean hasSlices()
+    {
+<span class="fc bfc" id="L486" title="All 2 branches covered.">        return type.allowClusteringColumnSlices()</span>
+<span class="fc bfc" id="L487" title="All 2 branches covered.">               &amp;&amp; getRestrictions().hasClusteringColumnsRestrictions()</span>
+<span class="fc bfc" id="L488" title="All 2 branches covered.">               &amp;&amp; getRestrictions().isColumnRange();</span>
+    }
+
+    public ResultMessage execute(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">        if (options.getConsistency() == null)</span>
+<span class="nc" id="L495">            throw new InvalidRequestException(&quot;Invalid empty consistency level&quot;);</span>
+
+<span class="fc" id="L497">        Guardrails.writeConsistencyLevels.guard(EnumSet.of(options.getConsistency(), options.getSerialConsistency()),</span>
+<span class="fc" id="L498">                                                queryState.getClientState());</span>
+
+<span class="fc bfc" id="L500" title="All 2 branches covered.">        return hasConditions()</span>
+<span class="fc" id="L501">             ? executeWithCondition(queryState, options, queryStartNanoTime)</span>
+<span class="fc" id="L502">             : executeWithoutCondition(queryState, options, queryStartNanoTime);</span>
+    }
+
+    private ResultMessage executeWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="pc bpc" id="L508" title="1 of 2 branches missed.">        if (isVirtual())</span>
+<span class="nc" id="L509">            return executeInternalWithoutCondition(queryState, options, queryStartNanoTime);</span>
+
+<span class="fc" id="L511">        ConsistencyLevel cl = options.getConsistency();</span>
+<span class="fc bfc" id="L512" title="All 2 branches covered.">        if (isCounter())</span>
+<span class="fc" id="L513">            cl.validateCounterForWrite(metadata());</span>
+        else
+<span class="fc" id="L515">            cl.validateForWrite();</span>
+
+<span class="fc" id="L517">        validateDiskUsage(options, queryState.getClientState());</span>
+<span class="fc" id="L518">        validateTimestamp(queryState, options);</span>
+
+<span class="fc" id="L520">        List&lt;? extends IMutation&gt; mutations =</span>
+<span class="fc" id="L521">            getMutations(queryState.getClientState(),</span>
+                         options,
+                         false,
+<span class="fc" id="L524">                         options.getTimestamp(queryState),</span>
+<span class="fc" id="L525">                         options.getNowInSeconds(queryState),</span>
+                         queryStartNanoTime);
+<span class="fc bfc" id="L527" title="All 2 branches covered.">        if (!mutations.isEmpty())</span>
+        {
+<span class="fc" id="L529">            StorageProxy.mutateWithTriggers(mutations, cl, false, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L531" title="All 2 branches covered.">            if (!SchemaConstants.isSystemKeyspace(metadata.keyspace))</span>
+<span class="fc" id="L532">                ClientRequestSizeMetrics.recordRowAndColumnCountMetrics(mutations);</span>
+        }
+
+<span class="fc" id="L535">        return null;</span>
+    }
+
+    private ResultMessage executeWithCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    {
+<span class="fc" id="L540">        CQL3CasRequest request = makeCasRequest(queryState, options);</span>
+
+<span class="fc" id="L542">        try (RowIterator result = StorageProxy.cas(keyspace(),</span>
+<span class="fc" id="L543">                                                   table(),</span>
+                                                   request.key,
+                                                   request,
+<span class="fc" id="L546">                                                   options.getSerialConsistency(),</span>
+<span class="fc" id="L547">                                                   options.getConsistency(),</span>
+<span class="fc" id="L548">                                                   queryState.getClientState(),</span>
+<span class="fc" id="L549">                                                   options.getNowInSeconds(queryState),</span>
+                                                   queryStartNanoTime))
+        {
+<span class="fc" id="L552">            return new ResultMessage.Rows(buildCasResultSet(result, queryState, options));</span>
+        }
+    }
+
+    private CQL3CasRequest makeCasRequest(QueryState queryState, QueryOptions options)
+    {
+<span class="fc" id="L558">        ClientState clientState = queryState.getClientState();</span>
+<span class="fc" id="L559">        List&lt;ByteBuffer&gt; keys = buildPartitionKeyNames(options, clientState);</span>
+        // We don't support IN for CAS operation so far
+<span class="fc" id="L561">        checkFalse(restrictions.keyIsInRelation(),</span>
+                   &quot;IN on the partition key is not supported with conditional %s&quot;,
+<span class="fc bfc" id="L563" title="All 2 branches covered.">                   type.isUpdate()? &quot;updates&quot; : &quot;deletions&quot;);</span>
+
+<span class="fc" id="L565">        DecoratedKey key = metadata().partitioner.decorateKey(keys.get(0));</span>
+<span class="fc" id="L566">        long timestamp = options.getTimestamp(queryState);</span>
+<span class="fc" id="L567">        long nowInSeconds = options.getNowInSeconds(queryState);</span>
+
+<span class="fc" id="L569">        checkFalse(restrictions.clusteringKeyRestrictionsHasIN(),</span>
+                   &quot;IN on the clustering key columns is not supported with conditional %s&quot;,
+<span class="fc bfc" id="L571" title="All 2 branches covered.">                    type.isUpdate()? &quot;updates&quot; : &quot;deletions&quot;);</span>
+
+<span class="fc" id="L573">        Clustering&lt;?&gt; clustering = Iterables.getOnlyElement(createClustering(options, clientState));</span>
+<span class="fc" id="L574">        CQL3CasRequest request = new CQL3CasRequest(metadata(), key, conditionColumns(), updatesRegularRows(), updatesStaticRow());</span>
+
+<span class="fc" id="L576">        addConditions(clustering, request, options);</span>
+<span class="fc" id="L577">        request.addRowUpdate(clustering, this, options, timestamp, nowInSeconds);</span>
+
+<span class="fc" id="L579">        return request;</span>
+    }
+
+    public void addConditions(Clustering&lt;?&gt; clustering, CQL3CasRequest request, QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L584">        conditions.addConditionsTo(request, clustering, options);</span>
+<span class="fc" id="L585">    }</span>
+
+    private static ResultSet.ResultMetadata buildCASSuccessMetadata(String ksName, String cfName)
+    {
+<span class="fc" id="L589">        List&lt;ColumnSpecification&gt; specs = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L590">        specs.add(casResultColumnSpecification(ksName, cfName));</span>
+
+<span class="fc" id="L592">        return new ResultSet.ResultMetadata(EMPTY_HASH, specs);</span>
+    }
+
+    private static ColumnSpecification casResultColumnSpecification(String ksName, String cfName)
+    {
+<span class="fc" id="L597">        return new ColumnSpecification(ksName, cfName, CAS_RESULT_COLUMN, BooleanType.instance);</span>
+    }
+
+    private ResultSet buildCasResultSet(RowIterator partition, QueryState state, QueryOptions options)
+    {
+<span class="fc" id="L602">        return buildCasResultSet(keyspace(), table(), partition, getColumnsWithConditions(), false, state, options);</span>
+    }
+
+    static ResultSet buildCasResultSet(String ksName,
+                                       String tableName,
+                                       RowIterator partition,
+                                       Iterable&lt;ColumnMetadata&gt; columnsWithConditions,
+                                       boolean isBatch,
+                                       QueryState state,
+                                       QueryOptions options)
+    {
+<span class="fc bfc" id="L613" title="All 2 branches covered.">        boolean success = partition == null;</span>
+
+<span class="fc" id="L615">        ResultSet.ResultMetadata metadata = buildCASSuccessMetadata(ksName, tableName);</span>
+<span class="fc" id="L616">        List&lt;List&lt;ByteBuffer&gt;&gt; rows = Collections.singletonList(Collections.singletonList(BooleanType.instance.decompose(success)));</span>
+
+<span class="fc" id="L618">        ResultSet rs = new ResultSet(metadata, rows);</span>
+<span class="fc bfc" id="L619" title="All 2 branches covered.">        return success ? rs : merge(rs, buildCasFailureResultSet(partition, columnsWithConditions, isBatch, options, options.getNowInSeconds(state)));</span>
+    }
+
+    private static ResultSet merge(ResultSet left, ResultSet right)
+    {
+<span class="pc bpc" id="L624" title="1 of 2 branches missed.">        if (left.size() == 0)</span>
+<span class="nc" id="L625">            return right;</span>
+<span class="fc bfc" id="L626" title="All 2 branches covered.">        else if (right.size() == 0)</span>
+<span class="fc" id="L627">            return left;</span>
+
+<span class="pc bpc" id="L629" title="1 of 2 branches missed.">        assert left.size() == 1;</span>
+<span class="fc" id="L630">        int size = left.metadata.names.size() + right.metadata.names.size();</span>
+<span class="fc" id="L631">        List&lt;ColumnSpecification&gt; specs = new ArrayList&lt;ColumnSpecification&gt;(size);</span>
+<span class="fc" id="L632">        specs.addAll(left.metadata.names);</span>
+<span class="fc" id="L633">        specs.addAll(right.metadata.names);</span>
+<span class="fc" id="L634">        List&lt;List&lt;ByteBuffer&gt;&gt; rows = new ArrayList&lt;&gt;(right.size());</span>
+<span class="fc bfc" id="L635" title="All 2 branches covered.">        for (int i = 0; i &lt; right.size(); i++)</span>
+        {
+<span class="fc" id="L637">            List&lt;ByteBuffer&gt; row = new ArrayList&lt;ByteBuffer&gt;(size);</span>
+<span class="fc" id="L638">            row.addAll(left.rows.get(0));</span>
+<span class="fc" id="L639">            row.addAll(right.rows.get(i));</span>
+<span class="fc" id="L640">            rows.add(row);</span>
+        }
+<span class="fc" id="L642">        return new ResultSet(new ResultSet.ResultMetadata(EMPTY_HASH, specs), rows);</span>
+    }
+
+    private static ResultSet buildCasFailureResultSet(RowIterator partition,
+                                                      Iterable&lt;ColumnMetadata&gt; columnsWithConditions,
+                                                      boolean isBatch,
+                                                      QueryOptions options,
+                                                      long nowInSeconds)
+    {
+<span class="fc" id="L651">        TableMetadata metadata = partition.metadata();</span>
+        Selection selection;
+<span class="fc bfc" id="L653" title="All 2 branches covered.">        if (columnsWithConditions == null)</span>
+        {
+<span class="fc" id="L655">            selection = Selection.wildcard(metadata, false, false);</span>
+        }
+        else
+        {
+            // We can have multiple conditions on the same columns (for collections) so use a set
+            // to avoid duplicate, but preserve the order just to it follows the order of IF in the query in general
+<span class="fc" id="L661">            Set&lt;ColumnMetadata&gt; defs = new LinkedHashSet&lt;&gt;();</span>
+            // Adding the partition key for batches to disambiguate if the conditions span multipe rows (we don't add them outside
+            // of batches for compatibility sakes).
+<span class="fc bfc" id="L664" title="All 2 branches covered.">            if (isBatch)</span>
+<span class="fc" id="L665">                Iterables.addAll(defs, metadata.primaryKeyColumns());</span>
+<span class="fc" id="L666">            Iterables.addAll(defs, columnsWithConditions);</span>
+<span class="fc" id="L667">            selection = Selection.forColumns(metadata, new ArrayList&lt;&gt;(defs), false);</span>
+
+        }
+
+<span class="fc" id="L671">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L672">        ResultSetBuilder builder = new ResultSetBuilder(selection.getResultMetadata(), selectors, false);</span>
+<span class="fc" id="L673">        SelectStatement.forSelection(metadata, selection)</span>
+<span class="fc" id="L674">                       .processPartition(partition, options, builder, nowInSeconds);</span>
+
+<span class="fc" id="L676">        return builder.build();</span>
+    }
+
+    public ResultMessage executeLocally(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc bfc" id="L681" title="All 2 branches covered.">        return hasConditions()</span>
+<span class="fc" id="L682">               ? executeInternalWithCondition(queryState, options)</span>
+<span class="fc" id="L683">               : executeInternalWithoutCondition(queryState, options, nanoTime());</span>
+    }
+
+    public ResultMessage executeInternalWithoutCondition(QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L689">        long timestamp = options.getTimestamp(queryState);</span>
+<span class="fc" id="L690">        long nowInSeconds = options.getNowInSeconds(queryState);</span>
+<span class="fc bfc" id="L691" title="All 2 branches covered.">        for (IMutation mutation : getMutations(queryState.getClientState(), options, true, timestamp, nowInSeconds, queryStartNanoTime))</span>
+<span class="fc" id="L692">            mutation.apply();</span>
+<span class="fc" id="L693">        return null;</span>
+    }
+
+    public ResultMessage executeInternalWithCondition(QueryState state, QueryOptions options)
+    {
+<span class="fc" id="L698">        CQL3CasRequest request = makeCasRequest(state, options);</span>
+
+<span class="fc" id="L700">        try (RowIterator result = casInternal(state.getClientState(), request, options.getTimestamp(state), options.getNowInSeconds(state)))</span>
+        {
+<span class="fc" id="L702">            return new ResultMessage.Rows(buildCasResultSet(result, state, options));</span>
+        }
+    }
+
+    static RowIterator casInternal(ClientState state, CQL3CasRequest request, long timestamp, long nowInSeconds)
+    {
+<span class="fc" id="L708">        Ballot ballot = BallotGenerator.Global.atUnixMicros(timestamp, NONE);</span>
+
+<span class="fc" id="L710">        SinglePartitionReadQuery readCommand = request.readCommand(nowInSeconds);</span>
+        FilteredPartition current;
+<span class="fc" id="L712">        try (ReadExecutionController executionController = readCommand.executionController();</span>
+<span class="fc" id="L713">             PartitionIterator iter = readCommand.executeInternal(executionController))</span>
+        {
+<span class="fc" id="L715">            current = FilteredPartition.create(PartitionIterators.getOnlyElement(iter, readCommand));</span>
+        }
+
+<span class="fc bfc" id="L718" title="All 2 branches covered.">        if (!request.appliesTo(current))</span>
+<span class="fc" id="L719">            return current.rowIterator();</span>
+
+<span class="fc" id="L721">        PartitionUpdate updates = request.makeUpdates(current, state, ballot);</span>
+<span class="fc" id="L722">        updates = TriggerExecutor.instance.execute(updates);</span>
+
+<span class="fc" id="L724">        Proposal proposal = Proposal.of(ballot, updates);</span>
+<span class="fc" id="L725">        proposal.makeMutation().apply();</span>
+<span class="fc" id="L726">        return null;</span>
+    }
+
+    /**
+     * Convert statement into a list of mutations to apply on the server
+     *
+     * @param state the client state
+     * @param options value for prepared statement markers
+     * @param local if true, any requests (for collections) performed by getMutation should be done locally only.
+     * @param timestamp the current timestamp in microseconds to use if no timestamp is user provided.
+     *
+     * @return list of the mutations
+     */
+    private List&lt;? extends IMutation&gt; getMutations(ClientState state,
+                                                   QueryOptions options,
+                                                   boolean local,
+                                                   long timestamp,
+                                                   long nowInSeconds,
+                                                   long queryStartNanoTime)
+    {
+<span class="fc" id="L746">        List&lt;ByteBuffer&gt; keys = buildPartitionKeyNames(options, state);</span>
+<span class="fc" id="L747">        HashMultiset&lt;ByteBuffer&gt; perPartitionKeyCounts = HashMultiset.create(keys);</span>
+<span class="fc" id="L748">        SingleTableUpdatesCollector collector = new SingleTableUpdatesCollector(metadata, updatedColumns, perPartitionKeyCounts);</span>
+<span class="fc" id="L749">        addUpdates(collector, keys, state, options, local, timestamp, nowInSeconds, queryStartNanoTime);</span>
+<span class="fc" id="L750">        return collector.toMutations();</span>
+    }
+
+    final void addUpdates(UpdatesCollector collector,
+                          List&lt;ByteBuffer&gt; keys,
+                          ClientState state,
+                          QueryOptions options,
+                          boolean local,
+                          long timestamp,
+                          long nowInSeconds,
+                          long queryStartNanoTime)
+    {
+<span class="fc bfc" id="L762" title="All 2 branches covered.">        if (hasSlices())</span>
+        {
+<span class="fc" id="L764">            Slices slices = createSlices(options);</span>
+
+            // If all the ranges were invalid we do not need to do anything.
+<span class="fc bfc" id="L767" title="All 2 branches covered.">            if (slices.isEmpty())</span>
+<span class="fc" id="L768">                return;</span>
+
+<span class="fc" id="L770">            UpdateParameters params = makeUpdateParameters(keys,</span>
+                                                           new ClusteringIndexSliceFilter(slices, false),
+                                                           state,
+                                                           options,
+                                                           DataLimits.NONE,
+                                                           local,
+                                                           timestamp,
+                                                           nowInSeconds,
+                                                           queryStartNanoTime);
+<span class="fc bfc" id="L779" title="All 2 branches covered.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="fc" id="L781">                Validation.validateKey(metadata(), key);</span>
+<span class="fc" id="L782">                DecoratedKey dk = metadata().partitioner.decorateKey(key);</span>
+
+<span class="fc" id="L784">                PartitionUpdate.Builder updateBuilder = collector.getPartitionUpdateBuilder(metadata(), dk, options.getConsistency());</span>
+
+<span class="fc bfc" id="L786" title="All 2 branches covered.">                for (Slice slice : slices)</span>
+<span class="fc" id="L787">                    addUpdateForKey(updateBuilder, slice, params);</span>
+<span class="fc" id="L788">            }</span>
+<span class="fc" id="L789">        }</span>
+        else
+        {
+<span class="fc" id="L792">            NavigableSet&lt;Clustering&lt;?&gt;&gt; clusterings = createClustering(options, state);</span>
+
+            // If some of the restrictions were unspecified (e.g. empty IN restrictions) we do not need to do anything.
+<span class="fc bfc" id="L795" title="All 4 branches covered.">            if (restrictions.hasClusteringColumnsRestrictions() &amp;&amp; clusterings.isEmpty())</span>
+<span class="fc" id="L796">                return;</span>
+
+<span class="fc" id="L798">            UpdateParameters params = makeUpdateParameters(keys, clusterings, state, options, local, timestamp, nowInSeconds, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L800" title="All 2 branches covered.">            for (ByteBuffer key : keys)</span>
+            {
+<span class="fc" id="L802">                Validation.validateKey(metadata(), key);</span>
+<span class="fc" id="L803">                DecoratedKey dk = metadata().partitioner.decorateKey(key);</span>
+
+<span class="fc" id="L805">                PartitionUpdate.Builder updateBuilder = collector.getPartitionUpdateBuilder(metadata(), dk, options.getConsistency());</span>
+
+<span class="fc bfc" id="L807" title="All 2 branches covered.">                if (!restrictions.hasClusteringColumnsRestrictions())</span>
+                {
+<span class="fc" id="L809">                    addUpdateForKey(updateBuilder, Clustering.EMPTY, params);</span>
+                }
+                else
+                {
+<span class="fc bfc" id="L813" title="All 2 branches covered.">                    for (Clustering&lt;?&gt; clustering : clusterings)</span>
+                    {
+<span class="fc" id="L815">                        clustering.validate();</span>
+<span class="fc" id="L816">                        addUpdateForKey(updateBuilder, clustering, params);</span>
+<span class="fc" id="L817">                    }</span>
+                }
+<span class="fc" id="L819">            }</span>
+        }
+<span class="fc" id="L821">    }</span>
+
+    public Slices createSlices(QueryOptions options)
+    {
+<span class="fc" id="L825">        SortedSet&lt;ClusteringBound&lt;?&gt;&gt; startBounds = restrictions.getClusteringColumnsBounds(Bound.START, options);</span>
+<span class="fc" id="L826">        SortedSet&lt;ClusteringBound&lt;?&gt;&gt; endBounds = restrictions.getClusteringColumnsBounds(Bound.END, options);</span>
+
+<span class="fc" id="L828">        return toSlices(startBounds, endBounds);</span>
+    }
+
+    private UpdateParameters makeUpdateParameters(Collection&lt;ByteBuffer&gt; keys,
+                                                  NavigableSet&lt;Clustering&lt;?&gt;&gt; clusterings,
+                                                  ClientState state,
+                                                  QueryOptions options,
+                                                  boolean local,
+                                                  long timestamp,
+                                                  long nowInSeconds,
+                                                  long queryStartNanoTime)
+    {
+<span class="fc bfc" id="L840" title="All 2 branches covered.">        if (clusterings.contains(Clustering.STATIC_CLUSTERING))</span>
+<span class="fc" id="L841">            return makeUpdateParameters(keys,</span>
+                                        new ClusteringIndexSliceFilter(Slices.ALL, false),
+                                        state,
+                                        options,
+<span class="fc" id="L845">                                        DataLimits.cqlLimits(1),</span>
+                                        local,
+                                        timestamp,
+                                        nowInSeconds,
+                                        queryStartNanoTime);
+
+<span class="fc" id="L851">        return makeUpdateParameters(keys,</span>
+                                    new ClusteringIndexNamesFilter(clusterings, false),
+                                    state,
+                                    options,
+                                    DataLimits.NONE,
+                                    local,
+                                    timestamp,
+                                    nowInSeconds,
+                                    queryStartNanoTime);
+    }
+
+    private UpdateParameters makeUpdateParameters(Collection&lt;ByteBuffer&gt; keys,
+                                                  ClusteringIndexFilter filter,
+                                                  ClientState state,
+                                                  QueryOptions options,
+                                                  DataLimits limits,
+                                                  boolean local,
+                                                  long timestamp,
+                                                  long nowInSeconds,
+                                                  long queryStartNanoTime)
+    {
+        // Some lists operation requires reading
+<span class="fc" id="L873">        Map&lt;DecoratedKey, Partition&gt; lists =</span>
+<span class="fc" id="L874">            readRequiredLists(keys,</span>
+                              filter,
+                              limits,
+                              local,
+<span class="fc" id="L878">                              options.getConsistency(),</span>
+                              nowInSeconds,
+                              queryStartNanoTime);
+
+<span class="fc" id="L882">        return new UpdateParameters(metadata(),</span>
+<span class="fc" id="L883">                                    updatedColumns(),</span>
+                                    state,
+                                    options,
+<span class="fc" id="L886">                                    getTimestamp(timestamp, options),</span>
+                                    nowInSeconds,
+<span class="fc" id="L888">                                    getTimeToLive(options),</span>
+                                    lists);
+    }
+
+    private Slices toSlices(SortedSet&lt;ClusteringBound&lt;?&gt;&gt; startBounds, SortedSet&lt;ClusteringBound&lt;?&gt;&gt; endBounds)
+    {
+<span class="fc" id="L894">        return toSlices(metadata, startBounds, endBounds);</span>
+    }
+
+    public static Slices toSlices(TableMetadata metadata, SortedSet&lt;ClusteringBound&lt;?&gt;&gt; startBounds, SortedSet&lt;ClusteringBound&lt;?&gt;&gt; endBounds)
+    {
+<span class="fc" id="L899">        return toSlices(metadata.comparator, startBounds, endBounds);</span>
+    }
+
+    public static Slices toSlices(ClusteringComparator comparator, SortedSet&lt;ClusteringBound&lt;?&gt;&gt; startBounds, SortedSet&lt;ClusteringBound&lt;?&gt;&gt; endBounds)
+    {
+<span class="pc bpc" id="L904" title="1 of 2 branches missed.">        assert startBounds.size() == endBounds.size();</span>
+
+<span class="fc" id="L906">        Slices.Builder builder = new Slices.Builder(comparator);</span>
+
+<span class="fc" id="L908">        Iterator&lt;ClusteringBound&lt;?&gt;&gt; starts = startBounds.iterator();</span>
+<span class="fc" id="L909">        Iterator&lt;ClusteringBound&lt;?&gt;&gt; ends = endBounds.iterator();</span>
+
+<span class="fc bfc" id="L911" title="All 2 branches covered.">        while (starts.hasNext())</span>
+        {
+<span class="fc" id="L913">            Slice slice = Slice.make(starts.next(), ends.next());</span>
+<span class="fc bfc" id="L914" title="All 2 branches covered.">            if (!slice.isEmpty(comparator))</span>
+            {
+<span class="fc" id="L916">                builder.add(slice);</span>
+            }
+<span class="fc" id="L918">        }</span>
+
+<span class="fc" id="L920">        return builder.build();</span>
+    }
+
+<span class="fc" id="L923">    public static abstract class Parsed extends QualifiedStatement</span>
+    {
+        protected final StatementType type;
+        private final Attributes.Raw attrs;
+        private final List&lt;Pair&lt;ColumnIdentifier, ColumnCondition.Raw&gt;&gt; conditions;
+        private final boolean ifNotExists;
+        private final boolean ifExists;
+
+        protected Parsed(QualifiedName name,
+                         StatementType type,
+                         Attributes.Raw attrs,
+                         List&lt;Pair&lt;ColumnIdentifier, ColumnCondition.Raw&gt;&gt; conditions,
+                         boolean ifNotExists,
+                         boolean ifExists)
+        {
+<span class="fc" id="L938">            super(name);</span>
+<span class="fc" id="L939">            this.type = type;</span>
+<span class="fc" id="L940">            this.attrs = attrs;</span>
+<span class="fc bfc" id="L941" title="All 2 branches covered.">            this.conditions = conditions == null ? Collections.emptyList() : conditions;</span>
+<span class="fc" id="L942">            this.ifNotExists = ifNotExists;</span>
+<span class="fc" id="L943">            this.ifExists = ifExists;</span>
+<span class="fc" id="L944">        }</span>
+
+        public ModificationStatement prepare(ClientState state)
+        {
+<span class="fc" id="L948">            return prepare(state, bindVariables);</span>
+        }
+
+        public ModificationStatement prepare(ClientState state, VariableSpecifications bindVariables)
+        {
+<span class="fc" id="L953">            TableMetadata metadata = Schema.instance.validateTable(keyspace(), name());</span>
+
+<span class="fc" id="L955">            Attributes preparedAttributes = attrs.prepare(keyspace(), name());</span>
+<span class="fc" id="L956">            preparedAttributes.collectMarkerSpecification(bindVariables);</span>
+
+<span class="fc" id="L958">            Conditions preparedConditions = prepareConditions(metadata, bindVariables);</span>
+
+<span class="fc" id="L960">            return prepareInternal(state, metadata, bindVariables, preparedConditions, preparedAttributes);</span>
+        }
+
+        /**
+         * Returns the column conditions.
+         *
+         * @param metadata the column family meta data
+         * @param bindVariables the bound names
+         * @return the column conditions.
+         */
+        private Conditions prepareConditions(TableMetadata metadata, VariableSpecifications bindVariables)
+        {
+            // To have both 'IF EXISTS'/'IF NOT EXISTS' and some other conditions doesn't make sense.
+            // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
+<span class="fc bfc" id="L974" title="All 2 branches covered.">            if (ifExists)</span>
+            {
+<span class="pc bpc" id="L976" title="1 of 2 branches missed.">                assert conditions.isEmpty();</span>
+<span class="pc bpc" id="L977" title="1 of 2 branches missed.">                assert !ifNotExists;</span>
+<span class="fc" id="L978">                return Conditions.IF_EXISTS_CONDITION;</span>
+            }
+
+<span class="fc bfc" id="L981" title="All 2 branches covered.">            if (ifNotExists)</span>
+            {
+<span class="pc bpc" id="L983" title="1 of 2 branches missed.">                assert conditions.isEmpty();</span>
+<span class="pc bpc" id="L984" title="1 of 2 branches missed.">                assert !ifExists;</span>
+<span class="fc" id="L985">                return Conditions.IF_NOT_EXISTS_CONDITION;</span>
+            }
+
+<span class="fc bfc" id="L988" title="All 2 branches covered.">            if (conditions.isEmpty())</span>
+<span class="fc" id="L989">                return Conditions.EMPTY_CONDITION;</span>
+
+<span class="fc" id="L991">            return prepareColumnConditions(metadata, bindVariables);</span>
+        }
+
+        /**
+         * Returns the column conditions.
+         *
+         * @param metadata the column family meta data
+         * @param bindVariables the bound names
+         * @return the column conditions.
+         */
+        private ColumnConditions prepareColumnConditions(TableMetadata metadata, VariableSpecifications bindVariables)
+        {
+<span class="fc" id="L1003">            checkNull(attrs.timestamp, &quot;Cannot provide custom timestamp for conditional updates&quot;);</span>
+
+<span class="fc" id="L1005">            ColumnConditions.Builder builder = ColumnConditions.newBuilder();</span>
+
+<span class="fc bfc" id="L1007" title="All 2 branches covered.">            for (Pair&lt;ColumnIdentifier, ColumnCondition.Raw&gt; entry : conditions)</span>
+            {
+<span class="fc" id="L1009">                ColumnMetadata def = metadata.getExistingColumn(entry.left);</span>
+<span class="fc" id="L1010">                ColumnCondition condition = entry.right.prepare(keyspace(), def, metadata);</span>
+<span class="fc" id="L1011">                condition.collectMarkerSpecification(bindVariables);</span>
+
+<span class="fc" id="L1013">                checkFalse(def.isPrimaryKeyColumn(), &quot;PRIMARY KEY column '%s' cannot have IF conditions&quot;, def.name);</span>
+<span class="fc" id="L1014">                builder.add(condition);</span>
+<span class="fc" id="L1015">            }</span>
+<span class="fc" id="L1016">            return builder.build();</span>
+        }
+
+        protected abstract ModificationStatement prepareInternal(ClientState state,
+                                                                 TableMetadata metadata,
+                                                                 VariableSpecifications bindVariables,
+                                                                 Conditions conditions,
+                                                                 Attributes attrs);
+
+        /**
+         * Creates the restrictions.
+         *
+         * @param metadata the column family meta data
+         * @param boundNames the bound names
+         * @param operations the column operations
+         * @param where the where clause
+         * @param conditions the conditions
+         * @return the restrictions
+         */
+        protected StatementRestrictions newRestrictions(ClientState state,
+                                                        TableMetadata metadata,
+                                                        VariableSpecifications boundNames,
+                                                        Operations operations,
+                                                        WhereClause where,
+                                                        Conditions conditions)
+        {
+<span class="fc bfc" id="L1042" title="All 2 branches covered.">            if (where.containsCustomExpressions())</span>
+<span class="fc" id="L1043">                throw new InvalidRequestException(CUSTOM_EXPRESSIONS_NOT_ALLOWED);</span>
+
+<span class="fc" id="L1045">            boolean applyOnlyToStaticColumns = appliesOnlyToStaticColumns(operations, conditions);</span>
+<span class="fc" id="L1046">            return new StatementRestrictions(state, type, metadata, where, boundNames, applyOnlyToStaticColumns, false, false);</span>
+        }
+
+        public List&lt;Pair&lt;ColumnIdentifier, ColumnCondition.Raw&gt;&gt; getConditions()
+        {
+<span class="nc" id="L1051">            return conditions;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

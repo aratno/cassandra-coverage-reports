@@ -1,0 +1,606 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RepairJob.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair</a> &gt; <span class="el_source">RepairJob.java</span></div><h1>RepairJob.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.repair;
+
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
+import java.util.function.Predicate;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.util.concurrent.*;
+
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.repair.state.JobState;
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.repair.asymmetric.DifferenceHolder;
+import org.apache.cassandra.repair.asymmetric.HostDifferences;
+import org.apache.cassandra.repair.asymmetric.PreferedNodeFilter;
+import org.apache.cassandra.repair.asymmetric.ReduceHelper;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.SystemDistributedKeyspace;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.service.paxos.cleanup.PaxosCleanup;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MerkleTrees;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.FutureCombiner;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+
+import static org.apache.cassandra.config.DatabaseDescriptor.paxosRepairEnabled;
+import static org.apache.cassandra.service.paxos.Paxos.useV2;
+
+/**
+ * RepairJob runs repair on given ColumnFamily.
+ */
+public class RepairJob extends AsyncFuture&lt;RepairResult&gt; implements Runnable
+{
+<span class="fc" id="L71">    private static final Logger logger = LoggerFactory.getLogger(RepairJob.class);</span>
+
+    private final SharedContext ctx;
+    public final JobState state;
+    private final RepairJobDesc desc;
+    private final RepairSession session;
+    private final RepairParallelism parallelismDegree;
+    private final Executor taskExecutor;
+
+<span class="fc" id="L80">    @VisibleForTesting</span>
+    final List&lt;ValidationTask&gt; validationTasks = new CopyOnWriteArrayList&lt;&gt;();
+
+<span class="fc" id="L83">    @VisibleForTesting</span>
+    final List&lt;SyncTask&gt; syncTasks = new CopyOnWriteArrayList&lt;&gt;();
+
+    /**
+     * Create repair job to run on specific columnfamily
+     *  @param session RepairSession that this RepairJob belongs
+     * @param columnFamily name of the ColumnFamily to repair
+     */
+    public RepairJob(RepairSession session, String columnFamily)
+<span class="fc" id="L92">    {</span>
+<span class="fc" id="L93">        this.ctx = session.ctx;</span>
+<span class="fc" id="L94">        this.session = session;</span>
+<span class="fc" id="L95">        this.taskExecutor = session.taskExecutor;</span>
+<span class="fc" id="L96">        this.parallelismDegree = session.parallelismDegree;</span>
+<span class="fc" id="L97">        this.desc = new RepairJobDesc(session.state.parentRepairSession, session.getId(), session.state.keyspace, columnFamily, session.state.commonRange.ranges);</span>
+<span class="fc" id="L98">        this.state = new JobState(ctx.clock(), desc, session.state.commonRange.endpoints);</span>
+<span class="fc" id="L99">    }</span>
+
+    public long getNowInSeconds()
+    {
+<span class="fc" id="L103">        long nowInSeconds = ctx.clock().nowInSeconds();</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">        if (session.previewKind == PreviewKind.REPAIRED)</span>
+        {
+<span class="fc" id="L106">            return nowInSeconds + DatabaseDescriptor.getValidationPreviewPurgeHeadStartInSec();</span>
+        }
+        else
+        {
+<span class="fc" id="L110">            return nowInSeconds;</span>
+        }
+    }
+
+    /**
+     * Runs repair job.
+     *
+     * This sets up necessary task and runs them on given {@code taskExecutor}.
+     * After submitting all tasks, waits until validation with replica completes.
+     */
+    public void run()
+    {
+<span class="fc" id="L122">        state.phase.start();</span>
+<span class="fc" id="L123">        Keyspace ks = Keyspace.open(desc.keyspace);</span>
+<span class="fc" id="L124">        ColumnFamilyStore cfs = ks.getColumnFamilyStore(desc.columnFamily);</span>
+<span class="fc" id="L125">        cfs.metric.repairsStarted.inc();</span>
+<span class="fc" id="L126">        List&lt;InetAddressAndPort&gt; allEndpoints = new ArrayList&lt;&gt;(session.state.commonRange.endpoints);</span>
+<span class="fc" id="L127">        allEndpoints.add(ctx.broadcastAddressAndPort());</span>
+
+        Future&lt;List&lt;TreeResponse&gt;&gt; treeResponses;
+        Future&lt;Void&gt; paxosRepair;
+<span class="pc bpc" id="L131" title="3 of 8 branches missed.">        if (paxosRepairEnabled() &amp;&amp; ((useV2() &amp;&amp; session.repairPaxos) || session.paxosOnly))</span>
+        {
+<span class="fc" id="L133">            logger.info(&quot;{} {}.{} starting paxos repair&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L134">            TableMetadata metadata = Schema.instance.getTableMetadata(desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L135">            paxosRepair = PaxosCleanup.cleanup(allEndpoints, metadata, desc.ranges, session.state.commonRange.hasSkippedReplicas, taskExecutor);</span>
+<span class="fc" id="L136">        }</span>
+        else
+        {
+<span class="fc" id="L139">            logger.info(&quot;{} {}.{} not running paxos repair&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L140">            paxosRepair = ImmediateFuture.success(null);</span>
+        }
+
+<span class="fc bfc" id="L143" title="All 2 branches covered.">        if (session.paxosOnly)</span>
+        {
+<span class="fc" id="L145">            paxosRepair.addCallback(new FutureCallback&lt;Void&gt;()</span>
+<span class="fc" id="L146">            {</span>
+                public void onSuccess(Void v)
+                {
+<span class="fc" id="L149">                    logger.info(&quot;{} {}.{} paxos repair completed&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L150">                    trySuccess(new RepairResult(desc, Collections.emptyList()));</span>
+<span class="fc" id="L151">                }</span>
+
+                /**
+                 * Snapshot, validation and sync failures are all handled here
+                 */
+                public void onFailure(Throwable t)
+                {
+<span class="fc" id="L158">                    logger.warn(&quot;{} {}.{} paxos repair failed&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L159">                    tryFailure(t);</span>
+<span class="fc" id="L160">                }</span>
+            }, taskExecutor);
+<span class="fc" id="L162">            return;</span>
+        }
+
+        // Create a snapshot at all nodes unless we're using pure parallel repairs
+<span class="fc bfc" id="L166" title="All 2 branches covered.">        if (parallelismDegree != RepairParallelism.PARALLEL)</span>
+        {
+            Future&lt;?&gt; allSnapshotTasks;
+<span class="fc bfc" id="L169" title="All 2 branches covered.">            if (session.isIncremental)</span>
+            {
+                // consistent repair does it's own &quot;snapshotting&quot;
+<span class="fc" id="L172">                allSnapshotTasks = paxosRepair.map(input -&gt; allEndpoints);</span>
+            }
+            else
+            {
+                // Request snapshot to all replica
+<span class="fc" id="L177">                allSnapshotTasks = paxosRepair.flatMap(input -&gt; {</span>
+<span class="fc" id="L178">                    List&lt;Future&lt;InetAddressAndPort&gt;&gt; snapshotTasks = new ArrayList&lt;&gt;(allEndpoints.size());</span>
+<span class="fc" id="L179">                    state.phase.snapshotsSubmitted();</span>
+<span class="fc bfc" id="L180" title="All 2 branches covered.">                    for (InetAddressAndPort endpoint : allEndpoints)</span>
+                    {
+<span class="fc" id="L182">                        SnapshotTask snapshotTask = new SnapshotTask(ctx, desc, endpoint);</span>
+<span class="fc" id="L183">                        snapshotTasks.add(snapshotTask);</span>
+<span class="fc" id="L184">                        taskExecutor.execute(snapshotTask);</span>
+<span class="fc" id="L185">                    }</span>
+<span class="fc" id="L186">                    return FutureCombiner.allOf(snapshotTasks).map(a -&gt; {</span>
+<span class="fc" id="L187">                        state.phase.snapshotsCompleted();</span>
+<span class="fc" id="L188">                        return a;</span>
+                    });
+                });
+            }
+
+            // When all snapshot complete, send validation requests
+<span class="fc" id="L194">            treeResponses = allSnapshotTasks.flatMap(endpoints -&gt; {</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">                if (parallelismDegree == RepairParallelism.SEQUENTIAL)</span>
+<span class="fc" id="L196">                    return sendSequentialValidationRequest(allEndpoints);</span>
+                else
+<span class="fc" id="L198">                    return sendDCAwareValidationRequest(allEndpoints);</span>
+                }, taskExecutor);
+<span class="fc" id="L200">        }</span>
+        else
+        {
+            // If not sequential, just send validation request to all replica
+<span class="fc" id="L204">            treeResponses = paxosRepair.flatMap(input -&gt; sendValidationRequest(allEndpoints));</span>
+        }
+<span class="fc" id="L206">        treeResponses = treeResponses.map(a -&gt; {</span>
+<span class="fc" id="L207">            state.phase.validationCompleted();</span>
+<span class="fc" id="L208">            return a;</span>
+        });
+
+        // When all validations complete, submit sync tasks
+<span class="pc bpc" id="L212" title="1 of 4 branches missed.">        Future&lt;List&lt;SyncStat&gt;&gt; syncResults = treeResponses.flatMap(session.optimiseStreams &amp;&amp; !session.pullRepair ? this::optimisedSyncing : this::standardSyncing, taskExecutor);</span>
+
+        // When all sync complete, set the final result
+<span class="fc" id="L215">        syncResults.addCallback(new FutureCallback&lt;List&lt;SyncStat&gt;&gt;()</span>
+<span class="fc" id="L216">        {</span>
+            @Override
+            public void onSuccess(List&lt;SyncStat&gt; stats)
+            {
+<span class="fc" id="L220">                state.phase.success();</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">                if (!session.previewKind.isPreview())</span>
+                {
+<span class="fc" id="L223">                    logger.info(&quot;{} {}.{} is fully synced&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L224">                    SystemDistributedKeyspace.successfulRepairJob(session.getId(), desc.keyspace, desc.columnFamily);</span>
+                }
+<span class="fc" id="L226">                cfs.metric.repairsCompleted.inc();</span>
+<span class="fc" id="L227">                trySuccess(new RepairResult(desc, stats));</span>
+<span class="fc" id="L228">            }</span>
+
+            /**
+             * Snapshot, validation and sync failures are all handled here
+             */
+            @Override
+            public void onFailure(Throwable t)
+            {
+<span class="fc" id="L236">                state.phase.fail(t);</span>
+<span class="fc" id="L237">                abort(t);</span>
+
+<span class="fc bfc" id="L239" title="All 2 branches covered.">                if (!session.previewKind.isPreview())</span>
+                {
+<span class="fc" id="L241">                    logger.warn(&quot;{} {}.{} sync failed&quot;, session.previewKind.logPrefix(session.getId()), desc.keyspace, desc.columnFamily);</span>
+<span class="fc" id="L242">                    SystemDistributedKeyspace.failedRepairJob(session.getId(), desc.keyspace, desc.columnFamily, t);</span>
+                }
+<span class="fc" id="L244">                cfs.metric.repairsCompleted.inc();</span>
+<span class="fc bfc" id="L245" title="All 2 branches covered.">                tryFailure(t instanceof NoSuchRepairSessionExceptionWrapper</span>
+<span class="fc" id="L246">                           ? ((NoSuchRepairSessionExceptionWrapper) t).wrapped</span>
+<span class="fc" id="L247">                           : t);</span>
+<span class="fc" id="L248">            }</span>
+        }, taskExecutor);
+<span class="fc" id="L250">    }</span>
+
+    public synchronized void abort(@Nullable Throwable reason)
+    {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">        if (reason == null)</span>
+<span class="fc" id="L255">            reason = new RuntimeException(&quot;Abort&quot;);</span>
+        // Make sure all validation tasks have cleaned up the off-heap Merkle trees they might contain.
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        for (ValidationTask v : validationTasks)</span>
+<span class="fc" id="L258">            v.abort(reason);</span>
+<span class="fc bfc" id="L259" title="All 2 branches covered.">        for (SyncTask s : syncTasks)</span>
+<span class="fc" id="L260">            s.abort(reason);</span>
+<span class="fc" id="L261">    }</span>
+
+    private boolean isTransient(InetAddressAndPort ep)
+    {
+<span class="fc" id="L265">        return session.state.commonRange.transEndpoints.contains(ep);</span>
+    }
+
+    private Future&lt;List&lt;SyncStat&gt;&gt; standardSyncing(List&lt;TreeResponse&gt; trees)
+    {
+<span class="fc" id="L270">        List&lt;SyncTask&gt; syncTasks = createStandardSyncTasks(ctx, desc,</span>
+                                                           trees,
+<span class="fc" id="L272">                                                           ctx.broadcastAddressAndPort(),</span>
+                                                           this::isTransient,
+                                                           session.isIncremental,
+                                                           session.pullRepair,
+                                                           session.previewKind);
+<span class="fc" id="L277">        return executeTasks(syncTasks);</span>
+    }
+
+    static List&lt;SyncTask&gt; createStandardSyncTasks(SharedContext ctx,
+                                                  RepairJobDesc desc,
+                                                  List&lt;TreeResponse&gt; trees,
+                                                  InetAddressAndPort local,
+                                                  Predicate&lt;InetAddressAndPort&gt; isTransient,
+                                                  boolean isIncremental,
+                                                  boolean pullRepair,
+                                                  PreviewKind previewKind)
+    {
+<span class="fc" id="L289">        long startedAt = ctx.clock().currentTimeMillis();</span>
+<span class="fc" id="L290">        List&lt;SyncTask&gt; syncTasks = new ArrayList&lt;&gt;();</span>
+        // We need to difference all trees one against another
+<span class="fc bfc" id="L292" title="All 2 branches covered.">        for (int i = 0; i &lt; trees.size() - 1; ++i)</span>
+        {
+<span class="fc" id="L294">            TreeResponse r1 = trees.get(i);</span>
+<span class="fc bfc" id="L295" title="All 2 branches covered.">            for (int j = i + 1; j &lt; trees.size(); ++j)</span>
+            {
+<span class="fc" id="L297">                TreeResponse r2 = trees.get(j);</span>
+
+                // Avoid streming between two tansient replicas
+<span class="pc bpc" id="L300" title="3 of 4 branches missed.">                if (isTransient.test(r1.endpoint) &amp;&amp; isTransient.test(r2.endpoint))</span>
+<span class="nc" id="L301">                    continue;</span>
+
+<span class="fc" id="L303">                List&lt;Range&lt;Token&gt;&gt; differences = MerkleTrees.difference(r1.trees, r2.trees);</span>
+
+                // Nothing to do
+<span class="fc bfc" id="L306" title="All 2 branches covered.">                if (differences.isEmpty())</span>
+<span class="fc" id="L307">                    continue;</span>
+
+                SyncTask task;
+<span class="pc bpc" id="L310" title="1 of 4 branches missed.">                if (r1.endpoint.equals(local) || r2.endpoint.equals(local))</span>
+                {
+<span class="pc bpc" id="L312" title="1 of 2 branches missed.">                    TreeResponse self = r1.endpoint.equals(local) ? r1 : r2;</span>
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">                    TreeResponse remote = r2.endpoint.equals(local) ? r1 : r2;</span>
+
+                    // pull only if local is full
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">                    boolean requestRanges = !isTransient.test(self.endpoint);</span>
+                    // push only if remote is full; additionally check for pull repair
+<span class="pc bpc" id="L318" title="2 of 4 branches missed.">                    boolean transferRanges = !isTransient.test(remote.endpoint) &amp;&amp; !pullRepair;</span>
+
+                    // Nothing to do
+<span class="pc bpc" id="L321" title="3 of 4 branches missed.">                    if (!requestRanges &amp;&amp; !transferRanges)</span>
+<span class="nc" id="L322">                        continue;</span>
+
+<span class="fc bfc" id="L324" title="All 2 branches covered.">                    task = new LocalSyncTask(ctx, desc, self.endpoint, remote.endpoint, differences, isIncremental ? desc.parentSessionId : null,</span>
+                                             requestRanges, transferRanges, previewKind);
+<span class="fc" id="L326">                }</span>
+<span class="pc bpc" id="L327" title="2 of 4 branches missed.">                else if (isTransient.test(r1.endpoint) || isTransient.test(r2.endpoint))</span>
+                {
+                    // Stream only from transient replica
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    TreeResponse streamFrom = isTransient.test(r1.endpoint) ? r1 : r2;</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">                    TreeResponse streamTo = isTransient.test(r1.endpoint) ? r2 : r1;</span>
+<span class="nc" id="L332">                    task = new AsymmetricRemoteSyncTask(ctx, desc, streamTo.endpoint, streamFrom.endpoint, differences, previewKind);</span>
+<span class="nc" id="L333">                }</span>
+                else
+                {
+<span class="fc" id="L336">                    task = new SymmetricRemoteSyncTask(ctx, desc, r1.endpoint, r2.endpoint, differences, previewKind);</span>
+                }
+<span class="fc" id="L338">                syncTasks.add(task);</span>
+            }
+<span class="fc" id="L340">            trees.get(i).trees.release();</span>
+        }
+<span class="fc" id="L342">        trees.get(trees.size() - 1).trees.release();</span>
+<span class="fc" id="L343">        logger.info(&quot;Created {} sync tasks based on {} merkle tree responses for {} (took: {}ms)&quot;,</span>
+<span class="fc" id="L344">                    syncTasks.size(), trees.size(), desc.parentSessionId, ctx.clock().currentTimeMillis() - startedAt);</span>
+<span class="fc" id="L345">        return syncTasks;</span>
+    }
+
+    private Future&lt;List&lt;SyncStat&gt;&gt; optimisedSyncing(List&lt;TreeResponse&gt; trees)
+    {
+<span class="fc" id="L350">        List&lt;SyncTask&gt; syncTasks = createOptimisedSyncingSyncTasks(ctx,</span>
+                                                                   desc,
+                                                                   trees,
+<span class="fc" id="L353">                                                                   FBUtilities.getLocalAddressAndPort(),</span>
+                                                                   this::isTransient,
+                                                                   this::getDC,
+                                                                   session.isIncremental,
+                                                                   session.previewKind);
+
+<span class="fc" id="L359">        return executeTasks(syncTasks);</span>
+    }
+
+    @VisibleForTesting
+    Future&lt;List&lt;SyncStat&gt;&gt; executeTasks(List&lt;SyncTask&gt; tasks)
+    {
+        try
+        {
+<span class="fc" id="L367">            ctx.repair().getParentRepairSession(desc.parentSessionId);</span>
+<span class="fc" id="L368">            syncTasks.addAll(tasks);</span>
+
+<span class="fc bfc" id="L370" title="All 2 branches covered.">            if (!tasks.isEmpty())</span>
+<span class="fc" id="L371">                state.phase.streamSubmitted();</span>
+
+<span class="fc bfc" id="L373" title="All 2 branches covered.">            for (SyncTask task : tasks)</span>
+            {
+<span class="fc bfc" id="L375" title="All 2 branches covered.">                if (!task.isLocal())</span>
+<span class="fc" id="L376">                    session.trackSyncCompletion(Pair.create(desc, task.nodePair()), (CompletableRemoteSyncTask) task);</span>
+<span class="fc" id="L377">                taskExecutor.execute(task);</span>
+<span class="fc" id="L378">            }</span>
+
+<span class="fc" id="L380">            return FutureCombiner.allOf(tasks);</span>
+        }
+<span class="fc" id="L382">        catch (NoSuchRepairSessionException e)</span>
+        {
+<span class="fc" id="L384">            return ImmediateFuture.failure(new NoSuchRepairSessionExceptionWrapper(e));</span>
+        }
+    }
+
+    // provided so we can throw NoSuchRepairSessionException from executeTasks without
+    // having to make it unchecked. Required as this is called as from standardSyncing/
+    // optimisedSyncing passed as a Function to transform merkle tree responses and so
+    // can't throw checked exceptions. These are unwrapped in the onFailure callback of
+    // that transformation so as to not pollute the checked usage of
+    // NoSuchRepairSessionException in the rest of the codebase.
+    private static class NoSuchRepairSessionExceptionWrapper extends RuntimeException
+    {
+        private final NoSuchRepairSessionException wrapped;
+        private NoSuchRepairSessionExceptionWrapper(NoSuchRepairSessionException wrapped)
+<span class="fc" id="L398">        {</span>
+<span class="fc" id="L399">            this.wrapped = wrapped;</span>
+<span class="fc" id="L400">        }</span>
+    }
+
+    static List&lt;SyncTask&gt; createOptimisedSyncingSyncTasks(SharedContext ctx,
+                                                          RepairJobDesc desc,
+                                                          List&lt;TreeResponse&gt; trees,
+                                                          InetAddressAndPort local,
+                                                          Predicate&lt;InetAddressAndPort&gt; isTransient,
+                                                          Function&lt;InetAddressAndPort, String&gt; getDC,
+                                                          boolean isIncremental,
+                                                          PreviewKind previewKind)
+    {
+<span class="fc" id="L412">        long startedAt = ctx.clock().currentTimeMillis();</span>
+<span class="fc" id="L413">        List&lt;SyncTask&gt; syncTasks = new ArrayList&lt;&gt;();</span>
+        // We need to difference all trees one against another
+<span class="fc" id="L415">        DifferenceHolder diffHolder = new DifferenceHolder(trees);</span>
+
+<span class="fc" id="L417">        logger.trace(&quot;diffs = {}&quot;, diffHolder);</span>
+<span class="fc" id="L418">        PreferedNodeFilter preferSameDCFilter = (streaming, candidates) -&gt;</span>
+<span class="fc" id="L419">                                                candidates.stream()</span>
+<span class="fc" id="L420">                                                          .filter(node -&gt; getDC.apply(streaming)</span>
+<span class="fc" id="L421">                                                                          .equals(getDC.apply(node)))</span>
+<span class="fc" id="L422">                                                          .collect(Collectors.toSet());</span>
+<span class="fc" id="L423">        ImmutableMap&lt;InetAddressAndPort, HostDifferences&gt; reducedDifferences = ReduceHelper.reduce(diffHolder, preferSameDCFilter);</span>
+
+<span class="fc bfc" id="L425" title="All 2 branches covered.">        for (int i = 0; i &lt; trees.size(); i++)</span>
+        {
+<span class="fc" id="L427">            InetAddressAndPort address = trees.get(i).endpoint;</span>
+
+            // we don't stream to transient replicas
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">            if (isTransient.test(address))</span>
+<span class="nc" id="L431">                continue;</span>
+
+<span class="fc" id="L433">            HostDifferences streamsFor = reducedDifferences.get(address);</span>
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">            if (streamsFor != null)</span>
+            {
+<span class="fc" id="L436">                Preconditions.checkArgument(streamsFor.get(address).isEmpty(), &quot;We should not fetch ranges from ourselves&quot;);</span>
+<span class="fc bfc" id="L437" title="All 2 branches covered.">                for (InetAddressAndPort fetchFrom : streamsFor.hosts())</span>
+                {
+<span class="fc" id="L439">                    List&lt;Range&lt;Token&gt;&gt; toFetch = new ArrayList&lt;&gt;(streamsFor.get(fetchFrom));</span>
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">                    assert !toFetch.isEmpty();</span>
+
+<span class="fc" id="L442">                    logger.trace(&quot;{} is about to fetch {} from {}&quot;, address, toFetch, fetchFrom);</span>
+                    SyncTask task;
+<span class="fc bfc" id="L444" title="All 2 branches covered.">                    if (address.equals(local))</span>
+                    {
+<span class="fc bfc" id="L446" title="All 2 branches covered.">                        task = new LocalSyncTask(ctx, desc, address, fetchFrom, toFetch, isIncremental ? desc.parentSessionId : null,</span>
+                                                 true, false, previewKind);
+                    }
+                    else
+                    {
+<span class="fc" id="L451">                        task = new AsymmetricRemoteSyncTask(ctx, desc, address, fetchFrom, toFetch, previewKind);</span>
+                    }
+<span class="fc" id="L453">                    syncTasks.add(task);</span>
+
+<span class="fc" id="L455">                }</span>
+            }
+            else
+            {
+<span class="nc" id="L459">                logger.trace(&quot;Node {} has nothing to stream&quot;, address);</span>
+            }
+        }
+<span class="fc" id="L462">        logger.info(&quot;Created {} optimised sync tasks based on {} merkle tree responses for {} (took: {}ms)&quot;,</span>
+<span class="fc" id="L463">                    syncTasks.size(), trees.size(), desc.parentSessionId, ctx.clock().currentTimeMillis() - startedAt);</span>
+<span class="fc" id="L464">        logger.trace(&quot;Optimised sync tasks for {}: {}&quot;, desc.parentSessionId, syncTasks);</span>
+<span class="fc" id="L465">        return syncTasks;</span>
+    }
+
+    private String getDC(InetAddressAndPort address)
+    {
+<span class="fc" id="L470">        return ctx.snitch().getDatacenter(address);</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor in parallel.
+     *
+     * @param endpoints Endpoint addresses to send validation request
+     * @return Future that can get all {@link TreeResponse} from replica, if all validation succeed.
+     */
+    private Future&lt;List&lt;TreeResponse&gt;&gt; sendValidationRequest(Collection&lt;InetAddressAndPort&gt; endpoints)
+    {
+<span class="fc" id="L481">        state.phase.validationSubmitted();</span>
+<span class="fc" id="L482">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="fc" id="L483">        logger.info(&quot;{} {}&quot;, session.previewKind.logPrefix(desc.sessionId), message);</span>
+<span class="fc" id="L484">        Tracing.traceRepair(message);</span>
+<span class="fc" id="L485">        long nowInSec = getNowInSeconds();</span>
+<span class="fc" id="L486">        List&lt;Future&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+<span class="fc bfc" id="L487" title="All 2 branches covered.">        for (InetAddressAndPort endpoint : endpoints)</span>
+        {
+<span class="fc" id="L489">            ValidationTask task = newValidationTask(endpoint, nowInSec);</span>
+<span class="fc" id="L490">            tasks.add(task);</span>
+<span class="fc" id="L491">            session.trackValidationCompletion(Pair.create(desc, endpoint), task);</span>
+<span class="fc" id="L492">            taskExecutor.execute(task);</span>
+<span class="fc" id="L493">        }</span>
+<span class="fc" id="L494">        return FutureCombiner.allOf(tasks);</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor so that tasks run sequentially.
+     */
+    private Future&lt;List&lt;TreeResponse&gt;&gt; sendSequentialValidationRequest(Collection&lt;InetAddressAndPort&gt; endpoints)
+    {
+<span class="fc" id="L502">        state.phase.validationSubmitted();</span>
+<span class="fc" id="L503">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="fc" id="L504">        logger.info(&quot;{} {}&quot;, session.previewKind.logPrefix(desc.sessionId), message);</span>
+<span class="fc" id="L505">        Tracing.traceRepair(message);</span>
+<span class="fc" id="L506">        long nowInSec = getNowInSeconds();</span>
+<span class="fc" id="L507">        List&lt;Future&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+
+<span class="fc" id="L509">        Queue&lt;InetAddressAndPort&gt; requests = new LinkedList&lt;&gt;(endpoints);</span>
+<span class="fc" id="L510">        InetAddressAndPort address = requests.poll();</span>
+<span class="fc" id="L511">        ValidationTask firstTask = newValidationTask(address, nowInSec);</span>
+<span class="fc" id="L512">        logger.info(&quot;{} Validating {}&quot;, session.previewKind.logPrefix(desc.sessionId), address);</span>
+<span class="fc" id="L513">        session.trackValidationCompletion(Pair.create(desc, address), firstTask);</span>
+<span class="fc" id="L514">        tasks.add(firstTask);</span>
+<span class="fc" id="L515">        ValidationTask currentTask = firstTask;</span>
+<span class="fc bfc" id="L516" title="All 2 branches covered.">        while (requests.size() &gt; 0)</span>
+        {
+<span class="fc" id="L518">            final InetAddressAndPort nextAddress = requests.poll();</span>
+<span class="fc" id="L519">            final ValidationTask nextTask = newValidationTask(nextAddress, nowInSec);</span>
+<span class="fc" id="L520">            tasks.add(nextTask);</span>
+<span class="fc" id="L521">            currentTask.addCallback(new FutureCallback&lt;TreeResponse&gt;()</span>
+<span class="fc" id="L522">            {</span>
+                public void onSuccess(TreeResponse result)
+                {
+<span class="fc" id="L525">                    logger.info(&quot;{} Validating {}&quot;, session.previewKind.logPrefix(desc.sessionId), nextAddress);</span>
+<span class="fc" id="L526">                    session.trackValidationCompletion(Pair.create(desc, nextAddress), nextTask);</span>
+<span class="fc" id="L527">                    taskExecutor.execute(nextTask);</span>
+<span class="fc" id="L528">                }</span>
+
+                // failure is handled at root of job chain
+<span class="fc" id="L531">                public void onFailure(Throwable t) {}</span>
+            });
+<span class="fc" id="L533">            currentTask = nextTask;</span>
+<span class="fc" id="L534">        }</span>
+        // start running tasks
+<span class="fc" id="L536">        taskExecutor.execute(firstTask);</span>
+<span class="fc" id="L537">        return FutureCombiner.allOf(tasks);</span>
+    }
+
+    /**
+     * Creates {@link ValidationTask} and submit them to task executor so that tasks run sequentially within each dc.
+     */
+    private Future&lt;List&lt;TreeResponse&gt;&gt; sendDCAwareValidationRequest(Collection&lt;InetAddressAndPort&gt; endpoints)
+    {
+<span class="fc" id="L545">        state.phase.validationSubmitted();</span>
+<span class="fc" id="L546">        String message = String.format(&quot;Requesting merkle trees for %s (to %s)&quot;, desc.columnFamily, endpoints);</span>
+<span class="fc" id="L547">        logger.info(&quot;{} {}&quot;, session.previewKind.logPrefix(desc.sessionId), message);</span>
+<span class="fc" id="L548">        Tracing.traceRepair(message);</span>
+<span class="fc" id="L549">        long nowInSec = getNowInSeconds();</span>
+<span class="fc" id="L550">        List&lt;Future&lt;TreeResponse&gt;&gt; tasks = new ArrayList&lt;&gt;(endpoints.size());</span>
+
+<span class="fc" id="L552">        Map&lt;String, Queue&lt;InetAddressAndPort&gt;&gt; requestsByDatacenter = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L553" title="All 2 branches covered.">        for (InetAddressAndPort endpoint : endpoints)</span>
+        {
+<span class="fc" id="L555">            String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(endpoint);</span>
+<span class="fc" id="L556">            Queue&lt;InetAddressAndPort&gt; queue = requestsByDatacenter.get(dc);</span>
+<span class="fc bfc" id="L557" title="All 2 branches covered.">            if (queue == null)</span>
+            {
+<span class="fc" id="L559">                queue = new LinkedList&lt;&gt;();</span>
+<span class="fc" id="L560">                requestsByDatacenter.put(dc, queue);</span>
+            }
+<span class="fc" id="L562">            queue.add(endpoint);</span>
+<span class="fc" id="L563">        }</span>
+
+<span class="fc bfc" id="L565" title="All 2 branches covered.">        for (Map.Entry&lt;String, Queue&lt;InetAddressAndPort&gt;&gt; entry : requestsByDatacenter.entrySet())</span>
+        {
+<span class="fc" id="L567">            Queue&lt;InetAddressAndPort&gt; requests = entry.getValue();</span>
+<span class="fc" id="L568">            InetAddressAndPort address = requests.poll();</span>
+<span class="fc" id="L569">            ValidationTask firstTask = newValidationTask(address, nowInSec);</span>
+<span class="fc" id="L570">            logger.info(&quot;{} Validating {}&quot;, session.previewKind.logPrefix(session.getId()), address);</span>
+<span class="fc" id="L571">            session.trackValidationCompletion(Pair.create(desc, address), firstTask);</span>
+<span class="fc" id="L572">            tasks.add(firstTask);</span>
+<span class="fc" id="L573">            ValidationTask currentTask = firstTask;</span>
+<span class="fc bfc" id="L574" title="All 2 branches covered.">            while (requests.size() &gt; 0)</span>
+            {
+<span class="fc" id="L576">                final InetAddressAndPort nextAddress = requests.poll();</span>
+<span class="fc" id="L577">                final ValidationTask nextTask = newValidationTask(nextAddress, nowInSec);</span>
+<span class="fc" id="L578">                tasks.add(nextTask);</span>
+<span class="fc" id="L579">                currentTask.addCallback(new FutureCallback&lt;TreeResponse&gt;()</span>
+<span class="fc" id="L580">                {</span>
+                    public void onSuccess(TreeResponse result)
+                    {
+<span class="fc" id="L583">                        logger.info(&quot;{} Validating {}&quot;, session.previewKind.logPrefix(session.getId()), nextAddress);</span>
+<span class="fc" id="L584">                        session.trackValidationCompletion(Pair.create(desc, nextAddress), nextTask);</span>
+<span class="fc" id="L585">                        taskExecutor.execute(nextTask);</span>
+<span class="fc" id="L586">                    }</span>
+
+                    // failure is handled at root of job chain
+<span class="fc" id="L589">                    public void onFailure(Throwable t) {}</span>
+                });
+<span class="fc" id="L591">                currentTask = nextTask;</span>
+<span class="fc" id="L592">            }</span>
+            // start running tasks
+<span class="fc" id="L594">            taskExecutor.execute(firstTask);</span>
+<span class="fc" id="L595">        }</span>
+<span class="fc" id="L596">        return FutureCombiner.allOf(tasks);</span>
+    }
+
+    private ValidationTask newValidationTask(InetAddressAndPort endpoint, long nowInSec)
+    {
+<span class="fc" id="L601">        ValidationTask task = new ValidationTask(session.ctx, desc, endpoint, nowInSec, session.previewKind);</span>
+<span class="fc" id="L602">        validationTasks.add(task);</span>
+<span class="fc" id="L603">        return task;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,550 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BinLog.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.binlog</a> &gt; <span class="el_source">BinLog.java</span></div><h1>BinLog.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils.binlog;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import org.apache.cassandra.io.util.File;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import net.openhft.chronicle.core.io.BackgroundResourceReleaser;
+import net.openhft.chronicle.queue.ChronicleQueue;
+import net.openhft.chronicle.queue.impl.single.SingleChronicleQueue;
+import net.openhft.chronicle.queue.impl.single.SingleChronicleQueueBuilder;
+import net.openhft.chronicle.queue.ExcerptAppender;
+import net.openhft.chronicle.queue.RollCycles;
+import net.openhft.chronicle.wire.WireOut;
+import net.openhft.chronicle.wire.WriteMarshallable;
+import net.openhft.posix.PosixAPI;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+import org.apache.cassandra.utils.concurrent.WeightedQueue;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CHRONICLE_ANNOUNCER_DISABLE;
+
+/**
+ * Bin log is a is quick and dirty binary log that is kind of a NIH version of binary logging with a traditional logging
+ * framework. It's goal is good enough performance, predictable footprint, simplicity in terms of implementation and configuration
+ * and most importantly minimal impact on producers of log records.
+ *
+ * Performance safety is accomplished by feeding items to the binary log using a weighted queue and dropping records if the binary log falls
+ * sufficiently far behind.
+ *
+ * Simplicity and good enough perforamance is achieved by using a single log writing thread as well as Chronicle Queue
+ * to handle writing the log, making it available for readers, as well as log rolling.
+ *
+ */
+public class BinLog implements Runnable
+{
+<span class="nc" id="L72">    private static final Logger logger = LoggerFactory.getLogger(BinLog.class);</span>
+<span class="nc" id="L73">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+<span class="nc" id="L74">    private static final NoSpamLogger.NoSpamLogStatement droppedSamplesStatement = noSpamLogger.getStatement(&quot;Dropped {} binary log samples&quot;, 1, TimeUnit.MINUTES);</span>
+
+    public final Path path;
+
+    public static final String VERSION = &quot;version&quot;;
+    public static final String TYPE = &quot;type&quot;;
+
+    static
+    {
+        // Avoid the chronicle announcement which is commercial advertisement, and debug info we already print at startup
+        // https://github.com/OpenHFT/Chronicle-Core/blob/chronicle-core-2.23.36/src/main/java/net/openhft/chronicle/core/announcer/Announcer.java#L32-L33
+<span class="nc" id="L85">        CHRONICLE_ANNOUNCER_DISABLE.setBoolean(true);</span>
+    }
+
+    private ChronicleQueue queue;
+    private ExcerptAppender appender;
+<span class="nc" id="L90">    @VisibleForTesting</span>
+<span class="nc" id="L91">    Thread binLogThread = new NamedThreadFactory(&quot;Binary Log thread&quot;).newThread(this);</span>
+    final WeightedQueue&lt;ReleaseableWriteMarshallable&gt; sampleQueue;
+    private final BinLogArchiver archiver;
+    private final boolean blocking;
+
+<span class="nc" id="L96">    private final AtomicLong droppedSamplesSinceLastLog = new AtomicLong();</span>
+
+    private BinLogOptions options;
+
+    /*
+    This set contains all the paths we are currently logging to, it is used to make sure
+    we don't start writing audit and full query logs to the same path.
+    */
+<span class="nc" id="L104">    private static final Set&lt;Path&gt; currentPaths = Collections.synchronizedSet(new HashSet&lt;&gt;());</span>
+
+<span class="nc" id="L106">    private static final ReleaseableWriteMarshallable NO_OP = new ReleaseableWriteMarshallable()</span>
+<span class="nc" id="L107">    {</span>
+        @Override
+        protected long version()
+        {
+<span class="nc" id="L111">            return 0;</span>
+        }
+
+        @Override
+        protected String type()
+        {
+<span class="nc" id="L117">            return &quot;no-op&quot;;</span>
+        }
+
+        @Override
+        public void writeMarshallablePayload(WireOut wire)
+        {
+<span class="nc" id="L123">        }</span>
+
+        @Override
+        public void release()
+        {
+<span class="nc" id="L128">        }</span>
+    };
+
+<span class="nc" id="L131">    private volatile boolean shouldContinue = true;</span>
+
+    private BinLog(Path path, BinLogOptions options, BinLogArchiver archiver)
+<span class="nc" id="L134">    {</span>
+<span class="nc" id="L135">        Preconditions.checkNotNull(PosixAPI.posix(), &quot;Cannot initialize OpenHFT Posix&quot;);</span>
+<span class="nc" id="L136">        Preconditions.checkNotNull(path, &quot;path was null&quot;);</span>
+<span class="nc" id="L137">        Preconditions.checkNotNull(options.roll_cycle, &quot;roll_cycle was null&quot;);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        Preconditions.checkArgument(options.max_queue_weight &gt; 0, &quot;max_queue_weight must be &gt; 0&quot;);</span>
+<span class="nc" id="L139">        SingleChronicleQueueBuilder builder = SingleChronicleQueueBuilder.single(path.toFile()); // checkstyle: permit this invocation</span>
+<span class="nc" id="L140">        builder.rollCycle(RollCycles.valueOf(options.roll_cycle));</span>
+
+<span class="nc" id="L142">        sampleQueue = new WeightedQueue&lt;&gt;(options.max_queue_weight);</span>
+<span class="nc" id="L143">        this.archiver = archiver;</span>
+<span class="nc" id="L144">        builder.storeFileListener(this.archiver);</span>
+<span class="nc" id="L145">        queue = builder.build();</span>
+<span class="nc" id="L146">        appender = queue.acquireAppender();</span>
+<span class="nc" id="L147">        this.blocking = options.block;</span>
+<span class="nc" id="L148">        this.path = path;</span>
+<span class="nc" id="L149">        this.options = options;</span>
+<span class="nc" id="L150">    }</span>
+
+    public BinLogOptions getBinLogOptions()
+    {
+<span class="nc" id="L154">        return options;</span>
+    }
+
+    /**
+     * Start the consumer thread that writes log records. Can only be done once.
+     */
+    @VisibleForTesting
+    void start()
+    {
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (!shouldContinue)</span>
+        {
+<span class="nc" id="L165">            throw new IllegalStateException(&quot;Can't reuse stopped BinLog&quot;);</span>
+        }
+<span class="nc" id="L167">        binLogThread.start();</span>
+<span class="nc" id="L168">    }</span>
+
+    /**
+     * Stop the consumer thread that writes log records. Can be called multiple times.
+     * @throws InterruptedException
+     */
+    public synchronized void stop() throws InterruptedException
+    {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if (!shouldContinue)</span>
+        {
+<span class="nc" id="L178">            return;</span>
+        }
+
+<span class="nc" id="L181">        shouldContinue = false;</span>
+<span class="nc" id="L182">        sampleQueue.put(NO_OP);</span>
+<span class="nc" id="L183">        BackgroundResourceReleaser.stop();</span>
+<span class="nc" id="L184">        binLogThread.join();</span>
+<span class="nc" id="L185">        appender.close();</span>
+<span class="nc" id="L186">        appender = null;</span>
+<span class="nc" id="L187">        queue.close();</span>
+<span class="nc" id="L188">        queue = null;</span>
+<span class="nc" id="L189">        archiver.stop();</span>
+<span class="nc" id="L190">        currentPaths.remove(path);</span>
+<span class="nc" id="L191">    }</span>
+
+    /**
+     * Offer a record to the log. If the in memory queue is full the record will be dropped and offer will return false.
+     * @param record The record to write to the log
+     * @return true if the record was queued and false otherwise
+     */
+    public boolean offer(ReleaseableWriteMarshallable record)
+    {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (!shouldContinue)</span>
+        {
+<span class="nc" id="L202">            return false;</span>
+        }
+
+<span class="nc" id="L205">        return sampleQueue.offer(record);</span>
+    }
+
+    /**
+     * Put a record into the log. If the in memory queue is full the putting thread will be blocked until there is space or it is interrupted.
+     * @param record The record to write to the log
+     * @throws InterruptedException
+     */
+    public void put(ReleaseableWriteMarshallable record) throws InterruptedException
+    {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        if (!shouldContinue)</span>
+        {
+<span class="nc" id="L217">            return;</span>
+        }
+
+        //Resolve potential deadlock at shutdown when queue is full
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        while (shouldContinue)</span>
+        {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (sampleQueue.offer(record, 1, TimeUnit.SECONDS))</span>
+            {
+<span class="nc" id="L225">                return;</span>
+            }
+        }
+<span class="nc" id="L228">    }</span>
+
+    private void processTasks(List&lt;ReleaseableWriteMarshallable&gt; tasks)
+    {
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        for (int ii = 0; ii &lt; tasks.size(); ii++)</span>
+        {
+<span class="nc" id="L234">            WriteMarshallable t = tasks.get(ii);</span>
+            //Don't write an empty document
+<span class="nc bnc" id="L236" title="All 2 branches missed.">            if (t == NO_OP)</span>
+            {
+<span class="nc" id="L238">                continue;</span>
+            }
+
+<span class="nc" id="L241">            appender.writeDocument(t);</span>
+        }
+<span class="nc" id="L243">    }</span>
+
+    @Override
+    public void run()
+    {
+<span class="nc" id="L248">        List&lt;ReleaseableWriteMarshallable&gt; tasks = new ArrayList&lt;&gt;(16);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        while (shouldContinue)</span>
+        {
+            try
+            {
+<span class="nc" id="L253">                tasks.clear();</span>
+<span class="nc" id="L254">                ReleaseableWriteMarshallable task = sampleQueue.take();</span>
+<span class="nc" id="L255">                tasks.add(task);</span>
+<span class="nc" id="L256">                sampleQueue.drainTo(tasks, 15);</span>
+
+<span class="nc" id="L258">                processTasks(tasks);</span>
+            }
+<span class="nc" id="L260">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L262">                logger.error(&quot;Unexpected exception in binary log thread&quot;, t);</span>
+            }
+            finally
+            {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">                for (int ii = 0; ii &lt; tasks.size(); ii++)</span>
+                {
+<span class="nc" id="L268">                    tasks.get(ii).release();</span>
+                }
+<span class="nc" id="L270">            }</span>
+        }
+
+        //Clean up the buffers on thread exit, finalization will check again once this
+        //is no longer reachable ensuring there are no stragglers in the queue.
+<span class="nc" id="L275">        finalize();</span>
+<span class="nc" id="L276">    }</span>
+
+
+    /**
+     * There is a race where we might not release a buffer, going to let finalization
+     * catch it since it shouldn't happen to a lot of buffers. Only test code would run
+     * into it anyways.
+     */
+    @Override
+    public void finalize()
+    {
+        ReleaseableWriteMarshallable toRelease;
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        while (((toRelease = sampleQueue.poll()) != null))</span>
+        {
+<span class="nc" id="L290">            toRelease.release();</span>
+        }
+<span class="nc" id="L292">    }</span>
+
+    // todo: refactor to helper class?
+    public void logRecord(ReleaseableWriteMarshallable record)
+    {
+<span class="nc" id="L297">        boolean putInQueue = false;</span>
+        try
+        {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (blocking)</span>
+            {
+                try
+                {
+<span class="nc" id="L304">                    put(record);</span>
+<span class="nc" id="L305">                    putInQueue = true;</span>
+                }
+<span class="nc" id="L307">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L309">                    throw new UncheckedInterruptedException(e);</span>
+<span class="nc" id="L310">                }</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                if (!offer(record))</span>
+                {
+<span class="nc" id="L316">                    logDroppedSample();</span>
+                }
+                else
+                {
+<span class="nc" id="L320">                    putInQueue = true;</span>
+                }
+            }
+        }
+        finally
+        {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (!putInQueue)</span>
+            {
+<span class="nc" id="L328">                record.release();</span>
+            }
+        }
+<span class="nc" id="L331">    }</span>
+
+    /**
+     * This is potentially lossy, but it's not super critical as we will always generally know
+     * when this is happening and roughly how bad it is.
+     */
+    private void logDroppedSample()
+    {
+<span class="nc" id="L339">        droppedSamplesSinceLastLog.incrementAndGet();</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (droppedSamplesStatement.warn(new Object[] {droppedSamplesSinceLastLog.get()}))</span>
+        {
+<span class="nc" id="L342">            droppedSamplesSinceLastLog.set(0);</span>
+        }
+<span class="nc" id="L344">    }</span>
+
+
+<span class="nc" id="L347">    public abstract static class ReleaseableWriteMarshallable implements WriteMarshallable</span>
+    {
+        @Override
+        public final void writeMarshallable(WireOut wire)
+        {
+<span class="nc" id="L352">            wire.write(VERSION).int16(version());</span>
+<span class="nc" id="L353">            wire.write(TYPE).text(type());</span>
+
+<span class="nc" id="L355">            writeMarshallablePayload(wire);</span>
+<span class="nc" id="L356">        }</span>
+
+        protected abstract long version();
+
+        protected abstract String type();
+
+        protected abstract void writeMarshallablePayload(WireOut wire);
+
+        public abstract void release();
+    }
+
+<span class="nc" id="L367">    public static class Builder</span>
+    {
+        private Path path;
+        private String rollCycle;
+        private int maxQueueWeight;
+        private long maxLogSize;
+        private String archiveCommand;
+        private int maxArchiveRetries;
+        private boolean blocking;
+
+        public Builder path(Path path)
+        {
+<span class="nc" id="L379">            Preconditions.checkNotNull(path, &quot;path was null&quot;);</span>
+<span class="nc" id="L380">            File pathAsFile = new File(path);</span>
+            //Exists and is a directory or can be created
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            Preconditions.checkArgument(!pathAsFile.toString().isEmpty(), &quot;you might have forgotten to specify a directory to save logs&quot;);</span>
+<span class="nc bnc" id="L383" title="All 8 branches missed.">            Preconditions.checkArgument((pathAsFile.exists() &amp;&amp; pathAsFile.isDirectory()) || (!pathAsFile.exists() &amp;&amp; pathAsFile.tryCreateDirectories()), &quot;path exists and is not a directory or couldn't be created&quot;);</span>
+<span class="nc bnc" id="L384" title="All 6 branches missed.">            Preconditions.checkArgument(pathAsFile.isReadable() &amp;&amp; pathAsFile.isWritable() &amp;&amp; pathAsFile.isExecutable(), &quot;path is not readable, writable, and executable&quot;);</span>
+<span class="nc" id="L385">            this.path = path;</span>
+<span class="nc" id="L386">            return this;</span>
+        }
+
+        public Builder rollCycle(String rollCycle)
+        {
+<span class="nc" id="L391">            Preconditions.checkNotNull(rollCycle, &quot;rollCycle was null&quot;);</span>
+<span class="nc" id="L392">            rollCycle = rollCycle.toUpperCase();</span>
+<span class="nc" id="L393">            Preconditions.checkNotNull(RollCycles.valueOf(rollCycle), &quot;unrecognized roll cycle&quot;);</span>
+<span class="nc" id="L394">            this.rollCycle = rollCycle;</span>
+<span class="nc" id="L395">            return this;</span>
+        }
+
+        public Builder maxQueueWeight(int maxQueueWeight)
+        {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            Preconditions.checkArgument(maxQueueWeight &gt; 0, &quot;maxQueueWeight must be &gt; 0&quot;);</span>
+<span class="nc" id="L401">            this.maxQueueWeight = maxQueueWeight;</span>
+<span class="nc" id="L402">            return this;</span>
+        }
+
+        public Builder maxLogSize(long maxLogSize)
+        {
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            Preconditions.checkArgument(maxLogSize &gt; 0, &quot;maxLogSize must be &gt; 0&quot;);</span>
+<span class="nc" id="L408">            this.maxLogSize = maxLogSize;</span>
+<span class="nc" id="L409">            return this;</span>
+        }
+
+        public Builder archiveCommand(String archiveCommand)
+        {
+<span class="nc" id="L414">            this.archiveCommand = archiveCommand;</span>
+<span class="nc" id="L415">            return this;</span>
+        }
+
+        public Builder maxArchiveRetries(int maxArchiveRetries)
+        {
+<span class="nc" id="L420">            this.maxArchiveRetries = maxArchiveRetries;</span>
+<span class="nc" id="L421">            return this;</span>
+        }
+
+        public Builder blocking(boolean blocking)
+        {
+<span class="nc" id="L426">            this.blocking = blocking;</span>
+<span class="nc" id="L427">            return this;</span>
+        }
+
+
+        public BinLog build(boolean cleanDirectory)
+        {
+<span class="nc" id="L433">            logger.info(&quot;Attempting to configure bin log: Path: {} Roll cycle: {} Blocking: {} Max queue weight: {} Max log size:{} Archive command: {}&quot;, path, rollCycle, blocking, maxQueueWeight, maxLogSize, archiveCommand);</span>
+<span class="nc" id="L434">            synchronized (currentPaths)</span>
+            {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                if (currentPaths.contains(path))</span>
+<span class="nc" id="L437">                    throw new IllegalStateException(&quot;Already logging to &quot; + path);</span>
+<span class="nc" id="L438">                currentPaths.add(path);</span>
+<span class="nc" id="L439">            }</span>
+            try
+            {
+<span class="nc" id="L442">                Throwable sanitationThrowable = cleanEmptyLogFiles(new File(path), null);</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                if (sanitationThrowable != null)</span>
+<span class="nc" id="L444">                    throw new RuntimeException(format(&quot;Unable to clean up %s directory from empty %s files.&quot;,</span>
+<span class="nc" id="L445">                                                      path.toAbsolutePath(), SingleChronicleQueue.SUFFIX),</span>
+                                               sanitationThrowable);
+
+                // create the archiver before cleaning directories - ExternalArchiver will try to archive any existing file.
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                BinLogArchiver archiver = Strings.isNullOrEmpty(archiveCommand) ? new DeletingArchiver(maxLogSize) : new ExternalArchiver(archiveCommand, path, maxArchiveRetries);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                if (cleanDirectory)</span>
+                {
+<span class="nc" id="L452">                    logger.info(&quot;Cleaning directory: {} as requested&quot;, path);</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">                    if (new File(path).exists())</span>
+                    {
+<span class="nc" id="L455">                        Throwable error = cleanDirectory(new File(path), null);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                        if (error != null)</span>
+                        {
+<span class="nc" id="L458">                            throw new RuntimeException(error);</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L463">                final BinLogOptions options = new BinLogOptions();</span>
+
+<span class="nc" id="L465">                options.max_log_size = maxLogSize;</span>
+<span class="nc" id="L466">                options.max_queue_weight = maxQueueWeight;</span>
+<span class="nc" id="L467">                options.block = blocking;</span>
+<span class="nc" id="L468">                options.roll_cycle = rollCycle;</span>
+<span class="nc" id="L469">                options.archive_command = archiveCommand;</span>
+<span class="nc" id="L470">                options.max_archive_retries = maxArchiveRetries;</span>
+
+<span class="nc" id="L472">                BinLog binlog = new BinLog(path, options, archiver);</span>
+<span class="nc" id="L473">                binlog.start();</span>
+<span class="nc" id="L474">                return binlog;</span>
+            }
+<span class="nc" id="L476">            catch (Exception e)</span>
+            {
+<span class="nc" id="L478">                currentPaths.remove(path);</span>
+<span class="nc" id="L479">                throw e;</span>
+            }
+        }
+    }
+
+    /**
+     * ChronicleQueue fails to start on cq4 files which are empty. Find such files in log dir and remove them.
+     */
+    private static Throwable cleanEmptyLogFiles(File directory, Throwable accumulate)
+    {
+<span class="nc" id="L489">        return cleanDirectory(directory, accumulate,</span>
+<span class="nc" id="L490">                              (dir) -&gt; dir.tryList(file -&gt; {</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                                  boolean foundEmptyCq4File = !file.isDirectory()</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                                                              &amp;&amp; file.length() == 0</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                                                              &amp;&amp; file.name().endsWith(SingleChronicleQueue.SUFFIX);</span>
+
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                                  if (foundEmptyCq4File)</span>
+<span class="nc" id="L496">                                      logger.warn(&quot;Found empty ChronicleQueue file {}. This file wil be deleted as part of BinLog initialization.&quot;,</span>
+<span class="nc" id="L497">                                                  file.absolutePath());</span>
+
+<span class="nc" id="L499">                                  return foundEmptyCq4File;</span>
+                              }));
+    }
+
+    public static Throwable cleanDirectory(File directory, Throwable accumulate)
+    {
+<span class="nc" id="L505">        return cleanDirectory(directory, accumulate, File::tryList);</span>
+    }
+
+    private static Throwable cleanDirectory(File directory, Throwable accumulate, Function&lt;File, File[]&gt; lister)
+    {
+<span class="nc" id="L510">        accumulate = checkDirectory(directory, accumulate);</span>
+
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        if (accumulate != null)</span>
+<span class="nc" id="L513">            return accumulate;</span>
+
+<span class="nc" id="L515">        File[] files = lister.apply(directory);</span>
+
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (files != null)</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">            for (File f : files)</span>
+<span class="nc" id="L519">                accumulate = deleteRecursively(f, accumulate);</span>
+
+<span class="nc bnc" id="L521" title="All 2 branches missed.">        if (accumulate instanceof FSError)</span>
+<span class="nc" id="L522">            JVMStabilityInspector.inspectThrowable(accumulate);</span>
+
+<span class="nc" id="L524">        return accumulate;</span>
+    }
+
+    private static Throwable deleteRecursively(File fileOrDirectory, Throwable accumulate)
+    {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">        if (fileOrDirectory.isDirectory())</span>
+        {
+<span class="nc" id="L531">            File[] files = fileOrDirectory.tryList();</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (files != null)</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">                for (File f : files)</span>
+<span class="nc" id="L534">                    accumulate = f.delete(accumulate, null);</span>
+        }
+<span class="nc" id="L536">        return fileOrDirectory.delete(accumulate, null);</span>
+    }
+
+    private static Throwable checkDirectory(File directory, Throwable accumulate)
+    {
+<span class="nc bnc" id="L541" title="All 2 branches missed.">        if (!directory.exists())</span>
+<span class="nc" id="L542">            accumulate = Throwables.merge(accumulate, new RuntimeException(format(&quot;%s does not exist&quot;, directory)));</span>
+
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        if (!directory.isDirectory())</span>
+<span class="nc" id="L545">            accumulate = Throwables.merge(accumulate, new RuntimeException(format(&quot;%s is not a directory&quot;, directory)));</span>
+
+<span class="nc" id="L547">        return accumulate;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

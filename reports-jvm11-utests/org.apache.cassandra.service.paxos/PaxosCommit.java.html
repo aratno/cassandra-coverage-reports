@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosCommit.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosCommit.java</span></div><h1>PaxosCommit.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos;
+
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.function.Consumer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.locator.InOurDc;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.NoPayload;
+import org.apache.cassandra.service.paxos.Paxos.Participants;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.concurrent.ConditionAsConsumer;
+
+import static java.util.Collections.emptyMap;
+import static org.apache.cassandra.exceptions.RequestFailureReason.NODE_DOWN;
+import static org.apache.cassandra.exceptions.RequestFailureReason.UNKNOWN;
+import static org.apache.cassandra.net.Verb.PAXOS2_COMMIT_REMOTE_REQ;
+import static org.apache.cassandra.net.Verb.PAXOS_COMMIT_REQ;
+import static org.apache.cassandra.service.StorageProxy.shouldHint;
+import static org.apache.cassandra.service.StorageProxy.submitHint;
+import static org.apache.cassandra.service.paxos.Commit.*;
+import static org.apache.cassandra.utils.concurrent.ConditionAsConsumer.newConditionAsConsumer;
+
+// Does not support EACH_QUORUM, as no such thing as EACH_SERIAL
+public class PaxosCommit&lt;OnDone extends Consumer&lt;? super PaxosCommit.Status&gt;&gt; extends PaxosRequestCallback&lt;NoPayload&gt;
+{
+<span class="fc" id="L58">    public static final RequestHandler requestHandler = new RequestHandler();</span>
+<span class="fc" id="L59">    private static final Logger logger = LoggerFactory.getLogger(PaxosCommit.class);</span>
+
+<span class="fc" id="L61">    private static volatile boolean ENABLE_DC_LOCAL_COMMIT = CassandraRelevantProperties.ENABLE_DC_LOCAL_COMMIT.getBoolean();</span>
+
+    public static boolean getEnableDcLocalCommit()
+    {
+<span class="nc" id="L65">        return ENABLE_DC_LOCAL_COMMIT;</span>
+    }
+
+    public static void setEnableDcLocalCommit(boolean enableDcLocalCommit)
+    {
+<span class="nc" id="L70">        ENABLE_DC_LOCAL_COMMIT = enableDcLocalCommit;</span>
+<span class="nc" id="L71">    }</span>
+
+    /**
+     * Represents the current status of a commit action: it is a status rather than a result,
+     * as the result may be unknown without sufficient responses (though in most cases it is final status).
+     */
+    static class Status
+    {
+        private final Paxos.MaybeFailure maybeFailure;
+
+        Status(Paxos.MaybeFailure maybeFailure)
+<span class="fc" id="L82">        {</span>
+<span class="fc" id="L83">            this.maybeFailure = maybeFailure;</span>
+<span class="fc" id="L84">        }</span>
+
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">        boolean isSuccess() { return maybeFailure == null; }</span>
+<span class="nc" id="L87">        Paxos.MaybeFailure maybeFailure() { return maybeFailure; }</span>
+
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        public String toString() { return maybeFailure == null ? &quot;Success&quot; : maybeFailure.toString(); }</span>
+    }
+
+<span class="fc" id="L92">    private static final Status success = new Status(null);</span>
+
+<span class="fc" id="L94">    private static final AtomicLongFieldUpdater&lt;PaxosCommit&gt; responsesUpdater = AtomicLongFieldUpdater.newUpdater(PaxosCommit.class, &quot;responses&quot;);</span>
+
+    final Agreed commit;
+    final boolean allowHints;
+    final ConsistencyLevel consistencyForConsensus;
+    final ConsistencyLevel consistencyForCommit;
+
+    final EndpointsForToken replicas;
+    final int required;
+    final OnDone onDone;
+
+    /**
+     * packs two 32-bit integers;
+     * bit 00-31: accepts
+     * bit 32-63: failures/timeouts
+     * 
+     * {@link #accepts} 
+     * {@link #failures}
+     */
+    private volatile long responses;
+
+    public PaxosCommit(Agreed commit, boolean allowHints, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, Participants participants, OnDone onDone)
+<span class="fc" id="L116">    {</span>
+<span class="fc" id="L117">        this.commit = commit;</span>
+<span class="fc" id="L118">        this.allowHints = allowHints;</span>
+<span class="fc" id="L119">        this.consistencyForConsensus = consistencyForConsensus;</span>
+<span class="fc" id="L120">        this.consistencyForCommit = consistencyForCommit;</span>
+<span class="fc" id="L121">        this.replicas = participants.all;</span>
+<span class="fc" id="L122">        this.onDone = onDone;</span>
+<span class="fc" id="L123">        this.required = participants.requiredFor(consistencyForCommit);</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">        if (required == 0)</span>
+<span class="nc" id="L125">            onDone.accept(status());</span>
+<span class="fc" id="L126">    }</span>
+
+    /**
+     * Submit the proposal for commit with all replicas, and wait synchronously until at most {@code deadline} for the result
+     */
+    static Paxos.Async&lt;Status&gt; commit(Agreed commit, Participants participants, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, @Deprecated boolean allowHints)
+    {
+        // to avoid unnecessary object allocations we extend PaxosPropose to implements Paxos.Async
+        class Async extends PaxosCommit&lt;ConditionAsConsumer&lt;Status&gt;&gt; implements Paxos.Async&lt;Status&gt;
+        {
+            private Async(Agreed commit, boolean allowHints, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, Participants participants)
+            {
+<span class="fc" id="L138">                super(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants, newConditionAsConsumer());</span>
+<span class="fc" id="L139">            }</span>
+
+            public Status awaitUntil(long deadline)
+            {
+                try
+                {
+<span class="fc" id="L145">                    onDone.awaitUntil(deadline);</span>
+                }
+<span class="nc" id="L147">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L149">                    Thread.currentThread().interrupt();</span>
+<span class="nc" id="L150">                    return new Status(new Paxos.MaybeFailure(true, replicas.size(), required, 0, emptyMap()));</span>
+<span class="fc" id="L151">                }</span>
+
+<span class="fc" id="L153">                return status();</span>
+            }
+        }
+
+<span class="fc" id="L157">        Async async = new Async(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants);</span>
+<span class="fc" id="L158">        async.start(participants, false);</span>
+<span class="fc" id="L159">        return async;</span>
+    }
+
+    /**
+     * Submit the proposal for commit with all replicas, and wait synchronously until at most {@code deadline} for the result
+     */
+    static &lt;T extends Consumer&lt;Status&gt;&gt; T commit(Agreed commit, Participants participants, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, @Deprecated boolean allowHints, T onDone)
+    {
+<span class="nc" id="L167">        new PaxosCommit&lt;&gt;(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants, onDone)</span>
+<span class="nc" id="L168">                .start(participants, true);</span>
+<span class="nc" id="L169">        return onDone;</span>
+    }
+
+    /**
+     * Send commit messages to peers (or self)
+     */
+    void start(Participants participants, boolean async)
+    {
+<span class="fc" id="L177">        boolean executeOnSelf = false;</span>
+<span class="fc" id="L178">        Message&lt;Agreed&gt; commitMessage = Message.out(PAXOS_COMMIT_REQ, commit);</span>
+<span class="pc bpc" id="L179" title="2 of 4 branches missed.">        Message&lt;Mutation&gt; mutationMessage = ENABLE_DC_LOCAL_COMMIT &amp;&amp; consistencyForConsensus.isDatacenterLocal()</span>
+<span class="pc" id="L180">                                            ? Message.out(PAXOS2_COMMIT_REMOTE_REQ, commit.makeMutation()) : null;</span>
+
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        for (int i = 0, mi = participants.allLive.size(); i &lt; mi ; ++i)</span>
+<span class="fc" id="L183">            executeOnSelf |= isSelfOrSend(commitMessage, mutationMessage, participants.allLive.endpoint(i));</span>
+
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">        for (int i = 0, mi = participants.allDown.size(); i &lt; mi ; ++i)</span>
+<span class="nc" id="L186">            onFailure(participants.allDown.endpoint(i), NODE_DOWN);</span>
+
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">        if (executeOnSelf)</span>
+        {
+<span class="fc" id="L190">            ExecutorPlus executor = PAXOS_COMMIT_REQ.stage.executor();</span>
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">            if (async) executor.execute(this::executeOnSelf);</span>
+<span class="fc" id="L192">            else executor.maybeExecuteImmediately(this::executeOnSelf);</span>
+        }
+<span class="fc" id="L194">    }</span>
+
+    /**
+     * If isLocal return true; otherwise if the destination is alive send our message, and if not mark the callback with failure
+     */
+    private boolean isSelfOrSend(Message&lt;Agreed&gt; commitMessage, Message&lt;Mutation&gt; mutationMessage, InetAddressAndPort destination)
+    {
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">        if (shouldExecuteOnSelf(destination))</span>
+<span class="fc" id="L202">            return true;</span>
+
+        // don't send commits to remote dcs for local_serial operations
+<span class="nc bnc" id="L205" title="All 4 branches missed.">        if (mutationMessage != null &amp;&amp; !isInLocalDc(destination))</span>
+<span class="nc" id="L206">            MessagingService.instance().sendWithCallback(mutationMessage, destination, this);</span>
+        else
+<span class="nc" id="L208">            MessagingService.instance().sendWithCallback(commitMessage, destination, this);</span>
+
+<span class="nc" id="L210">        return false;</span>
+    }
+
+    private static boolean isInLocalDc(InetAddressAndPort destination)
+    {
+<span class="nc" id="L215">        return DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(destination));</span>
+    }
+
+    /**
+     * Record a failure or timeout, and maybe submit a hint to {@code from}
+     */
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L225">            logger.trace(&quot;{} {} from {}&quot;, commit, reason, from);</span>
+
+<span class="nc" id="L227">        response(false, from);</span>
+<span class="nc" id="L228">        Replica replica = replicas.lookup(from);</span>
+
+<span class="nc bnc" id="L230" title="All 4 branches missed.">        if (allowHints &amp;&amp; shouldHint(replica))</span>
+<span class="nc" id="L231">            submitHint(commit.makeMutation(), replica, null);</span>
+<span class="nc" id="L232">    }</span>
+
+    /**
+     * Record a success response
+     */
+    public void onResponse(Message&lt;NoPayload&gt; response)
+    {
+<span class="nc" id="L239">        logger.trace(&quot;{} Success from {}&quot;, commit, response.from());</span>
+
+<span class="nc" id="L241">        response(true, response.from());</span>
+<span class="nc" id="L242">    }</span>
+
+    /**
+     * Execute locally and record response
+     */
+    public void executeOnSelf()
+    {
+<span class="fc" id="L249">        executeOnSelf(commit, RequestHandler::execute);</span>
+<span class="fc" id="L250">    }</span>
+
+    @Override
+    public void onResponse(NoPayload response, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        response(response != null, from);</span>
+<span class="fc" id="L256">    }</span>
+
+    /**
+     * Record a failure or success response if {@code from} contributes to our consistency.
+     * If we have reached a final outcome of the commit, run {@code onDone}.
+     */
+    private void response(boolean success, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L264" title="3 of 4 branches missed.">        if (consistencyForCommit.isDatacenterLocal() &amp;&amp; !InOurDc.endpoints().test(from))</span>
+<span class="nc" id="L265">            return;</span>
+
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">        long responses = responsesUpdater.addAndGet(this, success ? 0x1L : 0x100000000L);</span>
+        // next two clauses mutually exclusive to ensure we only invoke onDone once, when either failed or succeeded
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">        if (accepts(responses) == required) // if we have received _precisely_ the required accepts, we have succeeded</span>
+<span class="fc" id="L270">            onDone.accept(status());</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        else if (replicas.size() - failures(responses) == required - 1) // if we are _unable_ to receive the required accepts, we have failed</span>
+<span class="nc" id="L272">            onDone.accept(status());</span>
+<span class="fc" id="L273">    }</span>
+
+    /**
+     * @return the Status as of now, which may be final or may indicate we have not received sufficient responses
+     */
+    Status status()
+    {
+<span class="fc" id="L280">        long responses = this.responses;</span>
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">        if (isSuccessful(responses))</span>
+<span class="fc" id="L282">            return success;</span>
+
+<span class="nc" id="L284">        return new Status(new Paxos.MaybeFailure(replicas.size(), required, accepts(responses), failureReasonsAsMap()));</span>
+    }
+
+    private boolean isSuccessful(long responses)
+    {
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">        return accepts(responses) &gt;= required;</span>
+    }
+
+    private static int accepts(long responses)
+    {
+<span class="fc" id="L294">        return (int) (responses &amp; 0xffffffffL);</span>
+    }
+
+    private static int failures(long responses)
+    {
+<span class="nc" id="L299">        return (int) (responses &gt;&gt;&gt; 32);</span>
+    }
+
+<span class="fc" id="L302">    public static class RequestHandler implements IVerbHandler&lt;Agreed&gt;</span>
+    {
+        @Override
+        public void doVerb(Message&lt;Agreed&gt; message)
+        {
+<span class="nc" id="L307">            NoPayload response = execute(message.payload, message.from());</span>
+            // NOTE: for correctness, this must be our last action, so that we cannot throw an error and send both a response and a failure response
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (response == null)</span>
+<span class="nc" id="L310">                MessagingService.instance().respondWithFailure(UNKNOWN, message);</span>
+            else
+<span class="nc" id="L312">                MessagingService.instance().respond(response, message);</span>
+<span class="nc" id="L313">        }</span>
+
+        private static NoPayload execute(Agreed agreed, InetAddressAndPort from)
+        {
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">            if (!Paxos.isInRangeAndShouldProcess(from, agreed.update.partitionKey(), agreed.update.metadata(), false))</span>
+<span class="nc" id="L318">                return null;</span>
+
+<span class="fc" id="L320">            PaxosState.commitDirect(agreed);</span>
+<span class="fc" id="L321">            Tracing.trace(&quot;Enqueuing acknowledge to {}&quot;, from);</span>
+<span class="fc" id="L322">            return NoPayload.noPayload;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

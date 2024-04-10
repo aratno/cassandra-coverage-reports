@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IndexStatusManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index</a> &gt; <span class="el_source">IndexStatusManager.java</span></div><h1>IndexStatusManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.index;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.exceptions.ReadFailureException;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.locator.Endpoints;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JsonUtils;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+
+/**
+ * Handles the status of an index across the ring, updating the status per index and endpoint
+ * in a per-endpoint map.
+ * &lt;p&gt;
+ * Peer status changes are recieved via the {@link StorageService} {@link org.apache.cassandra.gms.IEndpointStateChangeSubscriber}.
+ * &lt;p&gt;
+ * Local status changes are propagated to the {@link Gossiper} using an async executor.
+ */
+public class IndexStatusManager
+{
+<span class="fc" id="L61">    private static final Logger logger = LoggerFactory.getLogger(IndexStatusManager.class);</span>
+
+<span class="fc" id="L63">    public static final IndexStatusManager instance = new IndexStatusManager();</span>
+
+    // executes index status propagation task asynchronously to avoid potential deadlock on SIM
+<span class="fc" id="L66">    private final ExecutorPlus statusPropagationExecutor = executorFactory().withJmxInternal()</span>
+<span class="fc" id="L67">                                                                            .sequential(&quot;StatusPropagationExecutor&quot;);</span>
+
+    /**
+     * A map of per-endpoint index statuses: the key of inner map is the identifier &quot;keyspace.index&quot;
+     */
+<span class="fc" id="L72">    public final Map&lt;InetAddressAndPort, Map&lt;String, Index.Status&gt;&gt; peerIndexStatus = new HashMap&lt;&gt;();</span>
+
+    private IndexStatusManager()
+<span class="fc" id="L75">    {}</span>
+
+    /**
+     * Remove endpoints whose indexes are not queryable for the specified {@link Index.QueryPlan}.
+     *
+     * @param liveEndpoints current live endpoints where non-queryable endpoints will be removed
+     * @param keyspace to be queried
+     * @param indexQueryPlan index query plan used in the read command
+     * @param level consistency level of read command
+     */
+    public &lt;E extends Endpoints&lt;E&gt;&gt; E filterForQuery(E liveEndpoints, Keyspace keyspace, Index.QueryPlan indexQueryPlan, ConsistencyLevel level)
+    {
+<span class="fc" id="L87">        E queryableEndpoints = liveEndpoints.filter(replica -&gt; {</span>
+
+<span class="fc bfc" id="L89" title="All 2 branches covered.">            for (Index index : indexQueryPlan.getIndexes())</span>
+            {
+<span class="fc" id="L91">                Index.Status status = getIndexStatus(replica.endpoint(), keyspace.getName(), index.getIndexMetadata().name);</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">                if (!index.isQueryable(status))</span>
+<span class="fc" id="L93">                    return false;</span>
+<span class="fc" id="L94">            }</span>
+
+<span class="fc" id="L96">            return true;</span>
+        });
+
+<span class="fc" id="L99">        int initial = liveEndpoints.size();</span>
+<span class="fc" id="L100">        int filtered = queryableEndpoints.size();</span>
+
+        // Throw ReadFailureException if read request cannot satisfy Consistency Level due to non-queryable indexes.
+        // It is to provide a better UX, compared to throwing UnavailableException when the nodes are actually alive.
+<span class="fc bfc" id="L104" title="All 2 branches covered.">        if (initial != filtered)</span>
+        {
+<span class="fc" id="L106">            int required = level.blockFor(keyspace.getReplicationStrategy());</span>
+<span class="pc bpc" id="L107" title="2 of 4 branches missed.">            if (required &lt;= initial &amp;&amp; required &gt; filtered)</span>
+            {
+<span class="fc" id="L109">                Map&lt;InetAddressAndPort, RequestFailureReason&gt; failureReasons = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L110">                liveEndpoints.without(queryableEndpoints.endpoints())</span>
+<span class="fc" id="L111">                             .forEach(replica -&gt; failureReasons.put(replica.endpoint(), RequestFailureReason.INDEX_NOT_AVAILABLE));</span>
+
+<span class="fc" id="L113">                throw new ReadFailureException(level, filtered, required, false, failureReasons);</span>
+            }
+        }
+
+<span class="fc" id="L117">        return queryableEndpoints;</span>
+    }
+
+    /**
+     * Recieve a new index status map from a peer. This will include the status for all the indexes on the peer.
+     *
+     * @param endpoint the {@link InetAddressAndPort} the index status map is coming from
+     * @param versionedValue the {@link VersionedValue} containing the index status map
+     */
+    public synchronized void receivePeerIndexStatus(InetAddressAndPort endpoint, VersionedValue versionedValue)
+    {
+        try
+        {
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">            if (versionedValue == null)</span>
+<span class="nc" id="L131">                return;</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            if (endpoint.equals(FBUtilities.getBroadcastAddressAndPort()))</span>
+<span class="fc" id="L133">                return;</span>
+
+<span class="fc" id="L135">            Map&lt;String, String&gt; peerStatus = JsonUtils.fromJsonMap(versionedValue.value);</span>
+<span class="fc" id="L136">            Map&lt;String, Index.Status&gt; indexStatus = new HashMap&lt;&gt;();</span>
+
+<span class="fc bfc" id="L138" title="All 2 branches covered.">            for (Map.Entry&lt;String, String&gt; e : peerStatus.entrySet())</span>
+            {
+<span class="fc" id="L140">                String keyspaceIndex = e.getKey();</span>
+<span class="fc" id="L141">                Index.Status status = Index.Status.valueOf(e.getValue());</span>
+<span class="fc" id="L142">                indexStatus.put(keyspaceIndex, status);</span>
+<span class="fc" id="L143">            }</span>
+
+<span class="fc" id="L145">            Map&lt;String, Index.Status&gt; oldStatus = peerIndexStatus.put(endpoint, indexStatus);</span>
+<span class="fc" id="L146">            Map&lt;String, Index.Status&gt; updated = updatedIndexStatuses(oldStatus, indexStatus);</span>
+<span class="fc" id="L147">            Set&lt;String&gt; removed = removedIndexStatuses(oldStatus, indexStatus);</span>
+<span class="fc bfc" id="L148" title="All 4 branches covered.">            if (!updated.isEmpty() || !removed.isEmpty())</span>
+<span class="fc" id="L149">                logger.debug(&quot;Received index status for peer {}:\n    Updated: {}\n    Removed: {}&quot;,</span>
+                             endpoint, updated, removed);
+        }
+<span class="nc" id="L152">        catch (MarshalException | IllegalArgumentException e)</span>
+        {
+<span class="nc" id="L154">            logger.warn(&quot;Unable to parse index status: {}&quot;, e.getMessage());</span>
+<span class="fc" id="L155">        }</span>
+<span class="fc" id="L156">    }</span>
+
+    /**
+     * Propagate a new index status to the ring. The new index status is added to the current index status map
+     * and the whole map is sent to the ring as a {@link VersionedValue}.
+     *
+     * @param keyspace the keyspace name for the index
+     * @param index the index name
+     * @param status the new {@link Index.Status}
+     */
+    public synchronized void propagateLocalIndexStatus(String keyspace, String index, Index.Status status)
+    {
+        try
+        {
+<span class="fc" id="L170">            Map&lt;String, Index.Status&gt; states = peerIndexStatus.computeIfAbsent(FBUtilities.getBroadcastAddressAndPort(),</span>
+<span class="fc" id="L171">                                                                               k -&gt; new HashMap&lt;&gt;());</span>
+<span class="fc" id="L172">            String keyspaceIndex = identifier(keyspace, index);</span>
+
+<span class="fc bfc" id="L174" title="All 2 branches covered.">            if (status == Index.Status.DROPPED)</span>
+<span class="fc" id="L175">                states.remove(keyspaceIndex);</span>
+            else
+<span class="fc" id="L177">                states.put(keyspaceIndex, status);</span>
+
+            // Don't try and propagate if the gossiper isn't enabled. This is primarily for tests where the
+            // Gossiper has not been started. If we attempt to propagate when not started an exception is
+            // logged and this causes a number of dtests to fail.
+<span class="fc bfc" id="L182" title="All 2 branches covered.">            if (Gossiper.instance.isEnabled())</span>
+            {
+<span class="fc" id="L184">                String newStatus = JsonUtils.JSON_OBJECT_MAPPER.writeValueAsString(states);</span>
+<span class="fc" id="L185">                statusPropagationExecutor.submit(() -&gt; {</span>
+                    // schedule gossiper update asynchronously to avoid potential deadlock when another thread is holding
+                    // gossiper taskLock.
+<span class="fc" id="L188">                    VersionedValue value = StorageService.instance.valueFactory.indexStatus(newStatus);</span>
+<span class="fc" id="L189">                    Gossiper.instance.addLocalApplicationState(ApplicationState.INDEX_STATUS, value);</span>
+<span class="fc" id="L190">                });</span>
+            }
+        }
+<span class="nc" id="L193">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L195">            logger.warn(&quot;Unable to propagate index status: {}&quot;, e.getMessage());</span>
+<span class="fc" id="L196">        }</span>
+<span class="fc" id="L197">    }</span>
+
+    @VisibleForTesting
+    public synchronized Index.Status getIndexStatus(InetAddressAndPort peer, String keyspace, String index)
+    {
+<span class="fc" id="L202">        return peerIndexStatus.getOrDefault(peer, Collections.emptyMap())</span>
+<span class="fc" id="L203">                              .getOrDefault(identifier(keyspace, index), Index.Status.UNKNOWN);</span>
+    }
+
+    /**
+     * Returns the names of indexes that are present in oldStatus but absent in newStatus.
+     */
+    private @Nonnull Set&lt;String&gt; removedIndexStatuses(@Nullable Map&lt;String, Index.Status&gt; oldStatus,
+                                                      @Nonnull Map&lt;String, Index.Status&gt; newStatus)
+    {
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        if (oldStatus == null)</span>
+<span class="fc" id="L213">            return Collections.emptySet();</span>
+<span class="fc" id="L214">        Set&lt;String&gt; result = new HashSet&lt;&gt;(oldStatus.keySet());</span>
+<span class="fc" id="L215">        result.removeAll(newStatus.keySet());</span>
+<span class="fc" id="L216">        return result;</span>
+    }
+
+    /**
+     * Returns a new map containing only the entries from newStatus that differ from corresponding entries in oldStatus.
+     */
+    private @Nonnull Map&lt;String, Index.Status&gt; updatedIndexStatuses(@Nullable Map&lt;String, Index.Status&gt; oldStatus,
+                                                                    @Nonnull Map&lt;String, Index.Status&gt; newStatus)
+    {
+<span class="fc" id="L225">        Map&lt;String, Index.Status&gt; delta = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        for (Map.Entry&lt;String, Index.Status&gt; e : newStatus.entrySet())</span>
+        {
+<span class="fc bfc" id="L228" title="All 4 branches covered.">            if (oldStatus == null || e.getValue() != oldStatus.get(e.getKey()))</span>
+<span class="fc" id="L229">                delta.put(e.getKey(), e.getValue());</span>
+<span class="fc" id="L230">        }</span>
+<span class="fc" id="L231">        return delta;</span>
+    }
+
+    private String identifier(String keyspace, String index)
+    {
+<span class="fc" id="L236">        return keyspace + '.' + index;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

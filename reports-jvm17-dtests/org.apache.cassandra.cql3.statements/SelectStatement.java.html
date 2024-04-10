@@ -1,0 +1,1740 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SelectStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">SelectStatement.java</span></div><h1>SelectStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
+
+import javax.annotation.concurrent.ThreadSafe;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.MoreObjects;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.selection.RawSelector;
+import org.apache.cassandra.cql3.selection.ResultSetBuilder;
+import org.apache.cassandra.cql3.selection.Selectable;
+import org.apache.cassandra.cql3.selection.Selectable.WithFunction;
+import org.apache.cassandra.cql3.selection.Selection;
+import org.apache.cassandra.cql3.selection.Selection.Selectors;
+import org.apache.cassandra.cql3.selection.Selector;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.aggregation.AggregationSpecification;
+import org.apache.cassandra.db.aggregation.GroupMaker;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.metrics.ClientRequestSizeMetrics;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.pager.AggregationQueryPager;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.service.pager.QueryPager;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkNull;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
+import static org.apache.cassandra.utils.ByteBufferUtil.UNSET_BYTE_BUFFER;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+/**
+ * Encapsulates a completely parsed SELECT query, including the target
+ * column family, expression, result count, and ordering clause.
+ *
+ * A number of public methods here are only used internally. However,
+ * many of these are made accessible for the benefit of custom
+ * QueryHandler implementations, so before reducing their accessibility
+ * due consideration should be given.
+ *
+ * Note that select statements can be accessed by multiple threads, so we cannot rely on mutable attributes.
+ */
+@ThreadSafe
+public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
+{
+<span class="fc" id="L108">    private static final Logger logger = LoggerFactory.getLogger(SelectStatement.class);</span>
+<span class="fc" id="L109">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(SelectStatement.logger, 1, TimeUnit.MINUTES);</span>
+
+    public static final int DEFAULT_PAGE_SIZE = 10000;
+
+    public final VariableSpecifications bindVariables;
+    public final TableMetadata table;
+    public final Parameters parameters;
+    private final Selection selection;
+    private final Term limit;
+    private final Term perPartitionLimit;
+
+    private final StatementRestrictions restrictions;
+
+    private final boolean isReversed;
+
+    /**
+     * The {@code Factory} used to create the {@code AggregationSpecification}.
+     */
+    private final AggregationSpecification.Factory aggregationSpecFactory;
+
+    /**
+     * The comparator used to orders results when multiple keys are selected (using IN).
+     */
+    private final Comparator&lt;List&lt;ByteBuffer&gt;&gt; orderingComparator;
+
+    // Used by forSelection below
+<span class="fc" id="L135">    private static final Parameters defaultParameters = new Parameters(Collections.emptyMap(),</span>
+<span class="fc" id="L136">                                                                       Collections.emptyList(),</span>
+                                                                       false,
+                                                                       false,
+                                                                       false);
+
+    public SelectStatement(TableMetadata table,
+                           VariableSpecifications bindVariables,
+                           Parameters parameters,
+                           Selection selection,
+                           StatementRestrictions restrictions,
+                           boolean isReversed,
+                           AggregationSpecification.Factory aggregationSpecFactory,
+                           Comparator&lt;List&lt;ByteBuffer&gt;&gt; orderingComparator,
+                           Term limit,
+                           Term perPartitionLimit)
+<span class="fc" id="L151">    {</span>
+<span class="fc" id="L152">        this.table = table;</span>
+<span class="fc" id="L153">        this.bindVariables = bindVariables;</span>
+<span class="fc" id="L154">        this.selection = selection;</span>
+<span class="fc" id="L155">        this.restrictions = restrictions;</span>
+<span class="fc" id="L156">        this.isReversed = isReversed;</span>
+<span class="fc" id="L157">        this.aggregationSpecFactory = aggregationSpecFactory;</span>
+<span class="fc" id="L158">        this.orderingComparator = orderingComparator;</span>
+<span class="fc" id="L159">        this.parameters = parameters;</span>
+<span class="fc" id="L160">        this.limit = limit;</span>
+<span class="fc" id="L161">        this.perPartitionLimit = perPartitionLimit;</span>
+<span class="fc" id="L162">    }</span>
+
+    @Override
+    public List&lt;ColumnSpecification&gt; getBindVariables()
+    {
+<span class="fc" id="L167">        return bindVariables.getBindVariables();</span>
+    }
+
+    @Override
+    public short[] getPartitionKeyBindVariableIndexes()
+    {
+<span class="fc" id="L173">        return bindVariables.getPartitionKeyBindVariableIndexes(table);</span>
+    }
+
+    @Override
+    public Iterable&lt;Function&gt; getFunctions()
+    {
+<span class="fc" id="L179">        List&lt;Function&gt; functions = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L180">        addFunctionsTo(functions);</span>
+<span class="fc" id="L181">        return functions;</span>
+    }
+
+    private void addFunctionsTo(List&lt;Function&gt; functions)
+    {
+<span class="fc" id="L186">        selection.addFunctionsTo(functions);</span>
+<span class="fc" id="L187">        restrictions.addFunctionsTo(functions);</span>
+
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        if (aggregationSpecFactory != null)</span>
+<span class="fc" id="L190">            aggregationSpecFactory.addFunctionsTo(functions);</span>
+
+<span class="fc bfc" id="L192" title="All 2 branches covered.">        if (limit != null)</span>
+<span class="fc" id="L193">            limit.addFunctionsTo(functions);</span>
+
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">        if (perPartitionLimit != null)</span>
+<span class="nc" id="L196">            perPartitionLimit.addFunctionsTo(functions);</span>
+<span class="fc" id="L197">    }</span>
+
+    /**
+     * The columns to fetch internally for this SELECT statement (which can be more than the one selected by the
+     * user as it also include any restricted column in particular).
+     */
+    public ColumnFilter queriedColumns()
+    {
+<span class="fc" id="L205">        return selection.newSelectors(QueryOptions.DEFAULT).getColumnFilter();</span>
+    }
+
+    // Creates a simple select based on the given selection.
+    // Note that the results select statement should not be used for actual queries, but only for processing already
+    // queried data through processColumnFamily.
+    static SelectStatement forSelection(TableMetadata table, Selection selection)
+    {
+<span class="fc" id="L213">        return new SelectStatement(table,</span>
+<span class="fc" id="L214">                                   VariableSpecifications.empty(),</span>
+                                   defaultParameters,
+                                   selection,
+<span class="fc" id="L217">                                   StatementRestrictions.empty(StatementType.SELECT, table),</span>
+                                   false,
+                                   null,
+                                   null,
+                                   null,
+                                   null);
+    }
+
+    public ResultSet.ResultMetadata getResultMetadata()
+    {
+<span class="fc" id="L227">        return selection.getResultMetadata();</span>
+    }
+
+    public void authorize(ClientState state) throws InvalidRequestException, UnauthorizedException
+    {
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">        if (table.isView())</span>
+        {
+<span class="nc" id="L234">            TableMetadataRef baseTable = View.findBaseTable(keyspace(), table());</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (baseTable != null)</span>
+<span class="nc" id="L236">                state.ensureTablePermission(baseTable, Permission.SELECT);</span>
+<span class="nc" id="L237">        }</span>
+        else
+        {
+<span class="fc" id="L240">            state.ensureTablePermission(table, Permission.SELECT);</span>
+        }
+
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        for (Function function : getFunctions())</span>
+<span class="nc" id="L244">            state.ensurePermission(Permission.EXECUTE, function);</span>
+
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        if (!state.hasTablePermission(table, Permission.UNMASK) &amp;&amp;</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">            !state.hasTablePermission(table, Permission.SELECT_MASKED))</span>
+        {
+<span class="fc" id="L249">            List&lt;ColumnMetadata&gt; queriedMaskedColumns = table.columns()</span>
+<span class="fc" id="L250">                                                             .stream()</span>
+<span class="fc" id="L251">                                                             .filter(ColumnMetadata::isMasked)</span>
+<span class="fc" id="L252">                                                             .filter(restrictions::isRestricted)</span>
+<span class="fc" id="L253">                                                             .collect(Collectors.toList());</span>
+
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">            if (!queriedMaskedColumns.isEmpty())</span>
+<span class="nc" id="L256">                throw new UnauthorizedException(format(&quot;User %s has no UNMASK nor SELECT_MASKED permission on table %s.%s, &quot; +</span>
+                                                       &quot;cannot query masked columns %s&quot;,
+<span class="nc" id="L258">                                                       state.getUser().getName(), keyspace(), table(), queriedMaskedColumns));</span>
+        }
+<span class="fc" id="L260">    }</span>
+
+    public void validate(ClientState state) throws InvalidRequestException
+    {
+<span class="fc bfc" id="L264" title="All 4 branches covered.">        if (parameters.allowFiltering &amp;&amp; !SchemaConstants.isSystemKeyspace(table.keyspace))</span>
+<span class="fc" id="L265">            Guardrails.allowFilteringEnabled.ensureEnabled(state);</span>
+<span class="fc" id="L266">    }</span>
+
+    public ResultMessage.Rows execute(QueryState state, QueryOptions options, long queryStartNanoTime)
+    {
+<span class="fc" id="L270">        ConsistencyLevel cl = options.getConsistency();</span>
+<span class="fc" id="L271">        checkNotNull(cl, &quot;Invalid empty consistency level&quot;);</span>
+
+<span class="fc" id="L273">        cl.validateForRead();</span>
+<span class="fc" id="L274">        Guardrails.readConsistencyLevels.guard(EnumSet.of(cl), state.getClientState());</span>
+
+<span class="fc" id="L276">        long nowInSec = options.getNowInSeconds(state);</span>
+<span class="fc" id="L277">        int userLimit = getLimit(options);</span>
+<span class="fc" id="L278">        int userPerPartitionLimit = getPerPartitionLimit(options);</span>
+<span class="fc" id="L279">        int pageSize = options.getPageSize();</span>
+<span class="pc bpc" id="L280" title="1 of 4 branches missed.">        boolean unmask = !table.hasMaskedColumns() || state.getClientState().hasTablePermission(table, Permission.UNMASK);</span>
+
+<span class="fc" id="L282">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L283">        AggregationSpecification aggregationSpec = getAggregationSpec(options);</span>
+<span class="fc" id="L284">        ReadQuery query = getQuery(options, state.getClientState(), selectors.getColumnFilter(),</span>
+                                   nowInSec, userLimit, userPerPartitionLimit, pageSize, aggregationSpec);
+
+<span class="fc bfc" id="L287" title="All 2 branches covered.">        if (options.isReadThresholdsEnabled())</span>
+<span class="fc" id="L288">            query.trackWarnings();</span>
+        ResultMessage.Rows rows;
+
+<span class="fc bfc" id="L291" title="All 6 branches covered.">        if (aggregationSpec == null &amp;&amp; (pageSize &lt;= 0 || (query.limits().count() &lt;= pageSize)))</span>
+        {
+<span class="fc" id="L293">            rows = execute(query, options, state.getClientState(), selectors, nowInSec, userLimit, null, queryStartNanoTime, unmask);</span>
+        }
+        else
+        {
+<span class="fc" id="L297">            QueryPager pager = getPager(query, options);</span>
+
+<span class="fc" id="L299">            rows = execute(state,</span>
+<span class="fc" id="L300">                           Pager.forDistributedQuery(pager, cl, state.getClientState()),</span>
+                           options,
+                           selectors,
+                           pageSize,
+                           nowInSec,
+                           userLimit,
+                           aggregationSpec,
+                           queryStartNanoTime,
+                           unmask);
+        }
+<span class="fc bfc" id="L310" title="All 2 branches covered.">        if (!SchemaConstants.isSystemKeyspace(table.keyspace))</span>
+<span class="fc" id="L311">            ClientRequestSizeMetrics.recordReadResponseMetrics(rows, restrictions, selection);</span>
+
+<span class="fc" id="L313">        return rows;</span>
+    }
+
+
+    public AggregationSpecification getAggregationSpec(QueryOptions options)
+    {
+<span class="fc bfc" id="L319" title="All 2 branches covered.">        return aggregationSpecFactory == null ? null : aggregationSpecFactory.newInstance(options);</span>
+    }
+
+    public ReadQuery getQuery(QueryOptions options, long nowInSec) throws RequestValidationException
+    {
+<span class="fc" id="L324">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L325">        return getQuery(options,</span>
+<span class="fc" id="L326">                        ClientState.forInternalCalls(),</span>
+<span class="fc" id="L327">                        selectors.getColumnFilter(),</span>
+                        nowInSec,
+<span class="fc" id="L329">                        getLimit(options),</span>
+<span class="fc" id="L330">                        getPerPartitionLimit(options),</span>
+<span class="fc" id="L331">                        options.getPageSize(),</span>
+<span class="fc" id="L332">                        getAggregationSpec(options));</span>
+    }
+
+    public ReadQuery getQuery(QueryOptions options,
+                              ClientState state,
+                              ColumnFilter columnFilter,
+                              long nowInSec,
+                              int userLimit,
+                              int perPartitionLimit,
+                              int pageSize,
+                              AggregationSpecification aggregationSpec)
+    {
+<span class="pc bpc" id="L344" title="1 of 4 branches missed.">        boolean isPartitionRangeQuery = restrictions.isKeyRange() || restrictions.usesSecondaryIndexing();</span>
+
+<span class="fc" id="L346">        DataLimits limit = getDataLimits(userLimit, perPartitionLimit, pageSize, aggregationSpec);</span>
+
+<span class="fc bfc" id="L348" title="All 2 branches covered.">        if (isPartitionRangeQuery)</span>
+<span class="fc" id="L349">            return getRangeCommand(options, state, columnFilter, limit, nowInSec);</span>
+
+<span class="fc" id="L351">        return getSliceCommands(options, state, columnFilter, limit, nowInSec);</span>
+    }
+
+    private ResultMessage.Rows execute(ReadQuery query,
+                                       QueryOptions options,
+                                       ClientState state,
+                                       Selectors selectors,
+                                       long nowInSec,
+                                       int userLimit,
+                                       AggregationSpecification aggregationSpec,
+                                       long queryStartNanoTime,
+                                       boolean unmask)
+    {
+<span class="fc" id="L364">        try (PartitionIterator data = query.execute(options.getConsistency(), state, queryStartNanoTime))</span>
+        {
+<span class="fc" id="L366">            return processResults(data, options, selectors, nowInSec, userLimit, aggregationSpec, unmask);</span>
+        }
+    }
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+<span class="nc" id="L373">        return new AuditLogContext(AuditLogEntryType.SELECT, keyspace(), table.name);</span>
+    }
+
+    // Simple wrapper class to avoid some code duplication
+    private static abstract class Pager
+    {
+        protected QueryPager pager;
+
+        protected Pager(QueryPager pager)
+<span class="fc" id="L382">        {</span>
+<span class="fc" id="L383">            this.pager = pager;</span>
+<span class="fc" id="L384">        }</span>
+
+        public static Pager forInternalQuery(QueryPager pager, ReadExecutionController executionController)
+        {
+<span class="fc" id="L388">            return new InternalPager(pager, executionController);</span>
+        }
+
+        public static Pager forDistributedQuery(QueryPager pager, ConsistencyLevel consistency, ClientState clientState)
+        {
+<span class="fc" id="L393">            return new NormalPager(pager, consistency, clientState);</span>
+        }
+
+        public boolean isExhausted()
+        {
+<span class="fc" id="L398">            return pager.isExhausted();</span>
+        }
+
+        public PagingState state()
+        {
+<span class="fc" id="L403">            return pager.state();</span>
+        }
+
+        public abstract PartitionIterator fetchPage(int pageSize, long queryStartNanoTime);
+
+        public static class NormalPager extends Pager
+        {
+            private final ConsistencyLevel consistency;
+            private final ClientState clientState;
+
+            private NormalPager(QueryPager pager, ConsistencyLevel consistency, ClientState clientState)
+            {
+<span class="fc" id="L415">                super(pager);</span>
+<span class="fc" id="L416">                this.consistency = consistency;</span>
+<span class="fc" id="L417">                this.clientState = clientState;</span>
+<span class="fc" id="L418">            }</span>
+
+            public PartitionIterator fetchPage(int pageSize, long queryStartNanoTime)
+            {
+<span class="fc" id="L422">                return pager.fetchPage(pageSize, consistency, clientState, queryStartNanoTime);</span>
+            }
+        }
+
+        public static class InternalPager extends Pager
+        {
+            private final ReadExecutionController executionController;
+
+            private InternalPager(QueryPager pager, ReadExecutionController executionController)
+            {
+<span class="fc" id="L432">                super(pager);</span>
+<span class="fc" id="L433">                this.executionController = executionController;</span>
+<span class="fc" id="L434">            }</span>
+
+            public PartitionIterator fetchPage(int pageSize, long queryStartNanoTime)
+            {
+<span class="fc" id="L438">                return pager.fetchPageInternal(pageSize, executionController);</span>
+            }
+        }
+    }
+
+    private ResultMessage.Rows execute(QueryState state,
+                                       Pager pager,
+                                       QueryOptions options,
+                                       Selectors selectors,
+                                       int pageSize,
+                                       long nowInSec,
+                                       int userLimit,
+                                       AggregationSpecification aggregationSpec,
+                                       long queryStartNanoTime,
+                                       boolean unmask)
+    {
+<span class="fc" id="L454">        Guardrails.pageSize.guard(pageSize, table(), false, state.getClientState());</span>
+
+<span class="fc bfc" id="L456" title="All 2 branches covered.">        if (aggregationSpecFactory != null)</span>
+        {
+<span class="fc bfc" id="L458" title="All 2 branches covered.">            if (!restrictions.hasPartitionKeyRestrictions())</span>
+            {
+<span class="fc" id="L460">                warn(&quot;Aggregation query used without partition key&quot;);</span>
+<span class="fc" id="L461">                noSpamLogger.warn(String.format(&quot;Aggregation query used without partition key on table %s.%s, aggregation type: %s&quot;,</span>
+<span class="fc" id="L462">                                                 keyspace(), table(), aggregationSpec.kind()));</span>
+            }
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">            else if (restrictions.keyIsInRelation())</span>
+            {
+<span class="nc" id="L466">                warn(&quot;Aggregation query used on multiple partition keys (IN restriction)&quot;);</span>
+<span class="nc" id="L467">                noSpamLogger.warn(String.format(&quot;Aggregation query used on multiple partition keys (IN restriction) on table %s.%s, aggregation type: %s&quot;,</span>
+<span class="nc" id="L468">                                                 keyspace(), table(), aggregationSpec.kind()));</span>
+            }
+        }
+
+        // We can't properly do post-query ordering if we page (see #6722)
+        // For GROUP BY or aggregation queries we always page internally even if the user has turned paging off
+<span class="pc bpc" id="L474" title="1 of 4 branches missed.">        checkFalse(pageSize &gt; 0 &amp;&amp; needsPostQueryOrdering(),</span>
+                  &quot;Cannot page queries with both ORDER BY and a IN restriction on the partition key;&quot;
+                  + &quot; you must either remove the ORDER BY or the IN and sort client side, or disable paging for this query&quot;);
+
+        ResultMessage.Rows msg;
+<span class="fc" id="L479">        try (PartitionIterator page = pager.fetchPage(pageSize, queryStartNanoTime))</span>
+        {
+<span class="fc" id="L481">            msg = processResults(page, options, selectors, nowInSec, userLimit, aggregationSpec, unmask);</span>
+        }
+
+        // Please note that the isExhausted state of the pager only gets updated when we've closed the page, so this
+        // shouldn't be moved inside the 'try' above.
+<span class="fc bfc" id="L486" title="All 2 branches covered.">        if (!pager.isExhausted())</span>
+<span class="fc" id="L487">            msg.result.metadata.setHasMorePages(pager.state());</span>
+
+<span class="fc" id="L489">        return msg;</span>
+    }
+
+    private void warn(String msg)
+    {
+<span class="fc" id="L494">        logger.warn(msg);</span>
+<span class="fc" id="L495">        ClientWarn.instance.warn(msg);</span>
+<span class="fc" id="L496">    }</span>
+
+    private ResultMessage.Rows processResults(PartitionIterator partitions,
+                                              QueryOptions options,
+                                              Selectors selectors,
+                                              long nowInSec,
+                                              int userLimit,
+                                              AggregationSpecification aggregationSpec,
+                                              boolean unmask) throws RequestValidationException
+    {
+<span class="fc" id="L506">        ResultSet rset = process(partitions, options, selectors, nowInSec, userLimit, aggregationSpec, unmask);</span>
+<span class="fc" id="L507">        return new ResultMessage.Rows(rset);</span>
+    }
+
+    public ResultMessage.Rows executeLocally(QueryState state, QueryOptions options) throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L512">        return executeInternal(state, options, options.getNowInSeconds(state), nanoTime());</span>
+    }
+
+    public ResultMessage.Rows executeInternal(QueryState state,
+                                              QueryOptions options,
+                                              long nowInSec,
+                                              long queryStartNanoTime)
+    {
+<span class="fc" id="L520">        int userLimit = getLimit(options);</span>
+<span class="fc" id="L521">        int userPerPartitionLimit = getPerPartitionLimit(options);</span>
+<span class="fc" id="L522">        int pageSize = options.getPageSize();</span>
+<span class="fc" id="L523">        boolean unmask = state.getClientState().hasTablePermission(table, Permission.UNMASK);</span>
+
+<span class="fc" id="L525">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L526">        AggregationSpecification aggregationSpec = getAggregationSpec(options);</span>
+<span class="fc" id="L527">        ReadQuery query = getQuery(options,</span>
+<span class="fc" id="L528">                                   state.getClientState(),</span>
+<span class="fc" id="L529">                                   selectors.getColumnFilter(),</span>
+                                   nowInSec,
+                                   userLimit,
+                                   userPerPartitionLimit,
+                                   pageSize,
+                                   aggregationSpec);
+
+<span class="fc" id="L536">        try (ReadExecutionController executionController = query.executionController())</span>
+        {
+<span class="pc bpc" id="L538" title="3 of 6 branches missed.">            if (aggregationSpec == null &amp;&amp; (pageSize &lt;= 0 || (query.limits().count() &lt;= pageSize)))</span>
+            {
+<span class="fc" id="L540">                try (PartitionIterator data = query.executeInternal(executionController))</span>
+                {
+<span class="fc" id="L542">                    return processResults(data, options, selectors, nowInSec, userLimit, null, unmask);</span>
+                }
+            }
+
+<span class="fc" id="L546">            QueryPager pager = getPager(query, options);</span>
+
+<span class="fc" id="L548">            return execute(state,</span>
+<span class="fc" id="L549">                           Pager.forInternalQuery(pager, executionController),</span>
+                           options,
+                           selectors,
+                           pageSize,
+                           nowInSec,
+                           userLimit,
+                           aggregationSpec,
+                           queryStartNanoTime,
+                           unmask);
+<span class="pc bpc" id="L558" title="1 of 2 branches missed.">        }</span>
+    }
+
+    private QueryPager getPager(ReadQuery query, QueryOptions options)
+    {
+<span class="fc" id="L563">        QueryPager pager = query.getPager(options.getPagingState(), options.getProtocolVersion());</span>
+
+<span class="pc bpc" id="L565" title="1 of 4 branches missed.">        if (aggregationSpecFactory == null || query.isEmpty())</span>
+<span class="fc" id="L566">            return pager;</span>
+
+<span class="fc" id="L568">        return new AggregationQueryPager(pager, query.limits());</span>
+    }
+
+    public Map&lt;DecoratedKey, List&lt;Row&gt;&gt; executeRawInternal(QueryOptions options, ClientState state, long nowInSec) throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L573">        int userLimit = getLimit(options);</span>
+<span class="fc" id="L574">        int userPerPartitionLimit = getPerPartitionLimit(options);</span>
+<span class="pc bpc" id="L575" title="1 of 2 branches missed.">        if (options.getPageSize() &gt; 0)</span>
+<span class="nc" id="L576">            throw new IllegalStateException();</span>
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">        if (aggregationSpecFactory != null)</span>
+<span class="nc" id="L578">            throw new IllegalStateException();</span>
+
+<span class="fc" id="L580">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L581">        ReadQuery query = getQuery(options, state, selectors.getColumnFilter(), nowInSec, userLimit, userPerPartitionLimit, Integer.MAX_VALUE, null);</span>
+
+<span class="fc" id="L583">        Map&lt;DecoratedKey, List&lt;Row&gt;&gt; result = Collections.emptyMap();</span>
+<span class="fc" id="L584">        try (ReadExecutionController executionController = query.executionController())</span>
+        {
+<span class="fc" id="L586">            try (PartitionIterator data = query.executeInternal(executionController))</span>
+            {
+<span class="fc bfc" id="L588" title="All 2 branches covered.">                while (data.hasNext())</span>
+                {
+<span class="fc" id="L590">                    try (RowIterator in = data.next())</span>
+                    {
+<span class="fc" id="L592">                        List&lt;Row&gt; out = Collections.emptyList();</span>
+<span class="fc bfc" id="L593" title="All 2 branches covered.">                        while (in.hasNext())</span>
+                        {
+<span class="pc bpc" id="L595" title="2 of 3 branches missed.">                            switch (out.size())</span>
+                            {
+<span class="fc" id="L597">                                case 0:  out = Collections.singletonList(in.next()); break;</span>
+<span class="nc" id="L598">                                case 1:  out = new ArrayList&lt;&gt;(out);</span>
+<span class="nc" id="L599">                                default: out.add(in.next());</span>
+                            }
+                        }
+<span class="pc bpc" id="L602" title="2 of 3 branches missed.">                        switch (result.size())</span>
+                        {
+<span class="fc" id="L604">                            case 0:  result = Collections.singletonMap(in.partitionKey(), out); break;</span>
+<span class="nc" id="L605">                            case 1:  result = new TreeMap&lt;&gt;(result);</span>
+<span class="nc" id="L606">                            default: result.put(in.partitionKey(), out);</span>
+                        }
+                    }
+                }
+<span class="fc" id="L610">                return result;</span>
+            }
+        }
+    }
+
+    public ResultSet process(PartitionIterator partitions, long nowInSec, boolean unmask) throws InvalidRequestException
+    {
+<span class="fc" id="L617">        QueryOptions options = QueryOptions.DEFAULT;</span>
+<span class="fc" id="L618">        Selectors selectors = selection.newSelectors(options);</span>
+<span class="fc" id="L619">        return process(partitions, options, selectors, nowInSec, getLimit(options), getAggregationSpec(options), unmask);</span>
+    }
+
+    @Override
+    public String keyspace()
+    {
+<span class="fc" id="L625">        return table.keyspace;</span>
+    }
+
+    public String table()
+    {
+<span class="fc" id="L630">        return table.name;</span>
+    }
+
+    /**
+     * May be used by custom QueryHandler implementations
+     */
+    public Selection getSelection()
+    {
+<span class="fc" id="L638">        return selection;</span>
+    }
+
+    /**
+     * May be used by custom QueryHandler implementations
+     */
+    public StatementRestrictions getRestrictions()
+    {
+<span class="nc" id="L646">        return restrictions;</span>
+    }
+
+    private ReadQuery getSliceCommands(QueryOptions options, ClientState state, ColumnFilter columnFilter,
+                                       DataLimits limit, long nowInSec)
+    {
+<span class="fc" id="L652">        Collection&lt;ByteBuffer&gt; keys = restrictions.getPartitionKeys(options, state);</span>
+<span class="pc bpc" id="L653" title="1 of 2 branches missed.">        if (keys.isEmpty())</span>
+<span class="nc" id="L654">            return ReadQuery.empty(table);</span>
+
+<span class="fc bfc" id="L656" title="All 2 branches covered.">        if (restrictions.keyIsInRelation())</span>
+        {
+<span class="fc" id="L658">            Guardrails.partitionKeysInSelect.guard(keys.size(), table.name, false, state);</span>
+        }
+
+<span class="fc" id="L661">        ClusteringIndexFilter filter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="fc bfc" id="L662" title="All 4 branches covered.">        if (filter == null || filter.isEmpty(table.comparator))</span>
+<span class="fc" id="L663">            return ReadQuery.empty(table);</span>
+
+<span class="fc" id="L665">        RowFilter rowFilter = getRowFilter(options);</span>
+
+<span class="fc" id="L667">        List&lt;DecoratedKey&gt; decoratedKeys = new ArrayList&lt;&gt;(keys.size());</span>
+<span class="fc bfc" id="L668" title="All 2 branches covered.">        for (ByteBuffer key : keys)</span>
+        {
+<span class="fc" id="L670">            QueryProcessor.validateKey(key);</span>
+<span class="fc" id="L671">            decoratedKeys.add(table.partitioner.decorateKey(ByteBufferUtil.clone(key)));</span>
+<span class="fc" id="L672">        }</span>
+
+<span class="fc" id="L674">        return SinglePartitionReadQuery.createGroup(table, nowInSec, columnFilter, rowFilter, limit, decoratedKeys, filter);</span>
+    }
+
+    /**
+     * Returns the slices fetched by this SELECT, assuming an internal call (no bound values in particular).
+     * &lt;p&gt;
+     * Note that if the SELECT intrinsically selects rows by names, we convert them into equivalent slices for
+     * the purpose of this method. This is used for MVs to restrict what needs to be read when we want to read
+     * everything that could be affected by a given view (and so, if the view SELECT statement has restrictions
+     * on the clustering columns, we can restrict what we read).
+     */
+    public Slices clusteringIndexFilterAsSlices()
+    {
+<span class="nc" id="L687">        QueryOptions options = QueryOptions.forInternalCalls(Collections.emptyList());</span>
+<span class="nc" id="L688">        ClientState state = ClientState.forInternalCalls();</span>
+<span class="nc" id="L689">        ColumnFilter columnFilter = selection.newSelectors(options).getColumnFilter();</span>
+<span class="nc" id="L690">        ClusteringIndexFilter filter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">        if (filter instanceof ClusteringIndexSliceFilter)</span>
+<span class="nc" id="L692">            return ((ClusteringIndexSliceFilter)filter).requestedSlices();</span>
+
+<span class="nc" id="L694">        Slices.Builder builder = new Slices.Builder(table.comparator);</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        for (Clustering&lt;?&gt; clustering: ((ClusteringIndexNamesFilter)filter).requestedRows())</span>
+<span class="nc" id="L696">            builder.add(Slice.make(clustering));</span>
+<span class="nc" id="L697">        return builder.build();</span>
+    }
+
+    /**
+     * Returns a read command that can be used internally to query all the rows queried by this SELECT for a
+     * give key (used for materialized views).
+     */
+    public SinglePartitionReadCommand internalReadForView(DecoratedKey key, long nowInSec)
+    {
+<span class="fc" id="L706">        QueryOptions options = QueryOptions.forInternalCalls(Collections.emptyList());</span>
+<span class="fc" id="L707">        ClientState state = ClientState.forInternalCalls();</span>
+<span class="fc" id="L708">        ColumnFilter columnFilter = selection.newSelectors(options).getColumnFilter();</span>
+<span class="fc" id="L709">        ClusteringIndexFilter filter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="fc" id="L710">        RowFilter rowFilter = getRowFilter(options);</span>
+<span class="fc" id="L711">        return SinglePartitionReadCommand.create(table, nowInSec, columnFilter, rowFilter, DataLimits.NONE, key, filter);</span>
+    }
+
+    /**
+     * The {@code RowFilter} for this SELECT, assuming an internal call (no bound values in particular).
+     */
+    public RowFilter rowFilterForInternalCalls()
+    {
+<span class="fc" id="L719">        return getRowFilter(QueryOptions.forInternalCalls(Collections.emptyList()));</span>
+    }
+
+    private ReadQuery getRangeCommand(QueryOptions options, ClientState state, ColumnFilter columnFilter, DataLimits limit, long nowInSec)
+    {
+<span class="fc" id="L724">        ClusteringIndexFilter clusteringIndexFilter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="pc bpc" id="L725" title="1 of 2 branches missed.">        if (clusteringIndexFilter == null)</span>
+<span class="nc" id="L726">            return ReadQuery.empty(table);</span>
+
+<span class="fc" id="L728">        RowFilter rowFilter = getRowFilter(options);</span>
+
+        // The LIMIT provided by the user is the number of CQL row he wants returned.
+        // We want to have getRangeSlice to count the number of columns, not the number of keys.
+<span class="fc" id="L732">        AbstractBounds&lt;PartitionPosition&gt; keyBounds = restrictions.getPartitionKeyBounds(options);</span>
+<span class="pc bpc" id="L733" title="1 of 2 branches missed.">        if (keyBounds == null)</span>
+<span class="nc" id="L734">            return ReadQuery.empty(table);</span>
+
+<span class="fc" id="L736">        ReadQuery command =</span>
+<span class="fc" id="L737">            PartitionRangeReadQuery.create(table, nowInSec, columnFilter, rowFilter, limit, new DataRange(keyBounds, clusteringIndexFilter));</span>
+
+        // If there's a secondary index that the command can use, have it validate the request parameters.
+<span class="fc" id="L740">        command.maybeValidateIndex();</span>
+
+<span class="fc" id="L742">        return command;</span>
+    }
+
+    private ClusteringIndexFilter makeClusteringIndexFilter(QueryOptions options, ClientState state, ColumnFilter columnFilter)
+    {
+<span class="fc bfc" id="L747" title="All 2 branches covered.">        if (parameters.isDistinct)</span>
+        {
+            // We need to be able to distinguish between partition having live rows and those that don't. But
+            // doing so is not trivial since &quot;having a live row&quot; depends potentially on
+            //   1) when the query is performed, due to TTLs
+            //   2) how thing reconcile together between different nodes
+            // so that it's hard to really optimize properly internally. So to keep it simple, we simply query
+            // for the first row of the partition and hence uses Slices.ALL. We'll limit it to the first live
+            // row however in getLimit().
+<span class="fc" id="L756">            return new ClusteringIndexSliceFilter(Slices.ALL, false);</span>
+        }
+
+<span class="fc bfc" id="L759" title="All 2 branches covered.">        if (restrictions.isColumnRange())</span>
+        {
+<span class="fc" id="L761">            Slices slices = makeSlices(options);</span>
+<span class="fc bfc" id="L762" title="All 4 branches covered.">            if (slices == Slices.NONE &amp;&amp; !selection.containsStaticColumns())</span>
+<span class="fc" id="L763">                return null;</span>
+
+<span class="fc" id="L765">            return new ClusteringIndexSliceFilter(slices, isReversed);</span>
+        }
+
+<span class="fc" id="L768">        NavigableSet&lt;Clustering&lt;?&gt;&gt; clusterings = getRequestedRows(options, state);</span>
+        // We can have no clusterings if either we're only selecting the static columns, or if we have
+        // a 'IN ()' for clusterings. In that case, we still want to query if some static columns are
+        // queried. But we're fine otherwise.
+<span class="fc bfc" id="L772" title="All 4 branches covered.">        if (clusterings.isEmpty() &amp;&amp; columnFilter.fetchedColumns().statics.isEmpty())</span>
+<span class="fc" id="L773">            return null;</span>
+
+<span class="fc" id="L775">        return new ClusteringIndexNamesFilter(clusterings, isReversed);</span>
+    }
+
+    @VisibleForTesting
+    public Slices makeSlices(QueryOptions options)
+    throws InvalidRequestException
+    {
+<span class="fc" id="L782">        SortedSet&lt;ClusteringBound&lt;?&gt;&gt; startBounds = restrictions.getClusteringColumnsBounds(Bound.START, options);</span>
+<span class="fc" id="L783">        SortedSet&lt;ClusteringBound&lt;?&gt;&gt; endBounds = restrictions.getClusteringColumnsBounds(Bound.END, options);</span>
+<span class="pc bpc" id="L784" title="1 of 2 branches missed.">        assert startBounds.size() == endBounds.size();</span>
+
+        // The case where startBounds == 1 is common enough that it's worth optimizing
+<span class="pc bpc" id="L787" title="1 of 2 branches missed.">        if (startBounds.size() == 1)</span>
+        {
+<span class="fc" id="L789">            ClusteringBound&lt;?&gt; start = startBounds.first();</span>
+<span class="fc" id="L790">            ClusteringBound&lt;?&gt; end = endBounds.first();</span>
+<span class="fc bfc" id="L791" title="All 2 branches covered.">            return Slice.isEmpty(table.comparator, start, end)</span>
+<span class="fc" id="L792">                 ? Slices.NONE</span>
+<span class="fc" id="L793">                 : Slices.with(table.comparator, Slice.make(start, end));</span>
+        }
+
+<span class="nc" id="L796">        Slices.Builder builder = new Slices.Builder(table.comparator, startBounds.size());</span>
+<span class="nc" id="L797">        Iterator&lt;ClusteringBound&lt;?&gt;&gt; startIter = startBounds.iterator();</span>
+<span class="nc" id="L798">        Iterator&lt;ClusteringBound&lt;?&gt;&gt; endIter = endBounds.iterator();</span>
+<span class="nc bnc" id="L799" title="All 4 branches missed.">        while (startIter.hasNext() &amp;&amp; endIter.hasNext())</span>
+        {
+<span class="nc" id="L801">            ClusteringBound&lt;?&gt; start = startIter.next();</span>
+<span class="nc" id="L802">            ClusteringBound&lt;?&gt; end = endIter.next();</span>
+
+            // Ignore slices that are nonsensical
+<span class="nc bnc" id="L805" title="All 2 branches missed.">            if (Slice.isEmpty(table.comparator, start, end))</span>
+<span class="nc" id="L806">                continue;</span>
+
+<span class="nc" id="L808">            builder.add(start, end);</span>
+<span class="nc" id="L809">        }</span>
+
+<span class="nc" id="L811">        return builder.build();</span>
+    }
+
+    private DataLimits getDataLimits(int userLimit,
+                                     int perPartitionLimit,
+                                     int pageSize,
+                                     AggregationSpecification aggregationSpec)
+    {
+<span class="fc" id="L819">        int cqlRowLimit = DataLimits.NO_LIMIT;</span>
+<span class="fc" id="L820">        int cqlPerPartitionLimit = DataLimits.NO_LIMIT;</span>
+
+        // If we do post ordering we need to get all the results sorted before we can trim them.
+<span class="fc bfc" id="L823" title="All 2 branches covered.">        if (aggregationSpec != AggregationSpecification.AGGREGATE_EVERYTHING)</span>
+        {
+<span class="pc bpc" id="L825" title="1 of 2 branches missed.">            if (!needsPostQueryOrdering())</span>
+<span class="fc" id="L826">                cqlRowLimit = userLimit;</span>
+<span class="fc" id="L827">            cqlPerPartitionLimit = perPartitionLimit;</span>
+        }
+
+        // Group by and aggregation queries will always be paged internally to avoid OOM.
+        // If the user provided a pageSize we'll use that to page internally (because why not), otherwise we use our default
+<span class="fc bfc" id="L832" title="All 2 branches covered.">        if (pageSize &lt;= 0)</span>
+<span class="fc" id="L833">            pageSize = DEFAULT_PAGE_SIZE;</span>
+
+        // Aggregation queries work fine on top of the group by paging but to maintain
+        // backward compatibility we need to use the old way.
+<span class="fc bfc" id="L837" title="All 4 branches covered.">        if (aggregationSpec != null &amp;&amp; aggregationSpec != AggregationSpecification.AGGREGATE_EVERYTHING)</span>
+        {
+<span class="pc bpc" id="L839" title="1 of 2 branches missed.">            if (parameters.isDistinct)</span>
+<span class="nc" id="L840">                return DataLimits.distinctLimits(cqlRowLimit);</span>
+
+<span class="fc" id="L842">            return DataLimits.groupByLimits(cqlRowLimit,</span>
+                                            cqlPerPartitionLimit,
+                                            pageSize,
+                                            aggregationSpec);
+        }
+
+<span class="fc bfc" id="L848" title="All 2 branches covered.">        if (parameters.isDistinct)</span>
+<span class="fc bfc" id="L849" title="All 2 branches covered.">            return cqlRowLimit == DataLimits.NO_LIMIT ? DataLimits.DISTINCT_NONE : DataLimits.distinctLimits(cqlRowLimit);</span>
+
+<span class="fc" id="L851">        return DataLimits.cqlLimits(cqlRowLimit, cqlPerPartitionLimit);</span>
+    }
+
+    /**
+     * Returns the limit specified by the user.
+     * May be used by custom QueryHandler implementations
+     *
+     * @return the limit specified by the user or &lt;code&gt;DataLimits.NO_LIMIT&lt;/code&gt; if no value
+     * as been specified.
+     */
+    public int getLimit(QueryOptions options)
+    {
+<span class="fc" id="L863">        return getLimit(limit, options);</span>
+    }
+
+    /**
+     * Returns the per partition limit specified by the user.
+     * May be used by custom QueryHandler implementations
+     *
+     * @return the per partition limit specified by the user or &lt;code&gt;DataLimits.NO_LIMIT&lt;/code&gt; if no value
+     * as been specified.
+     */
+    public int getPerPartitionLimit(QueryOptions options)
+    {
+<span class="fc" id="L875">        return getLimit(perPartitionLimit, options);</span>
+    }
+
+    private int getLimit(Term limit, QueryOptions options)
+    {
+<span class="fc" id="L880">        int userLimit = DataLimits.NO_LIMIT;</span>
+
+<span class="fc bfc" id="L882" title="All 2 branches covered.">        if (limit != null)</span>
+        {
+<span class="fc" id="L884">            ByteBuffer b = checkNotNull(limit.bindAndGet(options), &quot;Invalid null value of limit&quot;);</span>
+            // treat UNSET limit value as 'unlimited'
+<span class="pc bpc" id="L886" title="1 of 2 branches missed.">            if (b != UNSET_BYTE_BUFFER)</span>
+            {
+                try
+                {
+<span class="fc" id="L890">                    Int32Type.instance.validate(b);</span>
+<span class="fc" id="L891">                    userLimit = Int32Type.instance.compose(b);</span>
+<span class="pc bpc" id="L892" title="1 of 2 branches missed.">                    checkTrue(userLimit &gt; 0, &quot;LIMIT must be strictly positive&quot;);</span>
+                }
+<span class="nc" id="L894">                catch (MarshalException e)</span>
+                {
+<span class="nc" id="L896">                    throw new InvalidRequestException(&quot;Invalid limit value&quot;);</span>
+<span class="fc" id="L897">                }</span>
+            }
+        }
+<span class="fc" id="L900">        return userLimit;</span>
+    }
+
+    private NavigableSet&lt;Clustering&lt;?&gt;&gt; getRequestedRows(QueryOptions options, ClientState state) throws InvalidRequestException
+    {
+        // Note: getRequestedColumns don't handle static columns, but due to CASSANDRA-5762
+        // we always do a slice for CQL3 tables, so it's ok to ignore them here
+<span class="pc bpc" id="L907" title="1 of 2 branches missed.">        assert !restrictions.isColumnRange();</span>
+<span class="fc" id="L908">        return restrictions.getClusteringColumns(options, state);</span>
+    }
+
+    /**
+     * May be used by custom QueryHandler implementations
+     */
+    public RowFilter getRowFilter(QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L916">        IndexRegistry indexRegistry = IndexRegistry.obtain(table);</span>
+<span class="fc" id="L917">        return restrictions.getRowFilter(indexRegistry, options);</span>
+    }
+
+    private ResultSet process(PartitionIterator partitions,
+                              QueryOptions options,
+                              Selectors selectors,
+                              long nowInSec,
+                              int userLimit,
+                              AggregationSpecification aggregationSpec,
+                              boolean unmask) throws InvalidRequestException
+    {
+<span class="fc bfc" id="L928" title="All 2 branches covered.">        GroupMaker groupMaker = aggregationSpec == null ? null : aggregationSpec.newGroupMaker();</span>
+<span class="fc" id="L929">        ResultSetBuilder result = new ResultSetBuilder(getResultMetadata(), selectors, unmask, groupMaker);</span>
+
+<span class="fc bfc" id="L931" title="All 2 branches covered.">        while (partitions.hasNext())</span>
+        {
+<span class="fc" id="L933">            try (RowIterator partition = partitions.next())</span>
+            {
+<span class="fc" id="L935">                processPartition(partition, options, result, nowInSec);</span>
+            }
+        }
+
+<span class="fc" id="L939">        ResultSet cqlRows = result.build();</span>
+<span class="fc" id="L940">        maybeWarn(result, options);</span>
+
+<span class="fc" id="L942">        orderResults(cqlRows);</span>
+
+<span class="fc" id="L944">        cqlRows.trim(userLimit);</span>
+
+<span class="fc" id="L946">        return cqlRows;</span>
+    }
+
+    public static ByteBuffer[] getComponents(TableMetadata metadata, DecoratedKey dk)
+    {
+<span class="fc" id="L951">        ByteBuffer key = dk.getKey();</span>
+<span class="fc bfc" id="L952" title="All 2 branches covered.">        if (metadata.partitionKeyColumns().size() == 1)</span>
+<span class="fc" id="L953">            return new ByteBuffer[]{ key };</span>
+<span class="pc bpc" id="L954" title="1 of 2 branches missed.">        if (metadata.partitionKeyType instanceof CompositeType)</span>
+        {
+<span class="fc" id="L956">            return ((CompositeType)metadata.partitionKeyType).split(key);</span>
+        }
+        else
+        {
+<span class="nc" id="L960">            return new ByteBuffer[]{ key };</span>
+        }
+    }
+
+    private void maybeWarn(ResultSetBuilder result, QueryOptions options)
+    {
+<span class="fc bfc" id="L966" title="All 2 branches covered.">        if (!options.isReadThresholdsEnabled())</span>
+<span class="fc" id="L967">            return;</span>
+<span class="fc" id="L968">        ColumnFamilyStore store = cfs();</span>
+<span class="fc bfc" id="L969" title="All 2 branches covered.">        if (store != null)</span>
+<span class="fc" id="L970">            store.metric.coordinatorReadSize.update(result.getSize());</span>
+<span class="fc bfc" id="L971" title="All 2 branches covered.">        if (result.shouldWarn(options.getCoordinatorReadSizeWarnThresholdBytes()))</span>
+        {
+<span class="fc" id="L973">            String msg = String.format(&quot;Read on table %s has exceeded the size warning threshold of %,d bytes&quot;, table, options.getCoordinatorReadSizeWarnThresholdBytes());</span>
+<span class="fc" id="L974">            ClientState state = ClientState.forInternalCalls();</span>
+<span class="fc" id="L975">            ClientWarn.instance.warn(msg + &quot; with &quot; + loggableTokens(options, state));</span>
+<span class="fc" id="L976">            logger.warn(&quot;{} with query {}&quot;, msg, asCQL(options, state));</span>
+<span class="pc bpc" id="L977" title="1 of 2 branches missed.">            if (store != null)</span>
+<span class="fc" id="L978">                store.metric.coordinatorReadSizeWarnings.mark();</span>
+        }
+<span class="fc" id="L980">    }</span>
+
+    private void maybeFail(ResultSetBuilder result, QueryOptions options)
+    {
+<span class="fc bfc" id="L984" title="All 2 branches covered.">        if (!options.isReadThresholdsEnabled())</span>
+<span class="fc" id="L985">            return;</span>
+<span class="fc bfc" id="L986" title="All 2 branches covered.">        if (result.shouldReject(options.getCoordinatorReadSizeAbortThresholdBytes()))</span>
+        {
+<span class="fc" id="L988">            String msg = String.format(&quot;Read on table %s has exceeded the size failure threshold of %,d bytes&quot;, table, options.getCoordinatorReadSizeAbortThresholdBytes());</span>
+<span class="fc" id="L989">            ClientState state = ClientState.forInternalCalls();</span>
+<span class="fc" id="L990">            String clientMsg = msg + &quot; with &quot; + loggableTokens(options, state);</span>
+<span class="fc" id="L991">            ClientWarn.instance.warn(clientMsg);</span>
+<span class="fc" id="L992">            logger.warn(&quot;{} with query {}&quot;, msg, asCQL(options, state));</span>
+<span class="fc" id="L993">            ColumnFamilyStore store = cfs();</span>
+<span class="pc bpc" id="L994" title="1 of 2 branches missed.">            if (store != null)</span>
+            {
+<span class="fc" id="L996">                store.metric.coordinatorReadSizeAborts.mark();</span>
+<span class="fc" id="L997">                store.metric.coordinatorReadSize.update(result.getSize());</span>
+            }
+            // read errors require blockFor and recieved (its in the protocol message), but this isn't known;
+            // to work around this, treat the coordinator as the only response we care about and mark it failed
+<span class="fc" id="L1001">            ReadSizeAbortException exception = new ReadSizeAbortException(clientMsg, options.getConsistency(), 0, 1, true,</span>
+<span class="fc" id="L1002">                                                                          ImmutableMap.of(FBUtilities.getBroadcastAddressAndPort(), RequestFailureReason.READ_SIZE));</span>
+<span class="fc" id="L1003">            StorageProxy.recordReadRegularAbort(options.getConsistency(), exception);</span>
+<span class="fc" id="L1004">            throw exception;</span>
+        }
+<span class="fc" id="L1006">    }</span>
+
+    private ColumnFamilyStore cfs()
+    {
+<span class="fc" id="L1010">        return Schema.instance.getColumnFamilyStoreInstance(table.id);</span>
+    }
+
+    // Used by ModificationStatement for CAS operations
+    public void processPartition(RowIterator partition, QueryOptions options, ResultSetBuilder result, long nowInSec)
+    throws InvalidRequestException
+    {
+<span class="fc" id="L1017">        maybeFail(result, options);</span>
+<span class="fc" id="L1018">        ProtocolVersion protocolVersion = options.getProtocolVersion();</span>
+
+<span class="fc" id="L1020">        ByteBuffer[] keyComponents = getComponents(table, partition.partitionKey());</span>
+
+<span class="fc" id="L1022">        Row staticRow = partition.staticRow();</span>
+        // If there is no rows, we include the static content if we should and we're done.
+<span class="fc bfc" id="L1024" title="All 2 branches covered.">        if (!partition.hasNext())</span>
+        {
+<span class="fc bfc" id="L1026" title="All 4 branches covered.">            if (!staticRow.isEmpty() &amp;&amp; restrictions.returnStaticContentOnPartitionWithNoRows())</span>
+            {
+<span class="fc" id="L1028">                result.newRow(protocolVersion, partition.partitionKey(), staticRow.clustering(), selection.getColumns());</span>
+<span class="fc" id="L1029">                maybeFail(result, options);</span>
+<span class="fc bfc" id="L1030" title="All 2 branches covered.">                for (ColumnMetadata def : selection.getColumns())</span>
+                {
+<span class="fc bfc" id="L1032" title="All 3 branches covered.">                    switch (def.kind)</span>
+                    {
+                        case PARTITION_KEY:
+<span class="fc" id="L1035">                            result.add(keyComponents[def.position()]);</span>
+<span class="fc" id="L1036">                            break;</span>
+                        case STATIC:
+<span class="fc" id="L1038">                            result.add(partition.staticRow().getColumnData(def), nowInSec);</span>
+<span class="fc" id="L1039">                            break;</span>
+                        default:
+<span class="fc" id="L1041">                            result.add((ByteBuffer)null);</span>
+                    }
+<span class="fc" id="L1043">                }</span>
+            }
+<span class="fc" id="L1045">            return;</span>
+        }
+
+<span class="fc bfc" id="L1048" title="All 2 branches covered.">        while (partition.hasNext())</span>
+        {
+<span class="fc" id="L1050">            Row row = partition.next();</span>
+<span class="fc" id="L1051">            result.newRow(protocolVersion, partition.partitionKey(), row.clustering(), selection.getColumns());</span>
+
+            // reads aren't failed as soon the size exceeds the failure threshold, they're failed once the failure
+            // threshold has been exceeded and we start adding more data. We're slightly more permissive to avoid
+            // cases where a row can never be read. Since we only warn/fail after entire rows are read, this will
+            // still allow the entire dataset to be read with LIMIT 1 queries, even if every row is oversized
+<span class="fc" id="L1057">            maybeFail(result, options);</span>
+
+            // Respect selection order
+<span class="fc bfc" id="L1060" title="All 2 branches covered.">            for (ColumnMetadata def : selection.getColumns())</span>
+            {
+<span class="pc bpc" id="L1062" title="1 of 5 branches missed.">                switch (def.kind)</span>
+                {
+                    case PARTITION_KEY:
+<span class="fc" id="L1065">                        result.add(keyComponents[def.position()]);</span>
+<span class="fc" id="L1066">                        break;</span>
+                    case CLUSTERING:
+<span class="fc" id="L1068">                        result.add(row.clustering().bufferAt(def.position()));</span>
+<span class="fc" id="L1069">                        break;</span>
+                    case REGULAR:
+<span class="fc" id="L1071">                        result.add(row.getColumnData(def), nowInSec);</span>
+<span class="fc" id="L1072">                        break;</span>
+                    case STATIC:
+<span class="fc" id="L1074">                        result.add(staticRow.getColumnData(def), nowInSec);</span>
+                        break;
+                }
+<span class="fc" id="L1077">            }</span>
+<span class="fc" id="L1078">        }</span>
+<span class="fc" id="L1079">    }</span>
+
+    private boolean needsPostQueryOrdering()
+    {
+        // We need post-query ordering only for queries with IN on the partition key and an ORDER BY.
+<span class="pc bpc" id="L1084" title="1 of 4 branches missed.">        return restrictions.keyIsInRelation() &amp;&amp; !parameters.orderings.isEmpty();</span>
+    }
+
+    /**
+     * Orders results when multiple keys are selected (using IN)
+     */
+    private void orderResults(ResultSet cqlRows)
+    {
+<span class="pc bpc" id="L1092" title="1 of 4 branches missed.">        if (cqlRows.size() == 0 || !needsPostQueryOrdering())</span>
+<span class="fc" id="L1093">            return;</span>
+
+<span class="nc" id="L1095">        Collections.sort(cqlRows.rows, orderingComparator);</span>
+<span class="nc" id="L1096">    }</span>
+
+<span class="fc" id="L1098">    public static class RawStatement extends QualifiedStatement</span>
+    {
+        public final Parameters parameters;
+        public final List&lt;RawSelector&gt; selectClause;
+        public final WhereClause whereClause;
+        public final Term.Raw limit;
+        public final Term.Raw perPartitionLimit;
+        private ClientState state;
+
+        public RawStatement(QualifiedName cfName,
+                            Parameters parameters,
+                            List&lt;RawSelector&gt; selectClause,
+                            WhereClause whereClause,
+                            Term.Raw limit,
+                            Term.Raw perPartitionLimit)
+        {
+<span class="fc" id="L1114">            super(cfName);</span>
+<span class="fc" id="L1115">            this.parameters = parameters;</span>
+<span class="fc" id="L1116">            this.selectClause = selectClause;</span>
+<span class="fc" id="L1117">            this.whereClause = whereClause;</span>
+<span class="fc" id="L1118">            this.limit = limit;</span>
+<span class="fc" id="L1119">            this.perPartitionLimit = perPartitionLimit;</span>
+<span class="fc" id="L1120">        }</span>
+
+        public SelectStatement prepare(ClientState state)
+        {
+            // Cache locally for use by Guardrails
+<span class="fc" id="L1125">            this.state = state;</span>
+<span class="fc" id="L1126">            return prepare(state, false);</span>
+        }
+
+        public SelectStatement prepare(ClientState state, boolean forView) throws InvalidRequestException
+        {
+<span class="fc" id="L1131">            TableMetadata table = Schema.instance.validateTable(keyspace(), name());</span>
+
+<span class="fc" id="L1133">            List&lt;Selectable&gt; selectables = RawSelector.toSelectables(selectClause, table);</span>
+<span class="fc" id="L1134">            boolean containsOnlyStaticColumns = selectOnlyStaticColumns(table, selectables);</span>
+
+<span class="fc" id="L1136">            StatementRestrictions restrictions = prepareRestrictions(state, table, bindVariables, containsOnlyStaticColumns, forView);</span>
+
+            // If we order post-query, the sorted column needs to be in the ResultSet for sorting,
+            // even if we don't ultimately ship them to the client (CASSANDRA-4911).
+<span class="fc" id="L1140">            Map&lt;ColumnMetadata, Boolean&gt; orderingColumns = getOrderingColumns(table);</span>
+<span class="fc bfc" id="L1141" title="All 2 branches covered.">            Set&lt;ColumnMetadata&gt; resultSetOrderingColumns = restrictions.keyIsInRelation() ? orderingColumns.keySet()</span>
+<span class="fc" id="L1142">                                                                                          : Collections.emptySet();</span>
+
+<span class="fc" id="L1144">            Selection selection = prepareSelection(table,</span>
+                                                   selectables,
+                                                   bindVariables,
+                                                   resultSetOrderingColumns,
+                                                   restrictions);
+
+<span class="fc bfc" id="L1150" title="All 2 branches covered.">            if (parameters.isDistinct)</span>
+            {
+<span class="fc" id="L1152">                checkNull(perPartitionLimit, &quot;PER PARTITION LIMIT is not allowed with SELECT DISTINCT queries&quot;);</span>
+<span class="fc" id="L1153">                validateDistinctSelection(table, selection, restrictions);</span>
+            }
+
+<span class="fc" id="L1156">            AggregationSpecification.Factory aggregationSpecFactory = getAggregationSpecFactory(table,</span>
+                                                                                                bindVariables,
+                                                                                                selection,
+                                                                                                restrictions,
+                                                                                                parameters.isDistinct);
+
+<span class="pc bpc" id="L1162" title="1 of 4 branches missed.">            checkFalse(aggregationSpecFactory == AggregationSpecification.AGGREGATE_EVERYTHING_FACTORY</span>
+                       &amp;&amp; perPartitionLimit != null,
+                       &quot;PER PARTITION LIMIT is not allowed with aggregate queries.&quot;);
+
+<span class="fc" id="L1166">            Comparator&lt;List&lt;ByteBuffer&gt;&gt; orderingComparator = null;</span>
+<span class="fc" id="L1167">            boolean isReversed = false;</span>
+
+<span class="fc bfc" id="L1169" title="All 2 branches covered.">            if (!orderingColumns.isEmpty())</span>
+            {
+<span class="pc bpc" id="L1171" title="1 of 2 branches missed.">                assert !forView;</span>
+<span class="fc" id="L1172">                verifyOrderingIsAllowed(restrictions);</span>
+<span class="fc" id="L1173">                orderingComparator = getOrderingComparator(selection, restrictions, orderingColumns);</span>
+<span class="fc" id="L1174">                isReversed = isReversed(table, orderingColumns, restrictions);</span>
+<span class="fc bfc" id="L1175" title="All 2 branches covered.">                if (isReversed)</span>
+<span class="fc" id="L1176">                    orderingComparator = Collections.reverseOrder(orderingComparator);</span>
+            }
+
+<span class="fc" id="L1179">            checkNeedsFiltering(table, restrictions);</span>
+
+<span class="fc" id="L1181">            return new SelectStatement(table,</span>
+                                       bindVariables,
+                                       parameters,
+                                       selection,
+                                       restrictions,
+                                       isReversed,
+                                       aggregationSpecFactory,
+                                       orderingComparator,
+<span class="fc" id="L1189">                                       prepareLimit(bindVariables, limit, keyspace(), limitReceiver()),</span>
+<span class="fc" id="L1190">                                       prepareLimit(bindVariables, perPartitionLimit, keyspace(), perPartitionLimitReceiver()));</span>
+        }
+
+        private Selection prepareSelection(TableMetadata table,
+                                           List&lt;Selectable&gt; selectables,
+                                           VariableSpecifications boundNames,
+                                           Set&lt;ColumnMetadata&gt; resultSetOrderingColumns,
+                                           StatementRestrictions restrictions)
+        {
+<span class="fc bfc" id="L1199" title="All 2 branches covered.">            boolean hasGroupBy = !parameters.groups.isEmpty();</span>
+
+<span class="fc bfc" id="L1201" title="All 2 branches covered.">            if (hasGroupBy)</span>
+<span class="fc" id="L1202">                Guardrails.groupByEnabled.ensureEnabled(state);</span>
+
+<span class="fc" id="L1204">            boolean isJson = parameters.isJson;</span>
+<span class="fc" id="L1205">            boolean returnStaticContentOnPartitionWithNoRows = restrictions.returnStaticContentOnPartitionWithNoRows();</span>
+
+<span class="fc bfc" id="L1207" title="All 2 branches covered.">            if (selectables.isEmpty()) // wildcard query</span>
+            {
+<span class="fc bfc" id="L1209" title="All 4 branches covered.">                return hasGroupBy || table.hasMaskedColumns()</span>
+<span class="fc" id="L1210">                       ? Selection.wildcardWithGroupByOrMaskedColumns(table, boundNames, resultSetOrderingColumns, isJson, returnStaticContentOnPartitionWithNoRows)</span>
+<span class="fc" id="L1211">                       : Selection.wildcard(table, isJson, returnStaticContentOnPartitionWithNoRows);</span>
+            }
+
+<span class="fc" id="L1214">            return Selection.fromSelectors(table,</span>
+                                           selectables,
+                                           boundNames,
+                                           resultSetOrderingColumns,
+<span class="fc" id="L1218">                                           restrictions.nonPKRestrictedColumns(false),</span>
+                                           hasGroupBy,
+                                           isJson,
+                                           returnStaticContentOnPartitionWithNoRows);
+        }
+
+        /**
+         * Checks if the specified selectables select only partition key columns or static columns
+         *
+         * @param table the table metadata
+         * @param selectables the selectables to check
+         * @return {@code true} if the specified selectables select only partition key columns or static columns,
+         * {@code false} otherwise.
+         */
+        private boolean selectOnlyStaticColumns(TableMetadata table, List&lt;Selectable&gt; selectables)
+        {
+<span class="fc bfc" id="L1234" title="All 2 branches covered.">            if (table.isStaticCompactTable())</span>
+<span class="fc" id="L1235">                return false;</span>
+
+<span class="fc bfc" id="L1237" title="All 4 branches covered.">            if (!table.hasStaticColumns() || selectables.isEmpty())</span>
+<span class="fc" id="L1238">                return false;</span>
+
+<span class="fc bfc" id="L1240" title="All 2 branches covered.">            return Selectable.selectColumns(selectables, (column) -&gt; column.isStatic())</span>
+<span class="fc bfc" id="L1241" title="All 6 branches covered.">                    &amp;&amp; !Selectable.selectColumns(selectables, (column) -&gt; !column.isPartitionKey() &amp;&amp; !column.isStatic());</span>
+        }
+
+        /**
+         * Returns the columns used to order the data.
+         * @return the columns used to order the data.
+         */
+        private Map&lt;ColumnMetadata, Boolean&gt; getOrderingColumns(TableMetadata table)
+        {
+<span class="fc bfc" id="L1250" title="All 2 branches covered.">            if (parameters.orderings.isEmpty())</span>
+<span class="fc" id="L1251">                return Collections.emptyMap();</span>
+
+<span class="fc" id="L1253">            Map&lt;ColumnMetadata, Boolean&gt; orderingColumns = new LinkedHashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L1254" title="All 2 branches covered.">            for (Map.Entry&lt;ColumnIdentifier, Boolean&gt; entry : parameters.orderings.entrySet())</span>
+            {
+<span class="fc" id="L1256">                orderingColumns.put(table.getExistingColumn(entry.getKey()), entry.getValue());</span>
+<span class="fc" id="L1257">            }</span>
+<span class="fc" id="L1258">            return orderingColumns;</span>
+        }
+
+        /**
+         * Prepares the restrictions.
+         *
+         * @param metadata the column family meta data
+         * @param boundNames the variable specifications
+         * @param selectsOnlyStaticColumns {@code true} if the query select only static columns, {@code false} otherwise.
+         * @return the restrictions
+         * @throws InvalidRequestException if a problem occurs while building the restrictions
+         */
+        private StatementRestrictions prepareRestrictions(ClientState state,
+                                                          TableMetadata metadata,
+                                                          VariableSpecifications boundNames,
+                                                          boolean selectsOnlyStaticColumns,
+                                                          boolean forView) throws InvalidRequestException
+        {
+<span class="fc" id="L1276">            return new StatementRestrictions(state,</span>
+                                             StatementType.SELECT,
+                                             metadata,
+                                             whereClause,
+                                             boundNames,
+                                             selectsOnlyStaticColumns,
+                                             parameters.allowFiltering,
+                                             forView);
+        }
+
+        /** Returns a Term for the limit or null if no limit is set */
+        private Term prepareLimit(VariableSpecifications boundNames, Term.Raw limit,
+                                  String keyspace, ColumnSpecification limitReceiver) throws InvalidRequestException
+        {
+<span class="fc bfc" id="L1290" title="All 2 branches covered.">            if (limit == null)</span>
+<span class="fc" id="L1291">                return null;</span>
+
+<span class="fc" id="L1293">            Term prepLimit = limit.prepare(keyspace, limitReceiver);</span>
+<span class="fc" id="L1294">            prepLimit.collectMarkerSpecification(boundNames);</span>
+<span class="fc" id="L1295">            return prepLimit;</span>
+        }
+
+        private static void verifyOrderingIsAllowed(StatementRestrictions restrictions) throws InvalidRequestException
+        {
+<span class="fc" id="L1300">            checkFalse(restrictions.usesSecondaryIndexing(), &quot;ORDER BY with 2ndary indexes is not supported.&quot;);</span>
+<span class="fc" id="L1301">            checkFalse(restrictions.isKeyRange(), &quot;ORDER BY is only supported when the partition key is restricted by an EQ or an IN.&quot;);</span>
+<span class="fc" id="L1302">        }</span>
+
+        private static void validateDistinctSelection(TableMetadata metadata,
+                                                      Selection selection,
+                                                      StatementRestrictions restrictions)
+                                                      throws InvalidRequestException
+        {
+<span class="pc bpc" id="L1309" title="1 of 2 branches missed.">            checkFalse(restrictions.hasClusteringColumnsRestrictions() ||</span>
+<span class="pc bpc" id="L1310" title="3 of 4 branches missed.">                       (restrictions.hasNonPrimaryKeyRestrictions() &amp;&amp; !restrictions.nonPKRestrictedColumns(true).stream().allMatch(ColumnMetadata::isStatic)),</span>
+                       &quot;SELECT DISTINCT with WHERE clause only supports restriction by partition key and/or static columns.&quot;);
+
+<span class="fc" id="L1313">            Collection&lt;ColumnMetadata&gt; requestedColumns = selection.getColumns();</span>
+<span class="fc bfc" id="L1314" title="All 2 branches covered.">            for (ColumnMetadata def : requestedColumns)</span>
+<span class="pc bpc" id="L1315" title="1 of 4 branches missed.">                checkFalse(!def.isPartitionKey() &amp;&amp; !def.isStatic(),</span>
+                           &quot;SELECT DISTINCT queries must only request partition key columns and/or static columns (not %s)&quot;,
+                           def.name);
+
+            // If it's a key range, we require that all partition key columns are selected so we don't have to bother
+            // with post-query grouping.
+<span class="fc bfc" id="L1321" title="All 2 branches covered.">            if (!restrictions.isKeyRange())</span>
+<span class="fc" id="L1322">                return;</span>
+
+<span class="fc bfc" id="L1324" title="All 2 branches covered.">            for (ColumnMetadata def : metadata.partitionKeyColumns())</span>
+<span class="fc" id="L1325">                checkTrue(requestedColumns.contains(def),</span>
+                          &quot;SELECT DISTINCT queries must request all the partition key columns (missing %s)&quot;, def.name);
+<span class="fc" id="L1327">        }</span>
+
+        /**
+         * Creates the {@code AggregationSpecification.Factory} used to make the aggregates.
+         *
+         * @param metadata the table metadata
+         * @param selection the selection
+         * @param restrictions the restrictions
+         * @param isDistinct &lt;code&gt;true&lt;/code&gt; if the query is a DISTINCT one. 
+         * @return the {@code AggregationSpecification.Factory} used to make the aggregates
+         */
+        private AggregationSpecification.Factory getAggregationSpecFactory(TableMetadata metadata,
+                                                                           VariableSpecifications boundNames,
+                                                                           Selection selection,
+                                                                           StatementRestrictions restrictions,
+                                                                           boolean isDistinct)
+        {
+<span class="fc bfc" id="L1344" title="All 2 branches covered.">            if (parameters.groups.isEmpty())</span>
+<span class="fc bfc" id="L1345" title="All 2 branches covered.">                return selection.isAggregate() ? AggregationSpecification.AGGREGATE_EVERYTHING_FACTORY</span>
+<span class="fc" id="L1346">                                               : null;</span>
+
+<span class="fc" id="L1348">            int clusteringPrefixSize = 0;</span>
+
+<span class="fc" id="L1350">            Iterator&lt;ColumnMetadata&gt; pkColumns = metadata.primaryKeyColumns().iterator();</span>
+<span class="fc" id="L1351">            List&lt;ColumnMetadata&gt; columns = null;</span>
+<span class="fc" id="L1352">            Selector.Factory selectorFactory = null;</span>
+<span class="fc bfc" id="L1353" title="All 2 branches covered.">            for (Selectable.Raw raw : parameters.groups)</span>
+            {
+<span class="fc" id="L1355">                Selectable selectable = raw.prepare(metadata);</span>
+<span class="fc" id="L1356">                ColumnMetadata def = null;</span>
+
+                // For GROUP BY we only allow column names or functions at the higher level.
+<span class="fc bfc" id="L1359" title="All 2 branches covered.">                if (selectable instanceof WithFunction)</span>
+                {
+<span class="fc" id="L1361">                    WithFunction withFunction = (WithFunction) selectable;</span>
+<span class="fc" id="L1362">                    validateGroupByFunction(withFunction);</span>
+<span class="fc" id="L1363">                    columns = new ArrayList&lt;ColumnMetadata&gt;();</span>
+<span class="fc" id="L1364">                    selectorFactory = selectable.newSelectorFactory(metadata, null, columns, boundNames);</span>
+<span class="fc" id="L1365">                    checkFalse(columns.isEmpty(), &quot;GROUP BY functions must have one clustering column name as parameter&quot;);</span>
+<span class="pc bpc" id="L1366" title="1 of 2 branches missed.">                    if (columns.size() &gt; 1)</span>
+<span class="nc" id="L1367">                        throw invalidRequest(&quot;GROUP BY functions accept only one clustering column as parameter, got: %s&quot;,</span>
+<span class="nc" id="L1368">                                             columns.stream().map(c -&gt; c.name.toCQLString()).collect(Collectors.joining(&quot;,&quot;)));</span>
+
+<span class="fc" id="L1370">                    def = columns.get(0);</span>
+<span class="fc" id="L1371">                    checkTrue(def.isClusteringColumn(),</span>
+                              &quot;Group by functions are only supported on clustering columns, got %s&quot;, def.name);
+<span class="fc" id="L1373">                }</span>
+                else
+                {
+<span class="fc" id="L1376">                    def = (ColumnMetadata) selectable;</span>
+<span class="pc bpc" id="L1377" title="1 of 4 branches missed.">                    checkTrue(def.isPartitionKey() || def.isClusteringColumn(),</span>
+                              &quot;Group by is currently only supported on the columns of the PRIMARY KEY, got %s&quot;, def.name);
+<span class="fc" id="L1379">                    checkNull(selectorFactory, &quot;Functions are only supported on the last element of the GROUP BY clause&quot;);</span>
+                }
+
+                while (true)
+                {
+<span class="fc" id="L1384">                    checkTrue(pkColumns.hasNext(),</span>
+                              &quot;Group by currently only support groups of columns following their declared order in the PRIMARY KEY&quot;);
+
+<span class="fc" id="L1387">                    ColumnMetadata pkColumn = pkColumns.next();</span>
+
+<span class="fc bfc" id="L1389" title="All 2 branches covered.">                    if (pkColumn.isClusteringColumn())</span>
+<span class="fc" id="L1390">                        clusteringPrefixSize++;</span>
+
+                    // As we do not support grouping on only part of the partition key, we only need to know
+                    // which clustering columns need to be used to build the groups
+<span class="pc bpc" id="L1394" title="1 of 2 branches missed.">                    if (pkColumn.equals(def))</span>
+<span class="fc" id="L1395">                        break;</span>
+
+<span class="nc" id="L1397">                    checkTrue(restrictions.isColumnRestrictedByEq(pkColumn),</span>
+                              &quot;Group by currently only support groups of columns following their declared order in the PRIMARY KEY&quot;);
+<span class="nc" id="L1399">                }</span>
+<span class="fc" id="L1400">            }</span>
+
+<span class="pc bpc" id="L1402" title="1 of 4 branches missed.">            checkFalse(pkColumns.hasNext() &amp;&amp; pkColumns.next().isPartitionKey(),</span>
+                       &quot;Group by is not supported on only a part of the partition key&quot;);
+
+<span class="pc bpc" id="L1405" title="1 of 4 branches missed.">            checkFalse(clusteringPrefixSize &gt; 0 &amp;&amp; isDistinct,</span>
+                       &quot;Grouping on clustering columns is not allowed for SELECT DISTINCT queries&quot;);
+
+<span class="fc bfc" id="L1408" title="All 2 branches covered.">            return selectorFactory == null ? AggregationSpecification.aggregatePkPrefixFactory(metadata.comparator, clusteringPrefixSize)</span>
+<span class="fc" id="L1409">                                           : AggregationSpecification.aggregatePkPrefixFactoryWithSelector(metadata.comparator,</span>
+                                                                                                           clusteringPrefixSize,
+                                                                                                           selectorFactory,
+                                                                                                           columns);
+        }
+
+        /**
+         * Checks that the function used is a valid one for the GROUP BY clause.
+         *
+         * @param withFunction the {@code Selectable} from which the function must be retrieved.
+         * @return the monotonic scalar function that must be used for determining the groups.
+         */
+        private void validateGroupByFunction(WithFunction withFunction)
+        {
+<span class="fc" id="L1423">            Function f = withFunction.function;</span>
+<span class="fc" id="L1424">            checkFalse(f.isAggregate(), &quot;Aggregate functions are not supported within the GROUP BY clause, got: %s&quot;, f.name());</span>
+<span class="fc" id="L1425">        }</span>
+
+        private Comparator&lt;List&lt;ByteBuffer&gt;&gt; getOrderingComparator(Selection selection,
+                                                                   StatementRestrictions restrictions,
+                                                                   Map&lt;ColumnMetadata, Boolean&gt; orderingColumns)
+                                                                   throws InvalidRequestException
+        {
+<span class="pc bpc" id="L1432" title="1 of 2 branches missed.">            if (!restrictions.keyIsInRelation())</span>
+<span class="fc" id="L1433">                return null;</span>
+
+<span class="nc" id="L1435">            List&lt;Integer&gt; idToSort = new ArrayList&lt;&gt;(orderingColumns.size());</span>
+<span class="nc" id="L1436">            List&lt;Comparator&lt;ByteBuffer&gt;&gt; sorters = new ArrayList&lt;&gt;(orderingColumns.size());</span>
+
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">            for (ColumnMetadata orderingColumn : orderingColumns.keySet())</span>
+            {
+<span class="nc" id="L1440">                idToSort.add(selection.getOrderingIndex(orderingColumn));</span>
+<span class="nc" id="L1441">                sorters.add(orderingColumn.type);</span>
+<span class="nc" id="L1442">            }</span>
+<span class="nc bnc" id="L1443" title="All 2 branches missed.">            return idToSort.size() == 1 ? new SingleColumnComparator(idToSort.get(0), sorters.get(0))</span>
+<span class="nc" id="L1444">                    : new CompositeComparator(sorters, idToSort);</span>
+        }
+
+        private boolean isReversed(TableMetadata table, Map&lt;ColumnMetadata, Boolean&gt; orderingColumns, StatementRestrictions restrictions) throws InvalidRequestException
+        {
+<span class="fc" id="L1449">            Boolean[] reversedMap = new Boolean[table.clusteringColumns().size()];</span>
+<span class="fc" id="L1450">            int i = 0;</span>
+<span class="fc bfc" id="L1451" title="All 2 branches covered.">            for (Map.Entry&lt;ColumnMetadata, Boolean&gt; entry : orderingColumns.entrySet())</span>
+            {
+<span class="fc" id="L1453">                ColumnMetadata def = entry.getKey();</span>
+<span class="fc" id="L1454">                boolean reversed = entry.getValue();</span>
+
+<span class="fc" id="L1456">                checkTrue(def.isClusteringColumn(),</span>
+                          &quot;Order by is currently only supported on the clustered columns of the PRIMARY KEY, got %s&quot;, def.name);
+
+<span class="pc bpc" id="L1459" title="1 of 2 branches missed.">                while (i != def.position())</span>
+                {
+<span class="nc" id="L1461">                    checkTrue(restrictions.isColumnRestrictedByEq(table.clusteringColumns().get(i++)),</span>
+                              &quot;Order by currently only supports the ordering of columns following their declared order in the PRIMARY KEY&quot;);
+                }
+<span class="fc" id="L1464">                i++;</span>
+<span class="fc bfc" id="L1465" title="All 2 branches covered.">                reversedMap[def.position()] = (reversed != def.isReversedType());</span>
+<span class="fc" id="L1466">            }</span>
+
+            // Check that all boolean in reversedMap, if set, agrees
+<span class="fc" id="L1469">            Boolean isReversed = null;</span>
+<span class="fc bfc" id="L1470" title="All 2 branches covered.">            for (Boolean b : reversedMap)</span>
+            {
+                // Column on which order is specified can be in any order
+<span class="pc bpc" id="L1473" title="1 of 2 branches missed.">                if (b == null)</span>
+<span class="nc" id="L1474">                    continue;</span>
+
+<span class="fc bfc" id="L1476" title="All 2 branches covered.">                if (isReversed == null)</span>
+                {
+<span class="fc" id="L1478">                    isReversed = b;</span>
+<span class="fc" id="L1479">                    continue;</span>
+                }
+<span class="fc" id="L1481">                checkTrue(isReversed.equals(b), &quot;Unsupported order by relation&quot;);</span>
+            }
+<span class="pc bpc" id="L1483" title="1 of 2 branches missed.">            assert isReversed != null;</span>
+<span class="fc" id="L1484">            return isReversed;</span>
+        }
+
+        /** If ALLOW FILTERING was not specified, this verifies that it is not needed */
+        private void checkNeedsFiltering(TableMetadata table, StatementRestrictions restrictions) throws InvalidRequestException
+        {
+            // non-key-range non-indexed queries cannot involve filtering underneath
+<span class="pc bpc" id="L1491" title="1 of 6 branches missed.">            if (!parameters.allowFiltering &amp;&amp; (restrictions.isKeyRange() || restrictions.usesSecondaryIndexing()))</span>
+            {
+                // We will potentially filter data if the row filter is not the identity and there isn't any index group
+                // supporting all the expressions in the filter.
+<span class="fc bfc" id="L1495" title="All 2 branches covered.">                if (restrictions.requiresAllowFilteringIfNotSpecified())</span>
+<span class="fc" id="L1496">                    checkFalse(restrictions.needFiltering(table), StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE);</span>
+            }
+<span class="fc" id="L1498">        }</span>
+
+        private ColumnSpecification limitReceiver()
+        {
+<span class="fc" id="L1502">            return new ColumnSpecification(keyspace(), name(), new ColumnIdentifier(&quot;[limit]&quot;, true), Int32Type.instance);</span>
+        }
+
+        private ColumnSpecification perPartitionLimitReceiver()
+        {
+<span class="fc" id="L1507">            return new ColumnSpecification(keyspace(), name(), new ColumnIdentifier(&quot;[per_partition_limit]&quot;, true), Int32Type.instance);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1513">            return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L1514">                              .add(&quot;name&quot;, qualifiedName)</span>
+<span class="nc" id="L1515">                              .add(&quot;selectClause&quot;, selectClause)</span>
+<span class="nc" id="L1516">                              .add(&quot;whereClause&quot;, whereClause)</span>
+<span class="nc" id="L1517">                              .add(&quot;isDistinct&quot;, parameters.isDistinct)</span>
+<span class="nc" id="L1518">                              .toString();</span>
+        }
+    }
+
+    public static class Parameters
+    {
+        // Public because CASSANDRA-9858
+        public final Map&lt;ColumnIdentifier, Boolean&gt; orderings;
+        public final List&lt;Selectable.Raw&gt; groups;
+        public final boolean isDistinct;
+        public final boolean allowFiltering;
+        public final boolean isJson;
+
+        public Parameters(Map&lt;ColumnIdentifier, Boolean&gt; orderings,
+                          List&lt;Selectable.Raw&gt; groups,
+                          boolean isDistinct,
+                          boolean allowFiltering,
+                          boolean isJson)
+<span class="fc" id="L1536">        {</span>
+<span class="fc" id="L1537">            this.orderings = orderings;</span>
+<span class="fc" id="L1538">            this.groups = groups;</span>
+<span class="fc" id="L1539">            this.isDistinct = isDistinct;</span>
+<span class="fc" id="L1540">            this.allowFiltering = allowFiltering;</span>
+<span class="fc" id="L1541">            this.isJson = isJson;</span>
+<span class="fc" id="L1542">        }</span>
+    }
+
+    private static abstract class ColumnComparator&lt;T&gt; implements Comparator&lt;T&gt;
+    {
+        protected final int compare(Comparator&lt;ByteBuffer&gt; comparator, ByteBuffer aValue, ByteBuffer bValue)
+        {
+<span class="nc bnc" id="L1549" title="All 2 branches missed.">            if (aValue == null)</span>
+<span class="nc bnc" id="L1550" title="All 2 branches missed.">                return bValue == null ? 0 : -1;</span>
+
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">            return bValue == null ? 1 : comparator.compare(aValue, bValue);</span>
+        }
+    }
+
+    /**
+     * Used in orderResults(...) method when single 'ORDER BY' condition where given
+     */
+    private static class SingleColumnComparator extends ColumnComparator&lt;List&lt;ByteBuffer&gt;&gt;
+    {
+        private final int index;
+        private final Comparator&lt;ByteBuffer&gt; comparator;
+
+        public SingleColumnComparator(int columnIndex, Comparator&lt;ByteBuffer&gt; orderer)
+<span class="nc" id="L1565">        {</span>
+<span class="nc" id="L1566">            index = columnIndex;</span>
+<span class="nc" id="L1567">            comparator = orderer;</span>
+<span class="nc" id="L1568">        }</span>
+
+        public int compare(List&lt;ByteBuffer&gt; a, List&lt;ByteBuffer&gt; b)
+        {
+<span class="nc" id="L1572">            return compare(comparator, a.get(index), b.get(index));</span>
+        }
+    }
+
+    /**
+     * Used in orderResults(...) method when multiple 'ORDER BY' conditions where given
+     */
+    private static class CompositeComparator extends ColumnComparator&lt;List&lt;ByteBuffer&gt;&gt;
+    {
+        private final List&lt;Comparator&lt;ByteBuffer&gt;&gt; orderTypes;
+        private final List&lt;Integer&gt; positions;
+
+        private CompositeComparator(List&lt;Comparator&lt;ByteBuffer&gt;&gt; orderTypes, List&lt;Integer&gt; positions)
+<span class="nc" id="L1585">        {</span>
+<span class="nc" id="L1586">            this.orderTypes = orderTypes;</span>
+<span class="nc" id="L1587">            this.positions = positions;</span>
+<span class="nc" id="L1588">        }</span>
+
+        public int compare(List&lt;ByteBuffer&gt; a, List&lt;ByteBuffer&gt; b)
+        {
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">            for (int i = 0; i &lt; positions.size(); i++)</span>
+            {
+<span class="nc" id="L1594">                Comparator&lt;ByteBuffer&gt; type = orderTypes.get(i);</span>
+<span class="nc" id="L1595">                int columnPos = positions.get(i);</span>
+
+<span class="nc" id="L1597">                int comparison = compare(type, a.get(columnPos), b.get(columnPos));</span>
+
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">                if (comparison != 0)</span>
+<span class="nc" id="L1600">                    return comparison;</span>
+            }
+
+<span class="nc" id="L1603">            return 0;</span>
+        }
+    }
+    
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L1610">        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);</span>
+    }
+
+    private String loggableTokens(QueryOptions options, ClientState state)
+    {
+<span class="pc bpc" id="L1615" title="1 of 4 branches missed.">        if (restrictions.isKeyRange() || restrictions.usesSecondaryIndexing())</span>
+        {
+<span class="fc" id="L1617">            AbstractBounds&lt;PartitionPosition&gt; bounds = restrictions.getPartitionKeyBounds(options);</span>
+<span class="pc bpc" id="L1618" title="1 of 2 branches missed.">            return &quot;token range: &quot; + (bounds.inclusiveLeft() ? '[' : '(') +</span>
+<span class="fc" id="L1619">                   bounds.left.getToken().toString() + &quot;, &quot; +</span>
+<span class="fc" id="L1620">                   bounds.right.getToken().toString() +</span>
+<span class="pc bpc" id="L1621" title="1 of 2 branches missed.">                   (bounds.inclusiveRight() ? ']' : ')');</span>
+        }
+        else
+        {
+<span class="fc" id="L1625">            Collection&lt;ByteBuffer&gt; keys = restrictions.getPartitionKeys(options, state);</span>
+<span class="pc bpc" id="L1626" title="1 of 2 branches missed.">            if (keys.size() == 1)</span>
+            {
+<span class="fc" id="L1628">                return &quot;token: &quot; + table.partitioner.getToken(Iterables.getOnlyElement(keys)).toString();</span>
+            }
+            else
+            {
+<span class="nc" id="L1632">                StringBuilder sb = new StringBuilder(&quot;tokens: [&quot;);</span>
+<span class="nc" id="L1633">                boolean isFirst = true;</span>
+<span class="nc bnc" id="L1634" title="All 2 branches missed.">                for (ByteBuffer key : keys)</span>
+                {
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">                    if (!isFirst) sb.append(&quot;, &quot;);</span>
+<span class="nc" id="L1637">                    sb.append(table.partitioner.getToken(key).toString());</span>
+<span class="nc" id="L1638">                    isFirst = false;</span>
+<span class="nc" id="L1639">                }</span>
+<span class="nc" id="L1640">                return sb.append(']').toString();</span>
+            }
+        }
+    }
+
+    private String asCQL(QueryOptions options, ClientState state)
+    {
+<span class="fc" id="L1647">        ColumnFilter columnFilter = selection.newSelectors(options).getColumnFilter();</span>
+<span class="fc" id="L1648">        StringBuilder sb = new StringBuilder();</span>
+
+<span class="fc" id="L1650">        sb.append(&quot;SELECT &quot;).append(queriedColumns().toCQLString());</span>
+<span class="fc" id="L1651">        sb.append(&quot; FROM &quot;).append(table.keyspace).append('.').append(table.name);</span>
+<span class="pc bpc" id="L1652" title="1 of 4 branches missed.">        if (restrictions.isKeyRange() || restrictions.usesSecondaryIndexing())</span>
+        {
+            // partition range
+<span class="fc" id="L1655">            ClusteringIndexFilter clusteringIndexFilter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="pc bpc" id="L1656" title="1 of 2 branches missed.">            if (clusteringIndexFilter == null)</span>
+<span class="nc" id="L1657">                return &quot;EMPTY&quot;;</span>
+
+<span class="fc" id="L1659">            RowFilter rowFilter = getRowFilter(options);</span>
+
+            // The LIMIT provided by the user is the number of CQL row he wants returned.
+            // We want to have getRangeSlice to count the number of columns, not the number of keys.
+<span class="fc" id="L1663">            AbstractBounds&lt;PartitionPosition&gt; keyBounds = restrictions.getPartitionKeyBounds(options);</span>
+<span class="pc bpc" id="L1664" title="1 of 2 branches missed.">            if (keyBounds == null)</span>
+<span class="nc" id="L1665">                return &quot;EMPTY&quot;;</span>
+
+<span class="fc" id="L1667">            DataRange dataRange = new DataRange(keyBounds, clusteringIndexFilter);</span>
+
+<span class="pc bpc" id="L1669" title="2 of 4 branches missed.">            if (!dataRange.isUnrestricted(table) || !rowFilter.isEmpty())</span>
+            {
+<span class="nc" id="L1671">                sb.append(&quot; WHERE &quot;);</span>
+                // We put the row filter first because the data range can end by &quot;ORDER BY&quot;
+<span class="nc bnc" id="L1673" title="All 2 branches missed.">                if (!rowFilter.isEmpty())</span>
+                {
+<span class="nc" id="L1675">                    sb.append(rowFilter);</span>
+<span class="nc bnc" id="L1676" title="All 2 branches missed.">                    if (!dataRange.isUnrestricted(table))</span>
+<span class="nc" id="L1677">                        sb.append(&quot; AND &quot;);</span>
+                }
+<span class="nc bnc" id="L1679" title="All 2 branches missed.">                if (!dataRange.isUnrestricted(table))</span>
+<span class="nc" id="L1680">                    sb.append(dataRange.toCQLString(table, rowFilter));</span>
+            }
+<span class="fc" id="L1682">        }</span>
+        else
+        {
+            // single partition
+<span class="fc" id="L1686">            Collection&lt;ByteBuffer&gt; keys = restrictions.getPartitionKeys(options, state);</span>
+<span class="pc bpc" id="L1687" title="1 of 2 branches missed.">            if (keys.isEmpty())</span>
+<span class="nc" id="L1688">                return &quot;EMPTY&quot;;</span>
+<span class="fc" id="L1689">            ClusteringIndexFilter filter = makeClusteringIndexFilter(options, state, columnFilter);</span>
+<span class="pc bpc" id="L1690" title="1 of 2 branches missed.">            if (filter == null)</span>
+<span class="nc" id="L1691">                return &quot;EMPTY&quot;;</span>
+
+<span class="fc" id="L1693">            sb.append(&quot; WHERE &quot;);</span>
+
+
+<span class="pc bpc" id="L1696" title="1 of 2 branches missed.">            boolean compoundPk = table.partitionKeyColumns().size() &gt; 1;</span>
+<span class="pc bpc" id="L1697" title="1 of 2 branches missed.">            if (compoundPk) sb.append('(');</span>
+<span class="fc" id="L1698">            sb.append(ColumnMetadata.toCQLString(table.partitionKeyColumns()));</span>
+<span class="pc bpc" id="L1699" title="1 of 2 branches missed.">            if (compoundPk) sb.append(')');</span>
+<span class="pc bpc" id="L1700" title="1 of 2 branches missed.">            if (keys.size() == 1)</span>
+            {
+<span class="fc" id="L1702">                sb.append(&quot; = &quot;);</span>
+<span class="pc bpc" id="L1703" title="1 of 2 branches missed.">                if (compoundPk) sb.append('(');</span>
+<span class="fc" id="L1704">                DataRange.appendKeyString(sb, table.partitionKeyType, Iterables.getOnlyElement(keys));</span>
+<span class="pc bpc" id="L1705" title="1 of 2 branches missed.">                if (compoundPk) sb.append(')');</span>
+            }
+            else
+            {
+<span class="nc" id="L1709">                sb.append(&quot; IN (&quot;);</span>
+<span class="nc" id="L1710">                boolean first = true;</span>
+<span class="nc bnc" id="L1711" title="All 2 branches missed.">                for (ByteBuffer key : keys)</span>
+                {
+<span class="nc bnc" id="L1713" title="All 2 branches missed.">                    if (!first)</span>
+<span class="nc" id="L1714">                        sb.append(&quot;, &quot;);</span>
+
+<span class="nc bnc" id="L1716" title="All 2 branches missed.">                    if (compoundPk) sb.append('(');</span>
+<span class="nc" id="L1717">                    DataRange.appendKeyString(sb, table.partitionKeyType, key);</span>
+<span class="nc bnc" id="L1718" title="All 2 branches missed.">                    if (compoundPk) sb.append(')');</span>
+<span class="nc" id="L1719">                    first = false;</span>
+<span class="nc" id="L1720">                }</span>
+
+<span class="nc" id="L1722">                sb.append(')');</span>
+            }
+
+<span class="fc" id="L1725">            RowFilter rowFilter = getRowFilter(options);</span>
+<span class="pc bpc" id="L1726" title="1 of 2 branches missed.">            if (!rowFilter.isEmpty())</span>
+<span class="nc" id="L1727">                sb.append(&quot; AND &quot;).append(rowFilter);</span>
+
+<span class="fc" id="L1729">            String filterString = filter.toCQLString(table, rowFilter);</span>
+<span class="pc bpc" id="L1730" title="1 of 2 branches missed.">            if (!filterString.isEmpty())</span>
+<span class="nc" id="L1731">                sb.append(&quot; AND &quot;).append(filterString);</span>
+        }
+
+<span class="fc" id="L1734">        DataLimits limits = getDataLimits(getLimit(options), getPerPartitionLimit(options), options.getPageSize(), getAggregationSpec(options));</span>
+<span class="pc bpc" id="L1735" title="1 of 2 branches missed.">        if (limits != DataLimits.NONE)</span>
+<span class="nc" id="L1736">            sb.append(' ').append(limits);</span>
+<span class="fc" id="L1737">        return sb.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

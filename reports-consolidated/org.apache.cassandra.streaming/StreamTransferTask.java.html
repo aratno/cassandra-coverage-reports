@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamTransferTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamTransferTask.java</span></div><h1>StreamTransferTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.streaming.messages.OutgoingStreamMessage;
+import org.apache.cassandra.utils.ExecutorUtils;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+
+/**
+ * StreamTransferTask sends streams for a given table
+ */
+public class StreamTransferTask extends StreamTask
+{
+<span class="fc" id="L47">    private static final Logger logger = LoggerFactory.getLogger(StreamTransferTask.class);</span>
+<span class="fc" id="L48">    private static final ScheduledExecutorPlus timeoutExecutor = executorFactory().scheduled(false, &quot;StreamingTransferTaskTimeouts&quot;);</span>
+
+<span class="fc" id="L50">    private final AtomicInteger sequenceNumber = new AtomicInteger(0);</span>
+<span class="fc" id="L51">    private boolean aborted = false;</span>
+
+<span class="fc" id="L53">    @VisibleForTesting</span>
+    protected final Map&lt;Integer, OutgoingStreamMessage&gt; streams = new HashMap&lt;&gt;();
+<span class="fc" id="L55">    private final Map&lt;Integer, ScheduledFuture&lt;?&gt;&gt; timeoutTasks = new HashMap&lt;&gt;();</span>
+
+<span class="fc" id="L57">    private long totalSize = 0;</span>
+<span class="fc" id="L58">    private int totalFiles = 0;</span>
+
+    public StreamTransferTask(StreamSession session, TableId tableId)
+    {
+<span class="fc" id="L62">        super(session, tableId);</span>
+<span class="fc" id="L63">    }</span>
+
+    public synchronized void addTransferStream(OutgoingStream stream)
+    {
+<span class="fc" id="L67">        Preconditions.checkArgument(tableId.equals(stream.getTableId()));</span>
+<span class="fc" id="L68">        OutgoingStreamMessage message = new OutgoingStreamMessage(tableId, session, stream, sequenceNumber.getAndIncrement());</span>
+<span class="fc" id="L69">        message = StreamHook.instance.reportOutgoingStream(session, stream, message);</span>
+<span class="fc" id="L70">        streams.put(message.header.sequenceNumber, message);</span>
+<span class="fc" id="L71">        totalSize += message.stream.getEstimatedSize();</span>
+<span class="fc" id="L72">        totalFiles += message.stream.getNumFiles();</span>
+<span class="fc" id="L73">    }</span>
+
+    /**
+     * Received ACK for stream at {@code sequenceNumber}.
+     *
+     * @param sequenceNumber sequence number of stream
+     */
+    public void complete(int sequenceNumber)
+    {
+        boolean signalComplete;
+<span class="fc" id="L83">        synchronized (this)</span>
+        {
+<span class="fc" id="L85">            ScheduledFuture&lt;?&gt; timeout = timeoutTasks.remove(sequenceNumber);</span>
+<span class="fc bfc" id="L86" title="All 2 branches covered.">            if (timeout != null)</span>
+<span class="fc" id="L87">                timeout.cancel(false);</span>
+
+<span class="fc" id="L89">            OutgoingStreamMessage stream = streams.remove(sequenceNumber);</span>
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">            if (stream != null)</span>
+<span class="fc" id="L91">                stream.complete();</span>
+
+<span class="fc" id="L93">            logger.debug(&quot;received sequenceNumber {}, remaining files {}&quot;, sequenceNumber, streams.keySet());</span>
+<span class="fc" id="L94">            signalComplete = streams.isEmpty();</span>
+<span class="fc" id="L95">        }</span>
+
+        // all file sent, notify session this task is complete.
+<span class="fc bfc" id="L98" title="All 2 branches covered.">        if (signalComplete)</span>
+<span class="fc" id="L99">            session.taskCompleted(this);</span>
+<span class="fc" id="L100">    }</span>
+
+    /**
+     * Received ACK for stream at {@code sequenceNumber}.
+     *
+     * @param sequenceNumber sequence number of stream
+     */
+    public void timeout(int sequenceNumber)
+    {
+<span class="fc" id="L109">        synchronized (this)</span>
+        {
+<span class="fc" id="L111">            timeoutTasks.remove(sequenceNumber);</span>
+<span class="fc" id="L112">            OutgoingStreamMessage stream = streams.remove(sequenceNumber);</span>
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">            if (stream == null) return;</span>
+<span class="fc" id="L114">            stream.complete();</span>
+
+<span class="fc" id="L116">            logger.debug(&quot;timeout sequenceNumber {}, remaining files {}&quot;, sequenceNumber, streams.keySet());</span>
+<span class="fc" id="L117">        }</span>
+
+<span class="fc" id="L119">        session.sessionTimeout();</span>
+<span class="fc" id="L120">    }</span>
+
+    public synchronized void abort()
+    {
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">        if (aborted)</span>
+<span class="nc" id="L125">            return;</span>
+<span class="fc" id="L126">        aborted = true;</span>
+
+<span class="fc bfc" id="L128" title="All 2 branches covered.">        for (ScheduledFuture&lt;?&gt; future : timeoutTasks.values())</span>
+<span class="fc" id="L129">            future.cancel(false);</span>
+<span class="fc" id="L130">        timeoutTasks.clear();</span>
+
+<span class="fc" id="L132">        Throwable fail = null;</span>
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        for (OutgoingStreamMessage stream : streams.values())</span>
+        {
+            try
+            {
+<span class="fc" id="L137">                stream.complete();</span>
+            }
+<span class="nc" id="L139">            catch (Throwable t)</span>
+            {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">                if (fail == null) fail = t;</span>
+<span class="nc" id="L142">                else fail.addSuppressed(t);</span>
+<span class="fc" id="L143">            }</span>
+<span class="fc" id="L144">        }</span>
+<span class="fc" id="L145">        streams.clear();</span>
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        if (fail != null) {</span>
+<span class="nc" id="L147">            Throwables.throwIfUnchecked(fail);</span>
+<span class="nc" id="L148">            throw new RuntimeException(fail);</span>
+        }
+<span class="fc" id="L150">    }</span>
+
+    public synchronized int getTotalNumberOfFiles()
+    {
+<span class="fc" id="L154">        return totalFiles;</span>
+    }
+
+    public long getTotalSize()
+    {
+<span class="fc" id="L159">        return totalSize;</span>
+    }
+
+    public synchronized Collection&lt;OutgoingStreamMessage&gt; getFileMessages()
+    {
+        // We may race between queuing all those messages and the completion of the completion of
+        // the first ones. So copy the values to avoid a ConcurrentModificationException
+<span class="fc" id="L166">        return new ArrayList&lt;&gt;(streams.values());</span>
+    }
+
+    public synchronized OutgoingStreamMessage createMessageForRetry(int sequenceNumber)
+    {
+        // remove previous time out task to be rescheduled later
+<span class="nc" id="L172">        ScheduledFuture&lt;?&gt; future = timeoutTasks.remove(sequenceNumber);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (future != null)</span>
+<span class="nc" id="L174">            future.cancel(false);</span>
+<span class="nc" id="L175">        return streams.get(sequenceNumber);</span>
+    }
+
+    /**
+     * Schedule timeout task to release reference for stream sent.
+     * When not receiving ACK after sending to receiver in given time,
+     * the task will release reference.
+     *
+     * @param sequenceNumber sequence number of stream sent.
+     * @param time time to timeout
+     * @param unit unit of given time
+     * @return scheduled future for timeout task
+     */
+    public synchronized ScheduledFuture&lt;?&gt; scheduleTimeout(final int sequenceNumber, long time, TimeUnit unit)
+    {
+<span class="fc bfc" id="L190" title="All 2 branches covered.">        if (!streams.containsKey(sequenceNumber))</span>
+<span class="fc" id="L191">            return null;</span>
+
+<span class="fc" id="L193">        ScheduledFuture&lt;?&gt; future = timeoutExecutor.scheduleTimeoutWithDelay(() -&gt; StreamTransferTask.this.timeout(sequenceNumber), time, unit);</span>
+<span class="fc" id="L194">        ScheduledFuture&lt;?&gt; prev = timeoutTasks.put(sequenceNumber, future);</span>
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">        assert prev == null;</span>
+<span class="fc" id="L196">        return future;</span>
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L202">        ExecutorUtils.shutdownAndWait(timeout, units, timeoutExecutor);</span>
+<span class="fc" id="L203">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

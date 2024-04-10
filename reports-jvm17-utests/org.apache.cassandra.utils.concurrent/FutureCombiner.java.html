@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FutureCombiner.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.concurrent</a> &gt; <span class="el_source">FutureCombiner.java</span></div><h1>FutureCombiner.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils.concurrent;
+
+import io.netty.util.concurrent.GenericFutureListener;
+import io.netty.util.concurrent.GlobalEventExecutor;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import com.google.common.base.Preconditions;
+
+/**
+ * Netty's PromiseCombiner is not threadsafe, and we combine futures from multiple event executors.
+ *
+ * This class groups a number of Future into a single logical Future, by registering a listener to each that
+ * decrements a shared counter; if any of them fail, the FutureCombiner is completed with the first cause,
+ * but in all scenario only completes when all underlying future have completed (exceptionally or otherwise)
+ *
+ * This Future is always uncancellable.
+ *
+ * We extend AsyncFuture, and simply provide it an uncancellable Promise that will be completed by the listeners
+ * registered to the input futures.
+ */
+public class FutureCombiner&lt;T&gt; extends AsyncFuture&lt;T&gt;
+{
+    private interface ListenerFactory&lt;T&gt;
+    {
+        Listener&lt;T&gt; create(int count, Supplier&lt;T&gt; onSuccess, FutureCombiner&lt;T&gt; complete);
+    }
+
+    /**
+     * Tracks completion; once all futures have completed, invokes {@link Listener#complete#trySuccess(Object)} with {@link Listener#onSuccess}.
+     * Never invokes failure on {@link Listener#complete}.
+     */
+    private static class Listener&lt;T&gt; extends AtomicInteger implements GenericFutureListener&lt;io.netty.util.concurrent.Future&lt;Object&gt;&gt;
+    {
+        Supplier&lt;T&gt; onSuccess; // non-final so we can release resources immediately when failing fast
+        final FutureCombiner&lt;T&gt; complete;
+
+        Listener(int count, Supplier&lt;T&gt; onSuccess, FutureCombiner&lt;T&gt; complete)
+        {
+<span class="fc" id="L64">            super(count);</span>
+<span class="fc" id="L65">            Preconditions.checkNotNull(onSuccess);</span>
+<span class="fc" id="L66">            this.onSuccess = onSuccess;</span>
+<span class="fc" id="L67">            this.complete = complete;</span>
+<span class="fc" id="L68">        }</span>
+
+        @Override
+        public void operationComplete(io.netty.util.concurrent.Future&lt;Object&gt; result)
+        {
+<span class="fc bfc" id="L73" title="All 2 branches covered.">            if (0 == decrementAndGet())</span>
+<span class="fc" id="L74">                onCompletion();</span>
+<span class="fc" id="L75">        }</span>
+
+        void onCompletion()
+        {
+<span class="fc" id="L79">            complete.trySuccess(onSuccess.get());</span>
+<span class="fc" id="L80">            onSuccess = null;</span>
+<span class="fc" id="L81">        }</span>
+    }
+
+    /**
+     * Tracks completion; once all futures have completed, invokes {@link Listener#complete#trySuccess(Object)} with {@link Listener#onSuccess}.
+     * If any future fails, immediately propagates this failure and releases associated resources.
+     */
+    private static class FailFastListener&lt;T&gt; extends Listener&lt;T&gt;
+    {
+        FailFastListener(int count, Supplier&lt;T&gt; onSuccess, FutureCombiner&lt;T&gt; complete)
+        {
+<span class="fc" id="L92">            super(count, onSuccess, complete);</span>
+<span class="fc" id="L93">        }</span>
+
+        @Override
+        public void operationComplete(io.netty.util.concurrent.Future&lt;Object&gt; result)
+        {
+<span class="fc bfc" id="L98" title="All 2 branches covered.">            if (!result.isSuccess())</span>
+            {
+<span class="fc" id="L100">                onSuccess = null;</span>
+<span class="fc" id="L101">                complete.tryFailure(result.cause());</span>
+            }
+            else
+            {
+<span class="fc" id="L105">                super.operationComplete(result);</span>
+            }
+<span class="fc" id="L107">        }</span>
+    }
+
+    /**
+     * Tracks completion; once all futures have completed, invokes {@link Listener#complete#trySuccess(Object)} with {@link Listener#onSuccess}.
+     * If any future fails we propagate this failure, but only once all have completed.
+     */
+    private static class FailSlowListener&lt;T&gt; extends Listener&lt;T&gt;
+    {
+<span class="fc" id="L116">        private static final AtomicReferenceFieldUpdater&lt;FailSlowListener, Throwable&gt; firstCauseUpdater =</span>
+<span class="fc" id="L117">        AtomicReferenceFieldUpdater.newUpdater(FailSlowListener.class, Throwable.class, &quot;firstCause&quot;);</span>
+
+        private volatile Throwable firstCause;
+
+        FailSlowListener(int count, Supplier&lt;T&gt; onSuccess, FutureCombiner&lt;T&gt; complete)
+        {
+<span class="fc" id="L123">            super(count, onSuccess, complete);</span>
+<span class="fc" id="L124">        }</span>
+
+        @Override
+        void onCompletion()
+        {
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">            if (onSuccess == null)</span>
+<span class="nc" id="L130">                complete.tryFailure(firstCause);</span>
+            else
+<span class="fc" id="L132">                super.onCompletion();</span>
+<span class="fc" id="L133">        }</span>
+
+        @Override
+        public void operationComplete(io.netty.util.concurrent.Future&lt;Object&gt; result)
+        {
+<span class="pc bpc" id="L138" title="1 of 2 branches missed.">            if (!result.isSuccess())</span>
+            {
+<span class="nc" id="L140">                onSuccess = null;</span>
+<span class="nc" id="L141">                firstCauseUpdater.compareAndSet(FailSlowListener.this, null, result.cause());</span>
+            }
+
+<span class="fc" id="L144">            super.operationComplete(result);</span>
+<span class="fc" id="L145">        }</span>
+    }
+
+    private volatile Collection&lt;? extends io.netty.util.concurrent.Future&lt;?&gt;&gt; propagateCancellation;
+
+    private FutureCombiner(Collection&lt;? extends io.netty.util.concurrent.Future&lt;?&gt;&gt; combine, Supplier&lt;T&gt; resultSupplier, ListenerFactory&lt;T&gt; listenerFactory)
+<span class="fc" id="L151">    {</span>
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">        if (combine.isEmpty())</span>
+        {
+<span class="nc" id="L154">            trySuccess(null);</span>
+        }
+        else
+        {
+<span class="fc" id="L158">            Listener&lt;T&gt; listener = listenerFactory.create(combine.size(), resultSupplier, this);</span>
+<span class="fc" id="L159">            combine.forEach(f -&gt; {</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">                if (f.isDone()) listener.operationComplete((io.netty.util.concurrent.Future&lt;Object&gt;) f);</span>
+<span class="fc" id="L161">                else f.addListener(listener);</span>
+<span class="fc" id="L162">            });</span>
+        }
+<span class="fc" id="L164">    }</span>
+
+    @Override
+    protected boolean setUncancellable()
+    {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (!super.setUncancellable())</span>
+<span class="nc" id="L170">            return false;</span>
+<span class="nc" id="L171">        propagateCancellation = null;</span>
+<span class="nc" id="L172">        return true;</span>
+    }
+
+    @Override
+    protected boolean setUncancellableExclusive()
+    {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        if (!super.setUncancellableExclusive())</span>
+<span class="nc" id="L179">            return false;</span>
+<span class="nc" id="L180">        propagateCancellation = null;</span>
+<span class="nc" id="L181">        return true;</span>
+    }
+
+    @Override
+    protected boolean trySuccess(T t)
+    {
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">        if (!super.trySuccess(t))</span>
+<span class="nc" id="L188">            return false;</span>
+<span class="fc" id="L189">        propagateCancellation = null;</span>
+<span class="fc" id="L190">        return true;</span>
+    }
+
+    @Override
+    protected boolean tryFailure(Throwable throwable)
+    {
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        if (!super.tryFailure(throwable))</span>
+<span class="fc" id="L197">            return false;</span>
+<span class="fc" id="L198">        propagateCancellation = null;</span>
+<span class="fc" id="L199">        return true;</span>
+    }
+
+    @Override
+    public boolean cancel(boolean b)
+    {
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if (!super.cancel(b))</span>
+<span class="nc" id="L206">            return false;</span>
+<span class="nc" id="L207">        Collection&lt;? extends io.netty.util.concurrent.Future&lt;?&gt;&gt; propagate = propagateCancellation;</span>
+<span class="nc" id="L208">        propagateCancellation = null;</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (propagate != null)</span>
+<span class="nc" id="L210">            propagate.forEach(f -&gt; f.cancel(b));</span>
+<span class="nc" id="L211">        return true;</span>
+    }
+
+    /**
+     * Waits for all of {@code futures} to complete, only propagating failures on completion
+     */
+    public static FutureCombiner&lt;Void&gt; nettySuccessListener(Collection&lt;? extends io.netty.util.concurrent.Future&lt;?&gt;&gt; futures)
+    {
+<span class="fc" id="L219">        return new FutureCombiner&lt;Void&gt;(futures, () -&gt; null, FailSlowListener::new)</span>
+<span class="fc" id="L220">        {</span>
+            @Override
+            public Executor notifyExecutor()
+            {
+<span class="fc" id="L224">                return GlobalEventExecutor.INSTANCE;</span>
+            }
+        };
+    }
+
+    /**
+     * Waits only until the first failure, or until all have succeeded.
+     * Returns a list of results if successful; an exception if any failed.
+     *
+     * @param futures futures to wait for completion of
+     * @return a Future containing all results of {@code futures}
+     */
+    public static &lt;V&gt; Future&lt;List&lt;V&gt;&gt; allOf(Collection&lt;? extends io.netty.util.concurrent.Future&lt;? extends V&gt;&gt; futures)
+    {
+<span class="fc bfc" id="L238" title="All 2 branches covered.">        if (futures.isEmpty())</span>
+<span class="fc" id="L239">            return ImmediateFuture.success(Collections.emptyList());</span>
+
+<span class="fc" id="L241">        return new FutureCombiner&lt;&gt;(futures, () -&gt; futures.stream().map(f -&gt; f.getNow()).collect(Collectors.toList()), FailFastListener::new);</span>
+    }
+
+    /**
+     * Waits for all futures to complete, returning a list containing values of all successful input futures. This
+     * emulates Guava's Futures::successfulAsList in that results will be in the same order as inputs and any
+     * non-success value (e.g. failure or cancellation) will be replaced by null.
+     * @param futures futures to wait for completion of
+     * @return a Future containing all successful results of {@code futures} and nulls for non-successful futures
+     */
+    public static &lt;V&gt; Future&lt;List&lt;V&gt;&gt; successfulOf(List&lt;? extends io.netty.util.concurrent.Future&lt;V&gt;&gt; futures)
+    {
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">        if (futures.isEmpty())</span>
+<span class="nc" id="L254">            return ImmediateFuture.success(Collections.emptyList());</span>
+
+<span class="fc" id="L256">        return new FutureCombiner&lt;&gt;(futures,</span>
+<span class="fc" id="L257">                                    () -&gt; futures.stream()</span>
+<span class="fc bfc" id="L258" title="All 2 branches covered.">                                                 .map(f -&gt; f.isSuccess() ? f.getNow() : null)</span>
+<span class="fc" id="L259">                                                 .collect(Collectors.toList()),</span>
+                                    Listener::new);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,617 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UncommittedTableData.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.uncommitted</a> &gt; <span class="el_source">UncommittedTableData.java</span></div><h1>UncommittedTableData.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.uncommitted;
+
+import java.io.IOError;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.NavigableSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
+import com.google.common.collect.PeekingIterator;
+import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.SchemaElement;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.paxos.Ballot;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PaxosRepairHistory;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.MergeIterator;
+import org.apache.cassandra.utils.Throwables;
+
+import static com.google.common.collect.Iterables.elementsEqual;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.service.paxos.uncommitted.UncommittedDataFile.isCrcFile;
+import static org.apache.cassandra.service.paxos.uncommitted.UncommittedDataFile.isTmpFile;
+import static org.apache.cassandra.service.paxos.uncommitted.UncommittedDataFile.writer;
+
+/**
+ * On memtable flush
+ */
+public class UncommittedTableData
+{
+<span class="fc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(UncommittedTableData.class);</span>
+    private static final Collection&lt;Range&lt;Token&gt;&gt; FULL_RANGE;
+
+    static
+    {
+<span class="fc" id="L83">        Token min = DatabaseDescriptor.getPartitioner().getMinimumToken();</span>
+<span class="fc" id="L84">        FULL_RANGE = Collections.singleton(new Range&lt;&gt;(min, min));</span>
+    }
+
+<span class="fc" id="L87">    private static final SchemaElement UNKNOWN_TABLE = TableMetadata.minimal(&quot;UNKNOWN&quot;, &quot;UNKNOWN&quot;);</span>
+<span class="fc" id="L88">    private static final ExecutorPlus executor = executorFactory().sequential(&quot;PaxosUncommittedMerge&quot;);</span>
+
+    public interface FlushWriter
+    {
+        void append(PaxosKeyState commitState) throws IOException;
+
+        void finish();
+
+        Throwable abort(Throwable accumulate);
+
+        default void appendAll(Iterable&lt;PaxosKeyState&gt; states) throws IOException
+        {
+<span class="fc bfc" id="L100" title="All 2 branches covered.">            for (PaxosKeyState state : states)</span>
+<span class="fc" id="L101">                append(state);</span>
+<span class="fc" id="L102">        }</span>
+    }
+
+    private static class FilteringIterator extends AbstractIterator&lt;PaxosKeyState&gt; implements CloseableIterator&lt;PaxosKeyState&gt;
+    {
+        private final CloseableIterator&lt;PaxosKeyState&gt; wrapped;
+        private final PeekingIterator&lt;PaxosKeyState&gt; peeking;
+        private final PeekingIterator&lt;Range&lt;Token&gt;&gt; rangeIterator;
+        private final PaxosRepairHistory.Searcher historySearcher;
+
+        FilteringIterator(CloseableIterator&lt;PaxosKeyState&gt; wrapped, List&lt;Range&lt;Token&gt;&gt; ranges, PaxosRepairHistory history)
+<span class="fc" id="L113">        {</span>
+<span class="fc" id="L114">            this.wrapped = wrapped;</span>
+<span class="fc" id="L115">            this.peeking = Iterators.peekingIterator(wrapped);</span>
+<span class="fc" id="L116">            this.rangeIterator = Iterators.peekingIterator(Range.normalize(ranges).iterator());</span>
+<span class="fc" id="L117">            this.historySearcher = history.searcher();</span>
+<span class="fc" id="L118">        }</span>
+
+        protected PaxosKeyState computeNext()
+        {
+            while (true)
+            {
+<span class="fc bfc" id="L124" title="All 4 branches covered.">                if (!peeking.hasNext() || !rangeIterator.hasNext())</span>
+<span class="fc" id="L125">                    return endOfData();</span>
+
+<span class="fc" id="L127">                Range&lt;Token&gt; range = rangeIterator.peek();</span>
+
+<span class="fc" id="L129">                Token token = peeking.peek().key.getToken();</span>
+<span class="fc bfc" id="L130" title="All 2 branches covered.">                if (!range.contains(token))</span>
+                {
+<span class="fc bfc" id="L132" title="All 2 branches covered.">                    if (range.right.compareTo(token) &lt; 0)</span>
+<span class="fc" id="L133">                        rangeIterator.next();</span>
+                    else
+<span class="fc" id="L135">                        peeking.next();</span>
+<span class="fc" id="L136">                    continue;</span>
+                }
+
+<span class="fc" id="L139">                PaxosKeyState next = peeking.next();</span>
+
+<span class="fc" id="L141">                Ballot lowBound = historySearcher.ballotForToken(token);</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">                if (Commit.isAfter(lowBound, next.ballot))</span>
+<span class="fc" id="L143">                    continue;</span>
+
+<span class="fc" id="L145">                return next;</span>
+            }
+        }
+
+        public void close()
+        {
+<span class="fc" id="L151">            wrapped.close();</span>
+<span class="fc" id="L152">        }</span>
+    }
+
+<span class="fc" id="L155">    static abstract class FilterFactory</span>
+    {
+        abstract List&lt;Range&lt;Token&gt;&gt; getReplicatedRanges();
+        abstract PaxosRepairHistory getPaxosRepairHistory();
+
+        CloseableIterator&lt;PaxosKeyState&gt; filter(CloseableIterator&lt;PaxosKeyState&gt; iterator)
+        {
+<span class="fc" id="L162">            return new FilteringIterator(iterator, getReplicatedRanges(), getPaxosRepairHistory());</span>
+        }
+    }
+
+    private static class CFSFilterFactory extends FilterFactory
+    {
+        private final TableId tableId;
+
+        /**
+         * @param tableId must refer to a known CFS
+         */
+        CFSFilterFactory(TableId tableId)
+<span class="fc" id="L174">        {</span>
+<span class="fc" id="L175">            this.tableId = tableId;</span>
+<span class="fc" id="L176">        }</span>
+
+        List&lt;Range&lt;Token&gt;&gt; getReplicatedRanges()
+        {
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">            if (tableId == null)</span>
+<span class="nc" id="L181">                return Range.normalize(FULL_RANGE);</span>
+
+<span class="fc" id="L183">            ColumnFamilyStore table = Schema.instance.getColumnFamilyStoreInstance(tableId);</span>
+<span class="pc bpc" id="L184" title="1 of 2 branches missed.">            if (table == null)</span>
+<span class="nc" id="L185">                return Range.normalize(FULL_RANGE);</span>
+
+<span class="fc" id="L187">            String ksName = table.getKeyspaceName();</span>
+<span class="fc" id="L188">            List&lt;Range&lt;Token&gt;&gt; ranges = StorageService.instance.getLocalAndPendingRanges(ksName);</span>
+
+            // don't filter anything if we're not aware of any locally replicated ranges
+<span class="fc bfc" id="L191" title="All 2 branches covered.">            if (ranges.isEmpty())</span>
+<span class="fc" id="L192">                return Range.normalize(FULL_RANGE);</span>
+
+<span class="fc" id="L194">            return Range.normalize(ranges);</span>
+        }
+
+        PaxosRepairHistory getPaxosRepairHistory()
+        {
+<span class="fc" id="L199">            ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tableId);</span>
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">            if (cfs == null)</span>
+<span class="nc" id="L201">                return PaxosRepairHistory.EMPTY;</span>
+
+<span class="fc" id="L203">            return cfs.getPaxosRepairHistory();</span>
+        }
+    }
+
+    static class Data
+    {
+        final ImmutableSet&lt;UncommittedDataFile&gt; files;
+
+        Data(ImmutableSet&lt;UncommittedDataFile&gt; files)
+<span class="fc" id="L212">        {</span>
+<span class="fc" id="L213">            this.files = files;</span>
+<span class="fc" id="L214">        }</span>
+
+        Data withFile(UncommittedDataFile file)
+        {
+<span class="fc" id="L218">            return new Data(ImmutableSet.&lt;UncommittedDataFile&gt;builder().addAll(files).add(file).build());</span>
+        }
+
+        void truncate()
+        {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            for (UncommittedDataFile file : files)</span>
+<span class="nc" id="L224">                file.markDeleted();</span>
+<span class="nc" id="L225">        }</span>
+    }
+
+<span class="fc" id="L228">    private static class Reducer extends MergeIterator.Reducer&lt;PaxosKeyState, PaxosKeyState&gt;</span>
+    {
+<span class="fc" id="L230">        PaxosKeyState merged = null;</span>
+
+        public void reduce(int idx, PaxosKeyState current)
+        {
+<span class="fc" id="L234">            merged = PaxosKeyState.merge(merged, current);</span>
+<span class="fc" id="L235">        }</span>
+
+        protected PaxosKeyState getReduced()
+        {
+<span class="fc" id="L239">            return merged;</span>
+        }
+
+        protected void onKeyChange()
+        {
+<span class="fc" id="L244">            merged = null;</span>
+<span class="fc" id="L245">        }</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private static CloseableIterator&lt;PaxosKeyState&gt; merge(Collection&lt;UncommittedDataFile&gt; files, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="fc" id="L251">        List&lt;CloseableIterator&lt;PaxosKeyState&gt;&gt; iterators = new ArrayList&lt;&gt;(files.size());</span>
+        try
+        {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">            for (UncommittedDataFile file : files)</span>
+            {
+<span class="fc" id="L256">                CloseableIterator&lt;PaxosKeyState&gt; iterator = file.iterator(ranges);</span>
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">                if (iterator == null) continue;</span>
+<span class="fc" id="L258">                iterators.add(iterator);</span>
+<span class="fc" id="L259">            }</span>
+<span class="fc" id="L260">            return MergeIterator.get(iterators, PaxosKeyState.KEY_COMPARATOR, new Reducer());</span>
+        }
+<span class="nc" id="L262">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L264">            Throwables.close(t, iterators);</span>
+<span class="nc" id="L265">            throw t;</span>
+        }
+    }
+
+    class Merge implements Runnable
+    {
+        final int generation;
+<span class="fc" id="L272">        boolean isScheduled = false;</span>
+
+        Merge(int generation)
+<span class="fc" id="L275">        {</span>
+<span class="fc" id="L276">            this.generation = generation;</span>
+<span class="fc" id="L277">        }</span>
+
+        public void run()
+        {
+            try
+            {
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">                Preconditions.checkState(!dependsOnActiveFlushes());</span>
+<span class="fc" id="L284">                Data current = data;</span>
+<span class="fc" id="L285">                SchemaElement name = tableName(tableId);</span>
+<span class="fc" id="L286">                UncommittedDataFile.Writer writer = writer(directory, name.elementKeyspace(), name.elementName(), tableId, generation);</span>
+<span class="pc bpc" id="L287" title="1 of 2 branches missed.">                Set&lt;UncommittedDataFile&gt; files = Sets.newHashSet(Iterables.filter(current.files, u -&gt; u.generation() &lt; generation));</span>
+<span class="fc" id="L288">                logger.info(&quot;merging {} paxos uncommitted files into a new generation {} file for {}.{}&quot;, files.size(), generation, keyspace(), table());</span>
+<span class="fc" id="L289">                try (CloseableIterator&lt;PaxosKeyState&gt; iterator = filterFactory.filter(merge(files, FULL_RANGE)))</span>
+                {
+<span class="fc bfc" id="L291" title="All 2 branches covered.">                    while (iterator.hasNext())</span>
+                    {
+<span class="fc" id="L293">                        PaxosKeyState next = iterator.next();</span>
+
+<span class="fc bfc" id="L295" title="All 2 branches covered.">                        if (next.committed)</span>
+<span class="fc" id="L296">                            continue;</span>
+
+<span class="fc" id="L298">                        writer.append(next);</span>
+<span class="fc" id="L299">                    }</span>
+<span class="fc" id="L300">                    mergeComplete(this, writer.finish());</span>
+                }
+            }
+<span class="nc" id="L303">            catch (IOException e)</span>
+            {
+<span class="nc" id="L305">                throw new IOError(e);</span>
+<span class="fc" id="L306">            }</span>
+<span class="fc" id="L307">        }</span>
+
+        void maybeSchedule()
+        {
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">            if (isScheduled)</span>
+<span class="nc" id="L312">                return;</span>
+
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">            if (dependsOnActiveFlushes())</span>
+<span class="nc" id="L315">                return;</span>
+
+<span class="fc" id="L317">            executor.submit(merge);</span>
+<span class="fc" id="L318">            merge.isScheduled = true;</span>
+<span class="fc" id="L319">        }</span>
+
+        boolean dependsOnActiveFlushes()
+        {
+<span class="fc bfc" id="L323" title="All 2 branches covered.">            return !activeFlushes.headSet(generation).isEmpty();</span>
+        }
+    }
+
+    private final File directory;
+    private final TableId tableId;
+    private final FilterFactory filterFactory;
+
+    private volatile Data data;
+    private volatile Merge merge;
+<span class="fc" id="L333">    private volatile boolean rebuilding = false;</span>
+
+    private int nextGeneration;
+<span class="fc" id="L336">    private final NavigableSet&lt;Integer&gt; activeFlushes = new ConcurrentSkipListSet&lt;&gt;();</span>
+
+    private UncommittedTableData(File directory, TableId tableId, FilterFactory filterFactory, Data data)
+<span class="fc" id="L339">    {</span>
+<span class="fc" id="L340">        this.directory = directory;</span>
+<span class="fc" id="L341">        this.tableId = tableId;</span>
+<span class="fc" id="L342">        this.filterFactory = filterFactory;</span>
+<span class="fc" id="L343">        this.data = data;</span>
+<span class="fc" id="L344">        this.nextGeneration = 1 + (int) data.files.stream().mapToLong(UncommittedDataFile::generation).max().orElse(-1);</span>
+<span class="fc" id="L345">    }</span>
+
+    static UncommittedTableData load(File directory, TableId tableId, FilterFactory flushFilterFactory)
+    {
+<span class="fc" id="L349">        Preconditions.checkArgument(directory.exists());</span>
+<span class="fc" id="L350">        Preconditions.checkArgument(directory.isDirectory());</span>
+<span class="fc" id="L351">        Preconditions.checkNotNull(tableId);</span>
+
+<span class="fc" id="L353">        String[] fnames = directory.tryListNames();</span>
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">        Preconditions.checkArgument(fnames != null);</span>
+
+<span class="fc" id="L356">        Pattern pattern = UncommittedDataFile.fileRegexFor(tableId);</span>
+<span class="fc" id="L357">        Set&lt;Long&gt; generations = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L358">        List&lt;UncommittedDataFile&gt; files = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L359" title="All 2 branches covered.">        for (String fname : fnames)</span>
+        {
+<span class="fc" id="L361">            Matcher matcher = pattern.matcher(fname);</span>
+<span class="fc bfc" id="L362" title="All 2 branches covered.">            if (!matcher.matches())</span>
+<span class="fc" id="L363">                continue;</span>
+
+<span class="fc" id="L365">            File file = new File(directory, fname);</span>
+<span class="fc bfc" id="L366" title="All 2 branches covered.">            if (isTmpFile(fname))</span>
+            {
+<span class="fc" id="L368">                logger.info(&quot;deleting left over uncommitted paxos temp file {} for tableId {}&quot;, file, tableId);</span>
+<span class="fc" id="L369">                file.delete();</span>
+<span class="fc" id="L370">                continue;</span>
+            }
+
+<span class="fc bfc" id="L373" title="All 2 branches covered.">            if (isCrcFile(fname))</span>
+<span class="fc" id="L374">                continue;</span>
+
+<span class="fc" id="L376">            File crcFile = new File(directory, UncommittedDataFile.crcName(fname));</span>
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">            if (!crcFile.exists())</span>
+<span class="nc" id="L378">                throw new FSReadError(new IOException(String.format(&quot;%s does not have a corresponding crc file&quot;, file)), crcFile);</span>
+<span class="fc" id="L379">            long generation = Long.parseLong(matcher.group(1));</span>
+<span class="fc" id="L380">            files.add(UncommittedDataFile.create(tableId, file, crcFile, generation));</span>
+<span class="fc" id="L381">            generations.add(generation);</span>
+        }
+
+        // cleanup orphaned crc files
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        for (String fname : fnames)</span>
+        {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">            if (!isCrcFile(fname))</span>
+<span class="fc" id="L388">                continue;</span>
+
+<span class="fc" id="L390">            Matcher matcher = pattern.matcher(fname);</span>
+<span class="fc bfc" id="L391" title="All 2 branches covered.">            if (!matcher.matches())</span>
+<span class="fc" id="L392">                continue;</span>
+
+<span class="fc" id="L394">            long generation = Long.parseLong(matcher.group(1));</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">            if (!generations.contains(generation))</span>
+            {
+<span class="fc" id="L397">                File file = new File(directory, fname);</span>
+<span class="fc" id="L398">                logger.info(&quot;deleting left over uncommitted paxos crc file {} for tableId {}&quot;, file, tableId);</span>
+<span class="fc" id="L399">                file.delete();</span>
+            }
+        }
+
+<span class="fc" id="L403">        return new UncommittedTableData(directory, tableId, flushFilterFactory, new Data(ImmutableSet.copyOf(files)));</span>
+    }
+
+    static UncommittedTableData load(File directory, TableId tableId)
+    {
+<span class="fc" id="L408">        return load(directory, tableId, new CFSFilterFactory(tableId));</span>
+    }
+
+    static Set&lt;TableId&gt; listTableIds(File directory)
+    {
+<span class="fc" id="L413">        Preconditions.checkArgument(directory.isDirectory());</span>
+<span class="fc" id="L414">        return UncommittedDataFile.listTableIds(directory);</span>
+    }
+
+    private static SchemaElement tableName(TableId tableId)
+    {
+<span class="fc" id="L419">        TableMetadata name = Schema.instance.getTableMetadata(tableId);</span>
+<span class="fc bfc" id="L420" title="All 2 branches covered.">        return name != null ? name : UNKNOWN_TABLE;</span>
+    }
+
+    int numFiles()
+    {
+<span class="fc" id="L425">        return data.files.size();</span>
+    }
+
+    TableId tableId()
+    {
+<span class="fc" id="L430">        return tableId;</span>
+    }
+
+    public String keyspace()
+    {
+<span class="fc" id="L435">        return tableName(tableId).elementKeyspace();</span>
+    }
+
+    public String table()
+    {
+<span class="fc" id="L440">        return tableName(tableId).elementName();</span>
+    }
+
+    /**
+     * Return an iterator of the file contents for the given token ranges. Token ranges
+     * must be normalized
+     */
+    synchronized CloseableIterator&lt;PaxosKeyState&gt; iterator(Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+        // we don't wait for pending flushes because flushing memtable data is added in PaxosUncommittedIndex
+<span class="fc" id="L450">        Preconditions.checkArgument(elementsEqual(Range.normalize(ranges), ranges));</span>
+<span class="fc" id="L451">        return filterFactory.filter(merge(data.files, ranges));</span>
+    }
+
+    private void flushTerminated(int generation)
+    {
+<span class="fc" id="L456">        activeFlushes.remove(generation);</span>
+<span class="fc bfc" id="L457" title="All 2 branches covered.">        if (merge != null)</span>
+<span class="fc" id="L458">            merge.maybeSchedule();</span>
+<span class="fc" id="L459">    }</span>
+
+    private synchronized void flushSuccess(int generation, UncommittedDataFile newFile)
+    {
+<span class="pc bpc" id="L463" title="2 of 4 branches missed.">        assert newFile == null || generation == newFile.generation();</span>
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">        if (newFile != null)</span>
+<span class="fc" id="L465">            data = data.withFile(newFile);</span>
+<span class="fc" id="L466">        flushTerminated(generation);</span>
+<span class="fc" id="L467">    }</span>
+
+    private synchronized void flushAborted(int generation)
+    {
+<span class="fc" id="L471">        flushTerminated(generation);</span>
+<span class="fc" id="L472">    }</span>
+
+    private synchronized void mergeComplete(Merge merge, UncommittedDataFile newFile)
+    {
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">        Preconditions.checkArgument(this.merge == merge);</span>
+<span class="fc" id="L477">        ImmutableSet.Builder&lt;UncommittedDataFile&gt; files = ImmutableSet.builder();</span>
+<span class="fc" id="L478">        files.add(newFile);</span>
+<span class="fc bfc" id="L479" title="All 2 branches covered.">        for (UncommittedDataFile file : data.files)</span>
+        {
+<span class="pc bpc" id="L481" title="1 of 2 branches missed.">            if (file.generation() &gt; merge.generation)</span>
+<span class="nc" id="L482">                files.add(file);</span>
+            else
+<span class="fc" id="L484">                file.markDeleted();</span>
+<span class="fc" id="L485">        }</span>
+
+<span class="fc" id="L487">        data = new Data(files.build());</span>
+<span class="fc" id="L488">        this.merge = null;</span>
+<span class="fc" id="L489">        logger.info(&quot;paxos uncommitted merge completed for {}.{}, new generation {} file added&quot;, keyspace(), table(), newFile.generation());</span>
+<span class="fc" id="L490">    }</span>
+
+    synchronized FlushWriter flushWriter() throws IOException
+    {
+<span class="fc" id="L494">        int generation = nextGeneration++;</span>
+<span class="fc" id="L495">        UncommittedDataFile.Writer writer = writer(directory, keyspace(), table(), tableId, generation);</span>
+<span class="fc" id="L496">        activeFlushes.add(generation);</span>
+<span class="fc" id="L497">        logger.info(&quot;flushing generation {} uncommitted paxos file for {}.{}&quot;, generation, keyspace(), table());</span>
+
+<span class="fc" id="L499">        return new FlushWriter()</span>
+<span class="fc" id="L500">        {</span>
+            public void append(PaxosKeyState commitState) throws IOException
+            {
+<span class="fc" id="L503">                writer.append(commitState);</span>
+<span class="fc" id="L504">            }</span>
+
+            public void finish()
+            {
+<span class="fc" id="L508">                flushSuccess(generation, writer.finish());</span>
+<span class="fc" id="L509">            }</span>
+
+            public Throwable abort(Throwable accumulate)
+            {
+<span class="fc" id="L513">                accumulate = writer.abort(accumulate);</span>
+<span class="fc" id="L514">                flushAborted(generation);</span>
+<span class="fc" id="L515">                return accumulate;</span>
+            }
+        };
+    }
+
+    private synchronized void rebuildComplete(UncommittedDataFile file)
+    {
+<span class="fc" id="L522">        Preconditions.checkState(rebuilding);</span>
+<span class="pc bpc" id="L523" title="1 of 2 branches missed.">        Preconditions.checkState(!hasInProgressIO());</span>
+<span class="fc" id="L524">        Preconditions.checkState(data.files.isEmpty());</span>
+
+<span class="fc" id="L526">        data = new Data(ImmutableSet.of(file));</span>
+<span class="fc" id="L527">        logger.info(&quot;paxos rebuild completed for {}.{}&quot;, keyspace(), table());</span>
+<span class="fc" id="L528">        rebuilding = false;</span>
+<span class="fc" id="L529">    }</span>
+
+    synchronized FlushWriter rebuildWriter() throws IOException
+    {
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">        Preconditions.checkState(!rebuilding);</span>
+<span class="pc bpc" id="L534" title="1 of 2 branches missed.">        Preconditions.checkState(nextGeneration == 0);</span>
+<span class="pc bpc" id="L535" title="1 of 2 branches missed.">        Preconditions.checkState(!hasInProgressIO());</span>
+<span class="fc" id="L536">        rebuilding = true;</span>
+<span class="fc" id="L537">        int generation = nextGeneration++;</span>
+<span class="fc" id="L538">        UncommittedDataFile.Writer writer = writer(directory, keyspace(), table(), tableId, generation);</span>
+
+<span class="fc" id="L540">        return new FlushWriter()</span>
+<span class="fc" id="L541">        {</span>
+            public void append(PaxosKeyState commitState) throws IOException
+            {
+<span class="pc bpc" id="L544" title="1 of 2 branches missed.">                if (commitState.committed)</span>
+<span class="nc" id="L545">                    return;</span>
+
+<span class="fc" id="L547">                writer.append(commitState);</span>
+<span class="fc" id="L548">            }</span>
+
+            public void finish()
+            {
+<span class="fc" id="L552">                rebuildComplete(writer.finish());</span>
+<span class="fc" id="L553">            }</span>
+
+            public Throwable abort(Throwable accumulate)
+            {
+<span class="nc" id="L557">                accumulate = writer.abort(accumulate);</span>
+<span class="nc" id="L558">                logger.info(&quot;paxos rebuild aborted for {}.{}&quot;, keyspace(), table());</span>
+<span class="nc" id="L559">                rebuilding = false;</span>
+<span class="nc" id="L560">                return accumulate;</span>
+            }
+        };
+    }
+
+    synchronized void maybeScheduleMerge()
+    {
+<span class="fc" id="L567">        logger.info(&quot;Scheduling uncommitted paxos data merge task for {}.{}&quot;, keyspace(), table());</span>
+<span class="pc bpc" id="L568" title="3 of 4 branches missed.">        if (data.files.size() &lt; 2 || merge != null)</span>
+<span class="fc" id="L569">            return;</span>
+
+<span class="nc" id="L571">        createMergeTask().maybeSchedule();</span>
+<span class="nc" id="L572">    }</span>
+
+    @VisibleForTesting
+    synchronized Merge createMergeTask()
+    {
+<span class="pc bpc" id="L577" title="1 of 2 branches missed.">        Preconditions.checkState(merge == null);</span>
+<span class="fc" id="L578">        merge = new Merge(nextGeneration++);</span>
+<span class="fc" id="L579">        return merge;</span>
+    }
+
+    synchronized boolean hasInProgressIO()
+    {
+<span class="pc bpc" id="L584" title="2 of 4 branches missed.">        return merge != null || !activeFlushes.isEmpty();</span>
+    }
+
+    void truncate()
+    {
+<span class="nc" id="L589">        logger.info(&quot;truncating uncommitting paxos date for {}.{}&quot;, keyspace(), table());</span>
+<span class="nc" id="L590">        data.truncate();</span>
+<span class="nc" id="L591">        data = new Data(ImmutableSet.of());</span>
+<span class="nc" id="L592">    }</span>
+
+    @VisibleForTesting
+    Data data()
+    {
+<span class="fc" id="L597">        return data;</span>
+    }
+
+    @VisibleForTesting
+    long nextGeneration()
+    {
+<span class="fc" id="L603">        return nextGeneration;</span>
+    }
+
+    @VisibleForTesting
+    Merge currentMerge()
+    {
+<span class="fc" id="L609">        return merge;</span>
+    }
+
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L614">        ExecutorUtils.shutdownAndWait(timeout, units, executor);</span>
+<span class="fc" id="L615">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

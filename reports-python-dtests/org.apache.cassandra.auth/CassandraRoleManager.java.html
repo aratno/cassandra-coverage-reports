@@ -1,0 +1,707 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraRoleManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth</a> &gt; <span class="el_source">CassandraRoleManager.java</span></div><h1>CassandraRoleManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.auth;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableSet;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.mindrot.jbcrypt.BCrypt;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.AUTH_BCRYPT_GENSALT_LOG2_ROUNDS;
+import static org.apache.cassandra.service.QueryState.forInternalCalls;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+/**
+ * Responsible for the creation, maintenance and deletion of roles
+ * for the purposes of authentication and authorization.
+ * Role data is stored internally, using the roles and role_members tables
+ * in the system_auth keyspace.
+ *
+ * Additionally, if org.apache.cassandra.auth.PasswordAuthenticator is used,
+ * encrypted passwords are also stored in the system_auth.roles table. This
+ * coupling between the IAuthenticator and IRoleManager implementations exists
+ * because setting a role's password via CQL is done with a CREATE ROLE or
+ * ALTER ROLE statement, the processing of which is handled by IRoleManager.
+ * As IAuthenticator is concerned only with credentials checking and has no
+ * means to modify passwords, PasswordAuthenticator depends on
+ * CassandraRoleManager for those functions.
+ *
+ * Alternative IAuthenticator implementations may be used in conjunction with
+ * CassandraRoleManager, but WITH PASSWORD = 'password' will not be supported
+ * in CREATE/ALTER ROLE statements.
+ *
+ * Such a configuration could be implemented using a custom IRoleManager that
+ * extends CassandraRoleManager and which includes Option.PASSWORD in the {@code Set&lt;Option&gt;}
+ * returned from supportedOptions/alterableOptions. Any additional processing
+ * of the password itself (such as storing it in an alternative location) would
+ * be added in overridden createRole and alterRole implementations.
+ */
+public class CassandraRoleManager implements IRoleManager
+{
+<span class="fc" id="L84">    private static final Logger logger = LoggerFactory.getLogger(CassandraRoleManager.class);</span>
+<span class="fc" id="L85">    private static final NoSpamLogger nospamLogger = NoSpamLogger.getLogger(logger, 1L, TimeUnit.MINUTES);</span>
+
+    public static final String DEFAULT_SUPERUSER_NAME = &quot;cassandra&quot;;
+    public static final String DEFAULT_SUPERUSER_PASSWORD = &quot;cassandra&quot;;
+
+    /**
+     * We need to treat the default superuser as a special case since during initial node startup, we may end up with
+     * duplicate creation or deletion + re-creation of this user on different nodes unless we check at quorum to see if
+     * it's already been done.
+     */
+<span class="fc" id="L95">    static final ConsistencyLevel DEFAULT_SUPERUSER_CONSISTENCY_LEVEL = ConsistencyLevel.QUORUM;</span>
+
+    // Transform a row in the AuthKeyspace.ROLES to a Role instance
+<span class="fc" id="L98">    private static final Function&lt;UntypedResultSet.Row, Role&gt; ROW_TO_ROLE = row -&gt;</span>
+    {
+        try
+        {
+<span class="fc" id="L102">            return new Role(row.getString(&quot;role&quot;),</span>
+<span class="fc" id="L103">                            row.getBoolean(&quot;is_superuser&quot;),</span>
+<span class="fc" id="L104">                            row.getBoolean(&quot;can_login&quot;),</span>
+<span class="fc" id="L105">                            Collections.emptyMap(),</span>
+<span class="fc bfc" id="L106" title="All 2 branches covered.">                            row.has(&quot;member_of&quot;) ? row.getSet(&quot;member_of&quot;, UTF8Type.instance)</span>
+<span class="fc" id="L107">                                                 : Collections.&lt;String&gt;emptySet());</span>
+        }
+        // Failing to deserialize a boolean in is_superuser or can_login will throw an NPE
+<span class="fc" id="L110">        catch (NullPointerException e)</span>
+        {
+<span class="fc" id="L112">            logger.warn(&quot;An invalid value has been detected in the {} table for role {}. If you are &quot; +</span>
+                        &quot;unable to login, you may need to disable authentication and confirm &quot; +
+<span class="fc" id="L114">                        &quot;that values in that table are accurate&quot;, AuthKeyspace.ROLES, row.getString(&quot;role&quot;));</span>
+<span class="fc" id="L115">            throw new RuntimeException(String.format(&quot;Invalid metadata has been detected for role %s&quot;, row.getString(&quot;role&quot;)), e);</span>
+        }
+    };
+
+<span class="fc" id="L119">    private static final int GENSALT_LOG2_ROUNDS = getGensaltLogRounds();</span>
+
+    static int getGensaltLogRounds()
+    {
+<span class="fc" id="L123">        int rounds = AUTH_BCRYPT_GENSALT_LOG2_ROUNDS.getInt(10);</span>
+<span class="pc bpc" id="L124" title="2 of 4 branches missed.">        if (rounds &lt; 4 || rounds &gt; 30)</span>
+<span class="nc" id="L125">            throw new ConfigurationException(String.format(&quot;Bad value for system property %s.&quot; +</span>
+<span class="nc" id="L126">                                                           &quot;Please use a value between 4 and 30 inclusively&quot;, AUTH_BCRYPT_GENSALT_LOG2_ROUNDS.getKey()));</span>
+<span class="fc" id="L127">        return rounds;</span>
+    }
+
+    private SelectStatement loadRoleStatement;
+    private SelectStatement loadIdentityStatement;
+
+    private final Set&lt;Option&gt; supportedOptions;
+    private final Set&lt;Option&gt; alterableOptions;
+
+    public CassandraRoleManager()
+<span class="fc" id="L137">    {</span>
+<span class="fc bfc" id="L138" title="All 2 branches covered.">        supportedOptions = DatabaseDescriptor.getAuthenticator() instanceof PasswordAuthenticator</span>
+<span class="fc" id="L139">                         ? ImmutableSet.of(Option.LOGIN, Option.SUPERUSER, Option.PASSWORD, Option.HASHED_PASSWORD)</span>
+<span class="fc" id="L140">                         : ImmutableSet.of(Option.LOGIN, Option.SUPERUSER);</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        alterableOptions = DatabaseDescriptor.getAuthenticator() instanceof PasswordAuthenticator</span>
+<span class="fc" id="L142">                         ? ImmutableSet.of(Option.PASSWORD, Option.HASHED_PASSWORD)</span>
+<span class="fc" id="L143">                         : ImmutableSet.&lt;Option&gt;of();</span>
+<span class="fc" id="L144">    }</span>
+
+    @Override
+    public void setup()
+    {
+<span class="fc" id="L149">        loadRoleStatement();</span>
+<span class="fc" id="L150">        loadIdentityStatement();</span>
+<span class="fc" id="L151">        scheduleSetupTask(() -&gt; {</span>
+<span class="fc" id="L152">            setupDefaultRole();</span>
+<span class="fc" id="L153">            return null;</span>
+        });
+<span class="fc" id="L155">    }</span>
+
+    @Override
+    public String roleForIdentity(String identity)
+    {
+<span class="nc" id="L160">        QueryOptions options = QueryOptions.forInternalCalls(CassandraAuthorizer.authReadConsistencyLevel(),</span>
+<span class="nc" id="L161">                                                             Collections.singletonList(byteBuf(identity)));</span>
+<span class="nc" id="L162">        ResultMessage.Rows rows = select(loadIdentityStatement, options);</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (rows.result.isEmpty())</span>
+        {
+<span class="nc" id="L165">            nospamLogger.warn(&quot;No such identity {} in the identity_to_roles table&quot;, identity);</span>
+<span class="nc" id="L166">            return null;</span>
+        }
+<span class="nc" id="L168">        return UntypedResultSet.create(rows.result).one().getString(&quot;role&quot;);</span>
+    }
+
+    @Override
+    public Map&lt;String, String&gt; authorizedIdentities()
+    {
+<span class="nc" id="L174">        Map&lt;String, String&gt; validIdentities = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L175">        String query = String.format(&quot;SELECT identity, role from %s.%s&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="nc" id="L178">        UntypedResultSet rows = process(query, CassandraAuthorizer.authReadConsistencyLevel());</span>
+<span class="nc" id="L179">        rows.forEach(row -&gt; validIdentities.put(row.getString(&quot;identity&quot;), row.getString(&quot;role&quot;)));</span>
+<span class="nc" id="L180">        return validIdentities;</span>
+    }
+
+    @Override
+    public void addIdentity(String identity, String role)
+    {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        if (isExistingIdentity(identity))</span>
+        {
+<span class="nc" id="L188">            throw new IllegalStateException(&quot;Identity is already associated with another role, cannot associate it with role &quot; + role);</span>
+        }
+
+<span class="nc" id="L191">        String query = String.format(&quot;INSERT INTO %s.%s (identity, role) VALUES (?, ?)&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="nc" id="L194">        process(query, CassandraAuthorizer.authWriteConsistencyLevel(), byteBuf(identity), byteBuf(role));</span>
+<span class="nc" id="L195">    }</span>
+
+    @Override
+    public boolean isExistingIdentity(String identity)
+    {
+<span class="nc" id="L200">        String query = String.format(&quot;SELECT identity from %s.%s where identity=?&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="nc" id="L203">        UntypedResultSet rows = process(query, CassandraAuthorizer.authReadConsistencyLevel(), byteBuf(identity));</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        return !rows.isEmpty();</span>
+    }
+
+    @Override
+    public void dropIdentity(String identity)
+    {
+<span class="nc" id="L210">        String query = String.format(&quot;DELETE FROM %s.%s WHERE identity = ?&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="nc" id="L213">        process(query, CassandraAuthorizer.authWriteConsistencyLevel(), byteBuf(identity));</span>
+<span class="nc" id="L214">    }</span>
+
+    protected final void loadRoleStatement()
+    {
+<span class="fc" id="L218">        loadRoleStatement = (SelectStatement) prepare(&quot;SELECT * from %s.%s WHERE role = ?&quot;,</span>
+                                                      SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                      AuthKeyspace.ROLES);
+<span class="fc" id="L221">    }</span>
+
+
+    protected void loadIdentityStatement()
+    {
+<span class="fc" id="L226">        loadIdentityStatement = (SelectStatement) prepare(&quot;SELECT role from %s.%s where identity=?&quot;,</span>
+                                                          SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                          AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="fc" id="L229">    }</span>
+
+    public Set&lt;Option&gt; supportedOptions()
+    {
+<span class="fc" id="L233">        return supportedOptions;</span>
+    }
+
+    public Set&lt;Option&gt; alterableOptions()
+    {
+<span class="fc" id="L238">        return alterableOptions;</span>
+    }
+
+    public void createRole(AuthenticatedUser performer, RoleResource role, RoleOptions options)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L244">        List&lt;String&gt; identitiesOfRole = identitiesForRole(role.getRoleName());</span>
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">        if (!identitiesOfRole.isEmpty())</span>
+        {
+<span class="nc" id="L247">            throw new IllegalStateException(String.format(&quot;Cannot create a role '%s' when identities already exists for it&quot;, role.getRoleName()));</span>
+        }
+<span class="pc bpc" id="L249" title="1 of 4 branches missed.">        String insertCql = options.getPassword().isPresent() || options.getHashedPassword().isPresent()</span>
+<span class="fc" id="L250">                         ? String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login, salted_hash) VALUES ('%s', %s, %s, '%s')&quot;,</span>
+                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                         AuthKeyspace.ROLES,
+<span class="fc" id="L253">                                         escape(role.getRoleName()),</span>
+<span class="fc" id="L254">                                         options.getSuperuser().orElse(false),</span>
+<span class="fc" id="L255">                                         options.getLogin().orElse(false),</span>
+<span class="fc" id="L256">                                         options.getHashedPassword().orElseGet(() -&gt; escape(hashpw(options.getPassword().get()))))</span>
+<span class="fc" id="L257">                         : String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login) VALUES ('%s', %s, %s)&quot;,</span>
+                                         SchemaConstants.AUTH_KEYSPACE_NAME,
+                                         AuthKeyspace.ROLES,
+<span class="fc" id="L260">                                         escape(role.getRoleName()),</span>
+<span class="fc" id="L261">                                         options.getSuperuser().orElse(false),</span>
+<span class="fc" id="L262">                                         options.getLogin().orElse(false));</span>
+<span class="fc" id="L263">        process(insertCql, consistencyForRoleWrite(role.getRoleName()));</span>
+<span class="fc" id="L264">    }</span>
+
+    public void dropRole(AuthenticatedUser performer, RoleResource role) throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L268">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLES,
+<span class="fc" id="L271">                              escape(role.getRoleName())),</span>
+<span class="fc" id="L272">                consistencyForRoleWrite(role.getRoleName()));</span>
+<span class="fc" id="L273">        removeAllMembers(role.getRoleName());</span>
+<span class="fc" id="L274">        removeAllIdentitiesOfRole(role.getRoleName());</span>
+<span class="fc" id="L275">    }</span>
+
+    public void alterRole(AuthenticatedUser performer, RoleResource role, RoleOptions options)
+    {
+        // Unlike most of the other data access methods here, this does not use a
+        // prepared statement in order to allow the set of assignments to be variable.
+<span class="fc" id="L281">        String assignments = optionsToAssignments(options.getOptions());</span>
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">        if (!Strings.isNullOrEmpty(assignments))</span>
+        {
+<span class="fc" id="L284">            process(String.format(&quot;UPDATE %s.%s SET %s WHERE role = '%s'&quot;,</span>
+                                  SchemaConstants.AUTH_KEYSPACE_NAME,
+                                  AuthKeyspace.ROLES,
+                                  assignments,
+<span class="fc" id="L288">                                  escape(role.getRoleName())),</span>
+<span class="fc" id="L289">                    consistencyForRoleWrite(role.getRoleName()));</span>
+        }
+<span class="fc" id="L291">    }</span>
+
+    public void grantRole(AuthenticatedUser performer, RoleResource role, RoleResource grantee)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="pc bpc" id="L296" title="1 of 2 branches missed.">        if (getRoles(grantee, true).contains(role))</span>
+<span class="nc" id="L297">            throw new InvalidRequestException(String.format(&quot;%s is a member of %s&quot;,</span>
+<span class="nc" id="L298">                                                            grantee.getRoleName(),</span>
+<span class="nc" id="L299">                                                            role.getRoleName()));</span>
+<span class="fc bfc" id="L300" title="All 2 branches covered.">        if (getRoles(role, true).contains(grantee))</span>
+<span class="fc" id="L301">            throw new InvalidRequestException(String.format(&quot;%s is a member of %s&quot;,</span>
+<span class="fc" id="L302">                                                            role.getRoleName(),</span>
+<span class="fc" id="L303">                                                            grantee.getRoleName()));</span>
+
+<span class="fc" id="L305">        modifyRoleMembership(grantee.getRoleName(), role.getRoleName(), &quot;+&quot;);</span>
+<span class="fc" id="L306">        process(String.format(&quot;INSERT INTO %s.%s (role, member) values ('%s', '%s')&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="fc" id="L309">                              escape(role.getRoleName()),</span>
+<span class="fc" id="L310">                              escape(grantee.getRoleName())),</span>
+<span class="fc" id="L311">                consistencyForRoleWrite(role.getRoleName()));</span>
+<span class="fc" id="L312">    }</span>
+
+    public void revokeRole(AuthenticatedUser performer, RoleResource role, RoleResource revokee)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        if (!getRoles(revokee, false).contains(role))</span>
+<span class="nc" id="L318">            throw new InvalidRequestException(String.format(&quot;%s is not a member of %s&quot;,</span>
+<span class="nc" id="L319">                                                            revokee.getRoleName(),</span>
+<span class="nc" id="L320">                                                            role.getRoleName()));</span>
+
+<span class="fc" id="L322">        modifyRoleMembership(revokee.getRoleName(), role.getRoleName(), &quot;-&quot;);</span>
+<span class="fc" id="L323">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s' and member = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="fc" id="L326">                              escape(role.getRoleName()),</span>
+<span class="fc" id="L327">                              escape(revokee.getRoleName())),</span>
+<span class="fc" id="L328">                consistencyForRoleWrite(role.getRoleName()));</span>
+<span class="fc" id="L329">    }</span>
+
+    public Set&lt;RoleResource&gt; getRoles(RoleResource grantee, boolean includeInherited)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L334">        return collectRoles(getRole(grantee.getRoleName()),</span>
+                            includeInherited,
+<span class="fc" id="L336">                            filter(),</span>
+                            this::getRole)
+<span class="fc" id="L338">               .map(r -&gt; r.resource)</span>
+<span class="fc" id="L339">               .collect(Collectors.toSet());</span>
+    }
+
+    public Set&lt;Role&gt; getRoleDetails(RoleResource grantee)
+    {
+<span class="fc" id="L344">        return collectRoles(getRole(grantee.getRoleName()),</span>
+                            true,
+<span class="fc" id="L346">                            filter(),</span>
+                            this::getRole)
+<span class="fc" id="L348">               .collect(Collectors.toSet());</span>
+    }
+
+    /**
+     * We hard-code this query to Quorum regardless of the role or auth credentials of the queryer given the nature of
+     * this query: we expect to know *all* roles across the entire cluster when we query this, not just local quorum or
+     * on a single node.
+     */
+    public Set&lt;RoleResource&gt; getAllRoles() throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L358">        ImmutableSet.Builder&lt;RoleResource&gt; builder = ImmutableSet.builder();</span>
+<span class="fc" id="L359">        UntypedResultSet rows = process(String.format(&quot;SELECT role from %s.%s&quot;,</span>
+                                                      SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                      AuthKeyspace.ROLES),
+                                        ConsistencyLevel.QUORUM);
+<span class="fc" id="L363">        rows.forEach(row -&gt; builder.add(RoleResource.role(row.getString(&quot;role&quot;))));</span>
+<span class="fc" id="L364">        return builder.build();</span>
+    }
+
+    public boolean isSuper(RoleResource role)
+    {
+        try
+        {
+<span class="fc" id="L371">            return getRole(role.getRoleName()).isSuper;</span>
+        }
+<span class="nc" id="L373">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L375">            logger.debug(&quot;Failed to authorize {} for super-user permission&quot;, role.getRoleName());</span>
+<span class="nc" id="L376">            throw new UnauthorizedException(&quot;Unable to perform authorization of super-user permission: &quot; + e.getMessage(), e);</span>
+        }
+    }
+
+    public boolean canLogin(RoleResource role)
+    {
+        try
+        {
+<span class="fc" id="L384">            return getRole(role.getRoleName()).canLogin;</span>
+        }
+<span class="nc" id="L386">        catch (RequestExecutionException e)</span>
+        {
+<span class="nc" id="L388">            logger.debug(&quot;Failed to authorize {} for login permission&quot;, role.getRoleName());</span>
+<span class="nc" id="L389">            throw new UnauthorizedException(&quot;Unable to perform authorization of login permission: &quot; + e.getMessage(), e);</span>
+        }
+    }
+
+    public Map&lt;String, String&gt; getCustomOptions(RoleResource role)
+    {
+<span class="fc" id="L395">        return Collections.emptyMap();</span>
+    }
+
+    public boolean isExistingRole(RoleResource role)
+    {
+<span class="fc bfc" id="L400" title="All 2 branches covered.">        return !Roles.isNullRole(getRole(role.getRoleName()));</span>
+    }
+
+    public Set&lt;? extends IResource&gt; protectedResources()
+    {
+<span class="fc" id="L405">        return ImmutableSet.of(DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES),</span>
+<span class="fc" id="L406">                               DataResource.table(SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLE_MEMBERS));</span>
+    }
+
+    public void validateConfiguration() throws ConfigurationException
+    {
+<span class="fc" id="L411">    }</span>
+
+    /*
+     * Create the default superuser role to bootstrap role creation on a clean system. Preemptively
+     * gives the role the default password so PasswordAuthenticator can be used to log in (if
+     * configured)
+     */
+    private static void setupDefaultRole()
+    {
+<span class="fc bfc" id="L420" title="All 2 branches covered.">        if (StorageService.instance.getTokenMetadata().sortedTokens().isEmpty())</span>
+<span class="fc" id="L421">            throw new IllegalStateException(&quot;CassandraRoleManager skipped default role setup: no known tokens in ring&quot;);</span>
+
+        try
+        {
+<span class="fc bfc" id="L425" title="All 2 branches covered.">            if (!hasExistingRoles())</span>
+            {
+<span class="fc" id="L427">                QueryProcessor.process(createDefaultRoleQuery(),</span>
+<span class="fc" id="L428">                                       consistencyForRoleWrite(DEFAULT_SUPERUSER_NAME));</span>
+<span class="fc" id="L429">                logger.info(&quot;Created default superuser role '{}'&quot;, DEFAULT_SUPERUSER_NAME);</span>
+            }
+        }
+<span class="fc" id="L432">        catch (RequestExecutionException e)</span>
+        {
+<span class="fc" id="L434">            logger.warn(&quot;CassandraRoleManager skipped default role setup: some nodes were not ready&quot;);</span>
+<span class="fc" id="L435">            throw e;</span>
+<span class="fc" id="L436">        }</span>
+<span class="fc" id="L437">    }</span>
+
+    @VisibleForTesting
+    public static String createDefaultRoleQuery()
+    {
+<span class="fc" id="L442">        return String.format(&quot;INSERT INTO %s.%s (role, is_superuser, can_login, salted_hash) VALUES ('%s', true, true, '%s') USING TIMESTAMP 0&quot;,</span>
+                             SchemaConstants.AUTH_KEYSPACE_NAME,
+                             AuthKeyspace.ROLES,
+                             DEFAULT_SUPERUSER_NAME,
+<span class="fc" id="L446">                             escape(hashpw(DEFAULT_SUPERUSER_PASSWORD)));</span>
+    }
+
+    @VisibleForTesting
+    public static boolean hasExistingRoles() throws RequestExecutionException
+    {
+        // Try looking up the 'cassandra' default role first, to avoid the range query if possible.
+<span class="fc" id="L453">        String defaultSUQuery = String.format(&quot;SELECT * FROM %s.%s WHERE role = '%s'&quot;, SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES, DEFAULT_SUPERUSER_NAME);</span>
+<span class="fc" id="L454">        String allUsersQuery = String.format(&quot;SELECT * FROM %s.%s LIMIT 1&quot;, SchemaConstants.AUTH_KEYSPACE_NAME, AuthKeyspace.ROLES);</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">        return !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.ONE).isEmpty()</span>
+<span class="pc bpc" id="L456" title="1 of 2 branches missed.">               || !QueryProcessor.process(defaultSUQuery, ConsistencyLevel.QUORUM).isEmpty()</span>
+<span class="pc bpc" id="L457" title="1 of 2 branches missed.">               || !QueryProcessor.process(allUsersQuery, ConsistencyLevel.QUORUM).isEmpty();</span>
+    }
+
+    protected void scheduleSetupTask(final Callable&lt;Void&gt; setupTask)
+    {
+        // The delay is to give the node a chance to see its peers before attempting the operation
+<span class="fc" id="L463">        ScheduledExecutors.optionalTasks.scheduleSelfRecurring(() -&gt; {</span>
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">            if (!StorageProxy.isSafeToPerformRead())</span>
+            {
+<span class="nc" id="L466">                logger.trace(&quot;Setup task may not run due to it not being safe to perform reads... rescheduling&quot;);</span>
+<span class="nc" id="L467">                scheduleSetupTask(setupTask);</span>
+<span class="nc" id="L468">                return;</span>
+            }
+            try
+            {
+<span class="fc" id="L472">                setupTask.call();</span>
+            }
+<span class="fc" id="L474">            catch (Exception e)</span>
+            {
+<span class="fc" id="L476">                logger.info(&quot;Setup task failed with error, rescheduling&quot;);</span>
+<span class="fc" id="L477">                scheduleSetupTask(setupTask);</span>
+<span class="fc" id="L478">            }</span>
+<span class="fc" id="L479">        }, AuthKeyspace.SUPERUSER_SETUP_DELAY, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L480">    }</span>
+
+    private CQLStatement prepare(String template, String keyspace, String table)
+    {
+        try
+        {
+<span class="fc" id="L486">            return QueryProcessor.parseStatement(String.format(template, keyspace, table)).prepare(ClientState.forInternalCalls());</span>
+        }
+<span class="nc" id="L488">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L490">            throw new AssertionError(e); // not supposed to happen</span>
+        }
+    }
+
+    // Providing a function to fetch the details of granted roles allows us to read from the underlying tables during
+    // normal usage and fetch from a prepopulated in memory structure when building an initial set of roles to warm
+    // the RolesCache at startup
+    private Stream&lt;Role&gt; collectRoles(Role role, boolean includeInherited, Predicate&lt;String&gt; distinctFilter, Function&lt;String, Role&gt; loaderFunction)
+    {
+<span class="fc bfc" id="L499" title="All 2 branches covered.">        if (Roles.isNullRole(role))</span>
+<span class="fc" id="L500">            return Stream.empty();</span>
+
+<span class="fc bfc" id="L502" title="All 2 branches covered.">        if (!includeInherited)</span>
+<span class="fc" id="L503">            return Stream.concat(Stream.of(role), role.memberOf.stream().map(loaderFunction));</span>
+
+
+<span class="fc" id="L506">        return Stream.concat(Stream.of(role),</span>
+<span class="fc" id="L507">                             role.memberOf.stream()</span>
+<span class="fc" id="L508">                                          .filter(distinctFilter)</span>
+<span class="fc" id="L509">                                          .flatMap(r -&gt; collectRoles(loaderFunction.apply(r), true, distinctFilter, loaderFunction)));</span>
+    }
+
+    // Used as a stateful filtering function when recursively collecting granted roles
+    private static Predicate&lt;String&gt; filter()
+    {
+<span class="fc" id="L515">        final Set&lt;String&gt; seen = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L516">        return seen::add;</span>
+    }
+
+    /*
+     * Get a single Role instance given the role name. This never returns null, instead it
+     * uses a null object when a role with the given name cannot be found. So
+     * it's always safe to call methods on the returned object without risk of NPE.
+     */
+    private Role getRole(String name)
+    {
+<span class="fc" id="L526">        QueryOptions options = QueryOptions.forInternalCalls(consistencyForRoleRead(name),</span>
+<span class="fc" id="L527">                                                             Collections.singletonList(ByteBufferUtil.bytes(name)));</span>
+<span class="fc" id="L528">        ResultMessage.Rows rows = select(loadRoleStatement, options);</span>
+<span class="fc bfc" id="L529" title="All 2 branches covered.">        if (rows.result.isEmpty())</span>
+<span class="fc" id="L530">            return Roles.nullRole();</span>
+
+<span class="fc" id="L532">        return ROW_TO_ROLE.apply(UntypedResultSet.create(rows.result).one());</span>
+    }
+
+    /*
+     * Adds or removes a role name from the membership list of an entry in the roles table table
+     * (adds if op is &quot;+&quot;, removes if op is &quot;-&quot;)
+     */
+    private void modifyRoleMembership(String grantee, String role, String op)
+    throws RequestExecutionException
+    {
+<span class="fc" id="L542">        process(String.format(&quot;UPDATE %s.%s SET member_of = member_of %s {'%s'} WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLES,
+                              op,
+<span class="fc" id="L546">                              escape(role),</span>
+<span class="fc" id="L547">                              escape(grantee)),</span>
+<span class="fc" id="L548">                consistencyForRoleWrite(grantee));</span>
+<span class="fc" id="L549">    }</span>
+
+    private List&lt;String&gt; identitiesForRole(String role)
+    {
+        // Get all identities associated with a given role
+<span class="fc" id="L554">        String query = String.format(&quot;SELECT identity FROM %s.%s WHERE role = ? ALLOW FILTERING&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+<span class="fc" id="L557">        UntypedResultSet rows = process(query, consistencyForRoleRead(role), byteBuf(role));</span>
+<span class="fc" id="L558">        List&lt;String&gt; identities = new ArrayList&lt;&gt;();</span>
+<span class="pc" id="L559">        rows.forEach(row -&gt; identities.add(row.getString(&quot;identity&quot;)));</span>
+<span class="fc" id="L560">        return identities;</span>
+    }
+
+    private void removeAllIdentitiesOfRole(String role)
+    {
+<span class="fc" id="L565">        List&lt;String&gt; identities = identitiesForRole(role);</span>
+<span class="fc" id="L566">        String query = String.format(&quot;DELETE FROM %s.%s WHERE identity = ?&quot;,</span>
+                                     SchemaConstants.AUTH_KEYSPACE_NAME,
+                                     AuthKeyspace.IDENTITY_TO_ROLES);
+        // Remove all the identities associated with the role from the table
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">        for (String identity : identities)</span>
+        {
+<span class="nc" id="L572">            process(query, consistencyForRoleWrite(role), byteBuf(identity));</span>
+<span class="nc" id="L573">        }</span>
+<span class="fc" id="L574">    }</span>
+
+    /*
+     * Clear the membership list of the given role
+     */
+    private void removeAllMembers(String role) throws RequestValidationException, RequestExecutionException
+    {
+        // Get the membership list of the the given role
+<span class="fc" id="L582">        UntypedResultSet rows = process(String.format(&quot;SELECT member FROM %s.%s WHERE role = '%s'&quot;,</span>
+                                                      SchemaConstants.AUTH_KEYSPACE_NAME,
+                                                      AuthKeyspace.ROLE_MEMBERS,
+<span class="fc" id="L585">                                                      escape(role)),</span>
+<span class="fc" id="L586">                                        consistencyForRoleRead(role));</span>
+<span class="fc bfc" id="L587" title="All 2 branches covered.">        if (rows.isEmpty())</span>
+<span class="fc" id="L588">            return;</span>
+
+        // Update each member in the list, removing this role from its own list of granted roles
+<span class="fc bfc" id="L591" title="All 2 branches covered.">        for (UntypedResultSet.Row row : rows)</span>
+<span class="fc" id="L592">            modifyRoleMembership(row.getString(&quot;member&quot;), role, &quot;-&quot;);</span>
+
+        // Finally, remove the membership list for the dropped role
+<span class="fc" id="L595">        process(String.format(&quot;DELETE FROM %s.%s WHERE role = '%s'&quot;,</span>
+                              SchemaConstants.AUTH_KEYSPACE_NAME,
+                              AuthKeyspace.ROLE_MEMBERS,
+<span class="fc" id="L598">                              escape(role)),</span>
+<span class="fc" id="L599">                consistencyForRoleWrite(role));</span>
+<span class="fc" id="L600">    }</span>
+
+    /*
+     * Convert a map of Options from a CREATE/ALTER statement into
+     * assignment clauses used to construct a CQL UPDATE statement
+     */
+    private String optionsToAssignments(Map&lt;Option, Object&gt; options)
+    {
+<span class="fc" id="L608">        return options.entrySet()</span>
+<span class="fc" id="L609">                      .stream()</span>
+<span class="fc" id="L610">                      .map(entry -&gt;</span>
+                           {
+<span class="pc bpc" id="L612" title="2 of 5 branches missed.">                               switch (entry.getKey())</span>
+                               {
+                                   case LOGIN:
+<span class="fc" id="L615">                                       return String.format(&quot;can_login = %s&quot;, entry.getValue());</span>
+                                   case SUPERUSER:
+<span class="fc" id="L617">                                       return String.format(&quot;is_superuser = %s&quot;, entry.getValue());</span>
+                                   case PASSWORD:
+<span class="fc" id="L619">                                       return String.format(&quot;salted_hash = '%s'&quot;, escape(hashpw((String) entry.getValue())));</span>
+                                   case HASHED_PASSWORD:
+<span class="nc" id="L621">                                       return String.format(&quot;salted_hash = '%s'&quot;, (String) entry.getValue());</span>
+                                   default:
+<span class="nc" id="L623">                                       return null;</span>
+                               }
+                           })
+<span class="fc" id="L626">                      .filter(Objects::nonNull)</span>
+<span class="fc" id="L627">                      .collect(Collectors.joining(&quot;,&quot;));</span>
+    }
+
+    private static String hashpw(String password)
+    {
+<span class="fc" id="L632">        return BCrypt.hashpw(password, BCrypt.gensalt(GENSALT_LOG2_ROUNDS));</span>
+    }
+
+    private static String escape(String name)
+    {
+<span class="fc" id="L637">        return StringUtils.replace(name, &quot;'&quot;, &quot;''&quot;);</span>
+    }
+
+    private static ByteBuffer byteBuf(String str)
+    {
+<span class="fc" id="L642">        return UTF8Type.instance.decompose(str);</span>
+    }
+
+    /** Allows selective overriding of the consistency level for specific roles. */
+    protected static ConsistencyLevel consistencyForRoleWrite(String role)
+    {
+<span class="fc bfc" id="L648" title="All 2 branches covered.">        return role.equals(DEFAULT_SUPERUSER_NAME) ?</span>
+<span class="fc" id="L649">               DEFAULT_SUPERUSER_CONSISTENCY_LEVEL :</span>
+<span class="fc" id="L650">               CassandraAuthorizer.authWriteConsistencyLevel();</span>
+    }
+
+    protected static ConsistencyLevel consistencyForRoleRead(String role)
+    {
+<span class="fc bfc" id="L655" title="All 2 branches covered.">        return role.equals(DEFAULT_SUPERUSER_NAME) ?</span>
+<span class="fc" id="L656">               DEFAULT_SUPERUSER_CONSISTENCY_LEVEL :</span>
+<span class="fc" id="L657">               CassandraAuthorizer.authReadConsistencyLevel();</span>
+    }
+
+    /**
+     * Executes the provided query.
+     * This shouldn't be used during setup as this will directly return an error if the manager is not setup yet. Setup tasks
+     * should use QueryProcessor.process directly.
+     */
+    @VisibleForTesting
+    UntypedResultSet process(String query, ConsistencyLevel consistencyLevel)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L669">        return QueryProcessor.process(query, consistencyLevel);</span>
+    }
+
+    UntypedResultSet process(String query, ConsistencyLevel consistencyLevel, ByteBuffer... values)
+    throws RequestValidationException, RequestExecutionException
+    {
+<span class="fc" id="L675">        return QueryProcessor.process(query, consistencyLevel, Arrays.asList(values));</span>
+    }
+
+    @VisibleForTesting
+    ResultMessage.Rows select(SelectStatement statement, QueryOptions options)
+    {
+<span class="fc" id="L681">        return statement.execute(forInternalCalls(), options, nanoTime());</span>
+    }
+
+    @Override
+    public Supplier&lt;Map&lt;RoleResource, Set&lt;Role&gt;&gt;&gt; bulkLoader()
+    {
+<span class="fc" id="L687">        return () -&gt;</span>
+        {
+<span class="nc" id="L689">            Map&lt;RoleResource, Set&lt;Role&gt;&gt; entries = new HashMap&lt;&gt;();</span>
+
+<span class="nc" id="L691">            logger.info(&quot;Warming roles cache from roles table&quot;);</span>
+<span class="nc" id="L692">            UntypedResultSet results = process(&quot;SELECT * FROM system_auth.roles&quot;, CassandraAuthorizer.authReadConsistencyLevel());</span>
+
+            // Create flat temporary lookup of name -&gt; role mappings
+<span class="nc" id="L695">            Map&lt;String, Role&gt; roles = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L696">            results.forEach(row -&gt; roles.put(row.getString(&quot;role&quot;), ROW_TO_ROLE.apply(row)));</span>
+
+            // Iterate the flat structure and populate the fully hierarchical one
+<span class="nc" id="L699">            roles.forEach((key, value) -&gt;</span>
+<span class="nc" id="L700">                          entries.put(RoleResource.role(key),</span>
+<span class="nc" id="L701">                                      collectRoles(value, true, filter(), roles::get).collect(Collectors.toSet()))</span>
+            );
+<span class="nc" id="L703">            return entries;</span>
+        };
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

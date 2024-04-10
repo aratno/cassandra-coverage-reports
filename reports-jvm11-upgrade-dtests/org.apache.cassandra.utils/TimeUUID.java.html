@@ -1,0 +1,576 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TimeUUID.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">TimeUUID.java</span></div><h1>TimeUUID.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.io.Serializable;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.security.SecureRandom;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import com.google.common.hash.Hasher;
+import com.google.common.hash.Hashing;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+
+import static java.util.concurrent.TimeUnit.MICROSECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_UNSAFE_TIME_UUID_NODE;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DETERMINISM_UNSAFE_UUID_NODE;
+import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.Shared.Recursive.INTERFACES;
+
+@Shared(inner = INTERFACES)
+public class TimeUUID implements Serializable, Comparable&lt;TimeUUID&gt;
+{
+    public static final long serialVersionUID = 1L;
+
+    // A grand day! millis at 00:00:00.000 15 Oct 1582.
+    public static final long UUID_EPOCH_UNIX_MILLIS = -12219292800000L;
+    protected static final long TIMESTAMP_UUID_VERSION_IN_MSB = 0x1000L;
+    protected static final long UUID_VERSION_BITS_IN_MSB = 0xf000L;
+
+    /*
+     * The min and max possible lsb for a UUID.
+     * Note that his is not 0 and all 1's because Cassandra TimeUUIDType
+     * compares the lsb parts as a signed byte array comparison. So the min
+     * value is 8 times -128 and the max is 8 times +127.
+     *
+     * Note that we ignore the uuid variant (namely, MIN_CLOCK_SEQ_AND_NODE
+     * have variant 2 as it should, but MAX_CLOCK_SEQ_AND_NODE have variant 0).
+     * I don't think that has any practical consequence and is more robust in
+     * case someone provides a UUID with a broken variant.
+     */
+    private static final long MIN_CLOCK_SEQ_AND_NODE = 0x8080808080808080L;
+    private static final long MAX_CLOCK_SEQ_AND_NODE = 0x7f7f7f7f7f7f7f7fL;
+
+<span class="fc" id="L86">    public static final long TIMEUUID_SIZE = ObjectSizes.measureDeep(new TimeUUID(10, 10));</span>
+
+    final long uuidTimestamp, lsb;
+
+    public TimeUUID(long uuidTimestamp, long lsb)
+<span class="fc" id="L91">    {</span>
+        // we don't validate that this is a true TIMEUUID to avoid problems with historical mixing of UUID with TimeUUID
+<span class="fc" id="L93">        this.uuidTimestamp = uuidTimestamp;</span>
+<span class="fc" id="L94">        this.lsb = lsb;</span>
+<span class="fc" id="L95">    }</span>
+
+    public static TimeUUID atUnixMicrosWithLsb(long unixMicros, long uniqueLsb)
+    {
+<span class="fc" id="L99">        return new TimeUUID(unixMicrosToRawTimestamp(unixMicros), uniqueLsb);</span>
+    }
+
+    public static UUID atUnixMicrosWithLsbAsUUID(long unixMicros, long uniqueLsb)
+    {
+<span class="nc" id="L104">        return new UUID(rawTimestampToMsb(unixMicrosToRawTimestamp(unixMicros)), uniqueLsb);</span>
+    }
+
+    /**
+     * Returns the smaller possible type 1 UUID having the provided timestamp.
+     *
+     * &lt;b&gt;Warning:&lt;/b&gt; this method should only be used for querying as this
+     * doesn't at all guarantee the uniqueness of the resulting UUID.
+     */
+    public static TimeUUID minAtUnixMillis(long unixMillis)
+    {
+<span class="fc" id="L115">        return new TimeUUID(unixMillisToRawTimestamp(unixMillis, 0), MIN_CLOCK_SEQ_AND_NODE);</span>
+    }
+
+    /**
+     * Returns the biggest possible type 1 UUID having the provided timestamp.
+     *
+     * &lt;b&gt;Warning:&lt;/b&gt; this method should only be used for querying as this
+     * doesn't at all guarantee the uniqueness of the resulting UUID.
+     */
+    public static TimeUUID maxAtUnixMillis(long unixMillis)
+    {
+<span class="fc" id="L126">        return new TimeUUID(unixMillisToRawTimestamp(unixMillis + 1, 0) - 1, MAX_CLOCK_SEQ_AND_NODE);</span>
+    }
+
+    public static TimeUUID fromString(String uuidString)
+    {
+<span class="nc" id="L131">        return fromUuid(UUID.fromString(uuidString));</span>
+    }
+
+    public static TimeUUID fromUuid(UUID uuid)
+    {
+<span class="nc" id="L136">        return fromBytes(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits());</span>
+    }
+
+    public static TimeUUID fromBytes(long msb, long lsb)
+    {
+<span class="fc" id="L141">        return new TimeUUID(msbToRawTimestamp(msb), lsb);</span>
+    }
+
+    public static TimeUUID deserialize(ByteBuffer buffer)
+    {
+<span class="fc" id="L146">        return fromBytes(buffer.getLong(buffer.position()), buffer.getLong(buffer.position() + 8));</span>
+    }
+
+    public static TimeUUID deserialize(DataInput in) throws IOException
+    {
+<span class="fc" id="L151">        long msb = in.readLong();</span>
+<span class="fc" id="L152">        long lsb = in.readLong();</span>
+<span class="fc" id="L153">        return fromBytes(msb, lsb);</span>
+    }
+
+    public void serialize(DataOutput out) throws IOException
+    {
+<span class="fc" id="L158">        out.writeLong(msb());</span>
+<span class="fc" id="L159">        out.writeLong(lsb());</span>
+<span class="fc" id="L160">    }</span>
+
+    public ByteBuffer toBytes()
+    {
+<span class="fc" id="L164">        return ByteBuffer.wrap(toBytes(msb(), lsb()));</span>
+    }
+
+    public static byte[] toBytes(long msb, long lsb)
+    {
+<span class="fc" id="L169">        byte[] uuidBytes = new byte[16];</span>
+
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        for (int i = 0; i &lt; 8; i++)</span>
+<span class="fc" id="L172">            uuidBytes[i] = (byte) (msb &gt;&gt;&gt; 8 * (7 - i));</span>
+
+<span class="fc bfc" id="L174" title="All 2 branches covered.">        for (int i = 8; i &lt; 16; i++)</span>
+<span class="fc" id="L175">            uuidBytes[i] = (byte) (lsb &gt;&gt;&gt; 8 * (15 - i));</span>
+
+<span class="fc" id="L177">        return uuidBytes;</span>
+    }
+
+    public static long sizeInBytes()
+    {
+<span class="fc" id="L182">        return 16;</span>
+    }
+
+    public UUID asUUID()
+    {
+<span class="fc" id="L187">        return new UUID(rawTimestampToMsb(uuidTimestamp), lsb);</span>
+    }
+
+    /**
+     * The Cassandra internal micros-resolution timestamp of the TimeUUID, as of unix epoch
+     */
+    public long unix(TimeUnit units)
+    {
+<span class="fc" id="L195">        return units.convert(unixMicros(), MICROSECONDS);</span>
+    }
+
+    /**
+     * The Cassandra internal micros-resolution timestamp of the TimeUUID, as of unix epoch
+     */
+    public long unixMicros()
+    {
+<span class="fc" id="L203">        return rawTimestampToUnixMicros(uuidTimestamp);</span>
+    }
+
+    /**
+     * The UUID-format timestamp, i.e. 10x micros-resolution, as of UUIDGen.UUID_EPOCH_UNIX_MILLIS
+     * The tenths of a microsecond are used to store a flag value.
+     */
+    public long uuidTimestamp()
+    {
+<span class="fc" id="L212">        return uuidTimestamp &amp; 0x0FFFFFFFFFFFFFFFL;</span>
+    }
+
+    public long msb()
+    {
+<span class="fc" id="L217">        return rawTimestampToMsb(uuidTimestamp);</span>
+    }
+
+    public long lsb()
+    {
+<span class="fc" id="L222">        return lsb;</span>
+    }
+
+    public static long rawTimestampToUnixMicros(long rawTimestamp)
+    {
+<span class="fc" id="L227">        return (rawTimestamp / 10) + UUID_EPOCH_UNIX_MILLIS * 1000;</span>
+    }
+
+    public static long unixMillisToRawTimestamp(long unixMillis, long tenthsOfAMicro)
+    {
+<span class="fc" id="L232">        return unixMillis * 10000 - (UUID_EPOCH_UNIX_MILLIS * 10000) + tenthsOfAMicro;</span>
+    }
+
+    public static long unixMicrosToRawTimestamp(long unixMicros)
+    {
+<span class="fc" id="L237">        return unixMicros * 10 - (UUID_EPOCH_UNIX_MILLIS * 10000);</span>
+    }
+
+    public static long msbToRawTimestamp(long msb)
+    {
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        assert (UUID_VERSION_BITS_IN_MSB &amp; msb) == TIMESTAMP_UUID_VERSION_IN_MSB;</span>
+<span class="fc" id="L243">        msb &amp;= ~TIMESTAMP_UUID_VERSION_IN_MSB;</span>
+<span class="fc" id="L244">        return   (msb &amp;     0xFFFFL) &lt;&lt; 48</span>
+               | (msb &amp; 0xFFFF0000L) &lt;&lt; 16
+               | (msb &gt;&gt;&gt; 32);
+    }
+
+    public static long rawTimestampToMsb(long rawTimestamp)
+    {
+<span class="fc" id="L251">        return TIMESTAMP_UUID_VERSION_IN_MSB</span>
+               | (rawTimestamp &gt;&gt;&gt; 48)
+               | ((rawTimestamp &amp; 0xFFFF00000000L) &gt;&gt;&gt; 16)
+               | (rawTimestamp &lt;&lt; 32);
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="fc" id="L260">        return (int) ((uuidTimestamp ^ (uuidTimestamp &gt;&gt; 32) * 31) + (lsb ^ (lsb &gt;&gt; 32)));</span>
+    }
+
+    @Override
+    public boolean equals(Object that)
+    {
+<span class="pc bpc" id="L266" title="4 of 6 branches missed.">        return    (that instanceof UUID &amp;&amp; equals((UUID) that))</span>
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">               || (that instanceof TimeUUID &amp;&amp; equals((TimeUUID) that));</span>
+    }
+
+    public boolean equals(TimeUUID that)
+    {
+<span class="pc bpc" id="L272" title="2 of 6 branches missed.">        return that != null &amp;&amp; uuidTimestamp == that.uuidTimestamp &amp;&amp; lsb == that.lsb;</span>
+    }
+
+    public boolean equals(UUID that)
+    {
+<span class="nc bnc" id="L277" title="All 6 branches missed.">        return that != null &amp;&amp; uuidTimestamp == that.timestamp() &amp;&amp; lsb == that.getLeastSignificantBits();</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="fc" id="L283">        return asUUID().toString();</span>
+    }
+
+    public static String toString(TimeUUID ballot)
+    {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        return ballot == null ? &quot;null&quot; : ballot.uuidTimestamp() + &quot;:&quot; + ballot;</span>
+    }
+
+    public static String toString(TimeUUID ballot, String kind)
+    {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        return ballot == null ? &quot;null&quot; : String.format(&quot;%s(%d:%s)&quot;, kind, ballot.uuidTimestamp(), ballot);</span>
+    }
+
+    @Override
+    public int compareTo(TimeUUID that)
+    {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        return this.uuidTimestamp != that.uuidTimestamp</span>
+<span class="nc" id="L300">               ? Long.compare(this.uuidTimestamp, that.uuidTimestamp)</span>
+<span class="nc" id="L301">               : Long.compare(this.lsb, that.lsb);</span>
+    }
+
+<span class="fc" id="L304">    protected static abstract class AbstractSerializer&lt;T extends TimeUUID&gt; extends TypeSerializer&lt;T&gt;</span>
+    {
+        public &lt;V&gt; void validate(V value, ValueAccessor&lt;V&gt; accessor) throws MarshalException
+        {
+<span class="fc bfc" id="L308" title="All 2 branches covered.">            if (accessor.isEmpty(value))</span>
+<span class="fc" id="L309">                return;</span>
+
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">            if (accessor.size(value) != 16)</span>
+<span class="nc" id="L312">                throw new MarshalException(String.format(&quot;UUID should be 16 or 0 bytes (%d)&quot;, accessor.size(value)));</span>
+
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">            if ((accessor.getByte(value, 6) &amp; 0xf0) != 0x10)</span>
+<span class="nc" id="L315">                throw new MarshalException(String.format(&quot;Invalid version for TimeUUID type: 0x%s&quot;, Integer.toHexString((accessor.getByte(value, 0) &gt;&gt; 4) &amp; 0xf)));</span>
+<span class="fc" id="L316">        }</span>
+
+        public String toString(T value)
+        {
+<span class="fc bfc" id="L320" title="All 2 branches covered.">            return value == null ? &quot;&quot; : value.toString();</span>
+        }
+
+        public ByteBuffer serialize(T value)
+        {
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">            if (value == null)</span>
+<span class="nc" id="L326">                return EMPTY_BYTE_BUFFER;</span>
+<span class="fc" id="L327">            ByteBuffer buffer = ByteBuffer.allocate(16);</span>
+<span class="fc" id="L328">            buffer.putLong(value.msb());</span>
+<span class="fc" id="L329">            buffer.putLong(value.lsb());</span>
+<span class="fc" id="L330">            buffer.flip();</span>
+<span class="fc" id="L331">            return buffer;</span>
+        }
+    }
+
+<span class="fc" id="L335">    public static class Serializer extends AbstractSerializer&lt;TimeUUID&gt; implements IVersionedSerializer&lt;TimeUUID&gt;</span>
+    {
+<span class="fc" id="L337">        public static final Serializer instance = new Serializer();</span>
+
+        public &lt;V&gt; TimeUUID deserialize(V value, ValueAccessor&lt;V&gt; accessor)
+        {
+<span class="fc bfc" id="L341" title="All 2 branches covered.">            return accessor.isEmpty(value) ? null : accessor.toTimeUUID(value);</span>
+        }
+
+        public Class&lt;TimeUUID&gt; getType()
+        {
+<span class="nc" id="L346">            return TimeUUID.class;</span>
+        }
+
+        @Override
+        public void serialize(TimeUUID t, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L352">            t.serialize(out);</span>
+<span class="fc" id="L353">        }</span>
+
+        @Override
+        public TimeUUID deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L358">            return TimeUUID.deserialize(in);</span>
+        }
+
+        @Override
+        public long serializedSize(TimeUUID t, int version)
+        {
+<span class="fc" id="L364">            return 16;</span>
+        }
+    }
+
+<span class="nc" id="L368">    public static class Generator</span>
+    {
+<span class="fc" id="L370">        private static final long clockSeqAndNode = makeClockSeqAndNode();</span>
+
+<span class="fc" id="L372">        private static final AtomicLong lastMicros = new AtomicLong();</span>
+
+        public static TimeUUID nextTimeUUID()
+        {
+<span class="fc" id="L376">            return atUnixMicrosWithLsb(nextUnixMicros(), clockSeqAndNode);</span>
+        }
+
+        public static UUID nextTimeAsUUID()
+        {
+<span class="nc" id="L381">            return atUnixMicrosWithLsbAsUUID(nextUnixMicros(), clockSeqAndNode);</span>
+        }
+
+        public static TimeUUID atUnixMillis(long unixMillis)
+        {
+<span class="nc" id="L386">            return atUnixMillis(unixMillis, 0);</span>
+        }
+
+        public static TimeUUID atUnixMillis(long unixMillis, long tenthsOfAMicro)
+        {
+<span class="nc" id="L391">            return new TimeUUID(unixMillisToRawTimestamp(unixMillis, tenthsOfAMicro), clockSeqAndNode);</span>
+        }
+
+        public static byte[] atUnixMillisAsBytes(long unixMillis)
+        {
+<span class="nc" id="L396">            return atUnixMillisAsBytes(unixMillis, 0);</span>
+        }
+
+        public static byte[] atUnixMillisAsBytes(long unixMillis, long tenthsOfAMicro)
+        {
+<span class="nc" id="L401">            return toBytes(rawTimestampToMsb(unixMillisToRawTimestamp(unixMillis, tenthsOfAMicro)), clockSeqAndNode);</span>
+        }
+
+        public static byte[] nextTimeUUIDAsBytes()
+        {
+<span class="fc" id="L406">            return toBytes(rawTimestampToMsb(unixMicrosToRawTimestamp(nextUnixMicros())), clockSeqAndNode);</span>
+        }
+
+        // needs to return two different values for the same when.
+        // we can generate at most 10k UUIDs per ms.
+        private static long nextUnixMicros()
+        {
+            long newLastMicros;
+            while (true)
+            {
+                //Generate a candidate value for new lastNanos
+<span class="fc" id="L417">                newLastMicros = currentTimeMillis() * 1000;</span>
+<span class="fc" id="L418">                long originalLastNanos = lastMicros.get();</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">                if (newLastMicros &gt; originalLastNanos)</span>
+                {
+                    //Slow path once per millisecond do a CAS
+<span class="fc bfc" id="L422" title="All 2 branches covered.">                    if (lastMicros.compareAndSet(originalLastNanos, newLastMicros))</span>
+                    {
+<span class="fc" id="L424">                        break;</span>
+                    }
+                }
+                else
+                {
+                    //Fast path do an atomic increment
+                    //Or when falling behind this will move time forward past the clock if necessary
+<span class="fc" id="L431">                    newLastMicros = lastMicros.incrementAndGet();</span>
+<span class="fc" id="L432">                    break;</span>
+                }
+<span class="fc" id="L434">            }</span>
+<span class="fc" id="L435">            return newLastMicros;</span>
+        }
+
+        private static long makeClockSeqAndNode()
+        {
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">            if (DETERMINISM_UNSAFE_UUID_NODE.getBoolean())</span>
+<span class="nc" id="L441">                return FBUtilities.getBroadcastAddressAndPort().addressBytes[3];</span>
+
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">            if (CASSANDRA_UNSAFE_TIME_UUID_NODE.isPresent())</span>
+<span class="nc" id="L444">                return CASSANDRA_UNSAFE_TIME_UUID_NODE.getLong()</span>
+<span class="nc" id="L445">                       ^ FBUtilities.getBroadcastAddressAndPort().addressBytes[3]</span>
+<span class="nc" id="L446">                       ^ (FBUtilities.getBroadcastAddressAndPort().addressBytes[2] &lt;&lt; 8);</span>
+
+<span class="fc" id="L448">            long clock = new SecureRandom().nextLong();</span>
+
+<span class="fc" id="L450">            long lsb = 0;</span>
+<span class="fc" id="L451">            lsb |= 0x8000000000000000L;                 // variant (2 bits)</span>
+<span class="fc" id="L452">            lsb |= (clock &amp; 0x0000000000003FFFL) &lt;&lt; 48; // clock sequence (14 bits)</span>
+<span class="fc" id="L453">            lsb |= makeNode();                          // 6 bytes</span>
+<span class="fc" id="L454">            return lsb;</span>
+        }
+
+        private static long makeNode()
+        {
+            /*
+             * We don't have access to the MAC address but need to generate a node part
+             * that identify this host as uniquely as possible.
+             * The spec says that one option is to take as many source that identify
+             * this node as possible and hash them together. That's what we do here by
+             * gathering all the ip of this host.
+             * Note that FBUtilities.getJustBroadcastAddress() should be enough to uniquely
+             * identify the node *in the cluster* but it triggers DatabaseDescriptor
+             * instanciation and the UUID generator is used in Stress for instance,
+             * where we don't want to require the yaml.
+             */
+<span class="fc" id="L470">            Collection&lt;InetAddressAndPort&gt; localAddresses = getAllLocalAddresses();</span>
+<span class="pc bpc" id="L471" title="1 of 2 branches missed.">            if (localAddresses.isEmpty())</span>
+<span class="nc" id="L472">                throw new RuntimeException(&quot;Cannot generate the node component of the UUID because cannot retrieve any IP addresses.&quot;);</span>
+
+            // ideally, we'd use the MAC address, but java doesn't expose that.
+<span class="fc" id="L475">            byte[] hash = hash(localAddresses);</span>
+<span class="fc" id="L476">            long node = 0;</span>
+<span class="fc bfc" id="L477" title="All 2 branches covered.">            for (int i = 0; i &lt; Math.min(6, hash.length); i++)</span>
+<span class="fc" id="L478">                node |= (0x00000000000000ff &amp; (long)hash[i]) &lt;&lt; (5-i)*8;</span>
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">            assert (0xff00000000000000L &amp; node) == 0;</span>
+
+            // Since we don't use the mac address, the spec says that multicast
+            // bit (least significant bit of the first octet of the node ID) must be 1.
+<span class="fc" id="L483">            return node | 0x0000010000000000L;</span>
+        }
+
+        private static byte[] hash(Collection&lt;InetAddressAndPort&gt; data)
+        {
+            // Identify the host.
+<span class="fc" id="L489">            Hasher hasher = Hashing.md5().newHasher();</span>
+<span class="fc bfc" id="L490" title="All 2 branches covered.">            for(InetAddressAndPort addr : data)</span>
+            {
+<span class="fc" id="L492">                hasher.putBytes(addr.addressBytes);</span>
+<span class="fc" id="L493">                hasher.putInt(addr.getPort());</span>
+<span class="fc" id="L494">            }</span>
+
+            // Identify the process on the load: we use both the PID and class loader hash.
+<span class="fc" id="L497">            long pid = NativeLibrary.getProcessID();</span>
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">            if (pid &lt; 0)</span>
+<span class="nc" id="L499">                pid = new Random(currentTimeMillis()).nextLong();</span>
+<span class="fc" id="L500">            updateWithLong(hasher, pid);</span>
+
+<span class="fc" id="L502">            ClassLoader loader = UUIDGen.class.getClassLoader();</span>
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">            int loaderId = loader != null ? System.identityHashCode(loader) : 0;</span>
+<span class="fc" id="L504">            updateWithInt(hasher, loaderId);</span>
+
+<span class="fc" id="L506">            return hasher.hash().asBytes();</span>
+        }
+
+        private static void updateWithInt(Hasher hasher, int val)
+        {
+<span class="fc" id="L511">            hasher.putByte((byte) ((val &gt;&gt;&gt; 24) &amp; 0xFF));</span>
+<span class="fc" id="L512">            hasher.putByte((byte) ((val &gt;&gt;&gt; 16) &amp; 0xFF));</span>
+<span class="fc" id="L513">            hasher.putByte((byte) ((val &gt;&gt;&gt;  8) &amp; 0xFF));</span>
+<span class="fc" id="L514">            hasher.putByte((byte) ((val &gt;&gt;&gt; 0) &amp; 0xFF));</span>
+<span class="fc" id="L515">        }</span>
+
+        public static void updateWithLong(Hasher hasher, long val)
+        {
+<span class="fc" id="L519">            hasher.putByte((byte) ((val &gt;&gt;&gt; 56) &amp; 0xFF));</span>
+<span class="fc" id="L520">            hasher.putByte((byte) ((val &gt;&gt;&gt; 48) &amp; 0xFF));</span>
+<span class="fc" id="L521">            hasher.putByte((byte) ((val &gt;&gt;&gt; 40) &amp; 0xFF));</span>
+<span class="fc" id="L522">            hasher.putByte((byte) ((val &gt;&gt;&gt; 32) &amp; 0xFF));</span>
+<span class="fc" id="L523">            hasher.putByte((byte) ((val &gt;&gt;&gt; 24) &amp; 0xFF));</span>
+<span class="fc" id="L524">            hasher.putByte((byte) ((val &gt;&gt;&gt; 16) &amp; 0xFF));</span>
+<span class="fc" id="L525">            hasher.putByte((byte) ((val &gt;&gt;&gt;  8) &amp; 0xFF));</span>
+<span class="fc" id="L526">            hasher.putByte((byte)  ((val &gt;&gt;&gt; 0) &amp; 0xFF));</span>
+<span class="fc" id="L527">        }</span>
+
+        /**
+         * Helper function used exclusively by UUIDGen to create
+         **/
+        public static Collection&lt;InetAddressAndPort&gt; getAllLocalAddresses()
+        {
+<span class="fc" id="L534">            Set&lt;InetAddressAndPort&gt; localAddresses = new HashSet&lt;&gt;();</span>
+            try
+            {
+<span class="fc" id="L537">                Enumeration&lt;NetworkInterface&gt; nets = NetworkInterface.getNetworkInterfaces();</span>
+<span class="pc bpc" id="L538" title="1 of 2 branches missed.">                if (nets != null)</span>
+                {
+<span class="fc bfc" id="L540" title="All 2 branches covered.">                    while (nets.hasMoreElements())</span>
+                    {
+<span class="fc" id="L542">                        Function&lt;InetAddress, InetAddressAndPort&gt; converter =</span>
+<span class="fc" id="L543">                        address -&gt; InetAddressAndPort.getByAddressOverrideDefaults(address, 0);</span>
+<span class="fc" id="L544">                        List&lt;InetAddressAndPort&gt; addresses =</span>
+<span class="fc" id="L545">                        Collections.list(nets.nextElement().getInetAddresses()).stream().map(converter).collect(Collectors.toList());</span>
+<span class="fc" id="L546">                        localAddresses.addAll(addresses);</span>
+<span class="fc" id="L547">                    }</span>
+                }
+            }
+<span class="nc" id="L550">            catch (SocketException e)</span>
+            {
+<span class="nc" id="L552">                throw new AssertionError(e);</span>
+<span class="fc" id="L553">            }</span>
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">            if (DatabaseDescriptor.isDaemonInitialized())</span>
+            {
+<span class="fc" id="L556">                localAddresses.add(FBUtilities.getBroadcastAddressAndPort());</span>
+<span class="fc" id="L557">                localAddresses.add(FBUtilities.getBroadcastNativeAddressAndPort());</span>
+<span class="fc" id="L558">                localAddresses.add(FBUtilities.getLocalAddressAndPort());</span>
+            }
+<span class="fc" id="L560">            return localAddresses;</span>
+        }
+    }
+}
+
+// ---Copied from UUIDGen
+// for the curious, here is how I generated START_EPOCH
+//        Calendar c = Calendar.getInstance(TimeZone.getTimeZone(&quot;GMT-0&quot;));
+//        c.set(Calendar.YEAR, 1582);
+//        c.set(Calendar.MONTH, Calendar.OCTOBER);
+//        c.set(Calendar.DAY_OF_MONTH, 15);
+//        c.set(Calendar.HOUR_OF_DAY, 0);
+//        c.set(Calendar.MINUTE, 0);
+//        c.set(Calendar.SECOND, 0);
+//        c.set(Calendar.MILLISECOND, 0);
+//        long START_EPOCH = c.getTimeInMillis();
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

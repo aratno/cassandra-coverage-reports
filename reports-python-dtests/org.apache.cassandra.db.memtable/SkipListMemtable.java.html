@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SkipListMemtable.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.memtable</a> &gt; <span class="el_source">SkipListMemtable.java</span></div><h1>SkipListMemtable.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.memtable;
+
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.BufferDecoratedKey;
+import org.apache.cassandra.db.DataRange;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.AtomicBTreePartition;
+import org.apache.cassandra.db.partitions.BTreePartitionData;
+import org.apache.cassandra.db.partitions.BTreePartitionUpdater;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.IncludingExcludingBounds;
+import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.memory.Cloner;
+import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.apache.cassandra.utils.memory.NativeAllocator;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.MEMTABLE_OVERHEAD_COMPUTE_STEPS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.MEMTABLE_OVERHEAD_SIZE;
+
+public class SkipListMemtable extends AbstractAllocatorMemtable
+{
+<span class="fc" id="L68">    private static final Logger logger = LoggerFactory.getLogger(SkipListMemtable.class);</span>
+
+<span class="fc" id="L70">    public static final Factory FACTORY = SkipListMemtableFactory.INSTANCE;</span>
+
+    protected static final int ROW_OVERHEAD_HEAP_SIZE;
+    static
+    {
+<span class="fc" id="L75">        int userDefinedOverhead = MEMTABLE_OVERHEAD_SIZE.getInt(-1);</span>
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">        if (userDefinedOverhead &gt; 0)</span>
+<span class="nc" id="L77">            ROW_OVERHEAD_HEAP_SIZE = userDefinedOverhead;</span>
+        else
+<span class="fc" id="L79">            ROW_OVERHEAD_HEAP_SIZE = estimateRowOverhead(MEMTABLE_OVERHEAD_COMPUTE_STEPS.getInt());</span>
+<span class="fc" id="L80">    }</span>
+
+    // We index the memtable by PartitionPosition only for the purpose of being able
+    // to select key range using Token.KeyBound. However put() ensures that we
+    // actually only store DecoratedKey.
+<span class="fc" id="L85">    private final ConcurrentNavigableMap&lt;PartitionPosition, AtomicBTreePartition&gt; partitions = new ConcurrentSkipListMap&lt;&gt;();</span>
+
+<span class="fc" id="L87">    private final AtomicLong liveDataSize = new AtomicLong(0);</span>
+
+    protected SkipListMemtable(AtomicReference&lt;CommitLogPosition&gt; commitLogLowerBound, TableMetadataRef metadataRef, Owner owner)
+    {
+<span class="fc" id="L91">        super(commitLogLowerBound, metadataRef, owner);</span>
+<span class="fc" id="L92">    }</span>
+
+    @Override
+    public boolean isClean()
+    {
+<span class="fc" id="L97">        return partitions.isEmpty();</span>
+    }
+
+    /**
+     * Should only be called by ColumnFamilyStore.apply via Keyspace.apply, which supplies the appropriate
+     * OpOrdering.
+     *
+     * commitLogSegmentPosition should only be null if this is a secondary index, in which case it is *expected* to be null
+     */
+    @Override
+    public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
+    {
+<span class="fc" id="L109">        Cloner cloner = allocator.cloner(opGroup);</span>
+<span class="fc" id="L110">        AtomicBTreePartition previous = partitions.get(update.partitionKey());</span>
+
+<span class="fc" id="L112">        long initialSize = 0;</span>
+<span class="fc bfc" id="L113" title="All 2 branches covered.">        if (previous == null)</span>
+        {
+<span class="fc" id="L115">            final DecoratedKey cloneKey = cloner.clone(update.partitionKey());</span>
+<span class="fc" id="L116">            AtomicBTreePartition empty = new AtomicBTreePartition(metadata, cloneKey, allocator);</span>
+            // We'll add the columns later. This avoids wasting works if we get beaten in the putIfAbsent
+<span class="fc" id="L118">            previous = partitions.putIfAbsent(cloneKey, empty);</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">            if (previous == null)</span>
+            {
+<span class="fc" id="L121">                previous = empty;</span>
+                // allocate the row overhead after the fact; this saves over allocating and having to free after, but
+                // means we can overshoot our declared limit.
+<span class="fc" id="L124">                int overhead = (int) (cloneKey.getToken().getHeapSize() + ROW_OVERHEAD_HEAP_SIZE);</span>
+<span class="fc" id="L125">                allocator.onHeap().allocate(overhead, opGroup);</span>
+<span class="fc" id="L126">                initialSize = 8;</span>
+            }
+        }
+
+<span class="fc" id="L130">        BTreePartitionUpdater updater = previous.addAll(update, cloner, opGroup, indexer);</span>
+<span class="fc" id="L131">        updateMin(minTimestamp, update.stats().minTimestamp);</span>
+<span class="fc" id="L132">        updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);</span>
+<span class="fc" id="L133">        liveDataSize.addAndGet(initialSize + updater.dataSize);</span>
+<span class="fc" id="L134">        columnsCollector.update(update.columns());</span>
+<span class="fc" id="L135">        statsCollector.update(update.stats());</span>
+<span class="fc" id="L136">        currentOperations.addAndGet(update.operationCount());</span>
+<span class="fc" id="L137">        return updater.colUpdateTimeDelta;</span>
+    }
+
+    @Override
+    public long partitionCount()
+    {
+<span class="fc" id="L143">        return partitions.size();</span>
+    }
+
+    @Override
+    public MemtableUnfilteredPartitionIterator partitionIterator(final ColumnFilter columnFilter,
+                                                                 final DataRange dataRange,
+                                                                 SSTableReadsListener readsListener)
+    {
+<span class="fc" id="L151">        AbstractBounds&lt;PartitionPosition&gt; keyRange = dataRange.keyRange();</span>
+
+<span class="fc" id="L153">        PartitionPosition left = keyRange.left;</span>
+<span class="fc" id="L154">        PartitionPosition right = keyRange.right;</span>
+
+<span class="fc" id="L156">        boolean isBound = keyRange instanceof Bounds;</span>
+<span class="fc bfc" id="L157" title="All 4 branches covered.">        boolean includeLeft = isBound || keyRange instanceof IncludingExcludingBounds;</span>
+<span class="fc bfc" id="L158" title="All 4 branches covered.">        boolean includeRight = isBound || keyRange instanceof Range;</span>
+<span class="fc" id="L159">        Map&lt;PartitionPosition, AtomicBTreePartition&gt; subMap = getPartitionsSubMap(left,</span>
+                                                                                  includeLeft,
+                                                                                  right,
+                                                                                  includeRight);
+
+<span class="fc" id="L164">        return new MemtableUnfilteredPartitionIterator(metadata.get(), subMap, columnFilter, dataRange);</span>
+        // readsListener is ignored as it only accepts sstable signals
+    }
+
+    private Map&lt;PartitionPosition, AtomicBTreePartition&gt; getPartitionsSubMap(PartitionPosition left,
+                                                                             boolean includeLeft,
+                                                                             PartitionPosition right,
+                                                                             boolean includeRight)
+    {
+<span class="fc bfc" id="L173" title="All 4 branches covered.">        if (left != null &amp;&amp; left.isMinimum())</span>
+<span class="fc" id="L174">            left = null;</span>
+<span class="fc bfc" id="L175" title="All 4 branches covered.">        if (right != null &amp;&amp; right.isMinimum())</span>
+<span class="fc" id="L176">            right = null;</span>
+
+        try
+        {
+<span class="fc bfc" id="L180" title="All 2 branches covered.">            if (left == null)</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">                return right == null ? partitions : partitions.headMap(right, includeRight);</span>
+            else
+<span class="fc bfc" id="L183" title="All 2 branches covered.">                return right == null</span>
+<span class="fc" id="L184">                       ? partitions.tailMap(left, includeLeft)</span>
+<span class="fc" id="L185">                       : partitions.subMap(left, includeLeft, right, includeRight);</span>
+        }
+<span class="nc" id="L187">        catch (IllegalArgumentException e)</span>
+        {
+<span class="nc" id="L189">            logger.error(&quot;Invalid range requested {} - {}&quot;, left, right);</span>
+<span class="nc" id="L190">            throw e;</span>
+        }
+    }
+
+    Partition getPartition(DecoratedKey key)
+    {
+<span class="fc" id="L196">        return partitions.get(key);</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator rowIterator(DecoratedKey key, Slices slices, ColumnFilter selectedColumns, boolean reversed, SSTableReadsListener listener)
+    {
+<span class="fc" id="L202">        Partition p = getPartition(key);</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">        if (p == null)</span>
+<span class="fc" id="L204">            return null;</span>
+        else
+<span class="fc" id="L206">            return p.unfilteredIterator(selectedColumns, slices, reversed);</span>
+    }
+
+    @Override
+    public UnfilteredRowIterator rowIterator(DecoratedKey key)
+    {
+<span class="fc" id="L212">        Partition p = getPartition(key);</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        return p != null ? p.unfilteredIterator() : null;</span>
+    }
+
+    private static int estimateRowOverhead(final int count)
+    {
+        // calculate row overhead
+<span class="fc" id="L219">        try (final OpOrder.Group group = new OpOrder().start())</span>
+        {
+            int rowOverhead;
+<span class="fc" id="L222">            MemtableAllocator allocator = MEMORY_POOL.newAllocator(&quot;&quot;);</span>
+<span class="fc" id="L223">            Cloner cloner = allocator.cloner(group);</span>
+<span class="fc" id="L224">            ConcurrentNavigableMap&lt;PartitionPosition, Object&gt; partitions = new ConcurrentSkipListMap&lt;&gt;();</span>
+<span class="fc" id="L225">            final Object val = new Object();</span>
+<span class="fc" id="L226">            final int testBufferSize = 8;</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            for (int i = 0 ; i &lt; count ; i++)</span>
+<span class="fc" id="L228">                partitions.put(cloner.clone(new BufferDecoratedKey(new LongToken(i), ByteBuffer.allocate(testBufferSize))), val);</span>
+<span class="fc" id="L229">            double avgSize = ObjectSizes.measureDeepOmitShared(partitions) / (double) count;</span>
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            rowOverhead = (int) ((avgSize - Math.floor(avgSize)) &lt; 0.05 ? Math.floor(avgSize) : Math.ceil(avgSize));</span>
+<span class="fc" id="L231">            rowOverhead -= new LongToken(0).getHeapSize();</span>
+<span class="fc" id="L232">            rowOverhead += AtomicBTreePartition.EMPTY_SIZE;</span>
+<span class="fc" id="L233">            rowOverhead += BTreePartitionData.UNSHARED_HEAP_SIZE;</span>
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">            if (!(allocator instanceof NativeAllocator))</span>
+<span class="fc" id="L235">                rowOverhead -= testBufferSize;  // measureDeepOmitShared includes the given number of bytes even for</span>
+                                                // off-heap buffers, but not for direct memory.
+            // Decorated key overhead with byte buffer (if needed) is included
+<span class="fc" id="L238">            allocator.setDiscarding();</span>
+<span class="fc" id="L239">            allocator.setDiscarded();</span>
+<span class="fc" id="L240">            return rowOverhead;</span>
+        }
+    }
+
+    @Override
+    public FlushablePartitionSet&lt;?&gt; getFlushSet(PartitionPosition from, PartitionPosition to)
+    {
+<span class="fc" id="L247">        Map&lt;PartitionPosition, AtomicBTreePartition&gt; toFlush = getPartitionsSubMap(from, true, to, false);</span>
+<span class="fc" id="L248">        long keysSize = 0;</span>
+<span class="fc" id="L249">        long keyCount = 0;</span>
+
+<span class="fc" id="L251">        boolean trackContention = logger.isTraceEnabled();</span>
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">        if (trackContention)</span>
+        {
+<span class="nc" id="L254">            int heavilyContendedRowCount = 0;</span>
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            for (AtomicBTreePartition partition : toFlush.values())</span>
+            {
+<span class="nc" id="L258">                keysSize += partition.partitionKey().getKey().remaining();</span>
+<span class="nc" id="L259">                ++keyCount;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                if (partition.useLock())</span>
+<span class="nc" id="L261">                    heavilyContendedRowCount++;</span>
+<span class="nc" id="L262">            }</span>
+
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            if (heavilyContendedRowCount &gt; 0)</span>
+<span class="nc" id="L265">                logger.trace(&quot;High update contention in {}/{} partitions of {} &quot;, heavilyContendedRowCount, toFlush.size(), SkipListMemtable.this);</span>
+<span class="nc" id="L266">        }</span>
+        else
+        {
+<span class="fc bfc" id="L269" title="All 2 branches covered.">            for (PartitionPosition key : toFlush.keySet())</span>
+            {
+                //  make sure we don't write non-sensical keys
+<span class="pc bpc" id="L272" title="1 of 2 branches missed.">                assert key instanceof DecoratedKey;</span>
+<span class="fc" id="L273">                keysSize += ((DecoratedKey) key).getKey().remaining();</span>
+<span class="fc" id="L274">                ++keyCount;</span>
+<span class="fc" id="L275">            }</span>
+        }
+<span class="fc" id="L277">        final long partitionKeysSize = keysSize;</span>
+<span class="fc" id="L278">        final long partitionCount = keyCount;</span>
+
+<span class="fc" id="L280">        return new AbstractFlushablePartitionSet&lt;AtomicBTreePartition&gt;()</span>
+<span class="fc" id="L281">        {</span>
+            @Override
+            public Memtable memtable()
+            {
+<span class="fc" id="L285">                return SkipListMemtable.this;</span>
+            }
+
+            @Override
+            public PartitionPosition from()
+            {
+<span class="fc" id="L291">                return from;</span>
+            }
+
+            @Override
+            public PartitionPosition to()
+            {
+<span class="fc" id="L297">                return to;</span>
+            }
+
+            @Override
+            public long partitionCount()
+            {
+<span class="fc" id="L303">                return partitionCount;</span>
+            }
+
+            @Override
+            public Iterator&lt;AtomicBTreePartition&gt; iterator()
+            {
+<span class="fc" id="L309">                return toFlush.values().iterator();</span>
+            }
+
+            @Override
+            public long partitionKeysSize()
+            {
+<span class="fc" id="L315">                return partitionKeysSize;</span>
+            }
+        };
+    }
+
+
+<span class="fc" id="L321">    private static class MemtableUnfilteredPartitionIterator extends AbstractUnfilteredPartitionIterator implements UnfilteredPartitionIterator</span>
+    {
+        private final TableMetadata metadata;
+        private final Iterator&lt;Map.Entry&lt;PartitionPosition, AtomicBTreePartition&gt;&gt; iter;
+        private final ColumnFilter columnFilter;
+        private final DataRange dataRange;
+
+        MemtableUnfilteredPartitionIterator(TableMetadata metadata, Map&lt;PartitionPosition, AtomicBTreePartition&gt; map, ColumnFilter columnFilter, DataRange dataRange)
+<span class="fc" id="L329">        {</span>
+<span class="fc" id="L330">            this.metadata = metadata;</span>
+<span class="fc" id="L331">            this.iter = map.entrySet().iterator();</span>
+<span class="fc" id="L332">            this.columnFilter = columnFilter;</span>
+<span class="fc" id="L333">            this.dataRange = dataRange;</span>
+<span class="fc" id="L334">        }</span>
+
+        @Override
+        public TableMetadata metadata()
+        {
+<span class="fc" id="L339">            return metadata;</span>
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+<span class="fc" id="L345">            return iter.hasNext();</span>
+        }
+
+        @Override
+        public UnfilteredRowIterator next()
+        {
+<span class="fc" id="L351">            Map.Entry&lt;PartitionPosition, AtomicBTreePartition&gt; entry = iter.next();</span>
+            // Actual stored key should be true DecoratedKey
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">            assert entry.getKey() instanceof DecoratedKey;</span>
+<span class="fc" id="L354">            DecoratedKey key = (DecoratedKey)entry.getKey();</span>
+<span class="fc" id="L355">            ClusteringIndexFilter filter = dataRange.clusteringIndexFilter(key);</span>
+
+<span class="fc" id="L357">            return filter.getUnfilteredRowIterator(columnFilter, entry.getValue());</span>
+        }
+    }
+
+    @Override
+    public long getLiveDataSize()
+    {
+<span class="fc" id="L364">        return liveDataSize.get();</span>
+    }
+
+    /**
+     * For testing only. Give this memtable too big a size to make it always fail flushing.
+     */
+    @VisibleForTesting
+    public void makeUnflushable()
+    {
+<span class="nc" id="L373">        liveDataSize.addAndGet(1024L * 1024 * 1024 * 1024 * 1024);</span>
+<span class="nc" id="L374">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

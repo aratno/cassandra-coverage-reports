@@ -1,0 +1,763 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BlockBalancedTreeWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1.bbtree</a> &gt; <span class="el_source">BlockBalancedTreeWriter.java</span></div><h1>BlockBalancedTreeWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.index.sai.disk.v1.bbtree;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.base.MoreObjects;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.index.sai.disk.ResettableByteBuffersIndexOutput;
+import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
+import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.cassandra.utils.ByteArrayUtil;
+import org.apache.cassandra.utils.Pair;
+import org.apache.lucene.store.ByteBuffersDataOutput;
+import org.apache.lucene.store.DataOutput;
+import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.ArrayUtil;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IntroSorter;
+import org.apache.lucene.util.Sorter;
+import org.apache.lucene.util.bkd.BKDWriter;
+
+import static org.apache.cassandra.index.sai.postings.PostingList.END_OF_STREAM;
+
+/**
+ * This is a specialisation of the Lucene {@link BKDWriter} that only writes a single dimension
+ * balanced tree.
+ * &lt;p&gt;
+ * Recursively builds a block balanced tree to assign all incoming points to smaller
+ * and smaller rectangles (cells) until the number of points in a given
+ * rectangle is &amp;lt;= &lt;code&gt;maxPointsInLeafNode&lt;/code&gt;.  The tree is
+ * fully balanced, which means the leaf nodes will have between 50% and 100% of
+ * the requested &lt;code&gt;maxPointsInLeafNode&lt;/code&gt;.  Values that fall exactly
+ * on a cell boundary may be in either cell.
+ * &lt;p&gt;
+ * Visual representation of the disk format:
+ * &lt;pre&gt;
+ *
+ * +========+=======================================+==================+========+
+ * | HEADER | LEAF BLOCK LIST                       | BALANCED TREE    | FOOTER |
+ * +========+================+=====+================+==================+========+
+ *          | LEAF BLOCK (0) | ... | LEAF BLOCK (N) | VALUES PER LEAF  |
+ *          +----------------+-----+----------------+------------------|
+ *          | ORDER INDEX    |                      | BYTES PER VALUE  |
+ *          +----------------+                      +------------------+
+ *          | PREFIX         |                      | NUMBER OF LEAVES |
+ *          +----------------+                      +------------------+
+ *          | VALUES         |                      | MINIMUM VALUE    |
+ *          +----------------+                      +------------------+
+ *                                                  | MAXIMUM VALUE    |
+ *                                                  +------------------+
+ *                                                  | TOTAL VALUES     |
+ *                                                  +------------------+
+ *                                                  | INDEX TREE       |
+ *                                                  +--------+---------+
+ *                                                  | LENGTH | BYTES   |
+ *                                                  +--------+---------+
+ *  &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * &lt;b&gt;NOTE&lt;/b&gt;: This can write at most Integer.MAX_VALUE * &lt;code&gt;maxPointsInLeafNode&lt;/code&gt; total points.
+ * &lt;p&gt;
+ * @see BKDWriter
+ */
+@NotThreadSafe
+public class BlockBalancedTreeWriter
+{
+    // Enable to check that values are added to the tree in correct order and within bounds
+<span class="nc" id="L91">    public static final boolean DEBUG = CassandraRelevantProperties.SAI_TEST_BALANCED_TREE_DEBUG_ENABLED.getBoolean();</span>
+
+    // Default maximum number of point in each leaf block
+    public static final int DEFAULT_MAX_POINTS_IN_LEAF_NODE = 1024;
+
+    private final int bytesPerValue;
+    private final int maxPointsInLeafNode;
+    private final byte[] minPackedValue;
+    private final byte[] maxPackedValue;
+    private long valueCount;
+
+    public BlockBalancedTreeWriter(int bytesPerValue, int maxPointsInLeafNode)
+<span class="nc" id="L103">    {</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (maxPointsInLeafNode &lt;= 0)</span>
+<span class="nc" id="L105">            throw new IllegalArgumentException(&quot;maxPointsInLeafNode must be &gt; 0; got &quot; + maxPointsInLeafNode);</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        if (maxPointsInLeafNode &gt; ArrayUtil.MAX_ARRAY_LENGTH)</span>
+<span class="nc" id="L107">            throw new IllegalArgumentException(&quot;maxPointsInLeafNode must be &lt;= ArrayUtil.MAX_ARRAY_LENGTH (= &quot; +</span>
+                                               ArrayUtil.MAX_ARRAY_LENGTH + &quot;); got &quot; + maxPointsInLeafNode);
+
+<span class="nc" id="L110">        this.maxPointsInLeafNode = maxPointsInLeafNode;</span>
+<span class="nc" id="L111">        this.bytesPerValue = bytesPerValue;</span>
+
+<span class="nc" id="L113">        minPackedValue = new byte[bytesPerValue];</span>
+<span class="nc" id="L114">        maxPackedValue = new byte[bytesPerValue];</span>
+<span class="nc" id="L115">    }</span>
+
+    public long getValueCount()
+    {
+<span class="nc" id="L119">        return valueCount;</span>
+    }
+
+    public int getBytesPerValue()
+    {
+<span class="nc" id="L124">        return bytesPerValue;</span>
+    }
+
+    public int getMaxPointsInLeafNode()
+    {
+<span class="nc" id="L129">        return maxPointsInLeafNode;</span>
+    }
+
+    /**
+     * Write the sorted values from a {@link BlockBalancedTreeIterator}.
+     * &lt;p&gt;
+     * @param treeOutput The {@link IndexOutput} to write the balanced tree to
+     * @param values The {@link BlockBalancedTreeIterator} containing the values and rowIDs to be written
+     * @param callback The {@link Callback} used to record the leaf postings for each leaf
+     *
+     * @return The file pointer to the beginning of the balanced tree
+     */
+    public long write(IndexOutput treeOutput, BlockBalancedTreeIterator values, final Callback callback) throws IOException
+    {
+<span class="nc" id="L143">        SAICodecUtils.writeHeader(treeOutput);</span>
+
+<span class="nc" id="L145">        LeafWriter leafWriter = new LeafWriter(treeOutput, callback);</span>
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        while (values.hasNext())</span>
+        {
+<span class="nc" id="L149">            Pair&lt;byte[], PostingList&gt; pair = values.next();</span>
+            long segmentRowId;
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            while ((segmentRowId = pair.right.nextPosting()) != END_OF_STREAM)</span>
+<span class="nc" id="L152">                leafWriter.add(pair.left, segmentRowId);</span>
+<span class="nc" id="L153">        }</span>
+
+<span class="nc" id="L155">        valueCount = leafWriter.finish();</span>
+
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        long treeFilePointer = valueCount == 0 ? -1 : treeOutput.getFilePointer();</span>
+
+        // There is only any point in writing the balanced tree if any values were added
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (treeFilePointer &gt;= 0)</span>
+<span class="nc" id="L161">            writeBalancedTree(treeOutput, maxPointsInLeafNode, leafWriter.leafBlockStartValues, leafWriter.leafBlockFilePointers);</span>
+
+<span class="nc" id="L163">        SAICodecUtils.writeFooter(treeOutput);</span>
+
+<span class="nc" id="L165">        return treeFilePointer;</span>
+    }
+
+    private void writeBalancedTree(IndexOutput out, int countPerLeaf, List&lt;byte[]&gt; leafBlockStartValues, List&lt;Long&gt; leafBlockFilePointer) throws IOException
+    {
+<span class="nc" id="L170">        int numInnerNodes = leafBlockStartValues.size();</span>
+<span class="nc" id="L171">        byte[] splitValues = new byte[(1 + numInnerNodes) * bytesPerValue];</span>
+<span class="nc" id="L172">        int treeDepth = recurseBalanceTree(1, 0, numInnerNodes, 1, splitValues, leafBlockStartValues);</span>
+<span class="nc" id="L173">        long[] leafBlockFPs = leafBlockFilePointer.stream().mapToLong(l -&gt; l).toArray();</span>
+<span class="nc" id="L174">        byte[] packedIndex = packIndex(leafBlockFPs, splitValues);</span>
+
+<span class="nc" id="L176">        out.writeVInt(countPerLeaf);</span>
+<span class="nc" id="L177">        out.writeVInt(bytesPerValue);</span>
+
+<span class="nc" id="L179">        out.writeVInt(leafBlockFPs.length);</span>
+<span class="nc" id="L180">        out.writeVInt(Math.min(treeDepth, leafBlockFPs.length));</span>
+
+<span class="nc" id="L182">        out.writeBytes(minPackedValue, 0, bytesPerValue);</span>
+<span class="nc" id="L183">        out.writeBytes(maxPackedValue, 0, bytesPerValue);</span>
+
+<span class="nc" id="L185">        out.writeVLong(valueCount);</span>
+
+<span class="nc" id="L187">        out.writeVInt(packedIndex.length);</span>
+<span class="nc" id="L188">        out.writeBytes(packedIndex, 0, packedIndex.length);</span>
+<span class="nc" id="L189">    }</span>
+
+    /**
+     * This can, potentially, be removed in the future by CASSANDRA-18597
+     */
+    private int recurseBalanceTree(int nodeID, int offset, int count, int treeDepth, byte[] splitValues, List&lt;byte[]&gt; leafBlockStartValues)
+    {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (count == 1)</span>
+        {
+<span class="nc" id="L198">            treeDepth++;</span>
+            // Leaf index node
+<span class="nc" id="L200">            System.arraycopy(leafBlockStartValues.get(offset), 0, splitValues, nodeID * bytesPerValue, bytesPerValue);</span>
+        }
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        else if (count &gt; 1)</span>
+        {
+<span class="nc" id="L204">            treeDepth++;</span>
+            // Internal index node: binary partition of count
+<span class="nc" id="L206">            int countAtLevel = 1;</span>
+<span class="nc" id="L207">            int totalCount = 0;</span>
+            while (true)
+            {
+<span class="nc" id="L210">                int countLeft = count - totalCount;</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                if (countLeft &lt;= countAtLevel)</span>
+                {
+                    // This is the last level, possibly partially filled:
+<span class="nc" id="L214">                    int lastLeftCount = Math.min(countAtLevel / 2, countLeft);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    assert lastLeftCount &gt;= 0;</span>
+<span class="nc" id="L216">                    int leftHalf = (totalCount - 1) / 2 + lastLeftCount;</span>
+
+<span class="nc" id="L218">                    int rootOffset = offset + leftHalf;</span>
+
+<span class="nc" id="L220">                    System.arraycopy(leafBlockStartValues.get(rootOffset), 0, splitValues, nodeID * bytesPerValue, bytesPerValue);</span>
+
+                    // TODO: we could optimize/specialize, when we know it's simply fully balanced binary tree
+                    // under here, to save this while loop on each recursion
+
+                    // Recurse left
+<span class="nc" id="L226">                    int leftTreeDepth = recurseBalanceTree(2 * nodeID, offset, leftHalf, treeDepth, splitValues, leafBlockStartValues);</span>
+
+                    // Recurse right
+<span class="nc" id="L229">                    int rightTreeDepth = recurseBalanceTree(2 * nodeID + 1, rootOffset + 1, count - leftHalf - 1, treeDepth, splitValues, leafBlockStartValues);</span>
+<span class="nc" id="L230">                    return Math.max(leftTreeDepth, rightTreeDepth);</span>
+                }
+<span class="nc" id="L232">                totalCount += countAtLevel;</span>
+<span class="nc" id="L233">                countAtLevel *= 2;</span>
+<span class="nc" id="L234">            }</span>
+        }
+        else
+        {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            assert count == 0;</span>
+        }
+<span class="nc" id="L240">        return treeDepth;</span>
+    }
+
+    // Packs the two arrays, representing a balanced binary tree, into a compact byte[] structure.
+    private byte[] packIndex(long[] leafBlockFPs, byte[] splitValues) throws IOException
+    {
+<span class="nc" id="L246">        int numLeaves = leafBlockFPs.length;</span>
+
+        // Possibly rotate the leaf block FPs, if the index is not a fully balanced binary tree (only happens
+        // if it was created by TreeWriter).  In this case the leaf nodes may straddle the two bottom
+        // levels of the binary tree:
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (numLeaves &gt; 1)</span>
+        {
+<span class="nc" id="L253">            int levelCount = 2;</span>
+            while (true)
+            {
+<span class="nc bnc" id="L256" title="All 4 branches missed.">                if (numLeaves &gt;= levelCount &amp;&amp; numLeaves &lt;= 2 * levelCount)</span>
+                {
+<span class="nc" id="L258">                    int lastLevel = 2 * (numLeaves - levelCount);</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                    assert lastLevel &gt;= 0;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                    if (lastLevel != 0)</span>
+                    {
+                        // Last level is partially filled, so we must rotate the leaf FPs to match.  We do this here, after loading
+                        // at read-time, so that we can still delta code them on disk at write:
+<span class="nc" id="L264">                        long[] newLeafBlockFPs = new long[numLeaves];</span>
+<span class="nc" id="L265">                        System.arraycopy(leafBlockFPs, lastLevel, newLeafBlockFPs, 0, leafBlockFPs.length - lastLevel);</span>
+<span class="nc" id="L266">                        System.arraycopy(leafBlockFPs, 0, newLeafBlockFPs, leafBlockFPs.length - lastLevel, lastLevel);</span>
+<span class="nc" id="L267">                        leafBlockFPs = newLeafBlockFPs;</span>
+<span class="nc" id="L268">                    }</span>
+                    break;
+                }
+
+<span class="nc" id="L272">                levelCount *= 2;</span>
+            }
+        }
+
+        // Reused while packing the index
+<span class="nc" id="L277">        try (ResettableByteBuffersIndexOutput writeBuffer = new ResettableByteBuffersIndexOutput(&quot;PackedIndex&quot;))</span>
+        {
+            // This is the &quot;file&quot; we append the byte[] to:
+<span class="nc" id="L280">            List&lt;byte[]&gt; blocks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L281">            byte[] lastSplitValue = new byte[bytesPerValue];</span>
+<span class="nc" id="L282">            int totalSize = recursePackIndex(writeBuffer, leafBlockFPs, splitValues, 0, blocks, 1, lastSplitValue, false);</span>
+            // Compact the byte[] blocks into single byte index:
+<span class="nc" id="L284">            byte[] index = new byte[totalSize];</span>
+<span class="nc" id="L285">            int upto = 0;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            for (byte[] block : blocks)</span>
+            {
+<span class="nc" id="L288">                System.arraycopy(block, 0, index, upto, block.length);</span>
+<span class="nc" id="L289">                upto += block.length;</span>
+<span class="nc" id="L290">            }</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            assert upto == totalSize;</span>
+
+<span class="nc" id="L293">            return index;</span>
+        }
+    }
+
+    /**
+     * lastSplitValue is the split value previously seen; we use this to prefix-code the split byte[] on each
+     * inner node
+     */
+    private int recursePackIndex(ResettableByteBuffersIndexOutput writeBuffer, long[] leafBlockFPs, byte[] splitValues,
+                                 long minBlockFP, List&lt;byte[]&gt; blocks, int nodeID, byte[] lastSplitValue, boolean isLeft) throws IOException
+    {
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (nodeID &gt;= leafBlockFPs.length)</span>
+        {
+<span class="nc" id="L306">            int leafID = nodeID - leafBlockFPs.length;</span>
+
+            // In the unbalanced case it's possible the left most node only has one child:
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (leafID &lt; leafBlockFPs.length)</span>
+            {
+<span class="nc" id="L311">                long delta = leafBlockFPs[leafID] - minBlockFP;</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                if (isLeft)</span>
+                {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    assert delta == 0;</span>
+<span class="nc" id="L315">                    return 0;</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L319" title="All 4 branches missed.">                    assert nodeID == 1 || delta &gt; 0 : &quot;nodeID=&quot; + nodeID;</span>
+<span class="nc" id="L320">                    writeBuffer.writeVLong(delta);</span>
+<span class="nc" id="L321">                    return appendBlock(writeBuffer, blocks);</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L326">                throw new IllegalStateException(&quot;Unbalanced tree&quot;);</span>
+            }
+        }
+        else
+        {
+            long leftBlockFP;
+<span class="nc bnc" id="L332" title="All 2 branches missed.">            if (!isLeft)</span>
+            {
+<span class="nc" id="L334">                leftBlockFP = getLeftMostLeafBlockFP(leafBlockFPs, nodeID);</span>
+<span class="nc" id="L335">                long delta = leftBlockFP - minBlockFP;</span>
+<span class="nc bnc" id="L336" title="All 4 branches missed.">                assert nodeID == 1 || delta &gt; 0;</span>
+<span class="nc" id="L337">                writeBuffer.writeVLong(delta);</span>
+<span class="nc" id="L338">            }</span>
+            else
+            {
+                // The left tree's left most leaf block FP is always the minimal FP:
+<span class="nc" id="L342">                leftBlockFP = minBlockFP;</span>
+            }
+
+<span class="nc" id="L345">            int address = nodeID * bytesPerValue;</span>
+
+            // find common prefix with last split value in this dim:
+<span class="nc" id="L348">            int prefix = 0;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            for (; prefix &lt; bytesPerValue; prefix++)</span>
+            {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                if (splitValues[address + prefix] != lastSplitValue[prefix])</span>
+                {
+<span class="nc" id="L353">                    break;</span>
+                }
+            }
+
+            int firstDiffByteDelta;
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            if (prefix &lt; bytesPerValue)</span>
+            {
+<span class="nc" id="L360">                firstDiffByteDelta = (splitValues[address + prefix] &amp; 0xFF) - (lastSplitValue[prefix] &amp; 0xFF);</span>
+                // If this is left then we need to negate the delta
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                if (isLeft)</span>
+<span class="nc" id="L363">                    firstDiffByteDelta = -firstDiffByteDelta;</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                assert firstDiffByteDelta &gt; 0;</span>
+            }
+            else
+            {
+<span class="nc" id="L368">                firstDiffByteDelta = 0;</span>
+            }
+
+            // pack the prefix and delta first diff byte into a single vInt:
+<span class="nc" id="L372">            int code = (firstDiffByteDelta * (1 + bytesPerValue) + prefix);</span>
+
+<span class="nc" id="L374">            writeBuffer.writeVInt(code);</span>
+
+            // write the split value, prefix coded vs. our parent's split value:
+<span class="nc" id="L377">            int suffix = bytesPerValue - prefix;</span>
+<span class="nc" id="L378">            byte[] savSplitValue = new byte[suffix];</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (suffix &gt; 1)</span>
+            {
+<span class="nc" id="L381">                writeBuffer.writeBytes(splitValues, address + prefix + 1, suffix - 1);</span>
+            }
+
+<span class="nc" id="L384">            byte[] cmp = lastSplitValue.clone();</span>
+
+<span class="nc" id="L386">            System.arraycopy(lastSplitValue, prefix, savSplitValue, 0, suffix);</span>
+
+            // copy our split value into lastSplitValue for our children to prefix-code against
+<span class="nc" id="L389">            System.arraycopy(splitValues, address + prefix, lastSplitValue, prefix, suffix);</span>
+
+<span class="nc" id="L391">            int numBytes = appendBlock(writeBuffer, blocks);</span>
+
+            // placeholder for left-tree numBytes; we need this so that at search time if we only need to recurse into
+            // the right subtree we can quickly seek to its starting point
+<span class="nc" id="L395">            int idxSav = blocks.size();</span>
+<span class="nc" id="L396">            blocks.add(null);</span>
+
+<span class="nc" id="L398">            int leftNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitValues, leftBlockFP, blocks, 2 * nodeID, lastSplitValue, true);</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            if (nodeID * 2 &lt; leafBlockFPs.length)</span>
+            {
+<span class="nc" id="L402">                writeBuffer.writeVInt(leftNumBytes);</span>
+            }
+            else
+            {
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                assert leftNumBytes == 0 : &quot;leftNumBytes=&quot; + leftNumBytes;</span>
+            }
+<span class="nc" id="L408">            int numBytes2 = Math.toIntExact(writeBuffer.getFilePointer());</span>
+<span class="nc" id="L409">            byte[] bytes2 = writeBuffer.toArrayCopy();</span>
+<span class="nc" id="L410">            writeBuffer.reset();</span>
+            // replace our placeholder:
+<span class="nc" id="L412">            blocks.set(idxSav, bytes2);</span>
+
+<span class="nc" id="L414">            int rightNumBytes = recursePackIndex(writeBuffer, leafBlockFPs, splitValues, leftBlockFP, blocks, 2 * nodeID + 1, lastSplitValue, false);</span>
+
+            // restore lastSplitValue to what caller originally passed us:
+<span class="nc" id="L417">            System.arraycopy(savSplitValue, 0, lastSplitValue, prefix, suffix);</span>
+
+<span class="nc bnc" id="L419" title="All 2 branches missed.">            assert Arrays.equals(lastSplitValue, cmp);</span>
+
+<span class="nc" id="L421">            return numBytes + numBytes2 + leftNumBytes + rightNumBytes;</span>
+        }
+    }
+
+    /** Appends the current contents of writeBuffer as another block on the growing in-memory file */
+    private int appendBlock(ResettableByteBuffersIndexOutput writeBuffer, List&lt;byte[]&gt; blocks)
+    {
+<span class="nc" id="L428">        int pos = Math.toIntExact(writeBuffer.getFilePointer());</span>
+<span class="nc" id="L429">        byte[] bytes = writeBuffer.toArrayCopy();</span>
+<span class="nc" id="L430">        writeBuffer.reset();</span>
+<span class="nc" id="L431">        blocks.add(bytes);</span>
+<span class="nc" id="L432">        return pos;</span>
+    }
+
+    private long getLeftMostLeafBlockFP(long[] leafBlockFPs, int nodeID)
+    {
+        // TODO: can we do this cheaper, e.g. a closed form solution instead of while loop?  Or
+        // change the recursion while packing the index to return this left-most leaf block FP
+        // from each recursion instead?
+        //
+        // Still, the overall cost here is minor: this method's cost is O(log(N)), and while writing
+        // we call it O(N) times (N = number of leaf blocks)
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        while (nodeID &lt; leafBlockFPs.length)</span>
+        {
+<span class="nc" id="L445">            nodeID *= 2;</span>
+        }
+<span class="nc" id="L447">        int leafID = nodeID - leafBlockFPs.length;</span>
+<span class="nc" id="L448">        long result = leafBlockFPs[leafID];</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (result &lt; 0)</span>
+        {
+<span class="nc" id="L451">            throw new AssertionError(result + &quot; for leaf &quot; + leafID);</span>
+        }
+<span class="nc" id="L453">        return result;</span>
+    }
+
+    interface Callback
+    {
+        void writeLeafPostings(RowIDAndIndex[] leafPostings, int offset, int count);
+    }
+
+<span class="nc" id="L461">    static class RowIDAndIndex</span>
+    {
+        public int valueOrderIndex;
+        public long rowID;
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L469">            return MoreObjects.toStringHelper(this)</span>
+<span class="nc" id="L470">                              .add(&quot;valueOrderIndex&quot;, valueOrderIndex)</span>
+<span class="nc" id="L471">                              .add(&quot;rowID&quot;, rowID)</span>
+<span class="nc" id="L472">                              .toString();</span>
+        }
+    }
+
+    /**
+     * Responsible for writing the leaf blocks at the beginning of the balanced tree index.
+     */
+<span class="nc" id="L479">    private class LeafWriter</span>
+    {
+        private final IndexOutput treeOutput;
+<span class="nc" id="L482">        private final List&lt;Long&gt; leafBlockFilePointers = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L483">        private final List&lt;byte[]&gt; leafBlockStartValues = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L484">        private final byte[] leafValues = new byte[maxPointsInLeafNode * bytesPerValue];</span>
+<span class="nc" id="L485">        private final long[] leafRowIDs = new long[maxPointsInLeafNode];</span>
+<span class="nc" id="L486">        private final RowIDAndIndex[] rowIDAndIndexes = new RowIDAndIndex[maxPointsInLeafNode];</span>
+<span class="nc" id="L487">        private final int[] orderIndex = new int[maxPointsInLeafNode];</span>
+        private final Callback callback;
+<span class="nc" id="L489">        private final ByteBuffersDataOutput leafOrderIndexOutput = new ByteBuffersDataOutput(2 * 1024);</span>
+<span class="nc" id="L490">        private final ByteBuffersDataOutput leafBlockOutput = new ByteBuffersDataOutput(32 * 1024);</span>
+<span class="nc" id="L491">        private final byte[] lastPackedValue = new byte[bytesPerValue];</span>
+
+        private long valueCount;
+        private int leafValueCount;
+        private long lastRowID;
+
+        LeafWriter(IndexOutput treeOutput, Callback callback)
+<span class="nc" id="L498">        {</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">            assert callback != null : &quot;Callback cannot be null in TreeWriter&quot;;</span>
+
+<span class="nc" id="L501">            this.treeOutput = treeOutput;</span>
+<span class="nc" id="L502">            this.callback = callback;</span>
+
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            for (int x = 0; x &lt; rowIDAndIndexes.length; x++)</span>
+            {
+<span class="nc" id="L506">                rowIDAndIndexes[x] = new RowIDAndIndex();</span>
+            }
+<span class="nc" id="L508">        }</span>
+
+        /**
+         * Adds a value and row ID to the current leaf block. If the leaf block is full after the addition
+         * the current leaf block is written to disk.
+         */
+        void add(byte[] packedValue, long rowID) throws IOException
+        {
+<span class="nc bnc" id="L516" title="All 2 branches missed.">            if (DEBUG)</span>
+<span class="nc" id="L517">                valueInOrder(valueCount + leafValueCount, lastPackedValue, packedValue, 0, rowID, lastRowID);</span>
+
+<span class="nc" id="L519">            System.arraycopy(packedValue, 0, leafValues, leafValueCount * bytesPerValue, bytesPerValue);</span>
+<span class="nc" id="L520">            leafRowIDs[leafValueCount] = rowID;</span>
+<span class="nc" id="L521">            leafValueCount++;</span>
+
+<span class="nc bnc" id="L523" title="All 2 branches missed.">            if (leafValueCount == maxPointsInLeafNode)</span>
+            {
+                // We write a block once we hit exactly the max count
+<span class="nc" id="L526">                writeLeafBlock();</span>
+<span class="nc" id="L527">                leafValueCount = 0;</span>
+            }
+
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (DEBUG)</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                if ((lastRowID = rowID) &lt; 0)</span>
+<span class="nc" id="L532">                    throw new AssertionError(&quot;row id must be &gt;= 0; got &quot; + rowID);</span>
+<span class="nc" id="L533">        }</span>
+
+        /**
+         * Write a leaf block if we have unwritten values and return the total number of values added
+         */
+        public long finish() throws IOException
+        {
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            if (leafValueCount &gt; 0)</span>
+<span class="nc" id="L541">                writeLeafBlock();</span>
+
+<span class="nc" id="L543">            return valueCount;</span>
+        }
+
+        private void writeLeafBlock() throws IOException
+        {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            assert leafValueCount != 0;</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">            if (valueCount == 0)</span>
+            {
+<span class="nc" id="L551">                System.arraycopy(leafValues, 0, minPackedValue, 0, bytesPerValue);</span>
+            }
+<span class="nc" id="L553">            System.arraycopy(leafValues, (leafValueCount - 1) * bytesPerValue, maxPackedValue, 0, bytesPerValue);</span>
+
+<span class="nc" id="L555">            valueCount += leafValueCount;</span>
+
+<span class="nc bnc" id="L557" title="All 2 branches missed.">            if (leafBlockFilePointers.size() &gt; 0)</span>
+            {
+                // Save the first (minimum) value in each leaf block except the first, to build the split value index in the end:
+<span class="nc" id="L560">                leafBlockStartValues.add(ArrayUtil.copyOfSubArray(leafValues, 0, bytesPerValue));</span>
+            }
+<span class="nc" id="L562">            leafBlockFilePointers.add(treeOutput.getFilePointer());</span>
+<span class="nc" id="L563">            checkMaxLeafNodeCount(leafBlockFilePointers.size());</span>
+
+            // Find the common prefix between the first and last values in the block
+<span class="nc" id="L566">            int commonPrefixLength = bytesPerValue;</span>
+<span class="nc" id="L567">            int offset = (leafValueCount - 1) * bytesPerValue;</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">            for (int j = 0; j &lt; bytesPerValue; j++)</span>
+            {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">                if (leafValues[j] != leafValues[offset + j])</span>
+                {
+<span class="nc" id="L572">                    commonPrefixLength = j;</span>
+<span class="nc" id="L573">                    break;</span>
+                }
+            }
+
+<span class="nc" id="L577">            treeOutput.writeVInt(leafValueCount);</span>
+
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            for (int x = 0; x &lt; leafValueCount; x++)</span>
+            {
+<span class="nc" id="L581">                rowIDAndIndexes[x].valueOrderIndex = x;</span>
+<span class="nc" id="L582">                rowIDAndIndexes[x].rowID = leafRowIDs[x];</span>
+            }
+
+<span class="nc" id="L585">            final Sorter sorter = new IntroSorter()</span>
+<span class="nc" id="L586">            {</span>
+                RowIDAndIndex pivot;
+
+                @Override
+                protected void swap(int i, int j)
+                {
+<span class="nc" id="L592">                    RowIDAndIndex o = rowIDAndIndexes[i];</span>
+<span class="nc" id="L593">                    rowIDAndIndexes[i] = rowIDAndIndexes[j];</span>
+<span class="nc" id="L594">                    rowIDAndIndexes[j] = o;</span>
+<span class="nc" id="L595">                }</span>
+
+                @Override
+                protected void setPivot(int i)
+                {
+<span class="nc" id="L600">                    pivot = rowIDAndIndexes[i];</span>
+<span class="nc" id="L601">                }</span>
+
+                @Override
+                protected int comparePivot(int j)
+                {
+<span class="nc" id="L606">                    return Long.compare(pivot.rowID, rowIDAndIndexes[j].rowID);</span>
+                }
+            };
+
+<span class="nc" id="L610">            sorter.sort(0, leafValueCount);</span>
+
+            // write the leaf order index: leaf rowID -&gt; orig index
+<span class="nc" id="L613">            leafOrderIndexOutput.reset();</span>
+
+            // iterate in row ID order to get the row ID index for the given value order index
+            // place into an array to be written as packed ints
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            for (int x = 0; x &lt; leafValueCount; x++)</span>
+<span class="nc" id="L618">                orderIndex[rowIDAndIndexes[x].valueOrderIndex] = x;</span>
+
+<span class="nc" id="L620">            LeafOrderMap.write(orderIndex, leafValueCount, maxPointsInLeafNode - 1, leafOrderIndexOutput);</span>
+
+<span class="nc" id="L622">            treeOutput.writeVInt((int) leafOrderIndexOutput.size());</span>
+<span class="nc" id="L623">            leafOrderIndexOutput.copyTo(treeOutput);</span>
+
+<span class="nc" id="L625">            callback.writeLeafPostings(rowIDAndIndexes, 0, leafValueCount);</span>
+
+            // Write the common prefix for the leaf block
+<span class="nc" id="L628">            writeCommonPrefix(treeOutput, commonPrefixLength, leafValues);</span>
+
+            // Write the run length encoded packed values for the leaf block
+<span class="nc" id="L631">            leafBlockOutput.reset();</span>
+
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            if (DEBUG)</span>
+<span class="nc" id="L634">                valuesInOrderAndBounds(leafValueCount,</span>
+<span class="nc" id="L635">                                       ArrayUtil.copyOfSubArray(leafValues, 0, bytesPerValue),</span>
+<span class="nc" id="L636">                                       ArrayUtil.copyOfSubArray(leafValues, (leafValueCount - 1) * bytesPerValue, leafValueCount * bytesPerValue),</span>
+                                       leafRowIDs);
+
+<span class="nc" id="L639">            writeLeafBlockPackedValues(leafBlockOutput, commonPrefixLength, leafValueCount);</span>
+
+<span class="nc" id="L641">            leafBlockOutput.copyTo(treeOutput);</span>
+<span class="nc" id="L642">        }</span>
+
+        private void checkMaxLeafNodeCount(int numLeaves)
+        {
+<span class="nc bnc" id="L646" title="All 2 branches missed.">            if (bytesPerValue * (long) numLeaves &gt; ArrayUtil.MAX_ARRAY_LENGTH)</span>
+            {
+<span class="nc" id="L648">                throw new IllegalStateException(&quot;too many nodes; increase maxPointsInLeafNode (currently &quot; + maxPointsInLeafNode + &quot;) and reindex&quot;);</span>
+            }
+<span class="nc" id="L650">        }</span>
+
+        private void writeCommonPrefix(DataOutput treeOutput, int commonPrefixLength, byte[] packedValue) throws IOException
+        {
+<span class="nc" id="L654">            treeOutput.writeVInt(commonPrefixLength);</span>
+<span class="nc bnc" id="L655" title="All 2 branches missed.">            if (commonPrefixLength &gt; 0)</span>
+<span class="nc" id="L656">                treeOutput.writeBytes(packedValue, 0, commonPrefixLength);</span>
+<span class="nc" id="L657">        }</span>
+
+        private void writeLeafBlockPackedValues(DataOutput out, int commonPrefixLength, int count) throws IOException
+        {
+            // If all the values are the same (e.g. the common prefix length == bytes per value) then we don't
+            // need to write anything. Otherwise, we run length compress the values to disk.
+<span class="nc bnc" id="L663" title="All 2 branches missed.">            if (commonPrefixLength != bytesPerValue)</span>
+            {
+<span class="nc" id="L665">                int compressedByteOffset = commonPrefixLength;</span>
+<span class="nc" id="L666">                commonPrefixLength++;</span>
+<span class="nc bnc" id="L667" title="All 2 branches missed.">                for (int i = 0; i &lt; count; )</span>
+                {
+                    // do run-length compression on the byte at compressedByteOffset
+<span class="nc" id="L670">                    int runLen = runLen(i, Math.min(i + 0xff, count), compressedByteOffset);</span>
+<span class="nc bnc" id="L671" title="All 2 branches missed.">                    assert runLen &lt;= 0xff;</span>
+<span class="nc" id="L672">                    byte prefixByte = leafValues[i * bytesPerValue + compressedByteOffset];</span>
+<span class="nc" id="L673">                    out.writeByte(prefixByte);</span>
+<span class="nc" id="L674">                    out.writeByte((byte) runLen);</span>
+<span class="nc" id="L675">                    writeLeafBlockPackedValuesRange(out, commonPrefixLength, i, i + runLen);</span>
+<span class="nc" id="L676">                    i += runLen;</span>
+<span class="nc bnc" id="L677" title="All 2 branches missed.">                    assert i &lt;= count;</span>
+<span class="nc" id="L678">                }</span>
+            }
+<span class="nc" id="L680">        }</span>
+
+        private void writeLeafBlockPackedValuesRange(DataOutput out, int commonPrefixLength, int start, int end) throws IOException
+        {
+<span class="nc bnc" id="L684" title="All 2 branches missed.">            for (int i = start; i &lt; end; ++i)</span>
+            {
+<span class="nc" id="L686">                out.writeBytes(leafValues, i * bytesPerValue + commonPrefixLength, bytesPerValue - commonPrefixLength);</span>
+            }
+<span class="nc" id="L688">        }</span>
+
+        private int runLen(int start, int end, int byteOffset)
+        {
+<span class="nc" id="L692">            byte b = leafValues[start * bytesPerValue + byteOffset];</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            for (int i = start + 1; i &lt; end; ++i)</span>
+            {
+<span class="nc" id="L695">                byte b2 = leafValues[i * bytesPerValue + byteOffset];</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">                assert Byte.toUnsignedInt(b2) &gt;= Byte.toUnsignedInt(b);</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">                if (b != b2)</span>
+                {
+<span class="nc" id="L699">                    return i - start;</span>
+                }
+            }
+<span class="nc" id="L702">            return end - start;</span>
+        }
+
+        // The following 3 methods are only used when DEBUG is true:
+
+        private void valueInBounds(byte[] packedValue, int packedValueOffset, byte[] minPackedValue, byte[] maxPackedValue)
+        {
+<span class="nc bnc" id="L709" title="All 2 branches missed.">            if (ByteArrayUtil.compareUnsigned(packedValue,</span>
+                                              packedValueOffset,
+                                              minPackedValue,
+                                              0,
+                                              bytesPerValue) &lt; 0)
+            {
+<span class="nc" id="L715">                throw new AssertionError(&quot;value=&quot; + new BytesRef(packedValue, packedValueOffset, bytesPerValue) +</span>
+                                         &quot; is &lt; minPackedValue=&quot; + new BytesRef(minPackedValue));
+            }
+
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (ByteArrayUtil.compareUnsigned(packedValue,</span>
+                                              packedValueOffset,
+                                              maxPackedValue, 0,
+                                              bytesPerValue) &gt; 0)
+            {
+<span class="nc" id="L724">                throw new AssertionError(&quot;value=&quot; + new BytesRef(packedValue, packedValueOffset, bytesPerValue) +</span>
+                                         &quot; is &gt; maxPackedValue=&quot; + new BytesRef(maxPackedValue));
+            }
+<span class="nc" id="L727">        }</span>
+
+        private void valuesInOrderAndBounds(int count, byte[] minPackedValue, byte[] maxPackedValue, long[] rowIds)
+        {
+<span class="nc" id="L731">            byte[] lastPackedValue = new byte[bytesPerValue];</span>
+<span class="nc" id="L732">            long lastRowId = -1;</span>
+<span class="nc bnc" id="L733" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++)</span>
+            {
+<span class="nc" id="L735">                valueInOrder(i, lastPackedValue, leafValues, i * bytesPerValue, rowIds[i], lastRowId);</span>
+<span class="nc" id="L736">                lastRowId = rowIds[i];</span>
+
+                // Make sure this value does in fact fall within this leaf cell:
+<span class="nc" id="L739">                valueInBounds(leafValues, i * bytesPerValue, minPackedValue, maxPackedValue);</span>
+            }
+<span class="nc" id="L741">        }</span>
+
+        private void valueInOrder(long ord, byte[] lastPackedValue, byte[] packedValue, int packedValueOffset, long rowId, long lastRowId)
+        {
+<span class="nc bnc" id="L745" title="All 2 branches missed.">            if (ord &gt; 0)</span>
+            {
+<span class="nc" id="L747">                int cmp = ByteArrayUtil.compareUnsigned(lastPackedValue, 0, packedValue, packedValueOffset, bytesPerValue);</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                if (cmp &gt; 0)</span>
+                {
+<span class="nc" id="L750">                    throw new AssertionError(&quot;values out of order: last value=&quot; + new BytesRef(lastPackedValue) +</span>
+                                             &quot; current value=&quot; + new BytesRef(packedValue, packedValueOffset, bytesPerValue) +
+                                             &quot; ord=&quot; + ord);
+                }
+<span class="nc bnc" id="L754" title="All 4 branches missed.">                if (cmp == 0 &amp;&amp; rowId &lt; lastRowId)</span>
+                {
+<span class="nc" id="L756">                    throw new AssertionError(&quot;row IDs out of order: last rowID=&quot; + lastRowId + &quot; current rowID=&quot; + rowId + &quot; ord=&quot; + ord);</span>
+                }
+            }
+<span class="nc" id="L759">            System.arraycopy(packedValue, packedValueOffset, lastPackedValue, 0, bytesPerValue);</span>
+<span class="nc" id="L760">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

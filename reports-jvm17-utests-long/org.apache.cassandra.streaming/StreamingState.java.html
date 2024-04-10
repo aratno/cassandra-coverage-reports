@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamingState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.streaming</a> &gt; <span class="el_source">StreamingState.java</span></div><h1>StreamingState.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.streaming;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+import javax.annotation.concurrent.GuardedBy;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cache.IMeasurableMemory;
+import org.apache.cassandra.db.virtual.SimpleDataSet;
+import org.apache.cassandra.tools.nodetool.formatter.TableBuilder;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.TimeUUID;
+import org.checkerframework.checker.nullness.qual.Nullable;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+public class StreamingState implements StreamEventHandler, IMeasurableMemory
+{
+    private static final Logger logger = LoggerFactory.getLogger(StreamingState.class);
+
+    public static final long EMPTY = ObjectSizes.measureDeep(new StreamingState(nextTimeUUID(), StreamOperation.OTHER, false));
+
+<span class="fc" id="L53">    public enum Status</span>
+<span class="fc" id="L54">    {INIT, START, SUCCESS, FAILURE}</span>
+
+    private final long createdAtMillis = Clock.Global.currentTimeMillis();
+
+    private final TimeUUID id;
+    private final boolean follower;
+    private final StreamOperation operation;
+    private final Set&lt;InetSocketAddress&gt; peers = Collections.newSetFromMap(new ConcurrentHashMap&lt;&gt;());
+    @GuardedBy(&quot;this&quot;)
+    private final Sessions sessions = new Sessions();
+
+    private Status status;
+    private String completeMessage = null;
+
+    private final long[] stateTimesNanos;
+    private volatile long lastUpdatedAtNanos;
+
+    // API for state changes
+    public final Phase phase = new Phase();
+
+    @Override
+    public long unsharedHeapSize()
+    {
+        long costOfPeers = peers().size() * (ObjectSizes.IPV6_SOCKET_ADDRESS_SIZE + 48); // 48 represents the datastructure cost computed by the JOL
+        long costOfCompleteMessage = ObjectSizes.sizeOf(completeMessage());
+        return costOfPeers + costOfCompleteMessage + EMPTY;
+    }
+
+    public StreamingState(StreamResultFuture result)
+    {
+        this(result.planId, result.streamOperation, result.getCoordinator().isFollower());
+    }
+
+    private StreamingState(TimeUUID planId, StreamOperation streamOperation, boolean follower)
+    {
+        this.id = planId;
+        this.operation = streamOperation;
+        this.follower = follower;
+        this.stateTimesNanos = new long[Status.values().length];
+        updateState(Status.INIT);
+    }
+
+    public TimeUUID id()
+    {
+        return id;
+    }
+
+    public boolean follower()
+    {
+        return follower;
+    }
+
+    public StreamOperation operation()
+    {
+        return operation;
+    }
+
+    public Set&lt;InetSocketAddress&gt; peers()
+    {
+        return this.peers;
+    }
+
+    public String completeMessage()
+    {
+        return this.completeMessage;
+    }
+
+    public Status status()
+    {
+        return status;
+    }
+
+    public Sessions sessions()
+    {
+        return sessions;
+    }
+
+    public boolean isComplete()
+    {
+        switch (status)
+        {
+            case SUCCESS:
+            case FAILURE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    @VisibleForTesting
+    public StreamResultFuture future()
+    {
+        if (follower)
+            return StreamManager.instance.getReceivingStream(id);
+        else
+            return StreamManager.instance.getInitiatorStream(id);
+    }
+
+    public float progress()
+    {
+        switch (status)
+        {
+            case INIT:
+                return 0;
+            case START:
+                return Math.min(0.99f, sessions().progress().floatValue());
+            case SUCCESS:
+            case FAILURE:
+                return 1;
+            default:
+                throw new AssertionError(&quot;unknown state: &quot; + status);
+        }
+    }
+
+    public EnumMap&lt;Status, Long&gt; stateTimesMillis()
+    {
+        EnumMap&lt;Status, Long&gt; map = new EnumMap&lt;&gt;(Status.class);
+        for (int i = 0; i &lt; stateTimesNanos.length; i++)
+        {
+            long nanos = stateTimesNanos[i];
+            if (nanos != 0)
+                map.put(Status.values()[i], nanosToMillis(nanos));
+        }
+        return map;
+    }
+
+    public long durationMillis()
+    {
+        long endNanos = lastUpdatedAtNanos;
+        if (!isComplete())
+            endNanos = Clock.Global.nanoTime();
+        return TimeUnit.NANOSECONDS.toMillis(endNanos - stateTimesNanos[0]);
+    }
+
+    public long lastUpdatedAtMillis()
+    {
+        return nanosToMillis(lastUpdatedAtNanos);
+    }
+
+    public long lastUpdatedAtNanos()
+    {
+        return lastUpdatedAtNanos;
+    }
+
+    public String failureCause()
+    {
+        if (status == Status.FAILURE)
+            return completeMessage;
+        return null;
+    }
+
+    public String successMessage()
+    {
+        if (status == Status.SUCCESS)
+            return completeMessage;
+        return null;
+    }
+
+    @Override
+    public String toString()
+    {
+        TableBuilder table = new TableBuilder();
+        table.add(&quot;id&quot;, id.toString());
+        table.add(&quot;status&quot;, status().name().toLowerCase());
+        table.add(&quot;progress&quot;, (progress() * 100) + &quot;%&quot;);
+        table.add(&quot;duration_ms&quot;, Long.toString(durationMillis()));
+        table.add(&quot;last_updated_ms&quot;, Long.toString(lastUpdatedAtMillis()));
+        table.add(&quot;failure_cause&quot;, failureCause());
+        table.add(&quot;success_message&quot;, successMessage());
+        for (Map.Entry&lt;Status, Long&gt; e : stateTimesMillis().entrySet())
+            table.add(&quot;status_&quot; + e.getKey().name().toLowerCase() + &quot;_ms&quot;, e.toString());
+        return table.toString();
+    }
+
+    @Override
+    public synchronized void handleStreamEvent(StreamEvent event)
+    {
+        try
+        {
+            switch (event.eventType)
+            {
+                case STREAM_PREPARED:
+                    streamPrepared((StreamEvent.SessionPreparedEvent) event);
+                    break;
+                case STREAM_COMPLETE:
+                    // currently not taking track of state, so ignore
+                    break;
+                case FILE_PROGRESS:
+                    streamProgress((StreamEvent.ProgressEvent) event);
+                    break;
+                default:
+                    logger.warn(&quot;Unknown stream event type: {}&quot;, event.eventType);
+            }
+        }
+        catch (Throwable t)
+        {
+            logger.warn(&quot;Unexpected exception handling stream event&quot;, t);
+        }
+        lastUpdatedAtNanos = Clock.Global.nanoTime();
+    }
+
+    private void streamPrepared(StreamEvent.SessionPreparedEvent event)
+    {
+        SessionInfo session = event.session;
+        peers.add(session.peer);
+        // only update stats on ACK to avoid duplication
+        if (event.prepareDirection != StreamSession.PrepareDirection.ACK)
+            return;
+        sessions.bytesToReceive += session.getTotalSizeToReceive();
+        sessions.bytesToSend += session.getTotalSizeToSend();
+
+        sessions.filesToReceive += session.getTotalFilesToReceive();
+        sessions.filesToSend += session.getTotalFilesToSend();
+    }
+
+    private void streamProgress(StreamEvent.ProgressEvent event)
+    {
+        ProgressInfo info = event.progress;
+
+        if (info.direction == ProgressInfo.Direction.IN)
+        {
+            // receiving
+            sessions.bytesReceived += info.deltaBytes;
+            if (info.isCompleted())
+                sessions.filesReceived++;
+        }
+        else
+        {
+            // sending
+            sessions.bytesSent += info.deltaBytes;
+            if (info.isCompleted())
+                sessions.filesSent++;
+        }
+    }
+
+    @Override
+    public synchronized void onSuccess(@Nullable StreamState state)
+    {
+        updateState(Status.SUCCESS);
+    }
+
+    @Override
+    public synchronized void onFailure(Throwable throwable)
+    {
+        completeMessage = Throwables.getStackTraceAsString(throwable);
+        updateState(Status.FAILURE);
+        //we know the size is now very different from the estimate so recompute by adding again
+        StreamManager.instance.addStreamingStateAgain(this);
+    }
+
+    private synchronized void updateState(Status state)
+    {
+        this.status = state;
+        long now = Clock.Global.nanoTime();
+        stateTimesNanos[state.ordinal()] = now;
+        lastUpdatedAtNanos = now;
+    }
+
+    private long nanosToMillis(long nanos)
+    {
+        // nanos - creationTimeNanos = delta since init
+        return createdAtMillis + TimeUnit.NANOSECONDS.toMillis(nanos - stateTimesNanos[0]);
+    }
+
+    public class Phase
+    {
+        public void start()
+        {
+            updateState(Status.START);
+        }
+    }
+
+<span class="nc" id="L326">    public static class Sessions</span>
+    {
+        public long bytesToReceive, bytesReceived;
+        public long bytesToSend, bytesSent;
+        public long filesToReceive, filesReceived;
+        public long filesToSend, filesSent;
+
+        public static String columns()
+        {
+<span class="fc" id="L335">            return &quot;  bytes_to_receive bigint, \n&quot; +</span>
+                   &quot;  bytes_received bigint, \n&quot; +
+                   &quot;  bytes_to_send bigint, \n&quot; +
+                   &quot;  bytes_sent bigint, \n&quot; +
+                   &quot;  files_to_receive bigint, \n&quot; +
+                   &quot;  files_received bigint, \n&quot; +
+                   &quot;  files_to_send bigint, \n&quot; +
+                   &quot;  files_sent bigint, \n&quot;;
+        }
+
+        public boolean isEmpty()
+        {
+<span class="nc bnc" id="L347" title="All 8 branches missed.">            return bytesToReceive == 0 &amp;&amp; bytesToSend == 0 &amp;&amp; filesToReceive == 0 &amp;&amp; filesToSend == 0;</span>
+        }
+
+        public BigDecimal progress()
+        {
+<span class="nc" id="L352">            return div(bytesSent + bytesReceived, bytesToSend + bytesToReceive);</span>
+        }
+
+        private static BigDecimal div(long a, long b)
+        {
+            // not &quot;correct&quot; but its what you would do if this happened...
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            if (b == 0)</span>
+<span class="nc" id="L359">                return BigDecimal.ZERO;</span>
+<span class="nc" id="L360">            return BigDecimal.valueOf(a).divide(BigDecimal.valueOf(b), 4, RoundingMode.HALF_UP);</span>
+        }
+
+        public void update(SimpleDataSet ds)
+        {
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            if (isEmpty())</span>
+<span class="nc" id="L366">                return;</span>
+<span class="nc" id="L367">            ds.column(&quot;bytes_to_receive&quot;, bytesToReceive)</span>
+<span class="nc" id="L368">              .column(&quot;bytes_received&quot;, bytesReceived)</span>
+<span class="nc" id="L369">              .column(&quot;bytes_to_send&quot;, bytesToSend)</span>
+<span class="nc" id="L370">              .column(&quot;bytes_sent&quot;, bytesSent)</span>
+<span class="nc" id="L371">              .column(&quot;files_to_receive&quot;, filesToReceive)</span>
+<span class="nc" id="L372">              .column(&quot;files_received&quot;, filesReceived)</span>
+<span class="nc" id="L373">              .column(&quot;files_to_send&quot;, filesToSend)</span>
+<span class="nc" id="L374">              .column(&quot;files_sent&quot;, filesSent);</span>
+<span class="nc" id="L375">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

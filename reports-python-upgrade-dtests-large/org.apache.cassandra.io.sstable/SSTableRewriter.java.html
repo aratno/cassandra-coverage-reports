@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableRewriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTableRewriter.java</span></div><h1>SSTableRewriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+/**
+ * Wraps one or more writers as output for rewriting one or more readers: every sstable_preemptive_open_interval
+ * we look in the summary we're collecting for the latest writer for the penultimate key that we know to have been fully
+ * flushed to the index file, and then double check that the key is fully present in the flushed data file.
+ * Then we move the starts of each reader forwards to that point, replace them in the Tracker, and attach a runnable
+ * for on-close (i.e. when all references expire) that drops the page cache prior to that key position
+ *
+ * hard-links are created for each partially written sstable so that readers opened against them continue to work past
+ * renaming of the temporary file, which is deleted once all readers against the hard-link have been closed.
+ * If for any reason the writer is rolled over, we immediately rename and fully expose the completed file in the Tracker.
+ *
+ * On abort, we restore the original lower bounds to the existing readers and delete any temporary files we had in progress,
+ * but leave any hard-links in place for the readers we opened, and clean-up when the readers finish as we would do
+ * if we had finished successfully.
+ */
+public class SSTableRewriter extends Transactional.AbstractTransactional implements Transactional
+{
+    @VisibleForTesting
+<span class="fc" id="L53">    public static boolean disableEarlyOpeningForTests = false;</span>
+
+    private final long preemptiveOpenInterval;
+    private final long maxAge;
+<span class="fc" id="L57">    private long repairedAt = -1;</span>
+    // the set of final readers we will expose on commit
+    private final ILifecycleTransaction transaction; // the readers we are rewriting (updated as they are replaced)
+<span class="fc" id="L60">    private final List&lt;SSTableReader&gt; preparedForCommit = new ArrayList&lt;&gt;();</span>
+
+    private long currentlyOpenedEarlyAt; // the position (in MiB) in the target file we last (re)opened at
+    private long bytesWritten; // the bytes written by previous writers, or zero if the current writer is the first writer
+
+<span class="fc" id="L65">    private final List&lt;SSTableWriter&gt; writers = new ArrayList&lt;&gt;();</span>
+    private final boolean keepOriginals; // true if we do not want to obsolete the originals
+    private final boolean eagerWriterMetaRelease; // true if the writer metadata should be released when switch is called
+
+    private SSTableWriter writer;
+
+    // for testing (TODO: remove when have byteman setup)
+    private boolean throwEarly, throwLate;
+
+    @Deprecated
+    public SSTableRewriter(ILifecycleTransaction transaction, long maxAge, long preemptiveOpenInterval, boolean keepOriginals)
+    {
+<span class="nc" id="L77">        this(transaction, maxAge, preemptiveOpenInterval, keepOriginals, false);</span>
+<span class="nc" id="L78">    }</span>
+
+    SSTableRewriter(ILifecycleTransaction transaction, long maxAge, long preemptiveOpenInterval, boolean keepOriginals, boolean eagerWriterMetaRelease)
+<span class="fc" id="L81">    {</span>
+<span class="fc" id="L82">        this.transaction = transaction;</span>
+<span class="fc" id="L83">        this.maxAge = maxAge;</span>
+<span class="fc" id="L84">        this.preemptiveOpenInterval = preemptiveOpenInterval;</span>
+<span class="fc" id="L85">        this.keepOriginals = keepOriginals;</span>
+<span class="fc" id="L86">        this.eagerWriterMetaRelease = eagerWriterMetaRelease;</span>
+<span class="fc" id="L87">    }</span>
+
+    public static SSTableRewriter constructKeepingOriginals(ILifecycleTransaction transaction, boolean keepOriginals, long maxAge)
+    {
+<span class="nc" id="L91">        return new SSTableRewriter(transaction, maxAge, calculateOpenInterval(true), keepOriginals, true);</span>
+    }
+
+    public static SSTableRewriter constructWithoutEarlyOpening(ILifecycleTransaction transaction, boolean keepOriginals, long maxAge)
+    {
+<span class="nc" id="L96">        return new SSTableRewriter(transaction, maxAge, calculateOpenInterval(false), keepOriginals, true);</span>
+    }
+
+    public static SSTableRewriter construct(ColumnFamilyStore cfs, ILifecycleTransaction transaction, boolean keepOriginals, long maxAge)
+    {
+<span class="fc" id="L101">        return new SSTableRewriter(transaction, maxAge, calculateOpenInterval(cfs.supportsEarlyOpen()), keepOriginals, true);</span>
+    }
+
+    private static long calculateOpenInterval(boolean shouldOpenEarly)
+    {
+<span class="fc" id="L106">        long interval = DatabaseDescriptor.getSSTablePreemptiveOpenIntervalInMiB() * (1L &lt;&lt; 20);</span>
+<span class="pc bpc" id="L107" title="3 of 6 branches missed.">        if (disableEarlyOpeningForTests || !shouldOpenEarly || interval &lt; 0)</span>
+<span class="nc" id="L108">            interval = Long.MAX_VALUE;</span>
+<span class="fc" id="L109">        return interval;</span>
+    }
+
+    public SSTableWriter currentWriter()
+    {
+<span class="nc" id="L114">        return writer;</span>
+    }
+
+    public long bytesWritten()
+    {
+<span class="nc bnc" id="L119" title="All 2 branches missed.">        return bytesWritten + (writer == null ? 0 : writer.getFilePointer());</span>
+    }
+
+    public void forEachWriter(Consumer&lt;SSTableWriter&gt; op)
+    {
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        for (SSTableWriter writer : writers)</span>
+<span class="nc" id="L125">            op.accept(writer);</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (writer != null)</span>
+<span class="nc" id="L127">            op.accept(writer);</span>
+<span class="nc" id="L128">    }</span>
+
+    public AbstractRowIndexEntry append(UnfilteredRowIterator partition)
+    {
+        // we do this before appending to ensure we can resetAndTruncate() safely if appending fails
+<span class="fc" id="L133">        DecoratedKey key = partition.partitionKey();</span>
+<span class="fc" id="L134">        maybeReopenEarly(key);</span>
+<span class="fc" id="L135">        return writer.append(partition);</span>
+    }
+
+    // attempts to append the row, if fails resets the writer position
+    public AbstractRowIndexEntry tryAppend(UnfilteredRowIterator partition)
+    {
+<span class="nc" id="L141">        writer.mark();</span>
+        try
+        {
+<span class="nc" id="L144">            return append(partition);</span>
+        }
+<span class="nc" id="L146">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L148">            writer.resetAndTruncate();</span>
+<span class="nc" id="L149">            throw t;</span>
+        }
+    }
+
+    private void maybeReopenEarly(DecoratedKey key)
+    {
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">        if (writer.getFilePointer() - currentlyOpenedEarlyAt &gt; preemptiveOpenInterval)</span>
+        {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            if (transaction.isOffline())</span>
+            {
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                for (SSTableReader reader : transaction.originals())</span>
+                {
+<span class="nc" id="L161">                    reader.trySkipFileCacheBefore(key);</span>
+<span class="nc" id="L162">                }</span>
+            }
+            else
+            {
+<span class="nc" id="L166">                writer.setMaxDataAge(maxAge);</span>
+<span class="nc" id="L167">                writer.openEarly(reader -&gt; {</span>
+<span class="nc" id="L168">                    transaction.update(reader, false);</span>
+<span class="nc" id="L169">                    currentlyOpenedEarlyAt = writer.getFilePointer();</span>
+<span class="nc" id="L170">                    moveStarts(reader.getLast());</span>
+<span class="nc" id="L171">                    transaction.checkpoint();</span>
+<span class="nc" id="L172">                });</span>
+            }
+        }
+<span class="fc" id="L175">    }</span>
+
+    protected Throwable doAbort(Throwable accumulate)
+    {
+        // abort the writers
+<span class="fc bfc" id="L180" title="All 2 branches covered.">        for (SSTableWriter writer : writers)</span>
+<span class="fc" id="L181">            accumulate = writer.abort(accumulate);</span>
+        // abort the lifecycle transaction
+<span class="fc" id="L183">        accumulate = transaction.abort(accumulate);</span>
+<span class="fc" id="L184">        return accumulate;</span>
+    }
+
+    protected Throwable doCommit(Throwable accumulate)
+    {
+<span class="fc bfc" id="L189" title="All 2 branches covered.">        for (SSTableWriter writer : writers)</span>
+<span class="fc" id="L190">            accumulate = writer.commit(accumulate);</span>
+
+<span class="fc" id="L192">        accumulate = transaction.commit(accumulate);</span>
+<span class="fc" id="L193">        return accumulate;</span>
+    }
+
+    /**
+     * Replace the readers we are rewriting with cloneWithNewStart, reclaiming any page cache that is no longer
+     * needed, and transferring any key cache entries over to the new reader, expiring them from the old. if reset
+     * is true, we are instead restoring the starts of the readers from before the rewriting began
+     *
+     * note that we replace an existing sstable with a new *instance* of the same sstable, the replacement
+     * sstable .equals() the old one, BUT, it is a new instance, so, for example, since we releaseReference() on the old
+     * one, the old *instance* will have reference count == 0 and if we were to start a new compaction with that old
+     * instance, we would get exceptions.
+     *
+     * @param lowerbound if !reset, must be non-null, and marks the exclusive lowerbound of the start for each sstable
+     */
+    private void moveStarts(DecoratedKey lowerbound)
+    {
+<span class="pc bpc" id="L210" title="2 of 4 branches missed.">        if (transaction.isOffline() || preemptiveOpenInterval == Long.MAX_VALUE)</span>
+<span class="nc" id="L211">            return;</span>
+
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        for (SSTableReader sstable : transaction.originals())</span>
+        {
+            // we call getCurrentReplacement() to support multiple rewriters operating over the same source readers at once.
+            // note: only one such writer should be written to at any moment
+<span class="fc" id="L217">            final SSTableReader latest = transaction.current(sstable);</span>
+
+            // skip any sstables that we know to already be shadowed
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">            if (latest.getFirst().compareTo(lowerbound) &gt; 0)</span>
+<span class="nc" id="L221">                continue;</span>
+
+<span class="fc bfc" id="L223" title="All 2 branches covered.">            if (lowerbound.compareTo(latest.getLast()) &gt;= 0)</span>
+            {
+<span class="pc bpc" id="L225" title="1 of 2 branches missed.">                if (!transaction.isObsolete(latest))</span>
+<span class="fc" id="L226">                    transaction.obsolete(latest);</span>
+                continue;
+            }
+
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">            if (!transaction.isObsolete(latest))</span>
+            {
+<span class="fc" id="L232">                DecoratedKey newStart = latest.firstKeyBeyond(lowerbound);</span>
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">                assert newStart != null;</span>
+<span class="fc" id="L234">                SSTableReader replacement = latest.cloneWithNewStart(newStart);</span>
+<span class="fc" id="L235">                transaction.update(replacement, true);</span>
+            }
+<span class="fc" id="L237">        }</span>
+<span class="fc" id="L238">    }</span>
+
+    public void switchWriter(SSTableWriter newWriter)
+    {
+<span class="fc bfc" id="L242" title="All 2 branches covered.">        if (newWriter != null)</span>
+        {
+<span class="fc" id="L244">            newWriter.setMaxDataAge(maxAge);</span>
+<span class="fc" id="L245">            writers.add(newWriter);</span>
+        }
+
+<span class="pc bpc" id="L248" title="1 of 4 branches missed.">        if (eagerWriterMetaRelease &amp;&amp; writer != null)</span>
+<span class="fc" id="L249">            writer.releaseMetadataOverhead();</span>
+
+<span class="pc bpc" id="L251" title="1 of 4 branches missed.">        if (writer == null || writer.getFilePointer() == 0)</span>
+        {
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">            if (writer != null)</span>
+            {
+<span class="nc" id="L255">                writer.abort();</span>
+
+<span class="nc" id="L257">                transaction.untrackNew(writer);</span>
+<span class="nc" id="L258">                writers.remove(writer);</span>
+            }
+<span class="fc" id="L260">            writer = newWriter;</span>
+
+<span class="fc" id="L262">            return;</span>
+        }
+
+        // Open fully completed sstables early. This is also required for the final sstable in a set (where newWriter
+        // is null) to permit the compilation of a canonical set of sstables (see View.select).
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">        if (preemptiveOpenInterval != Long.MAX_VALUE)</span>
+        {
+            // we leave it as a tmp file, but we open it and add it to the Tracker
+<span class="fc" id="L270">            writer.setMaxDataAge(maxAge);</span>
+<span class="fc" id="L271">            SSTableReader reader = writer.openFinalEarly();</span>
+<span class="fc" id="L272">            transaction.update(reader, false);</span>
+<span class="fc" id="L273">            moveStarts(reader.getLast());</span>
+<span class="fc" id="L274">            transaction.checkpoint();</span>
+        }
+
+<span class="fc" id="L277">        currentlyOpenedEarlyAt = 0;</span>
+<span class="fc" id="L278">        bytesWritten += writer.getFilePointer();</span>
+<span class="fc" id="L279">        writer = newWriter;</span>
+<span class="fc" id="L280">    }</span>
+
+    /**
+     * @param repairedAt the repair time, -1 if we should use the time we supplied when we created
+     *                   the SSTableWriter (and called rewriter.switchWriter(..)), actual time if we want to override the
+     *                   repair time.
+     */
+    public SSTableRewriter setRepairedAt(long repairedAt)
+    {
+<span class="nc" id="L289">        this.repairedAt = repairedAt;</span>
+<span class="nc" id="L290">        return this;</span>
+    }
+
+    /**
+     * Finishes the new file(s)
+     *
+     * Creates final files, adds the new files to the Tracker (via replaceReader).
+     *
+     * We add them to the tracker to be able to get rid of the tmpfiles
+     *
+     * It is up to the caller to do the compacted sstables replacement
+     * gymnastics (ie, call Tracker#markCompactedSSTablesReplaced(..))
+     *
+     *
+     */
+    public List&lt;SSTableReader&gt; finish()
+    {
+<span class="nc" id="L307">        super.finish();</span>
+<span class="nc" id="L308">        return finished();</span>
+    }
+
+    // returns, in list form, the
+    public List&lt;SSTableReader&gt; finished()
+    {
+<span class="pc bpc" id="L314" title="3 of 4 branches missed.">        assert state() == State.COMMITTED || state() == State.READY_TO_COMMIT;</span>
+<span class="fc" id="L315">        return preparedForCommit;</span>
+    }
+
+    protected void doPrepare()
+    {
+<span class="fc" id="L320">        switchWriter(null);</span>
+
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">        if (throwEarly)</span>
+<span class="nc" id="L323">            throw new RuntimeException(&quot;exception thrown early in finish, for testing&quot;);</span>
+
+        // No early open to finalize and replace
+<span class="fc bfc" id="L326" title="All 2 branches covered.">        for (SSTableWriter writer : writers)</span>
+        {
+<span class="pc bpc" id="L328" title="1 of 2 branches missed.">            assert writer.getFilePointer() &gt; 0;</span>
+<span class="fc" id="L329">            writer.setRepairedAt(repairedAt);</span>
+<span class="fc" id="L330">            writer.setOpenResult(true);</span>
+<span class="fc" id="L331">            writer.prepareToCommit();</span>
+<span class="fc" id="L332">            SSTableReader reader = writer.finished();</span>
+<span class="fc" id="L333">            transaction.update(reader, false);</span>
+<span class="fc" id="L334">            preparedForCommit.add(reader);</span>
+<span class="fc" id="L335">        }</span>
+<span class="fc" id="L336">        transaction.checkpoint();</span>
+
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">        if (throwLate)</span>
+<span class="nc" id="L339">            throw new RuntimeException(&quot;exception thrown after all sstables finished, for testing&quot;);</span>
+
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">        if (!keepOriginals)</span>
+<span class="fc" id="L342">            transaction.obsoleteOriginals();</span>
+
+<span class="fc" id="L344">        transaction.prepareToCommit();</span>
+<span class="fc" id="L345">    }</span>
+
+    public void throwDuringPrepare(boolean earlyException)
+    {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (earlyException)</span>
+<span class="nc" id="L350">            throwEarly = true;</span>
+        else
+<span class="nc" id="L352">            throwLate = true;</span>
+<span class="nc" id="L353">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,931 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BTreeRow.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">BTreeRow.java</span></div><h1>BTreeRow.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.nio.ByteBuffer;
+
+import java.util.AbstractCollection;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import com.google.common.collect.Collections2;
+import com.google.common.collect.Iterators;
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.Columns;
+import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
+
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.schema.DroppedColumn;
+
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.BiLongAccumulator;
+import org.apache.cassandra.utils.BulkIterator;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.LongAccumulator;
+import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.BTreeSearchIterator;
+import org.apache.cassandra.utils.btree.UpdateFunction;
+import org.apache.cassandra.utils.memory.Cloner;
+
+/**
+ * Immutable implementation of a Row object.
+ */
+public class BTreeRow extends AbstractRow
+{
+<span class="fc" id="L68">    private static final long EMPTY_SIZE = ObjectSizes.measure(emptyRow(Clustering.EMPTY));</span>
+
+    private final Clustering&lt;?&gt; clustering;
+    private final LivenessInfo primaryKeyLivenessInfo;
+    private final Deletion deletion;
+
+    // The data for each columns present in this row in column sorted order.
+    private final Object[] btree;
+
+<span class="fc" id="L77">    private static final ColumnData FIRST_COMPLEX_STATIC = new ComplexColumnData(Columns.FIRST_COMPLEX_STATIC, new Object[0], DeletionTime.build(0, 0));</span>
+<span class="fc" id="L78">    private static final ColumnData FIRST_COMPLEX_REGULAR = new ComplexColumnData(Columns.FIRST_COMPLEX_REGULAR, new Object[0], DeletionTime.build(0, 0));</span>
+<span class="fc" id="L79">    private static final Comparator&lt;ColumnData&gt; COLUMN_COMPARATOR = (cd1, cd2) -&gt; cd1.column.compareTo(cd2.column);</span>
+
+
+    // We need to filter the tombstones of a row on every read (twice in fact: first to remove purgeable tombstone, and then after reconciliation to remove
+    // all tombstone since we don't return them to the client) as well as on compaction. But it's likely that many rows won't have any tombstone at all, so
+    // we want to speed up that case by not having to iterate/copy the row in this case. We could keep a single boolean telling us if we have tombstones,
+    // but that doesn't work for expiring columns. So instead we keep the deletion time for the first thing in the row to be deleted. This allow at any given
+    // time to know if we have any deleted information or not. If we any &quot;true&quot; tombstone (i.e. not an expiring cell), this value will be forced to
+    // Long.MIN_VALUE, but if we don't and have expiring cells, this will the time at which the first expiring cell expires. If we have no tombstones and
+    // no expiring cells, this will be Cell.MAX_DELETION_TIME;
+    private final long minLocalDeletionTime;
+
+    private BTreeRow(Clustering clustering,
+                     LivenessInfo primaryKeyLivenessInfo,
+                     Deletion deletion,
+                     Object[] btree,
+                     long minLocalDeletionTime)
+<span class="fc" id="L96">    {</span>
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        assert !deletion.isShadowedBy(primaryKeyLivenessInfo);</span>
+<span class="fc" id="L98">        this.clustering = clustering;</span>
+<span class="fc" id="L99">        this.primaryKeyLivenessInfo = primaryKeyLivenessInfo;</span>
+<span class="fc" id="L100">        this.deletion = deletion;</span>
+<span class="fc" id="L101">        this.btree = btree;</span>
+<span class="fc" id="L102">        this.minLocalDeletionTime = minLocalDeletionTime;</span>
+<span class="fc" id="L103">    }</span>
+
+    private BTreeRow(Clustering&lt;?&gt; clustering, Object[] btree, long minLocalDeletionTime)
+    {
+<span class="fc" id="L107">        this(clustering, LivenessInfo.EMPTY, Deletion.LIVE, btree, minLocalDeletionTime);</span>
+<span class="fc" id="L108">    }</span>
+
+    // Note that it's often easier/safer to use the sortedBuilder/unsortedBuilder or one of the static creation method below. Only directly useful in a small amount of cases.
+    public static BTreeRow create(Clustering&lt;?&gt; clustering,
+                                  LivenessInfo primaryKeyLivenessInfo,
+                                  Deletion deletion,
+                                  Object[] btree)
+    {
+<span class="fc" id="L116">        long minDeletionTime = Math.min(minDeletionTime(primaryKeyLivenessInfo), minDeletionTime(deletion.time()));</span>
+<span class="fc bfc" id="L117" title="All 2 branches covered.">        if (minDeletionTime != Long.MIN_VALUE)</span>
+        {
+<span class="fc" id="L119">            long result = BTree.&lt;ColumnData&gt;accumulate(btree, (cd, l) -&gt; Math.min(l, minDeletionTime(cd)) , minDeletionTime);</span>
+<span class="fc" id="L120">            minDeletionTime = result;</span>
+        }
+
+<span class="fc" id="L123">        return create(clustering, primaryKeyLivenessInfo, deletion, btree, minDeletionTime);</span>
+    }
+
+    public static BTreeRow create(Clustering&lt;?&gt; clustering,
+                                  LivenessInfo primaryKeyLivenessInfo,
+                                  Deletion deletion,
+                                  Object[] btree,
+                                  long minDeletionTime)
+    {
+<span class="fc" id="L132">        return new BTreeRow(clustering, primaryKeyLivenessInfo, deletion, btree, minDeletionTime);</span>
+    }
+
+    public static BTreeRow emptyRow(Clustering&lt;?&gt; clustering)
+    {
+<span class="fc" id="L137">        return new BTreeRow(clustering, BTree.empty(), Cell.MAX_DELETION_TIME);</span>
+    }
+
+    public static BTreeRow singleCellRow(Clustering&lt;?&gt; clustering, Cell&lt;?&gt; cell)
+    {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (cell.column().isSimple())</span>
+<span class="nc" id="L143">            return new BTreeRow(clustering, BTree.singleton(cell), minDeletionTime(cell));</span>
+
+<span class="nc" id="L145">        ComplexColumnData complexData = new ComplexColumnData(cell.column(), new Cell&lt;?&gt;[]{ cell }, DeletionTime.LIVE);</span>
+<span class="nc" id="L146">        return new BTreeRow(clustering, BTree.singleton(complexData), minDeletionTime(cell));</span>
+    }
+
+    public static BTreeRow emptyDeletedRow(Clustering&lt;?&gt; clustering, Deletion deletion)
+    {
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">        assert !deletion.isLive();</span>
+<span class="fc" id="L152">        return new BTreeRow(clustering, LivenessInfo.EMPTY, deletion, BTree.empty(), Long.MIN_VALUE);</span>
+    }
+
+    public static BTreeRow noCellLiveRow(Clustering&lt;?&gt; clustering, LivenessInfo primaryKeyLivenessInfo)
+    {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        assert !primaryKeyLivenessInfo.isEmpty();</span>
+<span class="nc" id="L158">        return new BTreeRow(clustering,</span>
+                            primaryKeyLivenessInfo,
+                            Deletion.LIVE,
+<span class="nc" id="L161">                            BTree.empty(),</span>
+<span class="nc" id="L162">                            minDeletionTime(primaryKeyLivenessInfo));</span>
+    }
+
+    private static long minDeletionTime(Cell&lt;?&gt; cell)
+    {
+<span class="fc bfc" id="L167" title="All 2 branches covered.">        return cell.isTombstone() ? Long.MIN_VALUE : cell.localDeletionTime();</span>
+    }
+
+    private static long minDeletionTime(LivenessInfo info)
+    {
+<span class="fc bfc" id="L172" title="All 2 branches covered.">        return info.isExpiring() ? info.localExpirationTime() : Cell.MAX_DELETION_TIME;</span>
+    }
+
+    private static long minDeletionTime(DeletionTime dt)
+    {
+<span class="fc bfc" id="L177" title="All 2 branches covered.">        return dt.isLive() ? Cell.MAX_DELETION_TIME : Long.MIN_VALUE;</span>
+    }
+
+    private static long minDeletionTime(ComplexColumnData cd)
+    {
+<span class="fc" id="L182">        long min = minDeletionTime(cd.complexDeletion());</span>
+<span class="fc bfc" id="L183" title="All 2 branches covered.">        for (Cell&lt;?&gt; cell : cd)</span>
+        {
+<span class="fc" id="L185">            min = Math.min(min, minDeletionTime(cell));</span>
+<span class="fc bfc" id="L186" title="All 2 branches covered.">            if (min == Long.MIN_VALUE)</span>
+<span class="fc" id="L187">                break;</span>
+<span class="fc" id="L188">        }</span>
+<span class="fc" id="L189">        return min;</span>
+    }
+
+    private static long minDeletionTime(ColumnData cd)
+    {
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        return cd.column().isSimple() ? minDeletionTime((Cell&lt;?&gt;) cd) : minDeletionTime((ComplexColumnData)cd);</span>
+    }
+
+    public void apply(Consumer&lt;ColumnData&gt; function)
+    {
+<span class="fc" id="L199">        BTree.apply(btree, function);</span>
+<span class="fc" id="L200">    }</span>
+
+    public &lt;A&gt; void apply(BiConsumer&lt;A, ColumnData&gt; function, A arg)
+    {
+<span class="fc" id="L204">        BTree.apply(btree, function, arg);</span>
+<span class="fc" id="L205">    }</span>
+
+    public long accumulate(LongAccumulator&lt;ColumnData&gt; accumulator, long initialValue)
+    {
+<span class="fc" id="L209">        return BTree.accumulate(btree, accumulator, initialValue);</span>
+    }
+
+    public long accumulate(LongAccumulator&lt;ColumnData&gt; accumulator, Comparator&lt;ColumnData&gt; comparator, ColumnData from, long initialValue)
+    {
+<span class="fc" id="L214">        return BTree.accumulate(btree, accumulator, comparator, from, initialValue);</span>
+    }
+
+    public &lt;A&gt; long accumulate(BiLongAccumulator&lt;A, ColumnData&gt; accumulator, A arg, long initialValue)
+    {
+<span class="fc" id="L219">        return BTree.accumulate(btree, accumulator, arg, initialValue);</span>
+    }
+
+    public &lt;A&gt; long accumulate(BiLongAccumulator&lt;A, ColumnData&gt; accumulator, A arg, Comparator&lt;ColumnData&gt; comparator, ColumnData from, long initialValue)
+    {
+<span class="nc" id="L224">        return BTree.accumulate(btree, accumulator, arg, comparator, from, initialValue);</span>
+    }
+
+    private static long minDeletionTime(Object[] btree, LivenessInfo info, DeletionTime rowDeletion)
+    {
+<span class="fc" id="L229">        long min = Math.min(minDeletionTime(info), minDeletionTime(rowDeletion));</span>
+<span class="fc" id="L230">        return BTree.&lt;ColumnData&gt;accumulate(btree, (cd, l) -&gt; Math.min(l, minDeletionTime(cd)), min);</span>
+    }
+
+    public Clustering&lt;?&gt; clustering()
+    {
+<span class="fc" id="L235">        return clustering;</span>
+    }
+
+    public Collection&lt;ColumnMetadata&gt; columns()
+    {
+<span class="fc" id="L240">        return Collections2.transform(columnData(), ColumnData::column);</span>
+    }
+
+    public int columnCount()
+    {
+<span class="fc" id="L245">        return BTree.size(btree);</span>
+    }
+
+    public LivenessInfo primaryKeyLivenessInfo()
+    {
+<span class="fc" id="L250">        return primaryKeyLivenessInfo;</span>
+    }
+
+    public boolean isEmpty()
+    {
+<span class="fc bfc" id="L255" title="All 2 branches covered.">        return primaryKeyLivenessInfo().isEmpty()</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">               &amp;&amp; deletion().isLive()</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">               &amp;&amp; BTree.isEmpty(btree);</span>
+    }
+
+    public Deletion deletion()
+    {
+<span class="fc" id="L262">        return deletion;</span>
+    }
+
+    public Cell&lt;?&gt; getCell(ColumnMetadata c)
+    {
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">        assert !c.isComplex();</span>
+<span class="fc" id="L268">        return (Cell&lt;?&gt;) BTree.&lt;Object&gt;find(btree, ColumnMetadata.asymmetricColumnDataComparator, c);</span>
+    }
+
+    public Cell&lt;?&gt; getCell(ColumnMetadata c, CellPath path)
+    {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        assert c.isComplex();</span>
+<span class="nc" id="L274">        ComplexColumnData cd = getComplexColumnData(c);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (cd == null)</span>
+<span class="nc" id="L276">            return null;</span>
+<span class="nc" id="L277">        return cd.getCell(path);</span>
+    }
+
+    public ComplexColumnData getComplexColumnData(ColumnMetadata c)
+    {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        assert c.isComplex();</span>
+<span class="nc" id="L283">        return (ComplexColumnData) getColumnData(c);</span>
+    }
+
+    public ColumnData getColumnData(ColumnMetadata c)
+    {
+<span class="fc" id="L288">        return (ColumnData) BTree.&lt;Object&gt;find(btree, ColumnMetadata.asymmetricColumnDataComparator, c);</span>
+    }
+
+    @Override
+    public Collection&lt;ColumnData&gt; columnData()
+    {
+<span class="fc" id="L294">        return new AbstractCollection&lt;ColumnData&gt;()</span>
+<span class="fc" id="L295">        {</span>
+<span class="fc" id="L296">            @Override public Iterator&lt;ColumnData&gt; iterator() { return BTreeRow.this.iterator(); }</span>
+<span class="fc" id="L297">            @Override public int size() { return BTree.size(btree); }</span>
+        };
+    }
+
+    public Iterator&lt;ColumnData&gt; iterator()
+    {
+<span class="fc" id="L303">        return searchIterator();</span>
+    }
+
+    public Iterable&lt;Cell&lt;?&gt;&gt; cells()
+    {
+<span class="fc" id="L308">        return CellIterator::new;</span>
+    }
+
+    public BTreeSearchIterator&lt;ColumnMetadata, ColumnData&gt; searchIterator()
+    {
+<span class="fc" id="L313">        return BTree.slice(btree, ColumnMetadata.asymmetricColumnDataComparator, BTree.Dir.ASC);</span>
+    }
+
+    public Row filter(ColumnFilter filter, TableMetadata metadata)
+    {
+<span class="fc" id="L318">        return filter(filter, DeletionTime.LIVE, false, metadata);</span>
+    }
+
+    public Row filter(ColumnFilter filter, DeletionTime activeDeletion, boolean setActiveDeletionToRow, TableMetadata metadata)
+    {
+<span class="fc" id="L323">        Map&lt;ByteBuffer, DroppedColumn&gt; droppedColumns = metadata.droppedColumns;</span>
+
+<span class="fc bfc" id="L325" title="All 4 branches covered.">        boolean mayFilterColumns = !filter.fetchesAllColumns(isStatic()) || !filter.allFetchedColumnsAreQueried();</span>
+        // When merging sstable data in Row.Merger#merge(), rowDeletion is removed if it doesn't supersede activeDeletion.
+<span class="fc bfc" id="L327" title="All 4 branches covered.">        boolean mayHaveShadowed = !activeDeletion.isLive() &amp;&amp; !deletion.time().supersedes(activeDeletion);</span>
+
+<span class="fc bfc" id="L329" title="All 6 branches covered.">        if (!mayFilterColumns &amp;&amp; !mayHaveShadowed &amp;&amp; droppedColumns.isEmpty())</span>
+<span class="fc" id="L330">            return this;</span>
+
+
+<span class="fc" id="L333">        LivenessInfo newInfo = primaryKeyLivenessInfo;</span>
+<span class="fc" id="L334">        Deletion newDeletion = deletion;</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">        if (mayHaveShadowed)</span>
+        {
+<span class="fc bfc" id="L337" title="All 2 branches covered.">            if (activeDeletion.deletes(newInfo.timestamp()))</span>
+<span class="fc" id="L338">                newInfo = LivenessInfo.EMPTY;</span>
+            // note that mayHaveShadowed means the activeDeletion shadows the row deletion. So if don't have setActiveDeletionToRow,
+            // the row deletion is shadowed and we shouldn't return it.
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">            newDeletion = setActiveDeletionToRow ? Deletion.regular(activeDeletion) : Deletion.LIVE;</span>
+        }
+
+<span class="fc" id="L344">        Columns columns = filter.fetchedColumns().columns(isStatic());</span>
+<span class="fc" id="L345">        Predicate&lt;ColumnMetadata&gt; inclusionTester = columns.inOrderInclusionTester();</span>
+<span class="fc" id="L346">        Predicate&lt;ColumnMetadata&gt; queriedByUserTester = filter.queriedColumns().columns(isStatic()).inOrderInclusionTester();</span>
+<span class="fc" id="L347">        final LivenessInfo rowLiveness = newInfo;</span>
+<span class="fc" id="L348">        return transformAndFilter(newInfo, newDeletion, (cd) -&gt; {</span>
+
+<span class="fc" id="L350">            ColumnMetadata column = cd.column();</span>
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">            if (!inclusionTester.test(column))</span>
+<span class="nc" id="L352">                return null;</span>
+
+<span class="fc" id="L354">            DroppedColumn dropped = droppedColumns.get(column.name.bytes);</span>
+<span class="fc bfc" id="L355" title="All 2 branches covered.">            if (column.isComplex())</span>
+<span class="fc bfc" id="L356" title="All 2 branches covered.">                return ((ComplexColumnData) cd).filter(filter, mayHaveShadowed ? activeDeletion : DeletionTime.LIVE, dropped, rowLiveness);</span>
+
+<span class="fc" id="L358">            Cell&lt;?&gt; cell = (Cell&lt;?&gt;) cd;</span>
+            // We include the cell unless it is 1) shadowed, 2) for a dropped column or 3) skippable.
+            // And a cell is skippable if it is for a column that is not queried by the user and its timestamp
+            // is lower than the row timestamp (see #10657 or SerializationHelper.includes() for details).
+<span class="pc bpc" id="L362" title="3 of 4 branches missed.">            boolean isForDropped = dropped != null &amp;&amp; cell.timestamp() &lt;= dropped.droppedTime;</span>
+<span class="fc bfc" id="L363" title="All 4 branches covered.">            boolean isShadowed = mayHaveShadowed &amp;&amp; activeDeletion.deletes(cell);</span>
+<span class="fc bfc" id="L364" title="All 2 branches covered.">            boolean isSkippable = !queriedByUserTester.test(column);</span>
+
+<span class="pc bpc" id="L366" title="1 of 8 branches missed.">            if (isForDropped || isShadowed || (isSkippable &amp;&amp; cell.timestamp() &lt; rowLiveness.timestamp()))</span>
+<span class="fc" id="L367">                return null;</span>
+
+            // We should apply the same &quot;optimization&quot; as in Cell.deserialize to avoid discrepances
+            // between sstables and memtables data, i.e resulting in a digest mismatch.
+<span class="fc bfc" id="L371" title="All 2 branches covered.">            return isSkippable ? cell.withSkippedValue() : cell;</span>
+        });
+    }
+
+    public Row withOnlyQueriedData(ColumnFilter filter)
+    {
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        if (filter.allFetchedColumnsAreQueried())</span>
+<span class="nc" id="L378">            return this;</span>
+
+<span class="fc" id="L380">        return transformAndFilter(primaryKeyLivenessInfo, deletion, (cd) -&gt; {</span>
+
+<span class="fc" id="L382">            ColumnMetadata column = cd.column();</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">            if (column.isComplex())</span>
+<span class="nc" id="L384">                return ((ComplexColumnData)cd).withOnlyQueriedData(filter);</span>
+
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">            return filter.fetchedColumnIsQueried(column) ? cd : null;</span>
+        });
+    }
+
+    public boolean hasComplex()
+    {
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        if (BTree.isEmpty(btree))</span>
+<span class="nc" id="L393">            return false;</span>
+
+<span class="nc" id="L395">        int size = BTree.size(btree);</span>
+<span class="nc" id="L396">        ColumnData last = BTree.findByIndex(btree, size - 1);</span>
+<span class="nc" id="L397">        return last.column.isComplex();</span>
+    }
+
+    public boolean hasComplexDeletion()
+    {
+<span class="fc bfc" id="L402" title="All 2 branches covered.">        long result = accumulate((cd, v) -&gt; ((ComplexColumnData) cd).complexDeletion().isLive() ? 0 : Cell.MAX_DELETION_TIME,</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">                                 COLUMN_COMPARATOR, isStatic() ? FIRST_COMPLEX_STATIC : FIRST_COMPLEX_REGULAR, 0L);</span>
+<span class="fc bfc" id="L404" title="All 2 branches covered.">        return result == Cell.MAX_DELETION_TIME;</span>
+    }
+
+    public Row markCounterLocalToBeCleared()
+    {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        return transform((cd) -&gt; cd.column().isCounterColumn() ? cd.markCounterLocalToBeCleared()</span>
+<span class="nc" id="L410">                                                               : cd);</span>
+    }
+
+    public boolean hasDeletion(long nowInSec)
+    {
+<span class="fc bfc" id="L415" title="All 2 branches covered.">        return nowInSec &gt;= minLocalDeletionTime;</span>
+    }
+
+    public boolean hasInvalidDeletions()
+    {
+<span class="pc bpc" id="L420" title="2 of 6 branches missed.">        if (primaryKeyLivenessInfo().isExpiring() &amp;&amp; (primaryKeyLivenessInfo().ttl() &lt; 0 || primaryKeyLivenessInfo().localExpirationTime() &lt; 0))</span>
+<span class="nc" id="L421">            return true;</span>
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">        if (!deletion().time().validate())</span>
+<span class="nc" id="L423">            return true;</span>
+<span class="pc bpc" id="L424" title="2 of 4 branches missed.">        return accumulate((cd, v) -&gt; cd.hasInvalidDeletions() ? Cell.MAX_DELETION_TIME : v, 0) != 0;</span>
+    }
+
+    /**
+     * Returns a copy of the row where all timestamps for live data have replaced by {@code newTimestamp} and
+     * all deletion timestamp by {@code newTimestamp - 1}.
+     *
+     * This exists for the Paxos path, see {@link PartitionUpdate#updateAllTimestamp} for additional details.
+     */
+    public Row updateAllTimestamp(long newTimestamp)
+    {
+<span class="fc bfc" id="L435" title="All 2 branches covered.">        LivenessInfo newInfo = primaryKeyLivenessInfo.isEmpty() ? primaryKeyLivenessInfo : primaryKeyLivenessInfo.withUpdatedTimestamp(newTimestamp);</span>
+        // If the deletion is shadowable and the row has a timestamp, we'll forced the deletion timestamp to be less than the row one, so we
+        // should get rid of said deletion.
+<span class="pc bpc" id="L438" title="5 of 6 branches missed.">        Deletion newDeletion = deletion.isLive() || (deletion.isShadowable() &amp;&amp; !primaryKeyLivenessInfo.isEmpty())</span>
+<span class="fc" id="L439">                             ? Deletion.LIVE</span>
+<span class="pc" id="L440">                             : new Deletion(DeletionTime.build(newTimestamp - 1, deletion.time().localDeletionTime()), deletion.isShadowable());</span>
+
+<span class="fc" id="L442">        return transformAndFilter(newInfo, newDeletion, (cd) -&gt; cd.updateAllTimestamp(newTimestamp));</span>
+    }
+
+    public Row withRowDeletion(DeletionTime newDeletion)
+    {
+        // Note that:
+        //  - it is a contract with the caller that the new deletion shouldn't shadow anything in
+        //    the row, and so in particular it can't shadow the row deletion. So if there is a
+        //    already a row deletion we have nothing to do.
+        //  - we set the minLocalDeletionTime to MIN_VALUE because we know the deletion is live
+<span class="fc bfc" id="L452" title="All 4 branches covered.">        return newDeletion.isLive() || !deletion.isLive()</span>
+<span class="fc" id="L453">             ? this</span>
+<span class="fc" id="L454">             : new BTreeRow(clustering, primaryKeyLivenessInfo, Deletion.regular(newDeletion), btree, Long.MIN_VALUE);</span>
+    }
+
+    public Row purge(DeletionPurger purger, long nowInSec, boolean enforceStrictLiveness)
+    {
+<span class="fc bfc" id="L459" title="All 2 branches covered.">        if (!hasDeletion(nowInSec))</span>
+<span class="fc" id="L460">            return this;</span>
+
+<span class="fc bfc" id="L462" title="All 2 branches covered.">        LivenessInfo newInfo = purger.shouldPurge(primaryKeyLivenessInfo, nowInSec) ? LivenessInfo.EMPTY : primaryKeyLivenessInfo;</span>
+<span class="fc bfc" id="L463" title="All 2 branches covered.">        Deletion newDeletion = purger.shouldPurge(deletion.time()) ? Deletion.LIVE : deletion;</span>
+
+        // when enforceStrictLiveness is set, a row is considered dead when it's PK liveness info is not present
+<span class="pc bpc" id="L466" title="5 of 6 branches missed.">        if (enforceStrictLiveness &amp;&amp; newDeletion.isLive() &amp;&amp; newInfo.isEmpty())</span>
+<span class="nc" id="L467">            return null;</span>
+
+<span class="fc" id="L469">        return transformAndFilter(newInfo, newDeletion, (cd) -&gt; cd.purge(purger, nowInSec));</span>
+    }
+
+    public Row purgeDataOlderThan(long timestamp, boolean enforceStrictLiveness)
+    {
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        LivenessInfo newInfo = primaryKeyLivenessInfo.timestamp() &lt; timestamp ? LivenessInfo.EMPTY : primaryKeyLivenessInfo;</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        Deletion newDeletion = deletion.time().markedForDeleteAt() &lt; timestamp ? Deletion.LIVE : deletion;</span>
+
+        // when enforceStrictLiveness is set, a row is considered dead when it's PK liveness info is not present
+<span class="nc bnc" id="L478" title="All 6 branches missed.">        if (enforceStrictLiveness &amp;&amp; newDeletion.isLive() &amp;&amp; newInfo.isEmpty())</span>
+<span class="nc" id="L479">            return null;</span>
+
+<span class="nc" id="L481">        return transformAndFilter(newInfo, newDeletion, cd -&gt; cd.purgeDataOlderThan(timestamp));</span>
+    }
+
+    @Override
+    public Row transformAndFilter(LivenessInfo info, Deletion deletion, Function&lt;ColumnData, ColumnData&gt; function)
+    {
+<span class="fc" id="L487">        return update(info, deletion, BTree.transformAndFilter(btree, function));</span>
+    }
+
+    private Row update(LivenessInfo info, Deletion deletion, Object[] newTree)
+    {
+<span class="pc bpc" id="L492" title="1 of 6 branches missed.">        if (btree == newTree &amp;&amp; info == this.primaryKeyLivenessInfo &amp;&amp; deletion == this.deletion)</span>
+<span class="fc" id="L493">            return this;</span>
+
+<span class="pc bpc" id="L495" title="1 of 6 branches missed.">        if (info.isEmpty() &amp;&amp; deletion.isLive() &amp;&amp; BTree.isEmpty(newTree))</span>
+<span class="fc" id="L496">            return null;</span>
+
+<span class="fc" id="L498">        long minDeletionTime = minDeletionTime(newTree, info, deletion.time());</span>
+<span class="fc" id="L499">        return BTreeRow.create(clustering, info, deletion, newTree, minDeletionTime);</span>
+    }
+
+    @Override
+    public Row transformAndFilter(Function&lt;ColumnData, ColumnData&gt; function)
+    {
+<span class="nc" id="L505">        return transformAndFilter(primaryKeyLivenessInfo, deletion, function);</span>
+    }
+
+    public Row transform(Function&lt;ColumnData, ColumnData&gt; function)
+    {
+<span class="nc" id="L510">        return update(primaryKeyLivenessInfo, deletion, BTree.transform(btree, function));</span>
+    }
+
+    @Override
+    public Row clone(Cloner cloner)
+    {
+<span class="fc" id="L516">        Object[] tree = BTree.&lt;ColumnData, ColumnData&gt;transform(btree, c -&gt; c.clone(cloner));</span>
+<span class="fc" id="L517">        return BTreeRow.create(cloner.clone(clustering), primaryKeyLivenessInfo, deletion, tree);</span>
+    }
+
+    public int dataSize()
+    {
+<span class="fc" id="L522">        int dataSize = clustering.dataSize()</span>
+<span class="fc" id="L523">                     + primaryKeyLivenessInfo.dataSize()</span>
+<span class="fc" id="L524">                     + deletion.dataSize();</span>
+
+<span class="fc" id="L526">        return Ints.checkedCast(accumulate((cd, v) -&gt; v + cd.dataSize(), dataSize));</span>
+    }
+
+    @Override
+    public long unsharedHeapSize()
+    {
+<span class="fc" id="L532">        long heapSize = EMPTY_SIZE</span>
+<span class="fc" id="L533">                        + clustering.unsharedHeapSize()</span>
+<span class="fc" id="L534">                        + primaryKeyLivenessInfo.unsharedHeapSize()</span>
+<span class="fc" id="L535">                        + deletion.unsharedHeapSize()</span>
+<span class="fc" id="L536">                        + BTree.sizeOfStructureOnHeap(btree);</span>
+
+<span class="fc" id="L538">        return accumulate((cd, v) -&gt; v + cd.unsharedHeapSize(), heapSize);</span>
+    }
+
+    @Override
+    public long unsharedHeapSizeExcludingData()
+    {
+<span class="fc" id="L544">        long heapSize = EMPTY_SIZE</span>
+<span class="fc" id="L545">                        + clustering.unsharedHeapSizeExcludingData()</span>
+<span class="fc" id="L546">                        + primaryKeyLivenessInfo.unsharedHeapSize()</span>
+<span class="fc" id="L547">                        + deletion.unsharedHeapSize()</span>
+<span class="fc" id="L548">                        + BTree.sizeOfStructureOnHeap(btree);</span>
+
+<span class="fc" id="L550">        return accumulate((cd, v) -&gt; v + cd.unsharedHeapSizeExcludingData(), heapSize);</span>
+    }
+
+    public static Row.Builder sortedBuilder()
+    {
+<span class="fc" id="L555">        return new Builder(true);</span>
+    }
+
+    public static Row.Builder unsortedBuilder()
+    {
+<span class="fc" id="L560">        return new Builder(false);</span>
+    }
+
+    // This is only used by PartitionUpdate.CounterMark but other uses should be avoided as much as possible as it breaks our general
+    // assumption that Row objects are immutable. This method should go away post-#6506 in particular.
+    // This method is in particular not exposed by the Row API on purpose.
+    // This method also *assumes* that the cell we're setting already exists.
+    public void setValue(ColumnMetadata column, CellPath path, ByteBuffer value)
+    {
+<span class="fc" id="L569">        ColumnData current = (ColumnData) BTree.&lt;Object&gt;find(btree, ColumnMetadata.asymmetricColumnDataComparator, column);</span>
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">        if (column.isSimple())</span>
+<span class="fc" id="L571">            BTree.replaceInSitu(btree, ColumnData.comparator, current, ((Cell&lt;?&gt;) current).withUpdatedValue(value));</span>
+        else
+<span class="nc" id="L573">            ((ComplexColumnData) current).setValue(path, value);</span>
+<span class="fc" id="L574">    }</span>
+
+    public Iterable&lt;Cell&lt;?&gt;&gt; cellsInLegacyOrder(TableMetadata metadata, boolean reversed)
+    {
+<span class="nc" id="L578">        return () -&gt; new CellInLegacyOrderIterator(metadata, reversed);</span>
+    }
+
+    public static Row merge(BTreeRow existing,
+                            BTreeRow update,
+                            ColumnData.PostReconciliationFunction reconcileF)
+    {
+<span class="fc" id="L585">        Object[] existingBtree = existing.btree;</span>
+<span class="fc" id="L586">        Object[] updateBtree = update.btree;</span>
+
+<span class="fc" id="L588">        LivenessInfo existingInfo = existing.primaryKeyLivenessInfo();</span>
+<span class="fc" id="L589">        LivenessInfo updateInfo = update.primaryKeyLivenessInfo();</span>
+<span class="fc bfc" id="L590" title="All 2 branches covered.">        LivenessInfo livenessInfo = existingInfo.supersedes(updateInfo) ? existingInfo : updateInfo;</span>
+
+<span class="fc bfc" id="L592" title="All 2 branches covered.">        Row.Deletion rowDeletion = existing.deletion().supersedes(update.deletion()) ? existing.deletion() : update.deletion();</span>
+
+<span class="fc bfc" id="L594" title="All 2 branches covered.">        if (rowDeletion.deletes(livenessInfo))</span>
+<span class="fc" id="L595">            livenessInfo = LivenessInfo.EMPTY;</span>
+<span class="pc bpc" id="L596" title="1 of 2 branches missed.">        else if (rowDeletion.isShadowedBy(livenessInfo))</span>
+<span class="nc" id="L597">            rowDeletion = Row.Deletion.LIVE;</span>
+
+<span class="fc" id="L599">        DeletionTime deletion = rowDeletion.time();</span>
+<span class="fc" id="L600">        try (ColumnData.Reconciler reconciler = ColumnData.reconciler(reconcileF, deletion))</span>
+        {
+<span class="fc bfc" id="L602" title="All 2 branches covered.">            if (!rowDeletion.isLive())</span>
+            {
+<span class="fc bfc" id="L604" title="All 2 branches covered.">                if (rowDeletion == existing.deletion())</span>
+                {
+<span class="fc" id="L606">                    updateBtree = BTree.transformAndFilter(updateBtree, reconciler::retain);</span>
+                }
+                else
+                {
+<span class="fc" id="L610">                    existingBtree = BTree.transformAndFilter(existingBtree, reconciler::retain);</span>
+                }
+            }
+<span class="fc" id="L613">            Object[] tree = BTree.update(existingBtree, updateBtree, ColumnData.comparator, reconciler);</span>
+<span class="fc" id="L614">            return new BTreeRow(existing.clustering, livenessInfo, rowDeletion, tree, minDeletionTime(tree, livenessInfo, deletion));</span>
+        }
+    }
+
+<span class="fc" id="L618">    private class CellIterator extends AbstractIterator&lt;Cell&lt;?&gt;&gt;</span>
+    {
+<span class="fc" id="L620">        private Iterator&lt;ColumnData&gt; columnData = iterator();</span>
+        private Iterator&lt;Cell&lt;?&gt;&gt; complexCells;
+
+        protected Cell&lt;?&gt; computeNext()
+        {
+            while (true)
+            {
+<span class="fc bfc" id="L627" title="All 2 branches covered.">                if (complexCells != null)</span>
+                {
+<span class="fc bfc" id="L629" title="All 2 branches covered.">                    if (complexCells.hasNext())</span>
+<span class="fc" id="L630">                        return complexCells.next();</span>
+
+<span class="fc" id="L632">                    complexCells = null;</span>
+                }
+
+<span class="fc bfc" id="L635" title="All 2 branches covered.">                if (!columnData.hasNext())</span>
+<span class="fc" id="L636">                    return endOfData();</span>
+
+<span class="fc" id="L638">                ColumnData cd = columnData.next();</span>
+<span class="fc bfc" id="L639" title="All 2 branches covered.">                if (cd.column().isComplex())</span>
+<span class="fc" id="L640">                    complexCells = ((ComplexColumnData)cd).iterator();</span>
+                else
+<span class="fc" id="L642">                    return (Cell&lt;?&gt;)cd;</span>
+<span class="fc" id="L643">            }</span>
+        }
+    }
+
+    private class CellInLegacyOrderIterator extends AbstractIterator&lt;Cell&lt;?&gt;&gt;
+    {
+        private final Comparator&lt;ByteBuffer&gt; comparator;
+        private final boolean reversed;
+        private final int firstComplexIdx;
+        private int simpleIdx;
+        private int complexIdx;
+        private Iterator&lt;Cell&lt;?&gt;&gt; complexCells;
+        private final Object[] data;
+
+        private CellInLegacyOrderIterator(TableMetadata metadata, boolean reversed)
+<span class="nc" id="L658">        {</span>
+<span class="nc" id="L659">            AbstractType&lt;?&gt; nameComparator = UTF8Type.instance;</span>
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            this.comparator = reversed ? Collections.reverseOrder(nameComparator) : nameComparator;</span>
+<span class="nc" id="L661">            this.reversed = reversed;</span>
+
+            // copy btree into array for simple separate iteration of simple and complex columns
+<span class="nc" id="L664">            this.data = new Object[BTree.size(btree)];</span>
+<span class="nc" id="L665">            BTree.toArray(btree, data, 0);</span>
+
+<span class="nc" id="L667">            int idx = Iterators.indexOf(Iterators.forArray(data), cd -&gt; cd instanceof ComplexColumnData);</span>
+<span class="nc bnc" id="L668" title="All 2 branches missed.">            this.firstComplexIdx = idx &lt; 0 ? data.length : idx;</span>
+<span class="nc" id="L669">            this.complexIdx = firstComplexIdx;</span>
+<span class="nc" id="L670">        }</span>
+
+        private int getSimpleIdx()
+        {
+<span class="nc bnc" id="L674" title="All 2 branches missed.">            return reversed ? firstComplexIdx - simpleIdx - 1 : simpleIdx;</span>
+        }
+
+        private int getSimpleIdxAndIncrement()
+        {
+<span class="nc" id="L679">            int idx = getSimpleIdx();</span>
+<span class="nc" id="L680">            ++simpleIdx;</span>
+<span class="nc" id="L681">            return idx;</span>
+        }
+
+        private int getComplexIdx()
+        {
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            return reversed ? data.length + firstComplexIdx - complexIdx - 1 : complexIdx;</span>
+        }
+
+        private int getComplexIdxAndIncrement()
+        {
+<span class="nc" id="L691">            int idx = getComplexIdx();</span>
+<span class="nc" id="L692">            ++complexIdx;</span>
+<span class="nc" id="L693">            return idx;</span>
+        }
+
+        private Iterator&lt;Cell&lt;?&gt;&gt; makeComplexIterator(Object complexData)
+        {
+<span class="nc" id="L698">            ComplexColumnData ccd = (ComplexColumnData)complexData;</span>
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            return reversed ? ccd.reverseIterator() : ccd.iterator();</span>
+        }
+
+        protected Cell&lt;?&gt; computeNext()
+        {
+            while (true)
+            {
+<span class="nc bnc" id="L706" title="All 2 branches missed.">                if (complexCells != null)</span>
+                {
+<span class="nc bnc" id="L708" title="All 2 branches missed.">                    if (complexCells.hasNext())</span>
+<span class="nc" id="L709">                        return complexCells.next();</span>
+
+<span class="nc" id="L711">                    complexCells = null;</span>
+                }
+
+<span class="nc bnc" id="L714" title="All 2 branches missed.">                if (simpleIdx &gt;= firstComplexIdx)</span>
+                {
+<span class="nc bnc" id="L716" title="All 2 branches missed.">                    if (complexIdx &gt;= data.length)</span>
+<span class="nc" id="L717">                        return endOfData();</span>
+
+<span class="nc" id="L719">                    complexCells = makeComplexIterator(data[getComplexIdxAndIncrement()]);</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L723" title="All 2 branches missed.">                    if (complexIdx &gt;= data.length)</span>
+<span class="nc" id="L724">                        return (Cell&lt;?&gt;)data[getSimpleIdxAndIncrement()];</span>
+
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                    if (comparator.compare(((ColumnData) data[getSimpleIdx()]).column().name.bytes, ((ColumnData) data[getComplexIdx()]).column().name.bytes) &lt; 0)</span>
+<span class="nc" id="L727">                        return (Cell&lt;?&gt;)data[getSimpleIdxAndIncrement()];</span>
+                    else
+<span class="nc" id="L729">                        complexCells = makeComplexIterator(data[getComplexIdxAndIncrement()]);</span>
+                }
+            }
+        }
+    }
+
+<span class="fc" id="L735">    public static class Builder implements Row.Builder</span>
+    {
+        // a simple marker class that will sort to the beginning of a run of complex cells to store the deletion time
+        private static class ComplexColumnDeletion extends BufferCell
+        {
+            public ComplexColumnDeletion(ColumnMetadata column, DeletionTime deletionTime)
+            {
+<span class="fc" id="L742">                super(column, deletionTime.markedForDeleteAt(), 0, deletionTime.localDeletionTime(), ByteBufferUtil.EMPTY_BYTE_BUFFER, CellPath.BOTTOM);</span>
+<span class="fc" id="L743">            }</span>
+        }
+
+        // converts a run of Cell with equal column into a ColumnData
+        private static class CellResolver implements BTree.Builder.Resolver
+        {
+<span class="fc" id="L749">            static final CellResolver instance = new CellResolver();</span>
+
+            public ColumnData resolve(Object[] cells, int lb, int ub)
+            {
+<span class="fc" id="L753">                Cell&lt;?&gt; cell = (Cell&lt;?&gt;) cells[lb];</span>
+<span class="fc" id="L754">                ColumnMetadata column = cell.column;</span>
+<span class="fc bfc" id="L755" title="All 2 branches covered.">                if (cell.column.isSimple())</span>
+                {
+<span class="pc bpc" id="L757" title="1 of 2 branches missed.">                    while (++lb &lt; ub)</span>
+<span class="nc" id="L758">                        cell = Cells.reconcile(cell, (Cell&lt;?&gt;) cells[lb]);</span>
+<span class="fc" id="L759">                    return cell;</span>
+                }
+
+                // TODO: relax this in the case our outer provider is sorted (want to delay until remaining changes are
+                // bedded in, as less important; galloping makes it pretty cheap anyway)
+<span class="fc" id="L764">                Arrays.sort(cells, lb, ub, (Comparator&lt;Object&gt;) column.cellComparator());</span>
+<span class="fc" id="L765">                DeletionTime deletion = DeletionTime.LIVE;</span>
+                // Deal with complex deletion (for which we've use &quot;fake&quot; ComplexColumnDeletion cells that we need to remove).
+                // Note that in almost all cases we'll at most one of those fake cell, but the contract of {{Row.Builder.addComplexDeletion}}
+                // does not forbid it being called twice (especially in the unsorted case) and this can actually happen when reading
+                // legacy sstables (see #10743).
+<span class="pc bpc" id="L770" title="1 of 2 branches missed.">                while (lb &lt; ub)</span>
+                {
+<span class="fc" id="L772">                    cell = (Cell&lt;?&gt;) cells[lb];</span>
+<span class="fc bfc" id="L773" title="All 2 branches covered.">                    if (!(cell instanceof ComplexColumnDeletion))</span>
+<span class="fc" id="L774">                        break;</span>
+
+<span class="pc bpc" id="L776" title="1 of 2 branches missed.">                    if (cell.timestamp() &gt; deletion.markedForDeleteAt())</span>
+<span class="fc" id="L777">                        deletion = DeletionTime.build(cell.timestamp(), cell.localDeletionTime());</span>
+<span class="fc" id="L778">                    lb++;</span>
+                }
+
+<span class="fc" id="L781">                Object[] buildFrom = new Object[ub - lb];</span>
+<span class="fc" id="L782">                int buildFromCount = 0;</span>
+<span class="fc" id="L783">                Cell&lt;?&gt; previous = null;</span>
+<span class="fc bfc" id="L784" title="All 2 branches covered.">                for (int i = lb; i &lt; ub; i++)</span>
+                {
+<span class="fc" id="L786">                    Cell&lt;?&gt; c = (Cell&lt;?&gt;) cells[i];</span>
+
+<span class="pc bpc" id="L788" title="1 of 4 branches missed.">                    if (deletion == DeletionTime.LIVE || c.timestamp() &gt;= deletion.markedForDeleteAt())</span>
+                    {
+<span class="pc bpc" id="L790" title="1 of 4 branches missed.">                        if (previous != null &amp;&amp; column.cellComparator().compare(previous, c) == 0)</span>
+                        {
+<span class="nc" id="L792">                            c = Cells.reconcile(previous, c);</span>
+<span class="nc" id="L793">                            buildFrom[buildFromCount - 1] = c;</span>
+                        }
+                        else
+                        {
+<span class="fc" id="L797">                            buildFrom[buildFromCount++] = c;</span>
+                        }
+<span class="fc" id="L799">                        previous = c;</span>
+                    }
+                }
+
+<span class="fc" id="L803">                try (BulkIterator&lt;Cell&gt; iterator = BulkIterator.of(buildFrom))</span>
+                {
+<span class="fc" id="L805">                    Object[] btree = BTree.build(iterator, buildFromCount, UpdateFunction.noOp());</span>
+<span class="fc" id="L806">                    return new ComplexColumnData(column, btree, deletion);</span>
+                }
+            }
+        }
+
+        protected Clustering&lt;?&gt; clustering;
+<span class="pc" id="L812">        protected LivenessInfo primaryKeyLivenessInfo = LivenessInfo.EMPTY;</span>
+<span class="pc" id="L813">        protected Deletion deletion = Deletion.LIVE;</span>
+
+        private final boolean isSorted;
+        private BTree.Builder&lt;Cell&lt;?&gt;&gt; cells_;
+<span class="pc" id="L817">        private boolean hasComplex = false;</span>
+
+        // For complex column at index i of 'columns', we store at complexDeletions[i] its complex deletion.
+
+        protected Builder(boolean isSorted)
+<span class="fc" id="L822">        {</span>
+<span class="fc" id="L823">            cells_ = null;</span>
+<span class="fc" id="L824">            this.isSorted = isSorted;</span>
+<span class="fc" id="L825">        }</span>
+
+        private BTree.Builder&lt;Cell&lt;?&gt;&gt; getCells()
+        {
+<span class="fc bfc" id="L829" title="All 2 branches covered.">            if (cells_ == null)</span>
+            {
+<span class="fc" id="L831">                cells_ = BTree.builder(ColumnData.comparator);</span>
+<span class="fc" id="L832">                cells_.auto(false);</span>
+            }
+<span class="fc" id="L834">            return cells_;</span>
+        }
+
+        protected Builder(Builder builder)
+<span class="nc" id="L838">        {</span>
+<span class="nc" id="L839">            clustering = builder.clustering;</span>
+<span class="nc" id="L840">            primaryKeyLivenessInfo = builder.primaryKeyLivenessInfo;</span>
+<span class="nc" id="L841">            deletion = builder.deletion;</span>
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            cells_ = builder.cells_ == null ? null : builder.cells_.copy();</span>
+<span class="nc" id="L843">            isSorted = builder.isSorted;</span>
+<span class="nc" id="L844">            hasComplex = builder.hasComplex;</span>
+<span class="nc" id="L845">        }</span>
+
+        @Override
+        public Builder copy()
+        {
+<span class="nc" id="L850">            return new Builder(this);</span>
+        }
+
+        public boolean isSorted()
+        {
+<span class="fc" id="L855">            return isSorted;</span>
+        }
+
+        public void newRow(Clustering&lt;?&gt; clustering)
+        {
+<span class="pc bpc" id="L860" title="1 of 2 branches missed.">            assert this.clustering == null; // Ensures we've properly called build() if we've use this builder before</span>
+<span class="fc" id="L861">            this.clustering = clustering;</span>
+<span class="fc" id="L862">        }</span>
+
+        public Clustering&lt;?&gt; clustering()
+        {
+<span class="nc" id="L866">            return clustering;</span>
+        }
+
+        protected void reset()
+        {
+<span class="fc" id="L871">            this.clustering = null;</span>
+<span class="fc" id="L872">            this.primaryKeyLivenessInfo = LivenessInfo.EMPTY;</span>
+<span class="fc" id="L873">            this.deletion = Deletion.LIVE;</span>
+<span class="fc" id="L874">            this.cells_.reuse();</span>
+<span class="fc" id="L875">            this.hasComplex = false;</span>
+<span class="fc" id="L876">        }</span>
+
+        public void addPrimaryKeyLivenessInfo(LivenessInfo info)
+        {
+            // The check is only required for unsorted builders, but it's worth the extra safety to have it unconditional
+<span class="fc bfc" id="L881" title="All 2 branches covered.">            if (!deletion.deletes(info))</span>
+<span class="fc" id="L882">                this.primaryKeyLivenessInfo = info;</span>
+<span class="fc" id="L883">        }</span>
+
+        public void addRowDeletion(Deletion deletion)
+        {
+<span class="fc" id="L887">            this.deletion = deletion;</span>
+            // The check is only required for unsorted builders, but it's worth the extra safety to have it unconditional
+<span class="fc bfc" id="L889" title="All 2 branches covered.">            if (deletion.deletes(primaryKeyLivenessInfo))</span>
+<span class="fc" id="L890">                this.primaryKeyLivenessInfo = LivenessInfo.EMPTY;</span>
+<span class="fc" id="L891">        }</span>
+
+        public void addCell(Cell&lt;?&gt; cell)
+        {
+<span class="pc bpc" id="L895" title="2 of 4 branches missed.">            assert cell.column().isStatic() == (clustering == Clustering.STATIC_CLUSTERING) : &quot;Column is &quot; + cell.column() + &quot;, clustering = &quot; + clustering;</span>
+
+            // In practice, only unsorted builder have to deal with shadowed cells, but it doesn't cost us much to deal with it unconditionally in this case
+<span class="pc bpc" id="L898" title="1 of 2 branches missed.">            if (deletion.deletes(cell))</span>
+<span class="nc" id="L899">                return;</span>
+
+<span class="fc" id="L901">            getCells().add(cell);</span>
+<span class="fc" id="L902">            hasComplex |= cell.column.isComplex();</span>
+<span class="fc" id="L903">        }</span>
+
+        public void addComplexDeletion(ColumnMetadata column, DeletionTime complexDeletion)
+        {
+<span class="fc" id="L907">            getCells().add(new ComplexColumnDeletion(column, complexDeletion));</span>
+<span class="fc" id="L908">            hasComplex = true;</span>
+<span class="fc" id="L909">        }</span>
+
+        public Row build()
+        {
+<span class="fc bfc" id="L913" title="All 2 branches covered.">            if (!isSorted)</span>
+<span class="fc" id="L914">                getCells().sort();</span>
+            // we can avoid resolving if we're sorted and have no complex values
+            // (because we'll only have unique simple cells, which are already in their final condition)
+<span class="fc bfc" id="L917" title="All 4 branches covered.">            if (!isSorted | hasComplex)</span>
+<span class="fc" id="L918">                getCells().resolve(CellResolver.instance);</span>
+<span class="fc" id="L919">            Object[] btree = getCells().build();</span>
+
+<span class="pc bpc" id="L921" title="1 of 2 branches missed.">            if (deletion.isShadowedBy(primaryKeyLivenessInfo))</span>
+<span class="nc" id="L922">                deletion = Deletion.LIVE;</span>
+
+<span class="fc" id="L924">            long minDeletionTime = minDeletionTime(btree, primaryKeyLivenessInfo, deletion.time());</span>
+<span class="fc" id="L925">            Row row = BTreeRow.create(clustering, primaryKeyLivenessInfo, deletion, btree, minDeletionTime);</span>
+<span class="fc" id="L926">            reset();</span>
+<span class="fc" id="L927">            return row;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

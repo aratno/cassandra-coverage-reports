@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SocketFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">SocketFactory.java</span></div><h1>SocketFactory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.spi.SelectorProvider;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeoutException;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSession;
+
+import com.google.common.collect.ImmutableList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFactory;
+import io.netty.channel.DefaultSelectStrategyFactory;
+import io.netty.channel.EventLoop;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.ServerChannel;
+import io.netty.channel.epoll.EpollChannelOption;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.epoll.EpollSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.channel.unix.Errors;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.ssl.SslClosedEngineException;
+import io.netty.util.concurrent.DefaultEventExecutorChooserFactory;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
+import io.netty.util.concurrent.ThreadPerTaskExecutor;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.service.NativeTransportService;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static io.netty.channel.unix.Errors.ERRNO_ECONNRESET_NEGATIVE;
+import static io.netty.channel.unix.Errors.ERROR_ECONNREFUSED_NEGATIVE;
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.config.CassandraRelevantProperties.INTERNODE_EVENT_THREADS;
+import static org.apache.cassandra.utils.Throwables.isCausedBy;
+
+/**
+ * A factory for building Netty {@link Channel}s. Channels here are setup with a pipeline to participate
+ * in the internode protocol handshake, either the inbound or outbound side as per the method invoked.
+ */
+public final class SocketFactory
+{
+<span class="fc" id="L84">    private static final Logger logger = LoggerFactory.getLogger(SocketFactory.class);</span>
+
+<span class="fc" id="L86">    private static final int EVENT_THREADS = INTERNODE_EVENT_THREADS.getInt(FBUtilities.getAvailableProcessors());</span>
+
+    /**
+     * The default task queue used by {@code NioEventLoop} and {@code EpollEventLoop} is {@code MpscUnboundedArrayQueue},
+     * provided by JCTools. While efficient, it has an undesirable quality for a queue backing an event loop: it is
+     * not non-blocking, and can cause the event loop to busy-spin while waiting for a partially completed task
+     * offer, if the producer thread has been suspended mid-offer.
+     *
+     * As it happens, however, we have an MPSC queue implementation that is perfectly fit for this purpose -
+     * {@link ManyToOneConcurrentLinkedQueue}, that is non-blocking, and already used throughout the codebase,
+     * that we can and do use here as well.
+     */
+<span class="fc" id="L98">    enum Provider</span>
+    {
+<span class="fc" id="L100">        NIO</span>
+        {
+            @Override
+            NioEventLoopGroup makeEventLoopGroup(int threadCount, ThreadFactory threadFactory)
+            {
+<span class="nc" id="L105">                return new NioEventLoopGroup(threadCount,</span>
+                                             new ThreadPerTaskExecutor(threadFactory),
+                                             DefaultEventExecutorChooserFactory.INSTANCE,
+<span class="nc" id="L108">                                             SelectorProvider.provider(),</span>
+                                             DefaultSelectStrategyFactory.INSTANCE,
+<span class="nc" id="L110">                                             RejectedExecutionHandlers.reject(),</span>
+<span class="nc" id="L111">                                             capacity -&gt; new ManyToOneConcurrentLinkedQueue&lt;&gt;());</span>
+            }
+
+            @Override
+            ChannelFactory&lt;NioSocketChannel&gt; clientChannelFactory()
+            {
+<span class="nc" id="L117">                return NioSocketChannel::new;</span>
+            }
+
+            @Override
+            ChannelFactory&lt;NioServerSocketChannel&gt; serverChannelFactory()
+            {
+<span class="nc" id="L123">                return NioServerSocketChannel::new;</span>
+            }
+        },
+<span class="fc" id="L126">        EPOLL</span>
+        {
+            @Override
+            EpollEventLoopGroup makeEventLoopGroup(int threadCount, ThreadFactory threadFactory)
+            {
+<span class="fc" id="L131">                return new EpollEventLoopGroup(threadCount,</span>
+                                               new ThreadPerTaskExecutor(threadFactory),
+                                               DefaultEventExecutorChooserFactory.INSTANCE,
+                                               DefaultSelectStrategyFactory.INSTANCE,
+<span class="fc" id="L135">                                               RejectedExecutionHandlers.reject(),</span>
+<span class="fc" id="L136">                                               capacity -&gt; new ManyToOneConcurrentLinkedQueue&lt;&gt;());</span>
+            }
+
+            @Override
+            ChannelFactory&lt;EpollSocketChannel&gt; clientChannelFactory()
+            {
+<span class="fc" id="L142">                return EpollSocketChannel::new;</span>
+            }
+
+            @Override
+            ChannelFactory&lt;EpollServerSocketChannel&gt; serverChannelFactory()
+            {
+<span class="fc" id="L148">                return EpollServerSocketChannel::new;</span>
+            }
+        };
+
+        EventLoopGroup makeEventLoopGroup(int threadCount, String threadNamePrefix)
+        {
+<span class="fc" id="L154">            logger.debug(&quot;using netty {} event loop for pool prefix {}&quot;, name(), threadNamePrefix);</span>
+<span class="fc" id="L155">            return makeEventLoopGroup(threadCount, new DefaultThreadFactory(threadNamePrefix, true));</span>
+        }
+
+        abstract EventLoopGroup makeEventLoopGroup(int threadCount, ThreadFactory threadFactory);
+        abstract ChannelFactory&lt;? extends Channel&gt; clientChannelFactory();
+        abstract ChannelFactory&lt;? extends ServerChannel&gt; serverChannelFactory();
+
+        static Provider optimalProvider()
+        {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">            return NativeTransportService.useEpoll() ? EPOLL : NIO;</span>
+        }
+    }
+
+    /** a useful addition for debugging; simply set to true to get more data in your logs */
+    static final boolean WIRETRACE = false;
+    static
+    {
+        if (WIRETRACE)
+            InternalLoggerFactory.setDefaultFactory(Slf4JLoggerFactory.INSTANCE);
+<span class="fc" id="L174">    }</span>
+
+    private final Provider provider;
+    private final EventLoopGroup acceptGroup;
+    private final EventLoopGroup defaultGroup;
+    // we need a separate EventLoopGroup for outbound streaming because sendFile is blocking
+    private final EventLoopGroup outboundStreamingGroup;
+<span class="fc" id="L181">    final ExecutorService synchronousWorkExecutor = executorFactory().pooled(&quot;Messaging-SynchronousWork&quot;, Integer.MAX_VALUE);</span>
+
+    SocketFactory()
+    {
+<span class="fc" id="L185">        this(Provider.optimalProvider());</span>
+<span class="fc" id="L186">    }</span>
+
+    SocketFactory(Provider provider)
+<span class="fc" id="L189">    {</span>
+<span class="fc" id="L190">        this.provider = provider;</span>
+<span class="fc" id="L191">        this.acceptGroup = provider.makeEventLoopGroup(1, &quot;Messaging-AcceptLoop&quot;);</span>
+<span class="fc" id="L192">        this.defaultGroup = provider.makeEventLoopGroup(EVENT_THREADS, NamedThreadFactory.globalPrefix() + &quot;Messaging-EventLoop&quot;);</span>
+<span class="fc" id="L193">        this.outboundStreamingGroup = provider.makeEventLoopGroup(EVENT_THREADS, &quot;Streaming-EventLoop&quot;);</span>
+<span class="fc" id="L194">    }</span>
+
+    Bootstrap newClientBootstrap(EventLoop eventLoop, int tcpUserTimeoutInMS)
+    {
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">        if (eventLoop == null)</span>
+<span class="nc" id="L199">            throw new IllegalArgumentException(&quot;must provide eventLoop&quot;);</span>
+
+<span class="fc" id="L201">        Bootstrap bootstrap = new Bootstrap().group(eventLoop).channelFactory(provider.clientChannelFactory());</span>
+
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">        if (provider == Provider.EPOLL)</span>
+<span class="fc" id="L204">            bootstrap.option(EpollChannelOption.TCP_USER_TIMEOUT, tcpUserTimeoutInMS);</span>
+
+<span class="fc" id="L206">        return bootstrap;</span>
+    }
+
+    ServerBootstrap newServerBootstrap()
+    {
+<span class="fc" id="L211">        return new ServerBootstrap().group(acceptGroup, defaultGroup).channelFactory(provider.serverChannelFactory());</span>
+    }
+
+    /**
+     * Creates a new {@link SslHandler} from provided SslContext.
+     * @param peer enables endpoint verification for remote address when not null
+     */
+    public static SslHandler newSslHandler(Channel channel, SslContext sslContext, @Nullable InetSocketAddress peer)
+    {
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">        if (peer == null)</span>
+<span class="fc" id="L221">            return sslContext.newHandler(channel.alloc());</span>
+
+<span class="nc" id="L223">        logger.debug(&quot;Creating SSL handler for {}:{}&quot;, peer.getHostString(), peer.getPort());</span>
+<span class="nc" id="L224">        SslHandler sslHandler = sslContext.newHandler(channel.alloc(), peer.getHostString(), peer.getPort());</span>
+<span class="nc" id="L225">        SSLEngine engine = sslHandler.engine();</span>
+<span class="nc" id="L226">        SSLParameters sslParameters = engine.getSSLParameters();</span>
+<span class="nc" id="L227">        sslParameters.setEndpointIdentificationAlgorithm(&quot;HTTPS&quot;);</span>
+<span class="nc" id="L228">        engine.setSSLParameters(sslParameters);</span>
+<span class="nc" id="L229">        return sslHandler;</span>
+    }
+
+    /**
+     * Summarizes the intended encryption options, suitable for logging. Once a connection is established, use
+     * {@link SocketFactory#encryptionConnectionSummary} below.
+     * @param options options to summarize
+     * @return description of encryption options
+     */
+    static String encryptionOptionsSummary(EncryptionOptions options)
+    {
+<span class="pc bpc" id="L240" title="1 of 4 branches missed.">        if (options == null || options.tlsEncryptionPolicy() == EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED)</span>
+<span class="fc" id="L241">            return EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED.description();</span>
+
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        String encryptionType = SSLFactory.openSslIsAvailable() ? &quot;openssl&quot; : &quot;jdk&quot;;</span>
+<span class="fc" id="L244">        return options.tlsEncryptionPolicy().description() + '(' + encryptionType + ')';</span>
+    }
+
+    /**
+     * Summarizes the encryption status of a channel, suitable for logging.
+     * @return description of channel encryption
+     */
+    static String encryptionConnectionSummary(Channel channel)
+    {
+<span class="fc" id="L253">        final SslHandler sslHandler = channel.pipeline().get(SslHandler.class);</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">        if (sslHandler == null)</span>
+        {
+<span class="fc" id="L256">            return EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED.description();</span>
+        }
+<span class="fc" id="L258">        SSLSession session = sslHandler.engine().getSession();</span>
+
+<span class="fc" id="L260">        return  &quot;encrypted(factory=&quot; +</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">                (SSLFactory.openSslIsAvailable() ? &quot;openssl&quot; : &quot;jdk&quot;) +</span>
+                &quot;;protocol=&quot; +
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">                (session != null ? session.getProtocol() : &quot;MISSING SESSION&quot;) +</span>
+                &quot;;cipher=&quot; +
+<span class="pc bpc" id="L265" title="1 of 2 branches missed.">                (session != null ? session.getCipherSuite() : &quot;MISSING SESSION&quot;) +</span>
+                ')';
+    }
+
+    EventLoopGroup defaultGroup()
+    {
+<span class="fc" id="L271">        return defaultGroup;</span>
+    }
+
+    public EventLoopGroup outboundStreamingGroup()
+    {
+<span class="fc" id="L276">        return outboundStreamingGroup;</span>
+    }
+
+    public void shutdownNow()
+    {
+<span class="fc" id="L281">        acceptGroup.shutdownGracefully(0, 2, SECONDS);</span>
+<span class="fc" id="L282">        defaultGroup.shutdownGracefully(0, 2, SECONDS);</span>
+<span class="fc" id="L283">        outboundStreamingGroup.shutdownGracefully(0, 2, SECONDS);</span>
+<span class="fc" id="L284">        synchronousWorkExecutor.shutdownNow();</span>
+<span class="fc" id="L285">    }</span>
+
+    void awaitTerminationUntil(long deadlineNanos) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L289">        List&lt;ExecutorService&gt; groups = ImmutableList.of(acceptGroup, defaultGroup, outboundStreamingGroup, synchronousWorkExecutor);</span>
+<span class="fc" id="L290">        ExecutorUtils.awaitTerminationUntil(deadlineNanos, groups);</span>
+<span class="fc" id="L291">    }</span>
+
+    static boolean isConnectionReset(Throwable t)
+    {
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">        if (t instanceof ClosedChannelException)</span>
+<span class="nc" id="L296">            return true;</span>
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">        if (t instanceof SslClosedEngineException)</span>
+<span class="nc" id="L298">            return true;</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">        if (t instanceof ConnectException)</span>
+<span class="nc" id="L300">            return true;</span>
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">        if (t instanceof Errors.NativeIoException)</span>
+        {
+<span class="fc" id="L303">            int errorCode = ((Errors.NativeIoException) t).expectedErr();</span>
+<span class="pc bpc" id="L304" title="3 of 4 branches missed.">            return errorCode == ERRNO_ECONNRESET_NEGATIVE || errorCode != ERROR_ECONNREFUSED_NEGATIVE;</span>
+        }
+<span class="nc bnc" id="L306" title="All 6 branches missed.">        return IOException.class == t.getClass() &amp;&amp; (&quot;Broken pipe&quot;.equals(t.getMessage()) || &quot;Connection reset by peer&quot;.equals(t.getMessage()));</span>
+    }
+
+    static boolean isCausedByConnectionReset(Throwable t)
+    {
+<span class="fc" id="L311">        return isCausedBy(t, SocketFactory::isConnectionReset);</span>
+    }
+
+    static String channelId(InetAddressAndPort from, InetSocketAddress realFrom, InetAddressAndPort to, InetSocketAddress realTo, ConnectionType type, String id)
+    {
+<span class="fc" id="L316">        return addressId(from, realFrom) + &quot;-&gt;&quot; + addressId(to, realTo) + '-' + type + '-' + id;</span>
+    }
+
+    static String addressId(InetAddressAndPort address, InetSocketAddress realAddress)
+    {
+<span class="fc" id="L321">        String str = address.toString();</span>
+<span class="fc bfc" id="L322" title="All 4 branches covered.">        if (!address.getAddress().equals(realAddress.getAddress()) || address.getPort() != realAddress.getPort())</span>
+<span class="fc" id="L323">            str += '(' + InetAddressAndPort.toString(realAddress.getAddress(), realAddress.getPort()) + ')';</span>
+<span class="fc" id="L324">        return str;</span>
+    }
+
+    static String channelId(InetAddressAndPort from, InetAddressAndPort to, ConnectionType type, String id)
+    {
+<span class="fc" id="L329">        return from + &quot;-&gt;&quot; + to + '-' + type + '-' + id;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

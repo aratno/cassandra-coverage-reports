@@ -1,0 +1,339 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableLoader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable</a> &gt; <span class="el_source">SSTableLoader.java</span></div><h1>SSTableLoader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Multimap;
+
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.streaming.OutgoingStream;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.streaming.StreamEvent;
+import org.apache.cassandra.streaming.StreamEventHandler;
+import org.apache.cassandra.streaming.StreamOperation;
+import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamResultFuture;
+import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.streaming.StreamingChannel;
+import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Ref;
+
+import static org.apache.cassandra.streaming.StreamingChannel.Factory.Global.streamingFactory;
+
+/**
+ * Cassandra SSTable bulk loader.
+ * Load an externally created sstable into a cluster.
+ */
+public class SSTableLoader implements StreamEventHandler
+{
+    private final File directory;
+    private final String keyspace;
+    private final String table;
+    private final Client client;
+    private final int connectionsPerHost;
+    private final OutputHandler outputHandler;
+<span class="fc" id="L75">    private final Set&lt;InetAddressAndPort&gt; failedHosts = new HashSet&lt;&gt;();</span>
+
+<span class="fc" id="L77">    private final List&lt;SSTableReader&gt; sstables = new ArrayList&lt;&gt;();</span>
+
+    public SSTableLoader(File directory, Client client, OutputHandler outputHandler)
+    {
+<span class="fc" id="L81">        this(directory, client, outputHandler, 1, null);</span>
+<span class="fc" id="L82">    }</span>
+
+    public SSTableLoader(File directory, Client client, OutputHandler outputHandler, int connectionsPerHost, String targetKeyspace)
+    {
+<span class="fc" id="L86">        this(directory, client, outputHandler, connectionsPerHost, targetKeyspace, null);</span>
+<span class="fc" id="L87">    }</span>
+
+    public SSTableLoader(File directory, Client client, OutputHandler outputHandler, int connectionsPerHost, String targetKeyspace, String targetTable)
+<span class="fc" id="L90">    {</span>
+<span class="fc" id="L91">        this.directory = directory;</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">        this.keyspace = targetKeyspace != null ? targetKeyspace : directory.parent().name();</span>
+<span class="fc" id="L93">        this.table = targetTable;</span>
+<span class="fc" id="L94">        this.client = client;</span>
+<span class="fc" id="L95">        this.outputHandler = outputHandler;</span>
+<span class="fc" id="L96">        this.connectionsPerHost = connectionsPerHost;</span>
+<span class="fc" id="L97">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private Multimap&lt;InetAddressAndPort, CassandraOutgoingFile&gt; openSSTables(final Map&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; ranges)
+    {
+<span class="fc" id="L102">        outputHandler.output(&quot;Opening sstables and calculating sections to stream&quot;);</span>
+
+<span class="fc" id="L104">        Multimap&lt;InetAddressAndPort, CassandraOutgoingFile&gt; streamingDetails = HashMultimap.create();</span>
+<span class="fc" id="L105">        LifecycleTransaction.getFiles(directory.toPath(),</span>
+                                      (file, type) -&gt;
+                                      {
+<span class="fc" id="L108">                                          File dir = file.parent();</span>
+<span class="fc" id="L109">                                          String name = file.name();</span>
+
+<span class="fc bfc" id="L111" title="All 2 branches covered.">                                          if (type != Directories.FileType.FINAL)</span>
+                                          {
+<span class="fc" id="L113">                                              outputHandler.output(String.format(&quot;Skipping temporary file %s&quot;, name));</span>
+<span class="fc" id="L114">                                              return false;</span>
+                                          }
+
+                                          Pair&lt;Descriptor, Component&gt; p;
+<span class="pc bpc" id="L118" title="1 of 4 branches missed.">                                          if (null != keyspace &amp;&amp; null != table)</span>
+                                          {
+<span class="fc" id="L120">                                              p = SSTable.tryComponentFromFilename(file, keyspace, table);</span>
+                                          }
+                                          else
+                                          {
+<span class="fc" id="L124">                                              p = SSTable.tryComponentFromFilename(file);</span>
+                                          }
+
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">                                          Descriptor desc = p == null ? null : p.left;</span>
+<span class="pc bpc" id="L128" title="1 of 4 branches missed.">                                          if (p == null || !p.right.equals(Components.DATA))</span>
+<span class="fc" id="L129">                                              return false;</span>
+
+<span class="fc bfc" id="L131" title="All 2 branches covered.">                                          for (Component c : desc.getFormat().primaryComponents())</span>
+                                          {
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">                                              if (!desc.fileFor(c).exists())</span>
+                                              {
+<span class="nc" id="L135">                                                  outputHandler.output(String.format(&quot;Skipping file %s because %s is missing&quot;, name, c.name));</span>
+<span class="nc" id="L136">                                                  return false;</span>
+                                              }
+<span class="fc" id="L138">                                          }</span>
+
+<span class="fc" id="L140">                                          TableMetadataRef metadata = client.getTableMetadata(desc.cfname);</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">                                          if (metadata == null)</span>
+                                          {
+<span class="nc" id="L143">                                              outputHandler.output(String.format(&quot;Skipping file %s: table %s.%s doesn't exist&quot;, name, keyspace, desc.cfname));</span>
+<span class="nc" id="L144">                                              return false;</span>
+                                          }
+
+<span class="fc" id="L147">                                          Set&lt;Component&gt; components = desc.getComponents(desc.getFormat().primaryComponents(), desc.getFormat().uploadComponents());</span>
+
+                                          try
+                                          {
+                                              // To conserve memory, open SSTableReaders without bloom filters and discard
+                                              // the index summary after calculating the file sections to stream and the estimated
+                                              // number of keys for each endpoint. See CASSANDRA-5555 for details.
+<span class="fc" id="L154">                                              SSTableReader sstable = SSTableReader.openForBatch(null, desc, components, metadata);</span>
+<span class="fc" id="L155">                                              sstables.add(sstable);</span>
+
+                                              // calculate the sstable sections to stream as well as the estimated number of
+                                              // keys per host
+<span class="fc bfc" id="L159" title="All 2 branches covered.">                                              for (Map.Entry&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; entry : ranges.entrySet())</span>
+                                              {
+<span class="fc" id="L161">                                                  InetAddressAndPort endpoint = entry.getKey();</span>
+<span class="fc" id="L162">                                                  List&lt;Range&lt;Token&gt;&gt; tokenRanges = Range.normalize(entry.getValue());</span>
+
+<span class="fc" id="L164">                                                  List&lt;SSTableReader.PartitionPositionBounds&gt; sstableSections = sstable.getPositionsForRanges(tokenRanges);</span>
+                                                  // Do not stream to nodes that don't own any part of the SSTable, empty streams
+                                                  // will generate an error on the server. See CASSANDRA-16349 for details.
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">                                                  if (sstableSections.isEmpty())</span>
+<span class="nc" id="L168">                                                      continue;</span>
+
+<span class="fc" id="L170">                                                  long estimatedKeys = sstable.estimatedKeysForRanges(tokenRanges);</span>
+<span class="fc" id="L171">                                                  Ref&lt;SSTableReader&gt; ref = sstable.ref();</span>
+<span class="fc" id="L172">                                                  CassandraOutgoingFile stream = new CassandraOutgoingFile(StreamOperation.BULK_LOAD, ref, sstableSections, tokenRanges, estimatedKeys);</span>
+<span class="fc" id="L173">                                                  streamingDetails.put(endpoint, stream);</span>
+<span class="fc" id="L174">                                              }</span>
+
+                                              // to conserve heap space when bulk loading
+<span class="fc" id="L177">                                              sstable.releaseInMemoryComponents();</span>
+                                          }
+<span class="nc" id="L179">                                          catch (FSError e)</span>
+                                          {
+                                              // todo: should we really continue if we can't open all sstables?
+<span class="nc" id="L182">                                              outputHandler.output(String.format(&quot;Skipping file %s, error opening it: %s&quot;, name, e.getMessage()));</span>
+<span class="fc" id="L183">                                          }</span>
+<span class="fc" id="L184">                                          return false;</span>
+                                      },
+                                      Directories.OnTxnErr.IGNORE);
+
+<span class="fc" id="L188">        return streamingDetails;</span>
+    }
+
+    public StreamResultFuture stream()
+    {
+<span class="fc" id="L193">        return stream(Collections.&lt;InetAddressAndPort&gt;emptySet());</span>
+    }
+
+    public StreamResultFuture stream(Set&lt;InetAddressAndPort&gt; toIgnore, StreamEventHandler... listeners)
+    {
+<span class="fc" id="L198">        client.init(keyspace);</span>
+<span class="fc" id="L199">        outputHandler.output(&quot;Established connection to initial hosts&quot;);</span>
+
+<span class="fc" id="L201">        StreamPlan plan = new StreamPlan(StreamOperation.BULK_LOAD, connectionsPerHost, false, null, PreviewKind.NONE).connectionFactory(client.getConnectionFactory());</span>
+
+<span class="fc" id="L203">        Map&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; endpointToRanges = client.getEndpointToRangesMap();</span>
+<span class="fc" id="L204">        Multimap&lt;InetAddressAndPort, CassandraOutgoingFile&gt; streamingDetails = openSSTables(endpointToRanges);</span>
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">        if (streamingDetails.isEmpty())</span>
+        {
+            // return empty result
+<span class="nc" id="L208">            return plan.execute();</span>
+        }
+
+<span class="fc" id="L211">        outputHandler.output(String.format(&quot;Streaming relevant part of %s to %s&quot;, names(streamingDetails.values()), endpointToRanges.keySet()));</span>
+
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; entry : endpointToRanges.entrySet())</span>
+        {
+<span class="fc" id="L215">            InetAddressAndPort remote = entry.getKey();</span>
+<span class="pc bpc" id="L216" title="1 of 2 branches missed.">            if (toIgnore.contains(remote))</span>
+<span class="nc" id="L217">                continue;</span>
+
+            // references are acquired when constructing the SSTableStreamingSections above
+<span class="fc" id="L220">            List&lt;OutgoingStream&gt; streams = new LinkedList&lt;&gt;(streamingDetails.get(remote));</span>
+
+<span class="fc" id="L222">            plan.transferStreams(remote, streams);</span>
+<span class="fc" id="L223">        }</span>
+<span class="fc" id="L224">        plan.listeners(this, listeners);</span>
+<span class="fc" id="L225">        return plan.execute();</span>
+    }
+
+    public void onSuccess(StreamState finalState)
+    {
+<span class="fc" id="L230">        releaseReferences();</span>
+<span class="fc" id="L231">    }</span>
+
+    public void onFailure(Throwable t)
+    {
+<span class="fc" id="L235">        releaseReferences();</span>
+<span class="fc" id="L236">    }</span>
+
+    /**
+     * releases the shared reference for all sstables, we acquire this when opening the sstable
+     */
+    private void releaseReferences()
+    {
+<span class="fc" id="L243">        Iterator&lt;SSTableReader&gt; it = sstables.iterator();</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">        while (it.hasNext())</span>
+        {
+<span class="fc" id="L246">            SSTableReader sstable = it.next();</span>
+<span class="fc" id="L247">            sstable.selfRef().release();</span>
+<span class="fc" id="L248">            it.remove();</span>
+<span class="fc" id="L249">        }</span>
+<span class="fc" id="L250">    }</span>
+
+    @VisibleForTesting
+    ImmutableList&lt;SSTableReader&gt; getSSTables()
+    {
+<span class="fc" id="L255">        return ImmutableList.copyOf(sstables);</span>
+    }
+
+    public void handleStreamEvent(StreamEvent event)
+    {
+<span class="fc bfc" id="L260" title="All 2 branches covered.">        if (event.eventType == StreamEvent.Type.STREAM_COMPLETE)</span>
+        {
+<span class="fc" id="L262">            StreamEvent.SessionCompleteEvent se = (StreamEvent.SessionCompleteEvent) event;</span>
+<span class="fc bfc" id="L263" title="All 2 branches covered.">            if (!se.success)</span>
+<span class="fc" id="L264">                failedHosts.add(se.peer);</span>
+        }
+<span class="fc" id="L266">    }</span>
+
+    private String names(Collection&lt;CassandraOutgoingFile&gt; sstables)
+    {
+<span class="fc" id="L270">        return sstables.stream().map(CassandraOutgoingFile::getName).distinct().collect(Collectors.joining(&quot; &quot;));</span>
+    }
+
+    public Set&lt;InetAddressAndPort&gt; getFailedHosts()
+    {
+<span class="nc" id="L275">        return failedHosts;</span>
+    }
+
+<span class="fc" id="L278">    public static abstract class Client</span>
+    {
+<span class="fc" id="L280">        private final Map&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; endpointToRanges = new HashMap&lt;&gt;();</span>
+
+        /**
+         * Initialize the client.
+         * Perform any step necessary so that after the call to the this
+         * method:
+         *   * partitioner is initialized
+         *   * getEndpointToRangesMap() returns a correct map
+         * This method is guaranteed to be called before any other method of a
+         * client.
+         */
+        public abstract void init(String keyspace);
+
+        /**
+         * Stop the client.
+         */
+        public void stop()
+        {
+<span class="nc" id="L298">        }</span>
+
+        /**
+         * Provides connection factory.
+         * By default, it uses DefaultConnectionFactory.
+         *
+         * @return StreamConnectionFactory to use
+         */
+        public StreamingChannel.Factory getConnectionFactory()
+        {
+<span class="fc" id="L308">            return streamingFactory();</span>
+        }
+
+        /**
+         * Validate that {@code keyspace} is an existing keyspace and {@code
+         * cfName} one of its existing column family.
+         */
+        public abstract TableMetadataRef getTableMetadata(String tableName);
+
+        public void setTableMetadata(TableMetadataRef cfm)
+        {
+<span class="nc" id="L319">            throw new RuntimeException();</span>
+        }
+
+        public Map&lt;InetAddressAndPort, Collection&lt;Range&lt;Token&gt;&gt;&gt; getEndpointToRangesMap()
+        {
+<span class="fc" id="L324">            return endpointToRanges;</span>
+        }
+
+        protected void addRangeForEndpoint(Range&lt;Token&gt; range, InetAddressAndPort endpoint)
+        {
+<span class="fc" id="L329">            Collection&lt;Range&lt;Token&gt;&gt; ranges = endpointToRanges.get(endpoint);</span>
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">            if (ranges == null)</span>
+            {
+<span class="fc" id="L332">                ranges = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L333">                endpointToRanges.put(endpoint, ranges);</span>
+            }
+<span class="fc" id="L335">            ranges.add(range);</span>
+<span class="fc" id="L336">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

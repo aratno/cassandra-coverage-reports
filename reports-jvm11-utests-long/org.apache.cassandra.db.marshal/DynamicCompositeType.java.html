@@ -1,0 +1,749 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DynamicCompositeType.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.marshal</a> &gt; <span class="el_source">DynamicCompositeType.java</span></div><h1>DynamicCompositeType.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.marshal;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.BytesSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable.Version;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
+
+import static com.google.common.collect.Iterables.any;
+
+/*
+ * The encoding of a DynamicCompositeType column name should be:
+ *   &lt;component&gt;&lt;component&gt;&lt;component&gt; ...
+ * where &lt;component&gt; is:
+ *   &lt;comparator part&gt;&lt;value&gt;&lt;'end-of-component' byte&gt;
+ * where:
+ *   - &lt;comparator part&gt;: either the comparator full name, or a declared
+ *     aliases. This is at least 2 bytes (those 2 bytes are called header in
+ *     the following). If the first bit of the header is 1, then this
+ *     comparator part is an alias, otherwise it's a comparator full name:
+ *       - aliases: the actual alias is the 2nd byte of header taken as a
+ *         character. The whole &lt;comparator part&gt; is thus 2 byte long.
+ *       - comparator full name: the header is the length of the remaining
+ *         part. The remaining part is the UTF-8 encoded comparator class
+ *         name.
+ *   - &lt;value&gt;: the component value bytes preceded by 2 byte containing the
+ *     size of value (see CompositeType).
+ *   - 'end-of-component' byte is defined as in CompositeType
+ */
+public class DynamicCompositeType extends AbstractCompositeType
+{
+    public static class Serializer extends BytesSerializer
+    {
+        // aliases are held to make sure the serializer is unique for each collection of types, this is to make sure it's
+        // safe to cache in all cases
+        private final Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases;
+
+        public Serializer(Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases)
+<span class="fc" id="L82">        {</span>
+<span class="fc" id="L83">            this.aliases = aliases;</span>
+<span class="fc" id="L84">        }</span>
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">            if (this == o) return true;</span>
+<span class="nc bnc" id="L90" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L91">            Serializer that = (Serializer) o;</span>
+<span class="nc" id="L92">            return aliases.equals(that.aliases);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L98">            return Objects.hash(aliases);</span>
+        }
+    }
+<span class="fc" id="L101">    private static final Logger logger = LoggerFactory.getLogger(DynamicCompositeType.class);</span>
+
+<span class="fc" id="L103">    private static final ByteSource[] EMPTY_BYTE_SOURCE_ARRAY = new ByteSource[0];</span>
+<span class="fc" id="L104">    private static final String REVERSED_TYPE = ReversedType.class.getSimpleName();</span>
+
+    @VisibleForTesting
+    public final Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases;
+    private final Map&lt;AbstractType&lt;?&gt;, Byte&gt; inverseMapping;
+    private final Serializer serializer;
+
+    // interning instances
+<span class="fc" id="L112">    private static final ConcurrentHashMap&lt;Map&lt;Byte, AbstractType&lt;?&gt;&gt;, DynamicCompositeType&gt; instances = new ConcurrentHashMap&lt;&gt;();</span>
+
+    public static DynamicCompositeType getInstance(TypeParser parser)
+    {
+<span class="nc" id="L116">        return getInstance(parser.getAliasParameters());</span>
+    }
+
+    public static DynamicCompositeType getInstance(Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases)
+    {
+<span class="fc" id="L121">        DynamicCompositeType dct = instances.get(aliases);</span>
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">        return null == dct</span>
+<span class="fc" id="L123">             ? instances.computeIfAbsent(aliases, DynamicCompositeType::new)</span>
+<span class="nc" id="L124">             : dct;</span>
+    }
+
+    private DynamicCompositeType(Map&lt;Byte, AbstractType&lt;?&gt;&gt; aliases)
+<span class="fc" id="L128">    {</span>
+<span class="fc" id="L129">        this.aliases = ImmutableMap.copyOf(aliases);</span>
+<span class="fc" id="L130">        this.serializer = new Serializer(this.aliases);</span>
+<span class="fc" id="L131">        this.inverseMapping = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        for (Map.Entry&lt;Byte, AbstractType&lt;?&gt;&gt; en : aliases.entrySet())</span>
+<span class="fc" id="L133">            this.inverseMapping.put(en.getValue(), en.getKey());</span>
+<span class="fc" id="L134">    }</span>
+
+    public int size()
+    {
+<span class="nc" id="L138">        return aliases.size();</span>
+    }
+
+    @Override
+    public List&lt;AbstractType&lt;?&gt;&gt; subTypes()
+    {
+<span class="nc" id="L144">        return new ArrayList&lt;&gt;(aliases.values());</span>
+    }
+
+    @Override
+    public TypeSerializer&lt;ByteBuffer&gt; getSerializer()
+    {
+<span class="nc" id="L150">        return serializer;</span>
+    }
+
+    protected &lt;V&gt; boolean readIsStatic(V value, ValueAccessor&lt;V&gt; accessor)
+    {
+        // We don't have the static nothing for DCT
+<span class="nc" id="L156">        return false;</span>
+    }
+
+    protected int startingOffset(boolean isStatic)
+    {
+<span class="nc" id="L161">        return 0;</span>
+    }
+
+    protected &lt;V&gt; int getComparatorSize(int i, V value, ValueAccessor&lt;V&gt; accessor, int offset)
+    {
+<span class="nc" id="L166">        int header = accessor.getShort(value, offset);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if ((header &amp; 0x8000) == 0)</span>
+        {
+<span class="nc" id="L169">            return 2 + header;</span>
+        }
+        else
+        {
+<span class="nc" id="L173">            return 2;</span>
+        }
+    }
+
+    private &lt;V&gt; AbstractType&lt;?&gt; getComparator(V value, ValueAccessor&lt;V&gt; accessor, int offset)
+    {
+        try
+        {
+<span class="nc" id="L181">            int header = accessor.getShort(value, offset);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">            if ((header &amp; 0x8000) == 0)</span>
+            {
+
+<span class="nc" id="L185">                String name = accessor.toString(accessor.slice(value, offset + 2, header));</span>
+<span class="nc" id="L186">                return TypeParser.parse(name);</span>
+            }
+            else
+            {
+<span class="nc" id="L190">                return aliases.get((byte)(header &amp; 0xFF));</span>
+            }
+        }
+<span class="nc" id="L193">        catch (CharacterCodingException e)</span>
+        {
+<span class="nc" id="L195">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    protected &lt;V&gt; AbstractType&lt;?&gt; getComparator(int i, V value, ValueAccessor&lt;V&gt; accessor, int offset)
+    {
+<span class="nc" id="L201">        return getComparator(value, accessor, offset);</span>
+    }
+
+    protected &lt;VL, VR&gt; AbstractType&lt;?&gt; getComparator(int i, VL left, ValueAccessor&lt;VL&gt; accessorL, VR right, ValueAccessor&lt;VR&gt; accessorR, int offsetL, int offsetR)
+    {
+<span class="nc" id="L206">        AbstractType&lt;?&gt; comp1 = getComparator(left, accessorL, offsetL);</span>
+<span class="nc" id="L207">        AbstractType&lt;?&gt; comp2 = getComparator(right, accessorR, offsetR);</span>
+<span class="nc" id="L208">        AbstractType&lt;?&gt; rawComp = comp1;</span>
+
+        /*
+         * If both types are ReversedType(Type), we need to compare on the wrapped type (which may differ between the two types) to avoid
+         * incompatible comparisons being made.
+         */
+<span class="nc bnc" id="L214" title="All 4 branches missed.">        if ((comp1 instanceof ReversedType) &amp;&amp; (comp2 instanceof ReversedType))</span>
+        {
+<span class="nc" id="L216">            comp1 = ((ReversedType&lt;?&gt;) comp1).baseType;</span>
+<span class="nc" id="L217">            comp2 = ((ReversedType&lt;?&gt;) comp2).baseType;</span>
+        }
+
+        // Fast test if the comparator uses singleton instances
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (comp1 != comp2)</span>
+        {
+            /*
+             * We compare component of different types by comparing the
+             * comparator class names. We start with the simple classname
+             * first because that will be faster in almost all cases, but
+             * fallback on the full name if necessary
+             */
+<span class="nc" id="L229">            int cmp = comp1.getClass().getSimpleName().compareTo(comp2.getClass().getSimpleName());</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (cmp != 0)</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                return cmp &lt; 0 ? FixedValueComparator.alwaysLesserThan : FixedValueComparator.alwaysGreaterThan;</span>
+
+<span class="nc" id="L233">            cmp = comp1.getClass().getName().compareTo(comp2.getClass().getName());</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            if (cmp != 0)</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                return cmp &lt; 0 ? FixedValueComparator.alwaysLesserThan : FixedValueComparator.alwaysGreaterThan;</span>
+
+            // if cmp == 0, we're actually having the same type, but one that
+            // did not have a singleton instance. It's ok (though inefficient).
+        }
+        // Use the raw comparator (prior to ReversedType unwrapping)
+<span class="nc" id="L241">        return rawComp;</span>
+    }
+
+    protected &lt;V&gt; AbstractType&lt;?&gt; getAndAppendComparator(int i, V value, ValueAccessor&lt;V&gt; accessor, StringBuilder sb, int offset)
+    {
+        try
+        {
+<span class="nc" id="L248">            int header = accessor.getShort(value, offset);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if ((header &amp; 0x8000) == 0)</span>
+            {
+<span class="nc" id="L251">                String name = accessor.toString(accessor.slice(value, offset + 2, header));</span>
+<span class="nc" id="L252">                sb.append(name).append(&quot;@&quot;);</span>
+<span class="nc" id="L253">                return TypeParser.parse(name);</span>
+            }
+            else
+            {
+<span class="nc" id="L257">                sb.append((char)(header &amp; 0xFF)).append(&quot;@&quot;);</span>
+<span class="nc" id="L258">                return aliases.get((byte)(header &amp; 0xFF));</span>
+            }
+        }
+<span class="nc" id="L261">        catch (CharacterCodingException e)</span>
+        {
+<span class="nc" id="L263">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    @Override
+    public &lt;V&gt; ByteSource asComparableBytes(ValueAccessor&lt;V&gt; accessor, V data, Version version)
+    {
+<span class="nc" id="L270">        List&lt;ByteSource&gt; srcs = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L271">        int length = accessor.size(data);</span>
+
+        // statics go first
+<span class="nc" id="L274">        boolean isStatic = readIsStatic(data, accessor);</span>
+<span class="nc" id="L275">        int offset = startingOffset(isStatic);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        srcs.add(isStatic ? null : ByteSource.EMPTY);</span>
+
+<span class="nc" id="L278">        byte lastEoc = 0;</span>
+<span class="nc" id="L279">        int i = 0;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        while (offset &lt; length)</span>
+        {
+            // Only the end-of-component byte of the last component of this composite can be non-zero, so the
+            // component before can't have a non-zero end-of-component byte.
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            assert lastEoc == 0 : lastEoc;</span>
+
+<span class="nc" id="L286">            AbstractType&lt;?&gt; comp = getComparator(data, accessor, offset);</span>
+<span class="nc" id="L287">            offset += getComparatorSize(i, data, accessor, offset);</span>
+            // The comparable bytes for the component need to ensure comparisons consistent with
+            // AbstractCompositeType.compareCustom(ByteBuffer, ByteBuffer) and
+            // DynamicCompositeType.getComparator(int, ByteBuffer, ByteBuffer):
+<span class="nc bnc" id="L291" title="All 4 branches missed.">            if (version == Version.LEGACY || !(comp instanceof ReversedType))</span>
+            {
+                // ...most often that means just adding the short name of the type, followed by the full name of the type.
+<span class="nc" id="L294">                srcs.add(ByteSource.of(comp.getClass().getSimpleName(), version));</span>
+<span class="nc" id="L295">                srcs.add(ByteSource.of(comp.getClass().getName(), version));</span>
+            }
+            else
+            {
+                // ...however some times the component uses a complex type (currently the only supported complex type
+                // is ReversedType - we can't have elements that are of MapType, CompositeType, TupleType, etc.)...
+<span class="nc" id="L301">                ReversedType&lt;?&gt; reversedComp = (ReversedType&lt;?&gt;) comp;</span>
+                // ...in this case, we need to add the short name of ReversedType before the short name of the base
+                // type, to ensure consistency with DynamicCompositeType.getComparator(int, ByteBuffer, ByteBuffer).
+<span class="nc" id="L304">                srcs.add(ByteSource.of(REVERSED_TYPE, version));</span>
+<span class="nc" id="L305">                srcs.add(ByteSource.of(reversedComp.baseType.getClass().getSimpleName(), version));</span>
+<span class="nc" id="L306">                srcs.add(ByteSource.of(reversedComp.baseType.getClass().getName(), version));</span>
+            }
+            // Only then the payload of the component gets encoded.
+<span class="nc" id="L309">            int componentLength = accessor.getUnsignedShort(data, offset);</span>
+<span class="nc" id="L310">            offset += 2;</span>
+<span class="nc" id="L311">            srcs.add(comp.asComparableBytes(accessor, accessor.slice(data, offset, componentLength), version));</span>
+<span class="nc" id="L312">            offset += componentLength;</span>
+            // The end-of-component byte also takes part in the comparison, and therefore needs to be encoded.
+<span class="nc" id="L314">            lastEoc = accessor.getByte(data, offset);</span>
+<span class="nc" id="L315">            offset += 1;</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            srcs.add(ByteSource.oneByte(version == Version.LEGACY ? lastEoc : lastEoc &amp; 0xFF ^ 0x80));</span>
+<span class="nc" id="L317">            ++i;</span>
+<span class="nc" id="L318">        }</span>
+
+<span class="nc" id="L320">        return ByteSource.withTerminatorMaybeLegacy(version, ByteSource.END_OF_STREAM, srcs.toArray(EMPTY_BYTE_SOURCE_ARRAY));</span>
+    }
+
+    @Override
+    public &lt;V&gt; V fromComparableBytes(ValueAccessor&lt;V&gt; accessor, ByteSource.Peekable comparableBytes, Version version)
+    {
+        // For ByteComparable.Version.LEGACY the terminator byte is ByteSource.END_OF_STREAM. Just like with
+        // CompositeType, this means that in multi-component sequences the terminator may be transformed to a regular
+        // component separator, but unlike CompositeType (where we have the expected number of types/components),
+        // this can make the end of the whole dynamic composite type indistinguishable from the end of a component
+        // somewhere in the middle of the dynamic composite type. Because of that, DynamicCompositeType elements
+        // cannot always be safely decoded using that encoding version.
+        // Even more so than with CompositeType, we just take advantage of the fact that we don't need to decode from
+        // Version.LEGACY, assume that we never do that, and assert it here.
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        assert version != Version.LEGACY;</span>
+
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (comparableBytes == null)</span>
+<span class="nc" id="L337">            return accessor.empty();</span>
+
+        // The first byte is the isStatic flag which we don't need but must consume to continue past it.
+<span class="nc" id="L340">        comparableBytes.next();</span>
+
+<span class="nc" id="L342">        List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L343">        List&lt;V&gt; values = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L344">        byte lastEoc = 0;</span>
+
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        for (int separator = comparableBytes.next(); separator != ByteSource.TERMINATOR; separator = comparableBytes.next())</span>
+        {
+            // Solely the end-of-component byte of the last component of this composite can be non-zero.
+<span class="nc bnc" id="L349" title="All 2 branches missed.">            assert lastEoc == 0 : lastEoc;</span>
+
+<span class="nc" id="L351">            boolean isReversed = false;</span>
+            // Decode the next type's simple class name that is encoded before its fully qualified class name (in order
+            // for comparisons to work correctly).
+<span class="nc" id="L354">            String simpleClassName = ByteSourceInverse.getString(ByteSourceInverse.nextComponentSource(comparableBytes, separator));</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            if (REVERSED_TYPE.equals(simpleClassName))</span>
+            {
+                // Special-handle if the type is reversed (and decode the actual base type simple class name).
+<span class="nc" id="L358">                isReversed = true;</span>
+<span class="nc" id="L359">                simpleClassName = ByteSourceInverse.getString(ByteSourceInverse.nextComponentSource(comparableBytes));</span>
+            }
+
+            // Decode the type's fully qualified class name and parse the actual type from it.
+<span class="nc" id="L363">            String fullClassName = ByteSourceInverse.getString(ByteSourceInverse.nextComponentSource(comparableBytes));</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">            assert fullClassName.endsWith(simpleClassName);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">            if (isReversed)</span>
+<span class="nc" id="L366">                fullClassName = REVERSED_TYPE + '(' + fullClassName + ')';</span>
+<span class="nc" id="L367">            AbstractType&lt;?&gt; type = TypeParser.parse(fullClassName);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            assert type != null;</span>
+<span class="nc" id="L369">            types.add(type);</span>
+
+            // Decode the payload from this type.
+<span class="nc" id="L372">            V value = type.fromComparableBytes(accessor, ByteSourceInverse.nextComponentSource(comparableBytes), version);</span>
+<span class="nc" id="L373">            values.add(value);</span>
+
+            // Also decode the corresponding end-of-component byte - the last one we decode will be taken into
+            // account when we deserialize the decoded data into an object.
+<span class="nc" id="L377">            lastEoc = ByteSourceInverse.getSignedByte(ByteSourceInverse.nextComponentSource(comparableBytes));</span>
+        }
+<span class="nc" id="L379">        return build(accessor, types, inverseMapping, values, lastEoc);</span>
+    }
+
+    public ByteBuffer build(Map&lt;Byte, Object&gt; valuesMap)
+    {
+<span class="nc" id="L384">        Sets.SetView&lt;Byte&gt; unknownAliases = Sets.difference(valuesMap.keySet(), aliases.keySet());</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (!unknownAliases.isEmpty())</span>
+<span class="nc" id="L386">            throw new IllegalArgumentException(String.format(&quot;Aliases %s used; only valid values are %s&quot;, unknownAliases, aliases.keySet()));</span>
+<span class="nc" id="L387">        List&lt;AbstractType&lt;?&gt;&gt; types = new ArrayList&lt;&gt;(valuesMap.size());</span>
+<span class="nc" id="L388">        List&lt;ByteBuffer&gt; values = new ArrayList&lt;&gt;(valuesMap.size());</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        for (Map.Entry&lt;Byte, Object&gt; e : valuesMap.entrySet())</span>
+        {
+            @SuppressWarnings(&quot;rawtype&quot;)
+<span class="nc" id="L392">            AbstractType type = aliases.get(e.getKey());</span>
+<span class="nc" id="L393">            types.add(type);</span>
+<span class="nc" id="L394">            values.add(type.decompose(e.getValue()));</span>
+<span class="nc" id="L395">        }</span>
+<span class="nc" id="L396">        return build(ByteBufferAccessor.instance, types, inverseMapping, values, (byte) 0);</span>
+    }
+
+    public static ByteBuffer build(List&lt;String&gt; types, List&lt;ByteBuffer&gt; values)
+    {
+<span class="nc" id="L401">        return build(ByteBufferAccessor.instance,</span>
+<span class="nc" id="L402">                     Lists.transform(types, TypeParser::parse),</span>
+<span class="nc" id="L403">                     Collections.emptyMap(),</span>
+                     values,
+                     (byte) 0);
+    }
+
+    @VisibleForTesting
+    public static &lt;V&gt; V build(ValueAccessor&lt;V&gt; accessor,
+                              List&lt;AbstractType&lt;?&gt;&gt; types,
+                              Map&lt;AbstractType&lt;?&gt;, Byte&gt; inverseMapping,
+                              List&lt;V&gt; values,
+                              byte lastEoc)
+    {
+<span class="nc bnc" id="L415" title="All 2 branches missed.">        assert types.size() == values.size();</span>
+
+<span class="nc" id="L417">        int numComponents = types.size();</span>
+        // Compute the total number of bytes that we'll need to store the types and their payloads.
+<span class="nc" id="L419">        int totalLength = 0;</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">        for (int i = 0; i &lt; numComponents; ++i)</span>
+        {
+<span class="nc" id="L422">            AbstractType&lt;?&gt; type = types.get(i);</span>
+<span class="nc" id="L423">            Byte alias = inverseMapping.get(type);</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            int typeNameLength = alias == null ? type.toString().getBytes(StandardCharsets.UTF_8).length : 0;</span>
+            // The type data will be stored by means of the type's fully qualified name, not by aliasing, so:
+            //   1. The type data header should be the fully qualified name length in bytes.
+            //   2. The length should be small enough so that it fits in 15 bits (2 bytes with the first bit zero).
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            assert typeNameLength &lt;= 0x7FFF;</span>
+<span class="nc" id="L429">            int valueLength = accessor.size(values.get(i));</span>
+            // The value length should also expect its first bit to be 0, as the length should be stored as a signed
+            // 2-byte value (short).
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            assert valueLength &lt;= 0x7FFF;</span>
+<span class="nc" id="L433">            totalLength += 2 + typeNameLength + 2 + valueLength + 1;</span>
+        }
+
+<span class="nc" id="L436">        V result = accessor.allocate(totalLength);</span>
+<span class="nc" id="L437">        int offset = 0;</span>
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        for (int i = 0; i &lt; numComponents; ++i)</span>
+        {
+<span class="nc" id="L440">            AbstractType&lt;?&gt; type = types.get(i);</span>
+<span class="nc" id="L441">            Byte alias = inverseMapping.get(type);</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            if (alias == null)</span>
+            {
+                // Write the type data (2-byte length header + the fully qualified type name in UTF-8).
+<span class="nc" id="L445">                byte[] typeNameBytes = type.toString().getBytes(StandardCharsets.UTF_8);</span>
+<span class="nc" id="L446">                accessor.putShort(result,</span>
+                                  offset,
+                                  (short) typeNameBytes.length); // this should work fine also if length &gt;= 32768
+<span class="nc" id="L449">                offset += 2;</span>
+<span class="nc" id="L450">                accessor.copyByteArrayTo(typeNameBytes, 0, result, offset, typeNameBytes.length);</span>
+<span class="nc" id="L451">                offset += typeNameBytes.length;</span>
+<span class="nc" id="L452">            }</span>
+            else
+            {
+<span class="nc" id="L455">                accessor.putShort(result, offset, (short) (alias | 0x8000));</span>
+<span class="nc" id="L456">                offset += 2;</span>
+            }
+
+            // Write the type payload data (2-byte length header + the payload).
+<span class="nc" id="L460">            V value = values.get(i);</span>
+<span class="nc" id="L461">            int bytesToCopy = accessor.size(value);</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            if ((short) bytesToCopy != bytesToCopy)</span>
+<span class="nc" id="L463">                throw new IllegalArgumentException(String.format(&quot;Value of type %s is of length %d; does not fit in a short&quot;, type.asCQL3Type(), bytesToCopy));</span>
+<span class="nc" id="L464">            accessor.putShort(result, offset, (short) bytesToCopy);</span>
+<span class="nc" id="L465">            offset += 2;</span>
+<span class="nc" id="L466">            accessor.copyTo(value, 0, result, accessor, offset, bytesToCopy);</span>
+<span class="nc" id="L467">            offset += bytesToCopy;</span>
+
+            // Write the end-of-component byte.
+<span class="nc bnc" id="L470" title="All 2 branches missed.">            accessor.putByte(result, offset, i != numComponents - 1 ? (byte) 0 : lastEoc);</span>
+<span class="nc" id="L471">            offset += 1;</span>
+        }
+<span class="nc" id="L473">        return result;</span>
+    }
+
+    protected ParsedComparator parseComparator(int i, String part)
+    {
+<span class="nc" id="L478">        return new DynamicParsedComparator(part);</span>
+    }
+
+    protected &lt;V&gt; AbstractType&lt;?&gt; validateComparator(int i, V input, ValueAccessor&lt;V&gt; accessor, int offset) throws MarshalException
+    {
+<span class="nc" id="L483">        AbstractType&lt;?&gt; comparator = null;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        if (accessor.sizeFromOffset(input, offset) &lt; 2)</span>
+<span class="nc" id="L485">            throw new MarshalException(&quot;Not enough bytes to header of the comparator part of component &quot; + i);</span>
+<span class="nc" id="L486">        int header = accessor.getShort(input, offset);</span>
+<span class="nc" id="L487">        offset += TypeSizes.SHORT_SIZE;</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">        if ((header &amp; 0x8000) == 0)</span>
+        {
+<span class="nc bnc" id="L490" title="All 2 branches missed.">            if (accessor.sizeFromOffset(input, offset) &lt; header)</span>
+<span class="nc" id="L491">                throw new MarshalException(&quot;Not enough bytes to read comparator name of component &quot; + i);</span>
+
+<span class="nc" id="L493">            V value = accessor.slice(input, offset, header);</span>
+<span class="nc" id="L494">            String valueStr = null;</span>
+            try
+            {
+<span class="nc" id="L497">                valueStr = accessor.toString(value);</span>
+<span class="nc" id="L498">                comparator = TypeParser.parse(valueStr);</span>
+            }
+<span class="nc" id="L500">            catch (CharacterCodingException ce)</span>
+            {
+                // ByteBufferUtil.string failed.
+                // Log it here and we'll further throw an exception below since comparator == null
+<span class="nc" id="L504">                logger.error(&quot;Failed when decoding the byte buffer in ByteBufferUtil.string()&quot;, ce);</span>
+            }
+<span class="nc" id="L506">            catch (Exception e)</span>
+            {
+                // parse failed.
+                // Log it here and we'll further throw an exception below since comparator == null
+<span class="nc" id="L510">                logger.error(&quot;Failed to parse value string \&quot;{}\&quot; with exception:&quot;, valueStr, e);</span>
+<span class="nc" id="L511">            }</span>
+<span class="nc" id="L512">        }</span>
+        else
+        {
+<span class="nc" id="L515">            comparator = aliases.get((byte)(header &amp; 0xFF));</span>
+        }
+
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if (comparator == null)</span>
+<span class="nc" id="L519">            throw new MarshalException(&quot;Cannot find comparator for component &quot; + i);</span>
+        else
+<span class="nc" id="L521">            return comparator;</span>
+    }
+
+    public ByteBuffer decompose(Object... objects)
+    {
+<span class="nc" id="L526">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType&lt;?&gt; previous)
+    {
+<span class="nc bnc" id="L532" title="All 2 branches missed.">        if (this == previous)</span>
+<span class="nc" id="L533">            return true;</span>
+
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        if (!(previous instanceof DynamicCompositeType))</span>
+<span class="nc" id="L536">            return false;</span>
+
+        // Adding new aliases is fine (but removing is not)
+        // Note that modifying the type for an alias to a compatible type is
+        // *not* fine since this would deal correctly with mixed aliased/not
+        // aliased component.
+<span class="nc" id="L542">        DynamicCompositeType cp = (DynamicCompositeType)previous;</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">        if (aliases.size() &lt; cp.aliases.size())</span>
+<span class="nc" id="L544">            return false;</span>
+
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        for (Map.Entry&lt;Byte, AbstractType&lt;?&gt;&gt; entry : cp.aliases.entrySet())</span>
+        {
+<span class="nc" id="L548">            AbstractType&lt;?&gt; tprev = entry.getValue();</span>
+<span class="nc" id="L549">            AbstractType&lt;?&gt; tnew = aliases.get(entry.getKey());</span>
+<span class="nc bnc" id="L550" title="All 4 branches missed.">            if (tnew == null || tnew != tprev)</span>
+<span class="nc" id="L551">                return false;</span>
+<span class="nc" id="L552">        }</span>
+<span class="nc" id="L553">        return true;</span>
+    }
+
+    @Override
+    public &lt;V&gt; boolean referencesUserType(V name, ValueAccessor&lt;V&gt; accessor)
+    {
+<span class="nc" id="L559">        return any(aliases.values(), t -&gt; t.referencesUserType(name, accessor));</span>
+    }
+
+    @Override
+    public DynamicCompositeType withUpdatedUserType(UserType udt)
+    {
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        if (!referencesUserType(udt.name))</span>
+<span class="nc" id="L566">            return this;</span>
+
+<span class="nc" id="L568">        instances.remove(aliases);</span>
+
+<span class="nc" id="L570">        return getInstance(Maps.transformValues(aliases, v -&gt; v.withUpdatedUserType(udt)));</span>
+    }
+
+    @Override
+    public AbstractType&lt;?&gt; expandUserTypes()
+    {
+<span class="nc" id="L576">        return getInstance(Maps.transformValues(aliases, v -&gt; v.expandUserTypes()));</span>
+    }
+
+    private class DynamicParsedComparator implements ParsedComparator
+    {
+        final AbstractType&lt;?&gt; type;
+        final boolean isAlias;
+        final String comparatorName;
+        final String remainingPart;
+
+        DynamicParsedComparator(String part)
+        {
+            String[] splits = part.split(&quot;@&quot;);
+            switch (splits.length)
+            {
+                default:
+                    throw new IllegalArgumentException(&quot;Invalid component representation: &quot; + part);
+                case 1:
+                {
+                    // empty is allowed for some types, so leave this to the higher level to validate empty makes sense for the type
+                    comparatorName = splits[0];
+                    remainingPart = &quot;&quot;;
+                }
+                break;
+                case 2:
+                {
+                    comparatorName = splits[0];
+                    remainingPart = splits[1];
+                }
+                break;
+            }
+
+            try
+            {
+                AbstractType&lt;?&gt; t = null;
+                if (comparatorName.length() == 1)
+                {
+                    // try for an alias
+                    // Note: the char to byte cast is theorically bogus for unicode character. I take full
+                    // responsibility if someone get hit by this (without making it on purpose)
+                    t = aliases.get((byte)comparatorName.charAt(0));
+                }
+                isAlias = t != null;
+                if (!isAlias)
+                {
+                    t = TypeParser.parse(comparatorName);
+                }
+                type = t;
+            }
+            catch (SyntaxException | ConfigurationException e)
+            {
+                throw new IllegalArgumentException(e);
+            }
+        }
+
+        public AbstractType&lt;?&gt; getAbstractType()
+        {
+            return type;
+        }
+
+        public String getRemainingPart()
+        {
+            return remainingPart;
+        }
+
+        public int getComparatorSerializedSize()
+        {
+            return isAlias ? 2 : 2 + ByteBufferUtil.bytes(comparatorName).remaining();
+        }
+
+        public void serializeComparator(ByteBuffer bb)
+        {
+            int header = 0;
+            if (isAlias)
+                header = 0x8000 | (((byte)comparatorName.charAt(0)) &amp; 0xFF);
+            else
+                header = comparatorName.length();
+            ByteBufferUtil.writeShortLength(bb, header);
+
+            if (!isAlias)
+                bb.put(ByteBufferUtil.bytes(comparatorName));
+        }
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L663" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L664" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="nc" id="L665">        DynamicCompositeType that = (DynamicCompositeType) o;</span>
+<span class="nc" id="L666">        return aliases.equals(that.aliases);</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L672">        return Objects.hash(aliases);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L678">        return getClass().getName() + TypeParser.stringifyAliasesParameters(aliases);</span>
+    }
+
+    /*
+     * A comparator that always sorts it's first argument before the second
+     * one.
+     */
+    @VisibleForTesting
+    public static class FixedValueComparator extends AbstractType&lt;Void&gt;
+    {
+<span class="nc" id="L688">        public static final FixedValueComparator alwaysLesserThan = new FixedValueComparator(-1);</span>
+<span class="nc" id="L689">        public static final FixedValueComparator alwaysGreaterThan = new FixedValueComparator(1);</span>
+
+        private final int cmp;
+
+        public FixedValueComparator(int cmp)
+        {
+<span class="nc" id="L695">            super(ComparisonType.CUSTOM);</span>
+<span class="nc" id="L696">            this.cmp = cmp;</span>
+<span class="nc" id="L697">        }</span>
+
+        public &lt;VL, VR&gt; int compareCustom(VL left, ValueAccessor&lt;VL&gt; accessorL, VR right, ValueAccessor&lt;VR&gt; accessorR)
+        {
+<span class="nc" id="L701">            return cmp;</span>
+        }
+
+        @Override
+        public &lt;V&gt; Void compose(V value, ValueAccessor&lt;V&gt; accessor)
+        {
+<span class="nc" id="L707">            throw new UnsupportedOperationException();</span>
+        }
+
+        public ByteBuffer decompose(Void value)
+        {
+<span class="nc" id="L712">            throw new UnsupportedOperationException();</span>
+        }
+
+        public &lt;V&gt; String getString(V value, ValueAccessor&lt;V&gt; accessor)
+        {
+<span class="nc" id="L717">            throw new UnsupportedOperationException();</span>
+        }
+
+        public ByteBuffer fromString(String str)
+        {
+<span class="nc" id="L722">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public Term fromJSONObject(Object parsed)
+        {
+<span class="nc" id="L728">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
+        {
+<span class="nc" id="L734">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public void validate(ByteBuffer bytes)
+        {
+<span class="nc" id="L740">            throw new UnsupportedOperationException();</span>
+        }
+
+        public TypeSerializer&lt;Void&gt; getSerializer()
+        {
+<span class="nc" id="L745">            throw new UnsupportedOperationException();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

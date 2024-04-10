@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ViewManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.view</a> &gt; <span class="el_source">ViewManager.java</span></div><h1>ViewManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.view;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+
+import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.Striped;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.ViewMetadata;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.schema.SystemDistributedKeyspace;
+import org.apache.cassandra.schema.Views;
+import org.apache.cassandra.service.StorageService;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.MV_ENABLE_COORDINATOR_BATCHLOG;
+
+/**
+ * Manages {@link View}'s for a single {@link ColumnFamilyStore}. All of the views for that table are created when this
+ * manager is initialized.
+ *
+ * The main purposes of the manager are to provide a single location for updates to be vetted to see whether they update
+ * any views {@link #updatesAffectView(Collection, boolean)}, provide locks to prevent multiple
+ * updates from creating incoherent updates in the view {@link #acquireLockFor(int)}, and
+ * to affect change on the view.
+ *
+ * TODO: I think we can get rid of that class. For addition/removal of view by names, we could move it Keyspace. And we
+ * not sure it's even worth keeping viewsByName as none of the related operation are performance sensitive so we could
+ * find the view by iterating over the CFStore.viewManager directly.
+ * For the lock, it could move to Keyspace too, but I don't remmenber why it has to be at the keyspace level and if it
+ * can be at the table level, maybe that's where it should be.
+ */
+public class ViewManager
+{
+<span class="fc" id="L58">    private static final Logger logger = LoggerFactory.getLogger(ViewManager.class);</span>
+
+<span class="fc" id="L60">    private static final Striped&lt;Lock&gt; LOCKS = Striped.lazyWeakLock(DatabaseDescriptor.getConcurrentViewWriters() * 1024);</span>
+
+<span class="fc" id="L62">    private static final boolean enableCoordinatorBatchlog = MV_ENABLE_COORDINATOR_BATCHLOG.getBoolean();</span>
+
+<span class="fc" id="L64">    private final ConcurrentMap&lt;String, View&gt; viewsByName = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L65">    private final ConcurrentMap&lt;TableId, TableViews&gt; viewsByBaseTable = new ConcurrentHashMap&lt;&gt;();</span>
+    private final Keyspace keyspace;
+
+    public ViewManager(Keyspace keyspace)
+<span class="fc" id="L69">    {</span>
+<span class="fc" id="L70">        this.keyspace = keyspace;</span>
+<span class="fc" id="L71">    }</span>
+
+    public boolean updatesAffectView(Collection&lt;? extends IMutation&gt; mutations, boolean coordinatorBatchlog)
+    {
+<span class="pc bpc" id="L75" title="1 of 4 branches missed.">        if (!enableCoordinatorBatchlog &amp;&amp; coordinatorBatchlog)</span>
+<span class="fc" id="L76">            return false;</span>
+
+<span class="fc bfc" id="L78" title="All 2 branches covered.">        for (IMutation mutation : mutations)</span>
+        {
+<span class="fc bfc" id="L80" title="All 2 branches covered.">            for (PartitionUpdate update : mutation.getPartitionUpdates())</span>
+            {
+<span class="pc bpc" id="L82" title="1 of 2 branches missed.">                assert keyspace.getName().equals(update.metadata().keyspace);</span>
+
+<span class="pc bpc" id="L84" title="3 of 4 branches missed.">                if (coordinatorBatchlog &amp;&amp; keyspace.getReplicationStrategy().getReplicationFactor().allReplicas == 1)</span>
+<span class="nc" id="L85">                    continue;</span>
+
+<span class="fc bfc" id="L87" title="All 2 branches covered.">                if (!forTable(update.metadata().id).updatedViews(update).isEmpty())</span>
+<span class="fc" id="L88">                    return true;</span>
+<span class="fc" id="L89">            }</span>
+<span class="fc" id="L90">        }</span>
+
+<span class="fc" id="L92">        return false;</span>
+    }
+
+    private Iterable&lt;View&gt; allViews()
+    {
+<span class="fc" id="L97">        return viewsByName.values();</span>
+    }
+
+    public void reload(boolean buildAllViews)
+    {
+<span class="fc" id="L102">        Views views = keyspace.getMetadata().views;</span>
+<span class="fc" id="L103">        Map&lt;String, ViewMetadata&gt; newViewsByName = Maps.newHashMapWithExpectedSize(views.size());</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">        for (ViewMetadata definition : views)</span>
+        {
+<span class="fc" id="L106">            newViewsByName.put(definition.name(), definition);</span>
+<span class="fc" id="L107">        }</span>
+
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        for (Map.Entry&lt;String, ViewMetadata&gt; entry : newViewsByName.entrySet())</span>
+        {
+<span class="fc bfc" id="L111" title="All 2 branches covered.">            if (!viewsByName.containsKey(entry.getKey()))</span>
+<span class="fc" id="L112">                addView(entry.getValue());</span>
+<span class="fc" id="L113">        }</span>
+
+<span class="fc bfc" id="L115" title="All 2 branches covered.">        if (!buildAllViews)</span>
+<span class="fc" id="L116">            return;</span>
+
+        // Building views involves updating view build status in the system_distributed
+        // keyspace and therefore it requires ring information. This check prevents builds
+        // being submitted when Keyspaces are initialized during CassandraDaemon::setup as
+        // that happens before StorageService &amp; gossip are initialized. After SS has been
+        // init'd we schedule builds for *all* views anyway, so this doesn't have any effect
+        // on startup. It does mean however, that builds will not be triggered if gossip is
+        // disabled via JMX or nodetool as that sets SS to an uninitialized state.
+<span class="fc bfc" id="L125" title="All 2 branches covered.">        if (!StorageService.instance.isInitialized())</span>
+        {
+<span class="fc" id="L127">            logger.info(&quot;Not submitting build tasks for views in keyspace {} as &quot; +</span>
+<span class="fc" id="L128">                        &quot;storage service is not initialized&quot;, keyspace.getName());</span>
+<span class="fc" id="L129">            return;</span>
+        }
+
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        for (View view : allViews())</span>
+        {
+<span class="fc" id="L134">            view.build();</span>
+            // We provide the new definition from the base metadata
+<span class="fc" id="L136">            view.updateDefinition(newViewsByName.get(view.name));</span>
+<span class="fc" id="L137">        }</span>
+<span class="fc" id="L138">    }</span>
+
+    public void addView(ViewMetadata definition)
+    {
+        // Skip if the base table doesn't exist due to schema propagation issues, see CASSANDRA-13737
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">        if (!keyspace.hasColumnFamilyStore(definition.baseTableId))</span>
+        {
+<span class="nc" id="L145">            logger.warn(&quot;Not adding view {} because the base table {} is unknown&quot;,</span>
+<span class="nc" id="L146">                        definition.name(),</span>
+                        definition.baseTableId);
+<span class="nc" id="L148">            return;</span>
+        }
+
+<span class="fc" id="L151">        View view = new View(definition, keyspace.getColumnFamilyStore(definition.baseTableId));</span>
+<span class="fc" id="L152">        forTable(view.getDefinition().baseTableId).add(view);</span>
+<span class="fc" id="L153">        viewsByName.put(definition.name(), view);</span>
+<span class="fc" id="L154">    }</span>
+
+    /**
+     * Stops the building of the specified view, no-op if it isn't building.
+     *
+     * @param name the name of the view
+     */
+    public void dropView(String name)
+    {
+<span class="nc" id="L163">        View view = viewsByName.remove(name);</span>
+
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        if (view == null)</span>
+<span class="nc" id="L166">            return;</span>
+
+<span class="nc" id="L168">        view.stopBuild();</span>
+<span class="nc" id="L169">        forTable(view.getDefinition().baseTableId).removeByName(name);</span>
+<span class="nc" id="L170">        SystemKeyspace.setViewRemoved(keyspace.getName(), view.name);</span>
+<span class="nc" id="L171">        SystemDistributedKeyspace.setViewRemoved(keyspace.getName(), view.name);</span>
+<span class="nc" id="L172">    }</span>
+
+    public View getByName(String name)
+    {
+<span class="fc" id="L176">        return viewsByName.get(name);</span>
+    }
+
+    public void buildAllViews()
+    {
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        for (View view : allViews())</span>
+<span class="fc" id="L182">            view.build();</span>
+<span class="fc" id="L183">    }</span>
+
+    public TableViews forTable(TableId id)
+    {
+<span class="fc" id="L187">        TableViews views = viewsByBaseTable.get(id);</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        if (views == null)</span>
+        {
+<span class="fc" id="L190">            views = new TableViews(id);</span>
+<span class="fc" id="L191">            TableViews previous = viewsByBaseTable.putIfAbsent(id, views);</span>
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">            if (previous != null)</span>
+<span class="nc" id="L193">                views = previous;</span>
+        }
+<span class="fc" id="L195">        return views;</span>
+    }
+
+    public static Lock acquireLockFor(int keyAndCfidHash)
+    {
+<span class="fc" id="L200">        Lock lock = LOCKS.get(keyAndCfidHash);</span>
+
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        if (lock.tryLock())</span>
+<span class="fc" id="L203">            return lock;</span>
+
+<span class="fc" id="L205">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

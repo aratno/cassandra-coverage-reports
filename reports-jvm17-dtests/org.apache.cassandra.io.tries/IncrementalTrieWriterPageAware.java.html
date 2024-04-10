@@ -1,0 +1,468 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>IncrementalTrieWriterPageAware.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.tries</a> &gt; <span class="el_source">IncrementalTrieWriterPageAware.java</span></div><h1>IncrementalTrieWriterPageAware.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.tries;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.NavigableSet;
+import java.util.TreeSet;
+
+import javax.annotation.concurrent.NotThreadSafe;
+
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+
+/**
+ * Incremental builders of on-disk tries which packs trie stages into disk cache pages.
+ *
+ * The incremental core is as in {@link IncrementalTrieWriterSimple}, which this augments by:
+ * &lt;ul&gt;
+ *   &lt;li&gt; calculating branch sizes reflecting the amount of data that needs to be written to store the trie
+ *     branch rooted at each node
+ *   &lt;li&gt; delaying writing any part of a completed node until its branch size is above the page size
+ *   &lt;li&gt; laying out (some of) its children branches (each smaller than a page) to be contained within a page
+ *   &lt;li&gt; adjusting the branch size to reflect the fact that the children are now written (i.e. removing their size)
+ * &lt;/ul&gt;
+ * &lt;p&gt;
+ * The process is bottom-up, i.e. pages are packed at the bottom and the root page is usually smaller.
+ * This may appear less efficient than a top-down process which puts more information in the top pages that
+ * tend to stay in cache, but in both cases performing a search will usually require an additional disk read
+ * for the leaf page. When we maximize the amount of relevant data that read brings by using the bottom-up
+ * process, we have practically the same efficiency with smaller intermediate page footprint, i.e. fewer data
+ * to keep in cache.
+ * &lt;p&gt;
+ * As an example, taking a sample page size fitting 4 nodes, a simple trie would be split like this:
+ * &lt;pre&gt;
+ * Node 0 |
+ *   -a-&gt; | Node 1
+ *        |   -s-&gt; Node 2
+ *        |          -k-&gt; Node 3 (payload 1)
+ *        |          -s-&gt; Node 4 (payload 2)
+ *        -----------------------------------
+ *   -b-&gt; Node 5 |
+ *          -a-&gt; |Node 6
+ *               |  -n-&gt; Node 7
+ *               |         -k-&gt; Node 8 (payload 3)
+ *               |                -s-&gt; Node 9 (payload 4)
+ * &lt;/pre&gt;
+ * where lines denote page boundaries.
+ * &lt;p&gt;
+ * The process itself will start by adding &quot;ask&quot; which adds three nodes after the root to the stack. Adding &quot;ass&quot;
+ * completes Node 3, setting its branch a size of 1 and replaces it on the stack with Node 4.
+ * The step of adding &quot;bank&quot; starts by completing Node 4 (size 1), Node 2 (size 3), Node 1 (size 4), then adds 4 more
+ * nodes to the stack. Adding &quot;banks&quot; descends one more node.
+ * &lt;p&gt;
+ * The trie completion step completes nodes 9 (size 1), 8 (size 2), 7 (size 3), 6 (size 4), 5 (size 5). Since the size
+ * of node 5 is above the page size, the algorithm lays out its children. Nodes 6, 7, 8, 9 are written in order. The
+ * size of node 5 is now just the size of it individually, 1. The process continues with completing Node 0 (size 6).
+ * This is bigger than the page size, so some of its children need to be written. The algorithm takes the largest,
+ * Node 1, and lays it out with its children in the file. Node 0 now has an adjusted size of 2 which is below the
+ * page size, and we can continue the process.
+ * &lt;p&gt;
+ * Since this was the root of the trie, the current page is padded and the remaining nodes 0, 5 are written.
+ */
+@NotThreadSafe
+public class IncrementalTrieWriterPageAware&lt;VALUE&gt;
+extends IncrementalTrieWriterBase&lt;VALUE, DataOutputPlus, IncrementalTrieWriterPageAware.Node&lt;VALUE&gt;&gt;
+implements IncrementalTrieWriter&lt;VALUE&gt;
+{
+    final int maxBytesPerPage;
+
+<span class="fc" id="L88">    private final static Comparator&lt;Node&lt;?&gt;&gt; BRANCH_SIZE_COMPARATOR = (l, r) -&gt;</span>
+    {
+        // Smaller branches first.
+<span class="nc" id="L91">        int c = Integer.compare(l.branchSize + l.nodeSize, r.branchSize + r.nodeSize);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (c != 0)</span>
+<span class="nc" id="L93">            return c;</span>
+
+        // Then order by character, which serves several purposes:
+        // - enforces inequality to make sure equal sizes aren't treated as duplicates,
+        // - makes sure the item we use for comparison key comes greater than all equal-sized nodes,
+        // - orders equal sized items so that most recently processed (and potentially having closer children) comes
+        //   last and is thus the first one picked for layout.
+<span class="nc" id="L100">        c = Integer.compare(l.transition, r.transition);</span>
+
+<span class="nc bnc" id="L102" title="All 4 branches missed.">        assert c != 0 || l == r;</span>
+<span class="nc" id="L103">        return c;</span>
+    };
+
+    IncrementalTrieWriterPageAware(TrieSerializer&lt;VALUE, ? super DataOutputPlus&gt; trieSerializer, DataOutputPlus dest)
+    {
+<span class="fc" id="L108">        super(trieSerializer, dest, new Node&lt;&gt;((byte) 0));</span>
+<span class="fc" id="L109">        this.maxBytesPerPage = dest.maxBytesInPage();</span>
+<span class="fc" id="L110">    }</span>
+
+    @Override
+    public void reset()
+    {
+<span class="nc" id="L115">        reset(new Node&lt;&gt;((byte) 0));</span>
+<span class="nc" id="L116">    }</span>
+
+    @Override
+    Node&lt;VALUE&gt; performCompletion() throws IOException
+    {
+<span class="fc" id="L121">        Node&lt;VALUE&gt; root = super.performCompletion();</span>
+
+<span class="fc" id="L123">        int actualSize = recalcTotalSize(root, dest.position());</span>
+<span class="fc" id="L124">        int bytesLeft = dest.bytesLeftInPage();</span>
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">        if (actualSize &gt; bytesLeft)</span>
+        {
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            if (actualSize &lt;= maxBytesPerPage)</span>
+            {
+<span class="nc" id="L129">                dest.padToPageBoundary();</span>
+<span class="nc" id="L130">                bytesLeft = maxBytesPerPage;</span>
+                // position changed, recalculate again
+<span class="nc" id="L132">                actualSize = recalcTotalSize(root, dest.position());</span>
+            }
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (actualSize &gt; bytesLeft)</span>
+            {
+                // Still greater. Lay out children separately.
+<span class="nc" id="L138">                layoutChildren(root);</span>
+
+                // Pad if needed and place.
+<span class="nc bnc" id="L141" title="All 2 branches missed.">                if (root.nodeSize &gt; dest.bytesLeftInPage())</span>
+                {
+<span class="nc" id="L143">                    dest.padToPageBoundary();</span>
+                    // Recalculate again as pointer size may have changed, triggering assertion in writeRecursive.
+<span class="nc" id="L145">                    recalcTotalSize(root, dest.position());</span>
+                }
+            }
+        }
+
+
+<span class="fc" id="L151">        root.finalizeWithPosition(write(root));</span>
+<span class="fc" id="L152">        return root;</span>
+    }
+
+    @Override
+    void complete(Node&lt;VALUE&gt; node) throws IOException
+    {
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">        assert node.filePos == -1;</span>
+
+<span class="fc" id="L160">        int branchSize = 0;</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">        for (Node&lt;VALUE&gt; child : node.children)</span>
+<span class="fc" id="L162">            branchSize += child.branchSize + child.nodeSize;</span>
+
+<span class="fc" id="L164">        node.branchSize = branchSize;</span>
+
+<span class="fc" id="L166">        int nodeSize = serializer.sizeofNode(node, dest.position());</span>
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (nodeSize + branchSize &lt; maxBytesPerPage)</span>
+        {
+            // Good. This node and all children will (most probably) fit page.
+<span class="fc" id="L170">            node.nodeSize = nodeSize;</span>
+<span class="fc" id="L171">            node.hasOutOfPageChildren = false;</span>
+<span class="fc" id="L172">            node.hasOutOfPageInBranch = false;</span>
+
+<span class="fc bfc" id="L174" title="All 2 branches covered.">            for (Node&lt;VALUE&gt; child : node.children)</span>
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">                if (child.filePos != -1)</span>
+<span class="nc" id="L176">                    node.hasOutOfPageChildren = true;</span>
+<span class="pc bpc" id="L177" title="2 of 4 branches missed.">                else if (child.hasOutOfPageChildren || child.hasOutOfPageInBranch)</span>
+<span class="nc" id="L178">                    node.hasOutOfPageInBranch = true;</span>
+
+<span class="fc" id="L180">            return;</span>
+        }
+
+        // Cannot fit. Lay out children; The current node will be marked as one with out-of-page children.
+<span class="nc" id="L184">        layoutChildren(node);</span>
+<span class="nc" id="L185">    }</span>
+
+    private void layoutChildren(Node&lt;VALUE&gt; node) throws IOException
+    {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        assert node.filePos == -1;</span>
+
+<span class="nc" id="L191">        NavigableSet&lt;Node&lt;VALUE&gt;&gt; children = node.getChildrenWithUnsetPosition();</span>
+
+<span class="nc" id="L193">        int bytesLeft = dest.bytesLeftInPage();</span>
+<span class="nc" id="L194">        Node&lt;VALUE&gt; cmp = new Node&lt;&gt;(256); // goes after all equal-sized unplaced nodes (whose transition character is 0-255)</span>
+<span class="nc" id="L195">        cmp.nodeSize = 0;</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        while (!children.isEmpty())</span>
+        {
+<span class="nc" id="L198">            cmp.branchSize = bytesLeft;</span>
+<span class="nc" id="L199">            Node&lt;VALUE&gt; child = children.headSet(cmp, true).pollLast();    // grab biggest that could fit</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (child == null)</span>
+            {
+<span class="nc" id="L202">                dest.padToPageBoundary();</span>
+<span class="nc" id="L203">                bytesLeft = maxBytesPerPage;</span>
+<span class="nc" id="L204">                child = children.pollLast();       // just biggest</span>
+            }
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            assert child != null;</span>
+<span class="nc bnc" id="L208" title="All 4 branches missed.">            if (child.hasOutOfPageChildren || child.hasOutOfPageInBranch)</span>
+            {
+                // We didn't know what size this branch will actually need to be, node's children may be far.
+                // We now know where we would place it, so let's reevaluate size.
+<span class="nc" id="L212">                int actualSize = recalcTotalSize(child, dest.position());</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                if (actualSize &gt; bytesLeft)</span>
+                {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    if (bytesLeft == maxBytesPerPage)</span>
+                    {
+                        // Branch doesn't even fit in a page.
+
+                        // Note: In this situation we aren't actually making the best choice as the layout should have
+                        // taken place at the child (which could have made the current parent small enough to fit).
+                        // This is not trivial to fix but should be very rare.
+
+<span class="nc" id="L223">                        layoutChildren(child);</span>
+<span class="nc" id="L224">                        bytesLeft = dest.bytesLeftInPage();</span>
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                        assert (child.filePos == -1);</span>
+                    }
+
+                    // Doesn't fit, but that's probably because we don't have a full page. Put it back with the new
+                    // size and retry when we do have enough space.
+<span class="nc" id="L231">                    children.add(child);</span>
+<span class="nc" id="L232">                    continue;</span>
+                }
+            }
+
+<span class="nc" id="L236">            child.finalizeWithPosition(write(child));</span>
+<span class="nc" id="L237">            bytesLeft = dest.bytesLeftInPage();</span>
+<span class="nc" id="L238">        }</span>
+
+        // The sizing below will use the branch size, so make sure it's set.
+<span class="nc" id="L241">        node.branchSize = 0;</span>
+<span class="nc" id="L242">        node.hasOutOfPageChildren = true;</span>
+<span class="nc" id="L243">        node.hasOutOfPageInBranch = false;</span>
+<span class="nc" id="L244">        node.nodeSize = serializer.sizeofNode(node, dest.position());</span>
+<span class="nc" id="L245">    }</span>
+
+    @SuppressWarnings(&quot;DuplicatedCode&quot;) // intentionally duplicated in IncrementalDeepTrieWriterPageAware
+    protected int recalcTotalSize(Node&lt;VALUE&gt; node, long nodePosition) throws IOException
+    {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (node.hasOutOfPageInBranch)</span>
+        {
+<span class="nc" id="L252">            int sz = 0;</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            for (Node&lt;VALUE&gt; child : node.children)</span>
+<span class="nc" id="L254">                sz += recalcTotalSize(child, nodePosition + sz);</span>
+<span class="nc" id="L255">            node.branchSize = sz;</span>
+        }
+
+        // The sizing below will use the branch size calculated above. Since that can change on out-of-page in branch,
+        // we need to recalculate the size if either flag is set.
+<span class="nc bnc" id="L260" title="All 4 branches missed.">        if (node.hasOutOfPageChildren || node.hasOutOfPageInBranch)</span>
+<span class="nc" id="L261">            node.nodeSize = serializer.sizeofNode(node, nodePosition + node.branchSize);</span>
+
+<span class="nc" id="L263">        return node.branchSize + node.nodeSize;</span>
+    }
+
+    @SuppressWarnings(&quot;DuplicatedCode&quot;) // intentionally duplicated in IncrementalDeepTrieWriterPageAware
+    protected long write(Node&lt;VALUE&gt; node) throws IOException
+    {
+<span class="nc" id="L269">        long nodePosition = dest.position();</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        for (Node&lt;VALUE&gt; child : node.children)</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (child.filePos == -1)</span>
+<span class="nc" id="L272">                child.filePos = write(child);</span>
+
+<span class="nc" id="L274">        nodePosition += node.branchSize;</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        assert dest.position() == nodePosition</span>
+<span class="nc" id="L276">                : &quot;Expected node position to be &quot; + nodePosition + &quot; but got &quot; + dest.position() + &quot; after writing children.\n&quot; + dumpNode(node, dest.position());</span>
+
+<span class="nc" id="L278">        serializer.write(dest, node, nodePosition);</span>
+
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        assert dest.position() == nodePosition + node.nodeSize</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                || dest.paddedPosition() == dest.position() // For PartitionIndexTest.testPointerGrowth where position may jump on page boundaries.</span>
+<span class="nc" id="L282">                : &quot;Expected node position to be &quot; + (nodePosition + node.nodeSize) + &quot; but got &quot; + dest.position() + &quot; after writing node, nodeSize &quot; + node.nodeSize + &quot;.\n&quot; + dumpNode(node, nodePosition);</span>
+<span class="nc" id="L283">        return nodePosition;</span>
+    }
+
+    protected String dumpNode(Node&lt;VALUE&gt; node, long nodePosition)
+    {
+<span class="nc" id="L288">        StringBuilder res = new StringBuilder(String.format(&quot;At %,d(%x) type %s child count %s nodeSize %,d branchSize %,d %s%s%n&quot;,</span>
+<span class="nc" id="L289">                                                            nodePosition, nodePosition,</span>
+<span class="nc" id="L290">                                                            TrieNode.typeFor(node, nodePosition), node.childCount(), node.nodeSize, node.branchSize,</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                                                            node.hasOutOfPageChildren ? &quot;C&quot; : &quot;&quot;,</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">                                                            node.hasOutOfPageInBranch ? &quot;B&quot; : &quot;&quot;));</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        for (Node&lt;VALUE&gt; child : node.children)</span>
+<span class="nc" id="L294">            res.append(String.format(&quot;Child %2x at %,d(%x) type %s child count %s size %s nodeSize %,d branchSize %,d %s%s%n&quot;,</span>
+<span class="nc" id="L295">                                     child.transition &amp; 0xFF,</span>
+<span class="nc" id="L296">                                     child.filePos,</span>
+<span class="nc" id="L297">                                     child.filePos,</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                                     child.children != null ? TrieNode.typeFor(child, child.filePos) : &quot;n/a&quot;,</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                                     child.children != null ? child.childCount() : &quot;n/a&quot;,</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                                     child.children != null ? serializer.sizeofNode(child, child.filePos) : &quot;n/a&quot;,</span>
+<span class="nc" id="L301">                                     child.nodeSize,</span>
+<span class="nc" id="L302">                                     child.branchSize,</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                                     child.hasOutOfPageChildren ? &quot;C&quot; : &quot;&quot;,</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">                                     child.hasOutOfPageInBranch ? &quot;B&quot; : &quot;&quot;));</span>
+
+<span class="nc" id="L306">        return res.toString();</span>
+    }
+
+    @Override
+    public PartialTail makePartialRoot() throws IOException
+    {
+        // The expectation is that the partial tail will be in memory, so we don't bother with page-fitting.
+        // We could also send some completed children to disk, but that could make suboptimal layout choices, so we'd
+        // rather not. Just write anything not written yet to a buffer, from bottom to top, and we're done.
+<span class="nc" id="L315">        try (DataOutputBuffer buf = new DataOutputBuffer())</span>
+        {
+<span class="nc" id="L317">            PTail tail = new PTail();</span>
+            // Readers ask rebufferers for page-aligned positions, so make sure tail starts at one.
+            // &quot;Padding&quot; of the cutoff point may leave some unaddressable space in the constructed file view.
+            // Nothing will point to it, though, so that's fine.
+<span class="nc" id="L321">            tail.cutoff = dest.paddedPosition();</span>
+<span class="nc" id="L322">            tail.count = count;</span>
+<span class="nc" id="L323">            tail.root = writePartial(stack.getFirst(), buf, tail.cutoff);</span>
+<span class="nc" id="L324">            tail.tail = buf.asNewBuffer();</span>
+<span class="nc" id="L325">            return tail;</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;DuplicatedCode&quot;) // intentionally duplicated in IncrementalDeepTrieWriterPageAware
+    protected long writePartial(Node&lt;VALUE&gt; node, DataOutputPlus dest, long baseOffset) throws IOException
+    {
+<span class="nc" id="L332">        long startPosition = dest.position() + baseOffset;</span>
+
+<span class="nc" id="L334">        List&lt;Node&lt;VALUE&gt;&gt; childrenToClear = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        for (Node&lt;VALUE&gt; child : node.children)</span>
+        {
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            if (child.filePos == -1)</span>
+            {
+<span class="nc" id="L339">                childrenToClear.add(child);</span>
+<span class="nc" id="L340">                child.filePos = writePartial(child, dest, baseOffset);</span>
+            }
+<span class="nc" id="L342">        }</span>
+
+<span class="nc" id="L344">        long nodePosition = dest.position() + baseOffset;</span>
+
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (node.hasOutOfPageInBranch)</span>
+        {
+            // Update the branch size with the size of what we have just written. This may be used by the node's
+            // maxPositionDelta, and it's a better approximation for later fitting calculations.
+<span class="nc" id="L350">            node.branchSize = (int) (nodePosition - startPosition);</span>
+        }
+
+<span class="nc" id="L353">        serializer.write(dest, node, nodePosition);</span>
+
+<span class="nc bnc" id="L355" title="All 4 branches missed.">        if (node.hasOutOfPageChildren || node.hasOutOfPageInBranch)</span>
+        {
+            // Update the node size with what we have just seen. It's a better approximation for later fitting
+            // calculations.
+<span class="nc" id="L359">            long endPosition = dest.position() + baseOffset;</span>
+<span class="nc" id="L360">            node.nodeSize = (int) (endPosition - nodePosition);</span>
+        }
+
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        for (Node&lt;VALUE&gt; child : childrenToClear)</span>
+<span class="nc" id="L364">            child.filePos = -1;</span>
+<span class="nc" id="L365">        return nodePosition;</span>
+    }
+
+<span class="fc" id="L368">    static class Node&lt;Value&gt; extends IncrementalTrieWriterBase.BaseNode&lt;Value, Node&lt;Value&gt;&gt;</span>
+    {
+        /**
+         * Currently calculated size of the branch below this node, not including the node itself.
+         * If hasOutOfPageInBranch is true, this may be underestimated as the size
+         * depends on the position the branch is written.
+         */
+<span class="fc" id="L375">        int branchSize = -1;</span>
+        /**
+         * Currently calculated node size. If hasOutOfPageChildren is true, this may be underestimated as the size
+         * depends on the position the node is written.
+         */
+<span class="fc" id="L380">        int nodeSize = -1;</span>
+
+        /**
+         * Whether there is an out-of-page, already written node in the branches below the immediate children of the
+         * node.
+         */
+<span class="fc" id="L386">        boolean hasOutOfPageInBranch = false;</span>
+        /**
+         * Whether a child of the node is out of page, already written.
+         * Forced to true before being set to make sure maxPositionDelta performs its evaluation on non-completed
+         * nodes for makePartialRoot.
+         */
+<span class="fc" id="L392">        boolean hasOutOfPageChildren = true;</span>
+
+        Node(int transition)
+        {
+<span class="fc" id="L396">            super(transition);</span>
+<span class="fc" id="L397">        }</span>
+
+        @Override
+        Node&lt;Value&gt; newNode(byte transition)
+        {
+<span class="fc" id="L402">            return new Node&lt;&gt;(transition &amp; 0xFF);</span>
+        }
+
+        public long serializedPositionDelta(int i, long nodePosition)
+        {
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">            assert (children.get(i).filePos != -1);</span>
+<span class="fc" id="L408">            return children.get(i).filePos - nodePosition;</span>
+        }
+
+        /**
+         * The max delta is the delta with either:
+         * - the position where the first child not-yet-placed child will be laid out.
+         * - the position of the furthest child that is already placed.
+         *
+         * This method assumes all children's branch and node sizes, as well as this node's branchSize, are already
+         * calculated.
+         */
+        public long maxPositionDelta(long nodePosition)
+        {
+            // The max delta is the position the first child would be laid out.
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">            assert (childCount() &gt; 0);</span>
+
+<span class="fc bfc" id="L424" title="All 2 branches covered.">            if (!hasOutOfPageChildren)</span>
+                // We need to be able to address the first child. We don't need to cover its branch, though.
+<span class="fc" id="L426">                return -(branchSize - children.get(0).branchSize);</span>
+
+<span class="fc" id="L428">            long minPlaced = 0;</span>
+<span class="fc" id="L429">            long minUnplaced = 1;</span>
+<span class="fc bfc" id="L430" title="All 2 branches covered.">            for (Node&lt;Value&gt; child : children)</span>
+            {
+<span class="pc bpc" id="L432" title="1 of 2 branches missed.">                if (child.filePos != -1)</span>
+<span class="nc" id="L433">                    minPlaced = Math.min(minPlaced, child.filePos - nodePosition);</span>
+<span class="pc bpc" id="L434" title="1 of 2 branches missed.">                else if (minUnplaced &gt; 0)   // triggers once</span>
+<span class="fc" id="L435">                    minUnplaced = -(branchSize - child.branchSize);</span>
+<span class="fc" id="L436">            }</span>
+
+<span class="fc" id="L438">            return Math.min(minPlaced, minUnplaced);</span>
+        }
+
+        NavigableSet&lt;Node&lt;Value&gt;&gt; getChildrenWithUnsetPosition()
+        {
+<span class="nc" id="L443">            NavigableSet&lt;Node&lt;Value&gt;&gt; result = new TreeSet&lt;&gt;(BRANCH_SIZE_COMPARATOR);</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            for (Node&lt;Value&gt; child : children)</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">                if (child.filePos == -1)</span>
+<span class="nc" id="L446">                    result.add(child);</span>
+
+<span class="nc" id="L448">            return result;</span>
+        }
+
+        @Override
+        void finalizeWithPosition(long position)
+        {
+<span class="fc" id="L454">            this.branchSize = 0;                // takes no space in current page</span>
+<span class="fc" id="L455">            this.nodeSize = 0;</span>
+<span class="fc" id="L456">            this.hasOutOfPageInBranch = false;  // its size no longer needs to be recalculated</span>
+<span class="fc" id="L457">            this.hasOutOfPageChildren = false;</span>
+<span class="fc" id="L458">            super.finalizeWithPosition(position);</span>
+<span class="fc" id="L459">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc bnc" id="L464" title="All 4 branches missed.">            return String.format(&quot;%02x branchSize=%04x nodeSize=%04x %s%s&quot;, transition, branchSize, nodeSize, hasOutOfPageInBranch ? &quot;B&quot; : &quot;&quot;, hasOutOfPageChildren ? &quot;C&quot; : &quot;&quot;);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

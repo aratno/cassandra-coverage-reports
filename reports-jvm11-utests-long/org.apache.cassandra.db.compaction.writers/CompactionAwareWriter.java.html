@@ -1,0 +1,326 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionAwareWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction.writers</a> &gt; <span class="el_source">CompactionAwareWriter.java</span></div><h1>CompactionAwareWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction.writers;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.DiskBoundaries;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.compaction.CompactionTask;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableRewriter;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+
+/**
+ * Class that abstracts away the actual writing of files to make it possible to use CompactionTask for more
+ * use cases.
+ */
+public abstract class CompactionAwareWriter extends Transactional.AbstractTransactional implements Transactional
+{
+<span class="fc" id="L55">    protected static final Logger logger = LoggerFactory.getLogger(CompactionAwareWriter.class);</span>
+
+    protected final ColumnFamilyStore cfs;
+    protected final Directories directories;
+    protected final Set&lt;SSTableReader&gt; nonExpiredSSTables;
+    protected final long estimatedTotalKeys;
+    protected final long maxAge;
+    protected final long minRepairedAt;
+    protected final TimeUUID pendingRepair;
+    protected final boolean isTransient;
+
+    protected final SSTableRewriter sstableWriter;
+    protected final LifecycleTransaction txn;
+    private final List&lt;Directories.DataDirectory&gt; locations;
+    private final List&lt;PartitionPosition&gt; diskBoundaries;
+    private int locationIndex;
+    protected Directories.DataDirectory currentDirectory;
+
+    public CompactionAwareWriter(ColumnFamilyStore cfs,
+                                 Directories directories,
+                                 LifecycleTransaction txn,
+                                 Set&lt;SSTableReader&gt; nonExpiredSSTables,
+                                 boolean keepOriginals)
+<span class="fc" id="L78">    {</span>
+<span class="fc" id="L79">        this.cfs = cfs;</span>
+<span class="fc" id="L80">        this.directories = directories;</span>
+<span class="fc" id="L81">        this.nonExpiredSSTables = nonExpiredSSTables;</span>
+<span class="fc" id="L82">        this.txn = txn;</span>
+
+<span class="fc" id="L84">        estimatedTotalKeys = SSTableReader.getApproximateKeyCount(nonExpiredSSTables);</span>
+<span class="fc" id="L85">        maxAge = CompactionTask.getMaxDataAge(nonExpiredSSTables);</span>
+<span class="fc" id="L86">        sstableWriter = SSTableRewriter.construct(cfs, txn, keepOriginals, maxAge);</span>
+<span class="fc" id="L87">        minRepairedAt = CompactionTask.getMinRepairedAt(nonExpiredSSTables);</span>
+<span class="fc" id="L88">        pendingRepair = CompactionTask.getPendingRepair(nonExpiredSSTables);</span>
+<span class="fc" id="L89">        isTransient = CompactionTask.getIsTransient(nonExpiredSSTables);</span>
+<span class="fc" id="L90">        DiskBoundaries db = cfs.getDiskBoundaries();</span>
+<span class="fc" id="L91">        diskBoundaries = db.positions;</span>
+<span class="fc" id="L92">        locations = db.directories;</span>
+<span class="fc" id="L93">        locationIndex = -1;</span>
+<span class="fc" id="L94">    }</span>
+
+    @Override
+    protected Throwable doAbort(Throwable accumulate)
+    {
+<span class="nc" id="L99">        return sstableWriter.abort(accumulate);</span>
+    }
+
+    @Override
+    protected Throwable doCommit(Throwable accumulate)
+    {
+<span class="fc" id="L105">        return sstableWriter.commit(accumulate);</span>
+    }
+
+    @Override
+    protected void doPrepare()
+    {
+<span class="fc" id="L111">        sstableWriter.prepareToCommit();</span>
+<span class="fc" id="L112">    }</span>
+
+    /**
+     * we are done, return the finished sstables so that the caller can mark the old ones as compacted
+     * @return all the written sstables sstables
+     */
+    @Override
+    public Collection&lt;SSTableReader&gt; finish()
+    {
+<span class="fc" id="L121">        super.finish();</span>
+<span class="fc" id="L122">        return sstableWriter.finished();</span>
+    }
+
+    /**
+     * estimated number of keys we should write
+     */
+    public long estimatedKeys()
+    {
+<span class="fc" id="L130">        return estimatedTotalKeys;</span>
+    }
+
+    /**
+     * Writes a partition in an implementation specific way
+     * @param partition the partition to append
+     * @return true if the partition was written, false otherwise
+     */
+    public final boolean append(UnfilteredRowIterator partition)
+    {
+<span class="fc" id="L140">        maybeSwitchWriter(partition.partitionKey());</span>
+<span class="fc" id="L141">        return realAppend(partition);</span>
+    }
+
+    public final File getSStableDirectory() throws IOException
+    {
+<span class="fc" id="L146">        return getDirectories().getLocationForDisk(currentDirectory);</span>
+    }
+
+    @Override
+    protected Throwable doPostCleanup(Throwable accumulate)
+    {
+<span class="fc" id="L152">        sstableWriter.close();</span>
+<span class="fc" id="L153">        return super.doPostCleanup(accumulate);</span>
+    }
+
+    protected boolean realAppend(UnfilteredRowIterator partition)
+    {
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">        return sstableWriter.append(partition) != null;</span>
+    }
+
+    /**
+     * Switches the writer if necessary, i.e. if the new key should be placed in a different data directory, or if the
+     * specific strategy has decided a new sstable is needed.
+     * Guaranteed to be called before the first call to realAppend.
+     */
+    protected void maybeSwitchWriter(DecoratedKey key)
+    {
+<span class="fc bfc" id="L168" title="All 2 branches covered.">        if (maybeSwitchLocation(key))</span>
+<span class="fc" id="L169">            return;</span>
+
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        if (shouldSwitchWriterInCurrentLocation(key))</span>
+<span class="fc" id="L172">            switchCompactionWriter(currentDirectory, key);</span>
+<span class="fc" id="L173">    }</span>
+
+    /**
+     * Switches the file location and writer and returns true if the new key should be placed in a different data
+     * directory.
+     */
+    protected boolean maybeSwitchLocation(DecoratedKey key)
+    {
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        if (diskBoundaries == null)</span>
+        {
+<span class="fc bfc" id="L183" title="All 2 branches covered.">            if (locationIndex &lt; 0)</span>
+            {
+<span class="fc" id="L185">                Directories.DataDirectory defaultLocation = getWriteDirectory(nonExpiredSSTables, getExpectedWriteSize());</span>
+<span class="fc" id="L186">                switchCompactionWriter(defaultLocation, key);</span>
+<span class="fc" id="L187">                locationIndex = 0;</span>
+<span class="fc" id="L188">                return true;</span>
+            }
+<span class="fc" id="L190">            return false;</span>
+        }
+
+<span class="pc bpc" id="L193" title="1 of 4 branches missed.">        if (locationIndex &gt; -1 &amp;&amp; key.compareTo(diskBoundaries.get(locationIndex)) &lt; 0)</span>
+<span class="fc" id="L194">            return false;</span>
+
+<span class="fc" id="L196">        int prevIdx = locationIndex;</span>
+<span class="pc bpc" id="L197" title="1 of 4 branches missed.">        while (locationIndex == -1 || key.compareTo(diskBoundaries.get(locationIndex)) &gt; 0)</span>
+<span class="fc" id="L198">            locationIndex++;</span>
+<span class="fc" id="L199">        Directories.DataDirectory newLocation = locations.get(locationIndex);</span>
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">        if (prevIdx &gt;= 0)</span>
+<span class="nc" id="L201">            logger.debug(&quot;Switching write location from {} to {}&quot;, locations.get(prevIdx), newLocation);</span>
+<span class="fc" id="L202">        switchCompactionWriter(newLocation, key);</span>
+<span class="fc" id="L203">        return true;</span>
+    }
+
+    /**
+     * Returns true if the writer should be switched for reasons other than switching to a new data directory
+     * (e.g. because an sstable size limit has been reached).
+     */
+    protected abstract boolean shouldSwitchWriterInCurrentLocation(DecoratedKey key);
+
+    /**
+     * Implementations of this method should finish the current sstable writer and start writing to this directory.
+     * &lt;p&gt;
+     * Called once before starting to append and then whenever we see a need to start writing to another directory.
+     *
+     * @param directory
+     * @param nextKey
+     */
+    protected void switchCompactionWriter(Directories.DataDirectory directory, DecoratedKey nextKey)
+    {
+<span class="fc" id="L222">        currentDirectory = directory;</span>
+<span class="fc" id="L223">        sstableWriter.switchWriter(sstableWriter(directory, nextKey));</span>
+<span class="fc" id="L224">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    protected SSTableWriter sstableWriter(Directories.DataDirectory directory, DecoratedKey nextKey)
+    {
+<span class="fc" id="L229">        Descriptor descriptor = cfs.newSSTableDescriptor(getDirectories().getLocationForDisk(directory));</span>
+<span class="fc" id="L230">        MetadataCollector collector = new MetadataCollector(txn.originals(), cfs.metadata().comparator)</span>
+<span class="fc" id="L231">                                      .sstableLevel(sstableLevel());</span>
+<span class="fc" id="L232">        SerializationHeader header = SerializationHeader.make(cfs.metadata(), nonExpiredSSTables);</span>
+
+<span class="fc" id="L234">        return newWriterBuilder(descriptor).setMetadataCollector(collector)</span>
+<span class="fc" id="L235">                                           .setSerializationHeader(header)</span>
+<span class="fc" id="L236">                                           .setKeyCount(sstableKeyCount())</span>
+<span class="fc" id="L237">                                           .build(txn, cfs);</span>
+    }
+
+    /**
+     * Returns the level that should be used when creating sstables.
+     */
+    protected int sstableLevel()
+    {
+<span class="nc" id="L245">        return 0;</span>
+    }
+
+    /**
+     * Returns the key count with which created sstables should be set up.
+     */
+    abstract protected long sstableKeyCount();
+
+    /**
+     * The directories we can write to
+     */
+    public Directories getDirectories()
+    {
+<span class="fc" id="L258">        return directories;</span>
+    }
+
+    /**
+     * Return a directory where we can expect expectedWriteSize to fit.
+     *
+     * @param sstables the sstables to compact
+     */
+    public Directories.DataDirectory getWriteDirectory(Iterable&lt;SSTableReader&gt; sstables, long estimatedWriteSize)
+    {
+<span class="fc" id="L268">        Descriptor descriptor = null;</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc bfc" id="L271" title="All 2 branches covered.">            if (descriptor == null)</span>
+<span class="fc" id="L272">                descriptor = sstable.descriptor;</span>
+<span class="fc bfc" id="L273" title="All 2 branches covered.">            if (!descriptor.directory.equals(sstable.descriptor.directory))</span>
+            {
+<span class="fc" id="L275">                logger.trace(&quot;All sstables not from the same disk - putting results in {}&quot;, descriptor.directory);</span>
+<span class="fc" id="L276">                break;</span>
+            }
+<span class="fc" id="L278">        }</span>
+<span class="fc" id="L279">        Directories.DataDirectory d = getDirectories().getDataDirectoryForFile(descriptor);</span>
+<span class="fc bfc" id="L280" title="All 2 branches covered.">        if (d != null)</span>
+        {
+<span class="fc" id="L282">            long availableSpace = d.getAvailableSpace();</span>
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">            if (availableSpace &lt; estimatedWriteSize)</span>
+<span class="nc" id="L284">                throw new RuntimeException(String.format(&quot;Not enough space to write %s to %s (%s available)&quot;,</span>
+<span class="nc" id="L285">                                                         FBUtilities.prettyPrintMemory(estimatedWriteSize),</span>
+                                                         d.location,
+<span class="nc" id="L287">                                                         FBUtilities.prettyPrintMemory(availableSpace)));</span>
+<span class="fc" id="L288">            logger.trace(&quot;putting compaction results in {}&quot;, descriptor.directory);</span>
+<span class="fc" id="L289">            return d;</span>
+        }
+<span class="fc" id="L291">        d = getDirectories().getWriteableLocation(estimatedWriteSize);</span>
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">        if (d == null)</span>
+<span class="nc" id="L293">            throw new RuntimeException(String.format(&quot;Not enough disk space to store %s&quot;,</span>
+<span class="nc" id="L294">                                                     FBUtilities.prettyPrintMemory(estimatedWriteSize)));</span>
+<span class="fc" id="L295">        return d;</span>
+    }
+
+    public CompactionAwareWriter setRepairedAt(long repairedAt)
+    {
+<span class="nc" id="L300">        this.sstableWriter.setRepairedAt(repairedAt);</span>
+<span class="nc" id="L301">        return this;</span>
+    }
+
+    protected long getExpectedWriteSize()
+    {
+<span class="fc" id="L306">        return cfs.getExpectedCompactedFileSize(nonExpiredSSTables, txn.opType());</span>
+    }
+
+    /**
+     * It is up to the caller to set the following fields:
+     * - {@link SSTableWriter.Builder#setKeyCount(long)},
+     * - {@link SSTableWriter.Builder#setSerializationHeader(SerializationHeader)} and,
+     * - {@link SSTableWriter.Builder#setMetadataCollector(MetadataCollector)}
+     */
+    protected SSTableWriter.Builder&lt;?, ?&gt; newWriterBuilder(Descriptor descriptor)
+    {
+<span class="fc" id="L317">        return descriptor.getFormat().getWriterFactory().builder(descriptor)</span>
+<span class="fc" id="L318">                         .setTableMetadataRef(cfs.metadata)</span>
+<span class="fc" id="L319">                         .setTransientSSTable(isTransient)</span>
+<span class="fc" id="L320">                         .setRepairedAt(minRepairedAt)</span>
+<span class="fc" id="L321">                         .setPendingRepair(pendingRepair)</span>
+<span class="fc" id="L322">                         .setSecondaryIndexGroups(cfs.indexManager.listIndexGroups())</span>
+<span class="fc" id="L323">                         .addDefaultComponents(cfs.indexManager.listIndexGroups());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

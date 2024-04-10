@@ -1,0 +1,461 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSLFactory.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.security</a> &gt; <span class="el_source">SSLFactory.java</span></div><h1>SSLFactory.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.security;
+
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.handler.ssl.CipherSuiteFilter;
+import io.netty.handler.ssl.OpenSsl;
+import io.netty.handler.ssl.SslContext;
+import io.netty.util.ReferenceCountUtil;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.security.ISslContextFactory.SocketType;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.DISABLE_TCACTIVE_OPENSSL;
+
+/**
+ * A Factory for providing and setting up client {@link SSLSocket}s. Also provides
+ * methods for creating both JSSE {@link SSLContext} instances as well as netty {@link SslContext} instances.
+ * &lt;p&gt;
+ * Netty {@link SslContext} instances are expensive to create (as well as to destroy) and consume a lof of resources
+ * (especially direct memory), but instances can be reused across connections (assuming the SSL params are the same).
+ * Hence we cache created instances in {@link #cachedSslContexts}.
+ */
+<span class="nc" id="L58">public final class SSLFactory</span>
+{
+<span class="fc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(SSLFactory.class);</span>
+
+    // Isolate calls to OpenSsl.isAvailable to allow in-jvm dtests to disable tcnative openssl
+    // support.  It creates a circular reference that prevents the instance class loader from being
+    // garbage collected.
+    static private final boolean openSslIsAvailable;
+    static
+    {
+<span class="pc bpc" id="L68" title="1 of 2 branches missed.">        if (DISABLE_TCACTIVE_OPENSSL.getBoolean())</span>
+        {
+<span class="nc" id="L70">            openSslIsAvailable = false;</span>
+        }
+        else
+        {
+<span class="fc" id="L74">            openSslIsAvailable = OpenSsl.isAvailable();</span>
+        }
+    }
+    public static boolean openSslIsAvailable()
+    {
+<span class="fc" id="L79">        return openSslIsAvailable;</span>
+    }
+
+    /**
+     * Cached references of SSL Contexts
+     */
+<span class="fc" id="L85">    private static final ConcurrentHashMap&lt;CacheKey, SslContext&gt; cachedSslContexts = new ConcurrentHashMap&lt;&gt;();</span>
+
+    /**
+     * Default initial delay for hot reloading
+     */
+    public static final int DEFAULT_HOT_RELOAD_INITIAL_DELAY_SEC = 600;
+
+    /**
+     * Default periodic check delay for hot reloading
+     */
+    public static final int DEFAULT_HOT_RELOAD_PERIOD_SEC = 600;
+
+    /**
+     * State variable to maintain initialization invariant
+     */
+<span class="fc" id="L100">    private static boolean isHotReloadingInitialized = false;</span>
+
+    /** Provides the list of protocols that would have been supported if &quot;TLS&quot; was selected as the
+     * protocol before the change for CASSANDRA-13325 that expects explicit protocol versions.
+     * @return list of enabled protocol names
+     */
+    public static List&lt;String&gt; tlsInstanceProtocolSubstitution()
+    {
+        try
+        {
+<span class="fc" id="L110">            SSLContext ctx = SSLContext.getInstance(&quot;TLS&quot;);</span>
+<span class="fc" id="L111">            ctx.init(null, null, null);</span>
+<span class="fc" id="L112">            SSLParameters params = ctx.getDefaultSSLParameters();</span>
+<span class="fc" id="L113">            String[] protocols = params.getProtocols();</span>
+<span class="fc" id="L114">            return Arrays.asList(protocols);</span>
+        }
+<span class="nc" id="L116">        catch (Exception e)</span>
+        {
+<span class="nc" id="L118">            throw new RuntimeException(&quot;Error finding supported TLS Protocols&quot;, e);</span>
+        }
+    }
+
+    /**
+     * Create a JSSE {@link SSLContext}.
+     */
+    public static SSLContext createSSLContext(EncryptionOptions options, boolean verifyPeerCertificate) throws IOException
+    {
+<span class="nc" id="L127">        return options.sslContextFactoryInstance.createJSSESslContext(verifyPeerCertificate);</span>
+    }
+
+    /**
+     * get a netty {@link SslContext} instance
+     */
+    public static SslContext getOrCreateSslContext(EncryptionOptions options, boolean verifyPeerCertificate,
+                                                   SocketType socketType,
+                                                   String contextDescription) throws IOException
+    {
+<span class="fc" id="L137">        CacheKey key = new CacheKey(options, socketType, contextDescription);</span>
+        SslContext sslContext;
+
+<span class="fc" id="L140">        sslContext = cachedSslContexts.get(key);</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        if (sslContext != null)</span>
+<span class="fc" id="L142">            return sslContext;</span>
+
+<span class="fc" id="L144">        sslContext = createNettySslContext(options, verifyPeerCertificate, socketType);</span>
+
+<span class="fc" id="L146">        SslContext previous = cachedSslContexts.putIfAbsent(key, sslContext);</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        if (previous == null)</span>
+<span class="fc" id="L148">            return sslContext;</span>
+
+<span class="fc" id="L150">        ReferenceCountUtil.release(sslContext);</span>
+<span class="fc" id="L151">        return previous;</span>
+    }
+
+    /**
+     * Create a Netty {@link SslContext}
+     */
+    static SslContext createNettySslContext(EncryptionOptions options, boolean verifyPeerCertificate,
+                                            SocketType socketType) throws IOException
+    {
+<span class="fc" id="L160">        return createNettySslContext(options, verifyPeerCertificate, socketType,</span>
+                                     LoggingCipherSuiteFilter.QUIET_FILTER);
+    }
+
+    /**
+     * Create a Netty {@link SslContext} with a supplied cipherFilter
+     */
+    static SslContext createNettySslContext(EncryptionOptions options, boolean verifyPeerCertificate,
+                                            SocketType socketType, CipherSuiteFilter cipherFilter) throws IOException
+    {
+<span class="fc" id="L170">        return options.sslContextFactoryInstance.createNettySslContext(verifyPeerCertificate, socketType,</span>
+                                                                       cipherFilter);
+    }
+
+    /**
+     * Performs a lightweight check whether the certificate files have been refreshed.
+     *
+     * @throws IllegalStateException if {@link #initHotReloading(EncryptionOptions.ServerEncryptionOptions, EncryptionOptions, boolean)}
+     *                               is not called first
+     */
+    public static void checkCertFilesForHotReloading()
+    {
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        if (!isHotReloadingInitialized)</span>
+<span class="nc" id="L183">            throw new IllegalStateException(&quot;Hot reloading functionality has not been initialized.&quot;);</span>
+<span class="fc" id="L184">        checkCachedContextsForReload(false);</span>
+<span class="fc" id="L185">    }</span>
+
+    /**
+     * Forces revalidation and loading of SSL certifcates if valid
+     */
+    public static void forceCheckCertFiles()
+    {
+<span class="nc" id="L192">        checkCachedContextsForReload(true);</span>
+<span class="nc" id="L193">    }</span>
+
+    private static void checkCachedContextsForReload(boolean forceReload)
+    {
+<span class="fc" id="L197">        List&lt;CacheKey&gt; keysToCheck = new ArrayList&lt;&gt;(Collections.list(cachedSslContexts.keys()));</span>
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">        while (!keysToCheck.isEmpty())</span>
+        {
+<span class="nc" id="L200">            CacheKey key = keysToCheck.remove(keysToCheck.size()-1);</span>
+<span class="nc" id="L201">            final EncryptionOptions opts = key.encryptionOptions;</span>
+
+<span class="nc" id="L203">            logger.debug(&quot;Checking whether certificates have been updated for {}&quot;, key.contextDescription);</span>
+<span class="nc bnc" id="L204" title="All 4 branches missed.">            if (forceReload || opts.sslContextFactoryInstance.shouldReload())</span>
+            {
+                try
+                {
+<span class="nc bnc" id="L208" title="All 4 branches missed.">                    validateSslContext(key.contextDescription, opts,</span>
+                            opts instanceof EncryptionOptions.ServerEncryptionOptions || opts.require_client_auth, false);
+<span class="nc" id="L210">                    logger.info(&quot;SSL certificates have been updated for {}. Resetting the ssl contexts for new &quot; +</span>
+                                &quot;connections.&quot;, key.contextDescription);
+<span class="nc" id="L212">                    clearSslContextCache(key.encryptionOptions, keysToCheck);</span>
+                }
+<span class="nc" id="L214">                catch (Throwable tr)</span>
+                {
+<span class="nc" id="L216">                    logger.error(&quot;Failed to hot reload the SSL Certificates! Please check the certificate files for {}.&quot;,</span>
+                                 key.contextDescription, tr);
+<span class="nc" id="L218">                }</span>
+            }
+<span class="nc" id="L220">        }</span>
+<span class="fc" id="L221">    }</span>
+
+    /**
+     * This clears the cache of Netty's SslContext objects for Client and Server sockets. This is made publically
+     * available so that any {@link ISslContextFactory}'s implementation can call this to handle any special scenario
+     * to invalidate the SslContext cache.
+     * This should be used with caution since the purpose of this cache is save costly creation of Netty's SslContext
+     * objects and this essentially results in re-creating it.
+     */
+    public static void clearSslContextCache()
+    {
+<span class="nc" id="L232">        cachedSslContexts.clear();</span>
+<span class="nc" id="L233">    }</span>
+
+    /**
+     * Clear all cachedSslContexts with this encryption option and remove them from future keys to check
+     */
+    private static void clearSslContextCache(EncryptionOptions options, List&lt;CacheKey&gt; keysToCheck)
+    {
+<span class="nc" id="L240">        cachedSslContexts.forEachKey(1, cacheKey -&gt; {</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if (Objects.equals(options, cacheKey.encryptionOptions))</span>
+            {
+<span class="nc" id="L243">                cachedSslContexts.remove(cacheKey);</span>
+<span class="nc" id="L244">                keysToCheck.remove(cacheKey);</span>
+            }
+<span class="nc" id="L246">        });</span>
+<span class="nc" id="L247">    }</span>
+
+    /**
+     * Determines whether to hot reload certificates and schedules a periodic task for it.
+     *
+     * @param serverOpts Server encryption options (Internode)
+     * @param clientOpts Client encryption options (Native Protocol)
+     */
+    public static synchronized void initHotReloading(EncryptionOptions.ServerEncryptionOptions serverOpts,
+                                                     EncryptionOptions clientOpts,
+                                                     boolean force) throws IOException
+    {
+<span class="pc bpc" id="L259" title="3 of 4 branches missed.">        if (isHotReloadingInitialized &amp;&amp; !force)</span>
+<span class="nc" id="L260">            return;</span>
+
+<span class="fc" id="L262">        logger.debug(&quot;Initializing hot reloading SSLContext&quot;);</span>
+
+<span class="pc bpc" id="L264" title="1 of 4 branches missed.">        if ( serverOpts != null &amp;&amp; serverOpts.tlsEncryptionPolicy() != EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED) {</span>
+<span class="fc" id="L265">            serverOpts.sslContextFactoryInstance.initHotReloading();</span>
+        }
+
+<span class="pc bpc" id="L268" title="2 of 4 branches missed.">        if ( clientOpts != null &amp;&amp; clientOpts.tlsEncryptionPolicy() != EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED) {</span>
+<span class="nc" id="L269">            clientOpts.sslContextFactoryInstance.initHotReloading();</span>
+        }
+
+<span class="pc bpc" id="L272" title="1 of 2 branches missed.">        if (!isHotReloadingInitialized)</span>
+        {
+<span class="fc" id="L274">            ScheduledExecutors.scheduledTasks</span>
+<span class="fc" id="L275">                .scheduleWithFixedDelay(SSLFactory::checkCertFilesForHotReloading,</span>
+                                        DEFAULT_HOT_RELOAD_INITIAL_DELAY_SEC,
+                                        DEFAULT_HOT_RELOAD_PERIOD_SEC, TimeUnit.SECONDS);
+        }
+
+<span class="fc" id="L280">        isHotReloadingInitialized = true;</span>
+<span class="fc" id="L281">    }</span>
+
+    // Non-logging
+    /*
+     * This class will filter all requested ciphers out that are not supported by the current {@link SSLEngine},
+     * logging messages for all dropped ciphers, and throws an exception if no ciphers are supported
+     */
+    public static final class LoggingCipherSuiteFilter implements CipherSuiteFilter
+    {
+        // Version without logging the ciphers, make sure same filtering logic is used
+        // all the time, regardless of user output.
+<span class="fc" id="L292">        public static final CipherSuiteFilter QUIET_FILTER = new LoggingCipherSuiteFilter();</span>
+        final String settingDescription;
+
+        private LoggingCipherSuiteFilter()
+<span class="fc" id="L296">        {</span>
+<span class="fc" id="L297">            this.settingDescription = null;</span>
+<span class="fc" id="L298">        }</span>
+
+        public LoggingCipherSuiteFilter(String settingDescription)
+<span class="fc" id="L301">        {</span>
+<span class="fc" id="L302">            this.settingDescription = settingDescription;</span>
+<span class="fc" id="L303">        }</span>
+
+
+        @Override
+        public String[] filterCipherSuites(Iterable&lt;String&gt; ciphers, List&lt;String&gt; defaultCiphers,
+                                           Set&lt;String&gt; supportedCiphers)
+        {
+<span class="nc" id="L310">            Objects.requireNonNull(defaultCiphers, &quot;defaultCiphers&quot;);</span>
+<span class="nc" id="L311">            Objects.requireNonNull(supportedCiphers, &quot;supportedCiphers&quot;);</span>
+
+            final List&lt;String&gt; newCiphers;
+<span class="nc bnc" id="L314" title="All 2 branches missed.">            if (ciphers == null)</span>
+            {
+<span class="nc" id="L316">                newCiphers = new ArrayList&lt;&gt;(defaultCiphers.size());</span>
+<span class="nc" id="L317">                ciphers = defaultCiphers;</span>
+            }
+            else
+            {
+<span class="nc" id="L321">                newCiphers = new ArrayList&lt;&gt;(supportedCiphers.size());</span>
+            }
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            for (String c : ciphers)</span>
+            {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (c == null)</span>
+                {
+<span class="nc" id="L327">                    break;</span>
+                }
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                if (supportedCiphers.contains(c))</span>
+                {
+<span class="nc" id="L331">                    newCiphers.add(c);</span>
+                }
+                else
+                {
+<span class="nc bnc" id="L335" title="All 2 branches missed.">                    if (settingDescription != null)</span>
+                    {
+<span class="nc" id="L337">                        logger.warn(&quot;Dropping unsupported cipher_suite {} from {} configuration&quot;,</span>
+<span class="nc" id="L338">                                    c, settingDescription.toLowerCase());</span>
+                    }
+                }
+<span class="nc" id="L341">            }</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (newCiphers.isEmpty())</span>
+            {
+<span class="nc" id="L344">                throw new IllegalStateException(&quot;No ciphers left after filtering supported cipher suite&quot;);</span>
+            }
+
+<span class="nc" id="L347">            return newCiphers.toArray(new String[0]);</span>
+        }
+    }
+
+    private static boolean filterOutSSLv2Hello(String string)
+    {
+<span class="fc bfc" id="L353" title="All 2 branches covered.">        return !string.equals(&quot;SSLv2Hello&quot;);</span>
+    }
+
+    public static void validateSslContext(String contextDescription, EncryptionOptions options, boolean verifyPeerCertificate, boolean logProtocolAndCiphers) throws IOException
+    {
+<span class="pc bpc" id="L358" title="1 of 4 branches missed.">        if (options != null &amp;&amp; options.tlsEncryptionPolicy() != EncryptionOptions.TlsEncryptionPolicy.UNENCRYPTED)</span>
+        {
+            try
+            {
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">                CipherSuiteFilter loggingCipherSuiteFilter = logProtocolAndCiphers ? new LoggingCipherSuiteFilter(contextDescription)</span>
+<span class="pc" id="L363">                                                                                   : LoggingCipherSuiteFilter.QUIET_FILTER;</span>
+<span class="fc" id="L364">                SslContext serverSslContext = createNettySslContext(options, verifyPeerCertificate, SocketType.SERVER, loggingCipherSuiteFilter);</span>
+                try
+                {
+<span class="fc" id="L367">                    SSLEngine engine = serverSslContext.newEngine(ByteBufAllocator.DEFAULT);</span>
+                    try
+                    {
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">                        if (logProtocolAndCiphers)</span>
+                        {
+<span class="fc" id="L372">                            String[] supportedProtocols = engine.getSupportedProtocols();</span>
+<span class="fc" id="L373">                            String[] supportedCiphers = engine.getSupportedCipherSuites();</span>
+                            // Netty always adds the SSLv2Hello pseudo-protocol.  (Netty commit 7a39afd031accea9ee38653afbd58eb1c466deda)
+                            // To avoid triggering any log scanners that are concerned about SSL2 references, filter
+                            // it from the output.
+<span class="fc" id="L377">                            String[] enabledProtocols = engine.getEnabledProtocols();</span>
+                            String filteredEnabledProtocols =
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">                                supportedProtocols == null ? &quot;system default&quot;</span>
+<span class="fc" id="L380">                                                           : Arrays.stream(engine.getEnabledProtocols())</span>
+<span class="fc" id="L381">                                                            .filter(SSLFactory::filterOutSSLv2Hello)</span>
+<span class="fc" id="L382">                                                            .collect(Collectors.joining(&quot;, &quot;));</span>
+<span class="fc" id="L383">                            String[] enabledCiphers = engine.getEnabledCipherSuites();</span>
+
+<span class="fc" id="L385">                            logger.debug(&quot;{} supported TLS protocols: {}&quot;, contextDescription,</span>
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">                                         supportedProtocols == null ? &quot;system default&quot; : String.join(&quot;, &quot;, supportedProtocols));</span>
+<span class="fc" id="L387">                            logger.debug(&quot;{} unfiltered enabled TLS protocols: {}&quot;, contextDescription,</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">                                        enabledProtocols == null ? &quot;system default&quot; : String.join(&quot;, &quot;, enabledProtocols));</span>
+<span class="fc" id="L389">                            logger.info(&quot;{} enabled TLS protocols: {}&quot;, contextDescription, filteredEnabledProtocols);</span>
+<span class="fc" id="L390">                            logger.debug(&quot;{} supported cipher suites: {}&quot;, contextDescription,</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">                                         supportedCiphers == null ? &quot;system default&quot; : String.join(&quot;, &quot;, supportedCiphers));</span>
+<span class="fc" id="L392">                            logger.info(&quot;{} enabled cipher suites: {}&quot;, contextDescription,</span>
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">                                        enabledCiphers == null ? &quot;system default&quot; : String.join(&quot;, &quot;, enabledCiphers));</span>
+                        }
+                    }
+                    finally
+                    {
+<span class="fc" id="L398">                        engine.closeInbound();</span>
+<span class="fc" id="L399">                        engine.closeOutbound();</span>
+<span class="fc" id="L400">                        ReferenceCountUtil.release(engine);</span>
+                    }
+                }
+                finally
+                {
+<span class="fc" id="L405">                    ReferenceCountUtil.release(serverSslContext);</span>
+                }
+
+                // Make sure it is possible to build the client context too
+<span class="fc" id="L409">                SslContext clientSslContext = createNettySslContext(options, verifyPeerCertificate, SocketType.CLIENT);</span>
+<span class="fc" id="L410">                ReferenceCountUtil.release(clientSslContext);</span>
+            }
+<span class="nc" id="L412">            catch (Exception e)</span>
+            {
+<span class="nc" id="L414">                throw new IOException(&quot;Failed to create SSL context using &quot; + contextDescription, e);</span>
+<span class="fc" id="L415">            }</span>
+        }
+<span class="fc" id="L417">    }</span>
+
+    /**
+     * Sanity checks all certificates to ensure we can actually load them
+     */
+    public static void validateSslCerts(EncryptionOptions.ServerEncryptionOptions serverOpts, EncryptionOptions clientOpts) throws IOException
+    {
+<span class="nc" id="L424">        validateSslContext(&quot;server_encryption_options&quot;, serverOpts, true, false);</span>
+<span class="nc" id="L425">        validateSslContext(&quot;client_encryption_options&quot;, clientOpts, clientOpts.require_client_auth, false);</span>
+<span class="nc" id="L426">    }</span>
+
+    static class CacheKey
+    {
+        private final EncryptionOptions encryptionOptions;
+        private final SocketType socketType;
+        private final String contextDescription;
+
+        public CacheKey(EncryptionOptions encryptionOptions, SocketType socketType, String contextDescription)
+<span class="fc" id="L435">        {</span>
+<span class="fc" id="L436">            this.encryptionOptions = encryptionOptions;</span>
+<span class="fc" id="L437">            this.socketType = socketType;</span>
+<span class="fc" id="L438">            this.contextDescription = contextDescription;</span>
+<span class="fc" id="L439">        }</span>
+
+        public boolean equals(Object o)
+        {
+<span class="pc bpc" id="L443" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="pc bpc" id="L444" title="2 of 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="fc" id="L445">            CacheKey cacheKey = (CacheKey) o;</span>
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">            return (socketType == cacheKey.socketType &amp;&amp;</span>
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">                    Objects.equals(encryptionOptions, cacheKey.encryptionOptions) &amp;&amp;</span>
+<span class="pc bpc" id="L448" title="1 of 2 branches missed.">                    Objects.equals(contextDescription, cacheKey.contextDescription));</span>
+        }
+
+        public int hashCode()
+        {
+<span class="fc" id="L453">            int result = 0;</span>
+<span class="fc" id="L454">            result += 31 * socketType.hashCode();</span>
+<span class="fc" id="L455">            result += 31 * encryptionOptions.hashCode();</span>
+<span class="fc" id="L456">            result += 31 * contextDescription.hashCode();</span>
+<span class="fc" id="L457">            return result;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

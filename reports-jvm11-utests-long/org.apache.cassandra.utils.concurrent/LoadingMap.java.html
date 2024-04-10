@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LoadingMap.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.concurrent</a> &gt; <span class="el_source">LoadingMap.java</span></div><h1>LoadingMap.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils.concurrent;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
+
+/**
+ * An extension of {@link NonBlockingHashMap} where all values are wrapped by {@link Future}.
+ * &lt;p&gt;
+ * The main purpose of this class is to provide the functionality of concurrent hash map which may perform operations like
+ * {@link ConcurrentHashMap#computeIfAbsent(Object, Function)} and {@link ConcurrentHashMap#computeIfPresent(Object, BiFunction)}
+ * with synchronization scope reduced to the single key - that is, when dealing with a single key, unlike
+ * {@link ConcurrentHashMap} we do not lock the whole map for the time the mapping function is running. This may help
+ * to avoid the case when we want to load/unload a value for a key K1 while loading/unloading a value for a key K2. Such
+ * scenario is forbidden in case of {@link ConcurrentHashMap} and leads to a deadlock. On the other hand, {@link NonBlockingHashMap}
+ * does not guarantee at-most-once semantics of running the mapping function for a single key.
+ *
+ * @param &lt;K&gt;
+ * @param &lt;V&gt;
+ */
+<span class="fc" id="L45">public class LoadingMap&lt;K, V&gt;</span>
+{
+<span class="fc" id="L47">    private final NonBlockingHashMap&lt;K, Future&lt;V&gt;&gt; internalMap = new NonBlockingHashMap&lt;&gt;();</span>
+
+    /**
+     * Returns a promise for the given key or null if there is nothing associated with the key.
+     * &lt;p/&gt;if the promise is not fulfilled, it means that there a loading process associated with the key
+     * &lt;p/&gt;if the promise is fulfilled with {@code null} value, it means that there is an unloading process associated with the key
+     * &lt;p/&gt;if the promise is fulfilled with a failure, it means that a loading process associated with the key failed
+     * but the exception was not propagated yet (a failed promise is eventually removed from the map)
+     */
+    @VisibleForTesting
+    Future&lt;V&gt; get(K key)
+    {
+<span class="nc" id="L59">        return internalMap.get(key);</span>
+    }
+
+    /**
+     * Get a value for a given key. Returns a non-null object only if there is a successfully initialized value associated,
+     * with the provided key. It returns {@code null} if there is no value for the key, or the value is being initialized
+     * or removed. It does not throw if the last attempt to initialize the value failed.
+     */
+    public V getIfReady(K key)
+    {
+<span class="fc" id="L69">        Future&lt;V&gt; future = internalMap.get(key);</span>
+<span class="fc bfc" id="L70" title="All 2 branches covered.">        return future != null ? future.getNow() : null;</span>
+    }
+
+    /**
+     * If the value for the given key is missing, execute a load function to obtain a value and put it into the map.
+     * It is guaranteed that the loading and unloading a value for a single key are executed serially. It is also
+     * guaranteed that the load function is executed exactly once to load a value into the map (regardless of the concurrent attempts).
+     * &lt;p/&gt;
+     * In case there is a concurrent attempt to load a value for this key, this attempt waits until the concurrent attempt
+     * is done and returns its result (if succeeded). If the concurrent attempt fails, this attempt is retried. However,
+     * if this attempt fails, it is not retried and the exception is rethrown. In case there is a concurrent attempt
+     * to unload a value for this key, this attempt waits until the concurrent attempt is done and retries loading.
+     * &lt;p/&gt;
+     * When the mapping function returns {@code null}, {@link NullPointerException} is thrown. When the mapping function
+     * throws exception, it is rethrown by this method. In both cases nothing gets added to the map.
+     * &lt;p/&gt;
+     * It is allowed to nest loading for a different key, though nested loading for the same key results in a deadlock.
+     */
+    public V blockingLoadIfAbsent(K key, Supplier&lt;? extends V&gt; loadFunction) throws RuntimeException
+    {
+        while (true)
+        {
+<span class="fc" id="L92">            Future&lt;V&gt; future = internalMap.get(key);</span>
+<span class="fc" id="L93">            boolean attemptedInThisThread = false;</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">            if (future == null)</span>
+            {
+<span class="fc" id="L96">                AsyncPromise&lt;V&gt; newEntry = new AsyncPromise&lt;&gt;();</span>
+<span class="fc" id="L97">                future = internalMap.putIfAbsent(key, newEntry);</span>
+<span class="pc bpc" id="L98" title="1 of 2 branches missed.">                if (future == null)</span>
+                {
+                    // We managed to create an entry for the value. Now initialize it.
+<span class="fc" id="L101">                    attemptedInThisThread = true;</span>
+<span class="fc" id="L102">                    future = newEntry;</span>
+                    try
+                    {
+<span class="fc" id="L105">                        V v = loadFunction.get();</span>
+<span class="pc bpc" id="L106" title="1 of 2 branches missed.">                        if (v == null)</span>
+<span class="nc" id="L107">                            throw new NullPointerException(&quot;The mapping function returned null&quot;);</span>
+                        else
+<span class="fc" id="L109">                            newEntry.setSuccess(v);</span>
+                    }
+<span class="nc" id="L111">                    catch (Throwable t)</span>
+                    {
+<span class="nc" id="L113">                        newEntry.setFailure(t);</span>
+                        // Remove future so that construction can be retried later
+<span class="nc" id="L115">                        internalMap.remove(key, future);</span>
+<span class="fc" id="L116">                    }</span>
+                }
+
+                // Else some other thread beat us to it, but we now have the reference to the future which we can wait for.
+            }
+
+<span class="fc" id="L122">            V v = future.awaitUninterruptibly().getNow();</span>
+
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">            if (v != null) // implies success</span>
+<span class="fc" id="L125">                return v;</span>
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            if (attemptedInThisThread)</span>
+                // Rethrow if the failing attempt was initiated by us (failed and attemptedInThisThread)
+<span class="nc" id="L129">                future.rethrowIfFailed();</span>
+
+            // Retry in other cases, that is, if blockingUnloadIfPresent was called in the meantime
+            // (success and getNow == null) hoping that unloading gets finished soon, and if the concurrent attempt
+            // to load entry fails
+<span class="nc" id="L134">            Thread.yield();</span>
+<span class="nc" id="L135">        }</span>
+    }
+
+    /**
+     * If a value for the given key is present, unload function is run and the value is removed from the map.
+     * Similarly to {@link #blockingLoadIfAbsent(Object, Supplier)} at-most-once semantics is guaranteed for unload
+     * function.
+     * &lt;p/&gt;
+     * When unload function fails, the value is removed from the map anyway and the failure is rethrown.
+     * &lt;p/&gt;
+     * When the key was not found, the method returns {@code null}.
+     *
+     * @throws UnloadExecutionException when the unloading failed to complete - this is checked exception because
+     *                                  the value is removed from the map regardless of the result of unloading;
+     *                                  therefore if the unloading failed, the caller is responsible for handling that
+     */
+    public V blockingUnloadIfPresent(K key, Consumer&lt;? super V&gt; unloadFunction) throws UnloadExecutionException
+    {
+<span class="fc" id="L153">        Promise&lt;V&gt; droppedFuture = new AsyncPromise&lt;V&gt;().setSuccess(null);</span>
+
+        Future&lt;V&gt; existingFuture;
+        do
+        {
+<span class="fc" id="L158">            existingFuture = internalMap.get(key);</span>
+<span class="pc bpc" id="L159" title="3 of 6 branches missed.">            if (existingFuture == null || existingFuture.isDone() &amp;&amp; existingFuture.getNow() == null)</span>
+<span class="nc" id="L160">                return null;</span>
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">        } while (!internalMap.replace(key, existingFuture, droppedFuture));</span>
+
+<span class="fc" id="L163">        V v = existingFuture.awaitUninterruptibly().getNow();</span>
+        try
+        {
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">            if (v == null)</span>
+                // which means that either the value failed to load or a concurrent attempt to unload already did the work
+<span class="nc" id="L168">                return null;</span>
+
+<span class="fc" id="L170">            unloadFunction.accept(v);</span>
+<span class="fc" id="L171">            return v;</span>
+        }
+<span class="nc" id="L173">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L175">            throw new UnloadExecutionException(v, t);</span>
+        }
+        finally
+        {
+<span class="fc" id="L179">            Future&lt;V&gt; future = internalMap.remove(key);</span>
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">            assert future == droppedFuture;</span>
+        }
+    }
+
+    /**
+     * Thrown when unloading a value failed. It encapsulates the value which was failed to unload.
+     */
+    public static class UnloadExecutionException extends ExecutionException
+    {
+        private final Object value;
+
+        public UnloadExecutionException(Object value, Throwable cause)
+        {
+<span class="nc" id="L193">            super(cause);</span>
+<span class="nc" id="L194">            this.value = value;</span>
+<span class="nc" id="L195">        }</span>
+
+        public &lt;T&gt; T value()
+        {
+<span class="nc" id="L199">            return (T) value;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

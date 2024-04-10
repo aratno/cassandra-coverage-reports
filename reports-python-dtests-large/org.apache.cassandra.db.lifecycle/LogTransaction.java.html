@@ -1,0 +1,569 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LogTransaction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.lifecycle</a> &gt; <span class="el_source">LogTransaction.java</span></div><h1>LogTransaction.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.lifecycle;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.Runnables;
+
+import com.codahale.metrics.Counter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LogRecord.Type;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.RefCounted;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+/**
+ * IMPORTANT: When this object is involved in a transactional graph, and is not encapsulated in a LifecycleTransaction,
+ * for correct behaviour its commit MUST occur before any others, since it may legitimately fail. This is consistent
+ * with the Transactional API, which permits one failing action to occur at the beginning of the commit phase, but also
+ * *requires* that the prepareToCommit() phase only take actions that can be rolled back.
+ *
+ * IMPORTANT: The transaction must complete (commit or abort) before any temporary files are deleted, even though the
+ * txn log file itself will not be deleted until all tracked files are deleted. This is required by FileLister to ensure
+ * a consistent disk state. LifecycleTransaction ensures this requirement, so this class should really never be used
+ * outside of LT. @see LogAwareFileLister.classifyFiles()
+ *
+ * A class that tracks sstable files involved in a transaction across sstables:
+ * if the transaction succeeds the old files should be deleted and the new ones kept; vice-versa if it fails.
+ *
+ * The transaction log file contains new and old sstables as follows:
+ *
+ * add:[sstable-2][CRC]
+ * remove:[sstable-1,max_update_time,num files][CRC]
+ *
+ * where sstable-2 is a new sstable to be retained if the transaction succeeds and sstable-1 is an old sstable to be
+ * removed. CRC is an incremental CRC of the file content up to this point. For old sstable files we also log the
+ * last update time of all files for the sstable descriptor and the number of sstable files.
+ *
+ * Upon commit we add a final line to the log file:
+ *
+ * commit:[commit_time][CRC]
+ *
+ * When the transaction log is cleaned-up by the TransactionTidier, which happens only after any old sstables have been
+ * osoleted, then any sstable files for old sstables are removed before deleting the transaction log if the transaction
+ * was committed, vice-versa if the transaction was aborted.
+ *
+ * On start-up we look for any transaction log files and repeat the cleanup process described above.
+ *
+ * See CASSANDRA-7066 for full details.
+ */
+class LogTransaction extends Transactional.AbstractTransactional implements Transactional
+{
+<span class="fc" id="L103">    private static final Logger logger = LoggerFactory.getLogger(LogTransaction.class);</span>
+
+    /**
+     * If the format of the lines in the transaction log is wrong or the checksum
+     * does not match, then we throw this exception.
+     */
+    public static final class CorruptTransactionLogException extends RuntimeException
+    {
+        public final LogFile txnFile;
+
+        public CorruptTransactionLogException(String message, LogFile txnFile)
+        {
+<span class="nc" id="L115">            super(message);</span>
+<span class="nc" id="L116">            this.txnFile = txnFile;</span>
+<span class="nc" id="L117">        }</span>
+    }
+
+    private final Tracker tracker;
+    private final LogFile txnFile;
+    // We need an explicit lock because the transaction tidier cannot store a reference to the transaction
+    private final Object lock;
+    private final Ref&lt;LogTransaction&gt; selfRef;
+    // Deleting sstables is tricky because the mmapping might not have been finalized yet.
+    // Additionally, we need to make sure to delete the data file first, so on restart the others
+    // will be recognized as GCable.
+<span class="fc" id="L128">    private static final Queue&lt;Runnable&gt; failedDeletions = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+    LogTransaction(OperationType opType)
+    {
+<span class="nc" id="L132">        this(opType, null);</span>
+<span class="nc" id="L133">    }</span>
+
+    LogTransaction(OperationType opType, Tracker tracker)
+<span class="fc" id="L136">    {</span>
+<span class="fc" id="L137">        this.tracker = tracker;</span>
+<span class="fc" id="L138">        this.txnFile = new LogFile(opType, nextTimeUUID());</span>
+<span class="fc" id="L139">        this.lock = new Object();</span>
+<span class="fc" id="L140">        this.selfRef = new Ref&lt;&gt;(this, new TransactionTidier(txnFile, lock));</span>
+
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L143">            logger.trace(&quot;Created transaction logs with id {}&quot;, txnFile.id());</span>
+<span class="fc" id="L144">    }</span>
+
+    /**
+     * Track a reader as new.
+     **/
+    void trackNew(SSTable table)
+    {
+<span class="fc" id="L151">        synchronized (lock)</span>
+        {
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L154">                logger.trace(&quot;Track NEW sstable {} in {}&quot;, table.getFilename(), txnFile.toString());</span>
+
+<span class="fc" id="L156">            txnFile.add(table);</span>
+<span class="fc" id="L157">        }</span>
+<span class="fc" id="L158">    }</span>
+
+    /**
+     * Stop tracking a reader as new.
+     */
+    void untrackNew(SSTable table)
+    {
+<span class="fc" id="L165">        synchronized (lock)</span>
+        {
+<span class="fc" id="L167">            txnFile.remove(table);</span>
+<span class="fc" id="L168">        }</span>
+<span class="fc" id="L169">    }</span>
+
+    /**
+     * helper method for tests, creates the remove records per sstable
+     */
+    @VisibleForTesting
+    SSTableTidier obsoleted(SSTableReader sstable)
+    {
+<span class="nc" id="L177">        return obsoleted(sstable, LogRecord.make(Type.REMOVE, sstable));</span>
+    }
+
+    /**
+     * Schedule a reader for deletion as soon as it is fully unreferenced.
+     */
+    SSTableTidier obsoleted(SSTableReader reader, LogRecord logRecord)
+    {
+<span class="fc" id="L185">        synchronized (lock)</span>
+        {
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L188">                logger.trace(&quot;Track OLD sstable {} in {}&quot;, reader.getFilename(), txnFile.toString());</span>
+
+<span class="fc bfc" id="L190" title="All 2 branches covered.">            if (txnFile.contains(Type.ADD, reader, logRecord))</span>
+            {
+<span class="pc bpc" id="L192" title="1 of 2 branches missed.">                if (txnFile.contains(Type.REMOVE, reader, logRecord))</span>
+<span class="nc" id="L193">                    throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L195">                return new SSTableTidier(reader, true, this);</span>
+            }
+
+<span class="fc" id="L198">            txnFile.addRecord(logRecord);</span>
+
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">            if (tracker != null)</span>
+<span class="fc" id="L201">                tracker.notifyDeleting(reader);</span>
+
+<span class="fc" id="L203">            return new SSTableTidier(reader, false, this);</span>
+        }
+    }
+
+    Map&lt;SSTable, LogRecord&gt; makeRemoveRecords(Iterable&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L209">        synchronized (lock)</span>
+        {
+<span class="fc" id="L211">            return txnFile.makeRecords(Type.REMOVE, sstables);</span>
+        }
+    }
+
+
+    OperationType type()
+    {
+<span class="fc" id="L218">        return txnFile.type();</span>
+    }
+
+    TimeUUID id()
+    {
+<span class="fc" id="L223">        return txnFile.id();</span>
+    }
+
+    @VisibleForTesting
+    LogFile txnFile()
+    {
+<span class="nc" id="L229">        return txnFile;</span>
+    }
+
+    @VisibleForTesting
+    List&lt;File&gt; logFiles()
+    {
+<span class="nc" id="L235">        return txnFile.getFiles();</span>
+    }
+
+    @VisibleForTesting
+    List&lt;String&gt; logFilePaths()
+    {
+<span class="nc" id="L241">        return txnFile.getFilePaths();</span>
+    }
+
+    static void delete(File file)
+    {
+        try
+        {
+<span class="fc bfc" id="L248" title="All 2 branches covered.">            if (!StorageService.instance.isDaemonSetupCompleted())</span>
+<span class="fc" id="L249">                logger.info(&quot;Unfinished transaction log, deleting {} &quot;, file);</span>
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">            else if (logger.isTraceEnabled())</span>
+<span class="nc" id="L251">                logger.trace(&quot;Deleting {}&quot;, file);</span>
+
+<span class="fc" id="L253">            Files.delete(file.toPath());</span>
+        }
+<span class="nc" id="L255">        catch (NoSuchFileException e)</span>
+        {
+<span class="nc" id="L257">            logger.error(&quot;Unable to delete {} as it does not exist, see debug log file for stack trace&quot;, file);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (logger.isDebugEnabled())</span>
+            {
+<span class="nc" id="L260">                ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L261">                try (PrintStream ps = new PrintStream(baos))</span>
+                {
+<span class="nc" id="L263">                    e.printStackTrace(ps);</span>
+                }
+<span class="nc" id="L265">                logger.debug(&quot;Unable to delete {} as it does not exist, stack trace:\n {}&quot;, file, baos);</span>
+            }
+        }
+<span class="nc" id="L268">        catch (IOException e)</span>
+        {
+<span class="nc" id="L270">            logger.error(&quot;Unable to delete {}&quot;, file, e);</span>
+<span class="nc" id="L271">            FileUtils.handleFSErrorAndPropagate(new FSWriteError(e, file));</span>
+<span class="pc" id="L272">        }</span>
+<span class="fc" id="L273">    }</span>
+
+    /**
+     * The transaction tidier.
+     *
+     * When the transaction reference is fully released we try to delete all the obsolete files
+     * depending on the transaction result, as well as the transaction log file.
+     */
+    private static class TransactionTidier implements RefCounted.Tidy, Runnable
+    {
+        private final LogFile data;
+        private final Object lock;
+
+        TransactionTidier(LogFile data, Object lock)
+<span class="fc" id="L287">        {</span>
+<span class="fc" id="L288">            this.data = data;</span>
+<span class="fc" id="L289">            this.lock = lock;</span>
+<span class="fc" id="L290">        }</span>
+
+        public void tidy()
+        {
+<span class="fc" id="L294">            run();</span>
+<span class="fc" id="L295">        }</span>
+
+        public String name()
+        {
+<span class="nc" id="L299">            return data.toString();</span>
+        }
+
+        public void run()
+        {
+<span class="fc" id="L304">            synchronized (lock)</span>
+            {
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L307">                    logger.trace(&quot;Removing files for transaction {}&quot;, name());</span>
+
+                // this happens if we forget to close a txn and the garbage collector closes it for us
+                // or if the transaction journal was never properly created in the first place
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">                if (!data.completed())</span>
+                {
+<span class="nc" id="L313">                    logger.error(&quot;{} was not completed, trying to abort it now&quot;, data);</span>
+
+<span class="nc" id="L315">                    Throwable err = Throwables.perform((Throwable) null, data::abort);</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                    if (err != null)</span>
+<span class="nc" id="L317">                        logger.error(&quot;Failed to abort {}&quot;, data, err);</span>
+                }
+
+<span class="fc" id="L320">                Throwable err = data.removeUnfinishedLeftovers(null);</span>
+
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">                if (err != null)</span>
+                {
+<span class="nc" id="L324">                    logger.info(&quot;Failed deleting files for transaction {}, we'll retry after GC and on on server restart&quot;, name(), err);</span>
+<span class="nc" id="L325">                    failedDeletions.add(this);</span>
+                }
+                else
+                {
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L330">                        logger.trace(&quot;Closing file transaction {}&quot;, name());</span>
+
+<span class="fc" id="L332">                    data.close();</span>
+                }
+<span class="fc" id="L334">            }</span>
+<span class="fc" id="L335">        }</span>
+    }
+
+    static class Obsoletion
+    {
+        final SSTableReader reader;
+        final SSTableTidier tidier;
+
+        Obsoletion(SSTableReader reader, SSTableTidier tidier)
+<span class="fc" id="L344">        {</span>
+<span class="fc" id="L345">            this.reader = reader;</span>
+<span class="fc" id="L346">            this.tidier = tidier;</span>
+<span class="fc" id="L347">        }</span>
+    }
+
+    /**
+     * The SSTableReader tidier. When a reader is fully released and no longer referenced
+     * by any one, we run this. It keeps a reference to the parent transaction and releases
+     * it when done, so that the final transaction cleanup can run when all obsolete readers
+     * are released.
+     */
+    public static class SSTableTidier implements Runnable
+    {
+        // must not retain a reference to the SSTableReader, else leak detection cannot kick in
+        private final Descriptor desc;
+        private final long sizeOnDisk;
+        private final boolean wasNew;
+        private final Object lock;
+        private final Ref&lt;LogTransaction&gt; parentRef;
+        private final Counter totalDiskSpaceUsed;
+
+        public SSTableTidier(SSTableReader referent, boolean wasNew, LogTransaction parent)
+<span class="fc" id="L367">        {</span>
+<span class="fc" id="L368">            this.desc = referent.descriptor;</span>
+<span class="fc" id="L369">            this.sizeOnDisk = referent.bytesOnDisk();</span>
+<span class="fc" id="L370">            this.wasNew = wasNew;</span>
+<span class="fc" id="L371">            this.lock = parent.lock;</span>
+<span class="fc" id="L372">            this.parentRef = parent.selfRef.tryRef();</span>
+
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">            if (this.parentRef == null)</span>
+<span class="nc" id="L375">                throw new IllegalStateException(&quot;Transaction already completed&quot;);</span>
+
+            // While the parent cfs may be dropped in the interim of us taking a reference to this and using it, at worst
+            // we'll be updating a metric for a now dropped ColumnFamilyStore. We do not hold a reference to the tracker or
+            // cfs as that would create a strong ref loop and violate our ability to do leak detection.
+<span class="pc bpc" id="L380" title="1 of 4 branches missed.">            totalDiskSpaceUsed = parent.tracker != null &amp;&amp; parent.tracker.cfstore != null ?</span>
+<span class="fc" id="L381">                                 parent.tracker.cfstore.metric.totalDiskSpaceUsed :</span>
+<span class="fc" id="L382">                                 null;</span>
+<span class="fc" id="L383">        }</span>
+
+        public void run()
+        {
+            // While this may be a dummy tracker w/out information in the metrics table, we attempt to delete regardless
+            // and allow the delete to silently fail if this is an invalid ks + cf combination at time of tidy run.
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">            if (DatabaseDescriptor.isDaemonInitialized())</span>
+<span class="fc" id="L390">                SystemKeyspace.clearSSTableReadMeter(desc.ksname, desc.cfname, desc.id);</span>
+
+<span class="fc" id="L392">            synchronized (lock)</span>
+            {
+                try
+                {
+                    // If we can't successfully delete the DATA component, set the task to be retried later: see TransactionTidier
+
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">                    if (logger.isTraceEnabled())</span>
+<span class="nc" id="L399">                        logger.trace(&quot;Tidier running for old sstable {}&quot;, desc);</span>
+
+<span class="pc bpc" id="L401" title="3 of 4 branches missed.">                    if (!desc.fileFor(Components.DATA).exists() &amp;&amp; !wasNew)</span>
+<span class="nc" id="L402">                        logger.error(&quot;SSTableTidier ran with no existing data file for an sstable that was not new&quot;);</span>
+
+<span class="fc" id="L404">                    desc.getFormat().delete(desc);</span>
+                }
+<span class="nc" id="L406">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L408">                    logger.error(&quot;Failed deletion for {}, we'll retry after GC and on server restart&quot;, desc);</span>
+<span class="nc" id="L409">                    failedDeletions.add(this);</span>
+<span class="nc" id="L410">                    return;</span>
+<span class="fc" id="L411">                }</span>
+
+                // It's possible we're the last one's holding a ref to this metric if it's already been released in the
+                // parent TableMetrics; we run this regardless rather than holding a ref to that CFS or Tracker and thus
+                // creating a strong ref loop
+<span class="pc bpc" id="L416" title="2 of 6 branches missed.">                if (DatabaseDescriptor.isDaemonInitialized() &amp;&amp; totalDiskSpaceUsed != null &amp;&amp; !wasNew)</span>
+<span class="fc" id="L417">                    totalDiskSpaceUsed.dec(sizeOnDisk);</span>
+
+                // release the referent to the parent so that the all transaction files can be released
+<span class="fc" id="L420">                parentRef.release();</span>
+<span class="fc" id="L421">            }</span>
+<span class="fc" id="L422">        }</span>
+
+        public void abort()
+        {
+<span class="nc" id="L426">            synchronized (lock)</span>
+            {
+<span class="nc" id="L428">                parentRef.release();</span>
+<span class="nc" id="L429">            }</span>
+<span class="nc" id="L430">        }</span>
+    }
+
+
+    static void rescheduleFailedDeletions()
+    {
+        Runnable task;
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        while ( null != (task = failedDeletions.poll()))</span>
+<span class="nc" id="L438">            ScheduledExecutors.nonPeriodicTasks.submit(task);</span>
+<span class="nc" id="L439">    }</span>
+
+    static void waitForDeletions()
+    {
+<span class="fc" id="L443">        FBUtilities.waitOnFuture(ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS));</span>
+<span class="fc" id="L444">    }</span>
+
+    @VisibleForTesting
+    Throwable complete(Throwable accumulate)
+    {
+<span class="pc bpc" id="L449" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L450">            logger.trace(&quot;Completing txn {} with last record {}&quot;,</span>
+<span class="nc" id="L451">                         txnFile.toString(), txnFile.getLastRecord());</span>
+
+        try
+        {
+<span class="fc" id="L455">            accumulate = selfRef.ensureReleased(accumulate);</span>
+<span class="fc" id="L456">            return accumulate;</span>
+        }
+<span class="nc" id="L458">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L460">            logger.error(&quot;Failed to complete file transaction id {}&quot;, id(), t);</span>
+<span class="nc" id="L461">            return Throwables.merge(accumulate, t);</span>
+        }
+    }
+
+    protected Throwable doCommit(Throwable accumulate)
+    {
+<span class="fc" id="L467">        synchronized (lock)</span>
+        {
+<span class="fc" id="L469">            return complete(Throwables.perform(accumulate, txnFile::commit));</span>
+        }
+    }
+
+    protected Throwable doAbort(Throwable accumulate)
+    {
+<span class="fc" id="L475">        synchronized (lock)</span>
+        {
+<span class="fc" id="L477">            return complete(Throwables.perform(accumulate, txnFile::abort));</span>
+        }
+    }
+
+<span class="fc" id="L481">    protected void doPrepare() { }</span>
+
+    /**
+     * Removes any leftovers from unifinished transactions as indicated by any transaction log files that
+     * are found in the table directories. This means that any old sstable files for transactions that were committed,
+     * or any new sstable files for transactions that were aborted or still in progress, should be removed *if
+     * it is safe to do so*. Refer to the checks in LogFile.verify for further details on the safety checks
+     * before removing transaction leftovers and refer to the comments at the beginning of this file or in NEWS.txt
+     * for further details on transaction logs.
+     *
+     * This method is called on startup and by the standalone sstableutil tool when the cleanup option is specified,
+     * @see org.apache.cassandra.tools.StandaloneSSTableUtil
+     *
+     * @return true if the leftovers of all transaction logs found were removed, false otherwise.
+     *
+     */
+    static boolean removeUnfinishedLeftovers(TableMetadata metadata)
+    {
+<span class="fc" id="L499">        return removeUnfinishedLeftovers(new Directories(metadata).getCFDirectories());</span>
+    }
+
+    @VisibleForTesting
+    static boolean removeUnfinishedLeftovers(List&lt;File&gt; directories)
+    {
+<span class="fc" id="L505">        LogFilesByName logFiles = new LogFilesByName();</span>
+<span class="fc" id="L506">        directories.forEach(logFiles::list);</span>
+<span class="fc" id="L507">        return logFiles.removeUnfinishedLeftovers();</span>
+    }
+
+<span class="fc" id="L510">    private static final class LogFilesByName</span>
+    {
+        // This maps a transaction log file name to a list of physical files. Each sstable
+        // can have multiple directories and a transaction is trakced by identical transaction log
+        // files, one per directory. So for each transaction file name we can have multiple
+        // physical files.
+<span class="fc" id="L516">        Map&lt;String, List&lt;File&gt;&gt; files = new HashMap&lt;&gt;();</span>
+
+        void list(File directory)
+        {
+<span class="fc" id="L520">            Arrays.stream(directory.tryList(LogFile::isLogFile)).forEach(this::add);</span>
+<span class="fc" id="L521">        }</span>
+
+        void add(File file)
+        {
+<span class="nc" id="L525">            List&lt;File&gt; filesByName = files.get(file.name());</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            if (filesByName == null)</span>
+            {
+<span class="nc" id="L528">                filesByName = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L529">                files.put(file.name(), filesByName);</span>
+            }
+
+<span class="nc" id="L532">            filesByName.add(file);</span>
+<span class="nc" id="L533">        }</span>
+
+        boolean removeUnfinishedLeftovers()
+        {
+<span class="fc" id="L537">            return files.entrySet()</span>
+<span class="fc" id="L538">                        .stream()</span>
+<span class="fc" id="L539">                        .map(LogFilesByName::removeUnfinishedLeftovers)</span>
+<span class="fc" id="L540">                        .allMatch(Predicate.isEqual(true));</span>
+        }
+
+        static boolean removeUnfinishedLeftovers(Map.Entry&lt;String, List&lt;File&gt;&gt; entry)
+        {
+<span class="nc" id="L545">            try(LogFile txn = LogFile.make(entry.getKey(), entry.getValue()))</span>
+            {
+<span class="nc" id="L547">                logger.info(&quot;Verifying logfile transaction {}&quot;, txn);</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                if (txn.verify())</span>
+                {
+<span class="nc" id="L550">                    Throwable failure = txn.removeUnfinishedLeftovers(null);</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                    if (failure != null)</span>
+                    {
+<span class="nc" id="L553">                        logger.error(&quot;Failed to remove unfinished transaction leftovers for transaction log {}&quot;,</span>
+<span class="nc" id="L554">                                     txn.toString(true), failure);</span>
+<span class="nc" id="L555">                        return false;</span>
+                    }
+
+<span class="nc" id="L558">                    return true;</span>
+                }
+                else
+                {
+<span class="nc" id="L562">                    logger.error(&quot;Unexpected disk state: failed to read transaction log {}&quot;, txn.toString(true));</span>
+<span class="nc" id="L563">                    return false;</span>
+                }
+<span class="nc bnc" id="L565" title="All 4 branches missed.">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

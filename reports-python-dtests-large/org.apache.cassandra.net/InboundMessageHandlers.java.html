@@ -1,0 +1,456 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>InboundMessageHandlers.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">InboundMessageHandlers.java</span></div><h1>InboundMessageHandlers.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.util.Collection;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.function.Consumer;
+import java.util.function.ToLongFunction;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import io.netty.channel.Channel;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.InternodeInboundMetrics;
+import org.apache.cassandra.net.Message.Header;
+
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+
+/**
+ * An aggregation of {@link InboundMessageHandler}s for all connections from a peer.
+ *
+ * Manages metrics and shared resource limits. Can have multiple connections of a single
+ * type open simultaneousely (legacy in particular).
+ */
+public final class InboundMessageHandlers
+{
+    private final InetAddressAndPort self;
+    private final InetAddressAndPort peer;
+
+    private final int queueCapacity;
+    private final ResourceLimits.Limit endpointReserveCapacity;
+    private final ResourceLimits.Limit globalReserveCapacity;
+
+    private final InboundMessageHandler.WaitQueue endpointWaitQueue;
+    private final InboundMessageHandler.WaitQueue globalWaitQueue;
+
+<span class="fc" id="L55">    private final InboundCounters urgentCounters = new InboundCounters();</span>
+<span class="fc" id="L56">    private final InboundCounters smallCounters  = new InboundCounters();</span>
+<span class="fc" id="L57">    private final InboundCounters largeCounters  = new InboundCounters();</span>
+<span class="fc" id="L58">    private final InboundCounters legacyCounters = new InboundCounters();</span>
+
+    private final InboundMessageCallbacks urgentCallbacks;
+    private final InboundMessageCallbacks smallCallbacks;
+    private final InboundMessageCallbacks largeCallbacks;
+    private final InboundMessageCallbacks legacyCallbacks;
+
+    private final InternodeInboundMetrics metrics;
+    private final MessageConsumer messageConsumer;
+
+    private final HandlerProvider handlerProvider;
+<span class="fc" id="L69">    private final Collection&lt;InboundMessageHandler&gt; handlers = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+    static class GlobalResourceLimits
+    {
+        final ResourceLimits.Limit reserveCapacity;
+        final InboundMessageHandler.WaitQueue waitQueue;
+
+        GlobalResourceLimits(ResourceLimits.Limit reserveCapacity)
+<span class="fc" id="L77">        {</span>
+<span class="fc" id="L78">            this.reserveCapacity = reserveCapacity;</span>
+<span class="fc" id="L79">            this.waitQueue = InboundMessageHandler.WaitQueue.global(reserveCapacity);</span>
+<span class="fc" id="L80">        }</span>
+    }
+
+    public interface MessageConsumer extends Consumer&lt;Message&lt;?&gt;&gt;
+    {
+        void fail(Message.Header header, Throwable failure);
+    }
+
+    public interface GlobalMetricCallbacks
+    {
+        LatencyConsumer internodeLatencyRecorder(InetAddressAndPort to);
+        void recordInternalLatency(Verb verb, long timeElapsed, TimeUnit timeUnit);
+        void recordInternodeDroppedMessage(Verb verb, long timeElapsed, TimeUnit timeUnit);
+    }
+
+    public InboundMessageHandlers(InetAddressAndPort self,
+                                  InetAddressAndPort peer,
+                                  int queueCapacity,
+                                  long endpointReserveCapacity,
+                                  GlobalResourceLimits globalResourceLimits,
+                                  GlobalMetricCallbacks globalMetricCallbacks,
+                                  MessageConsumer messageConsumer)
+    {
+<span class="fc" id="L103">        this(self, peer, queueCapacity, endpointReserveCapacity, globalResourceLimits, globalMetricCallbacks, messageConsumer, InboundMessageHandler::new);</span>
+<span class="fc" id="L104">    }</span>
+
+    public InboundMessageHandlers(InetAddressAndPort self,
+                                  InetAddressAndPort peer,
+                                  int queueCapacity,
+                                  long endpointReserveCapacity,
+                                  GlobalResourceLimits globalResourceLimits,
+                                  GlobalMetricCallbacks globalMetricCallbacks,
+                                  MessageConsumer messageConsumer,
+                                  HandlerProvider handlerProvider)
+<span class="fc" id="L114">    {</span>
+<span class="fc" id="L115">        this.self = self;</span>
+<span class="fc" id="L116">        this.peer = peer;</span>
+
+<span class="fc" id="L118">        this.queueCapacity = queueCapacity;</span>
+<span class="fc" id="L119">        this.endpointReserveCapacity = new ResourceLimits.Concurrent(endpointReserveCapacity);</span>
+<span class="fc" id="L120">        this.globalReserveCapacity = globalResourceLimits.reserveCapacity;</span>
+<span class="fc" id="L121">        this.endpointWaitQueue = InboundMessageHandler.WaitQueue.endpoint(this.endpointReserveCapacity);</span>
+<span class="fc" id="L122">        this.globalWaitQueue = globalResourceLimits.waitQueue;</span>
+<span class="fc" id="L123">        this.messageConsumer = messageConsumer;</span>
+
+<span class="fc" id="L125">        this.handlerProvider = handlerProvider;</span>
+
+<span class="fc" id="L127">        urgentCallbacks = makeMessageCallbacks(peer, urgentCounters, globalMetricCallbacks, messageConsumer);</span>
+<span class="fc" id="L128">        smallCallbacks  = makeMessageCallbacks(peer, smallCounters,  globalMetricCallbacks, messageConsumer);</span>
+<span class="fc" id="L129">        largeCallbacks  = makeMessageCallbacks(peer, largeCounters,  globalMetricCallbacks, messageConsumer);</span>
+<span class="fc" id="L130">        legacyCallbacks = makeMessageCallbacks(peer, legacyCounters, globalMetricCallbacks, messageConsumer);</span>
+
+<span class="fc" id="L132">        metrics = new InternodeInboundMetrics(peer, this);</span>
+<span class="fc" id="L133">    }</span>
+
+    InboundMessageHandler createHandler(FrameDecoder frameDecoder, ConnectionType type, Channel channel, int version)
+    {
+<span class="fc" id="L137">        InboundMessageHandler handler =</span>
+<span class="fc" id="L138">            handlerProvider.provide(frameDecoder,</span>
+
+                                    type,
+                                    channel,
+                                    self,
+                                    peer,
+                                    version,
+                                    OutboundConnections.LARGE_MESSAGE_THRESHOLD,
+
+                                    queueCapacity,
+                                    endpointReserveCapacity,
+                                    globalReserveCapacity,
+                                    endpointWaitQueue,
+                                    globalWaitQueue,
+
+                                    this::onHandlerClosed,
+<span class="fc" id="L154">                                    callbacksFor(type),</span>
+                                    messageConsumer);
+<span class="fc" id="L156">        handlers.add(handler);</span>
+<span class="fc" id="L157">        return handler;</span>
+    }
+
+    void releaseMetrics()
+    {
+<span class="fc" id="L162">        metrics.release();</span>
+<span class="fc" id="L163">    }</span>
+
+    private void onHandlerClosed(AbstractMessageHandler handler)
+    {
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        assert handler instanceof InboundMessageHandler;</span>
+<span class="fc" id="L168">        handlers.remove(handler);</span>
+<span class="fc" id="L169">        absorbCounters((InboundMessageHandler)handler);</span>
+<span class="fc" id="L170">    }</span>
+
+    @VisibleForTesting
+    public int count()
+    {
+<span class="nc" id="L175">        return handlers.size();</span>
+    }
+
+    /*
+     * Message callbacks
+     */
+
+    private InboundMessageCallbacks callbacksFor(ConnectionType type)
+    {
+<span class="pc bpc" id="L184" title="2 of 5 branches missed.">        switch (type)</span>
+        {
+<span class="fc" id="L186">            case URGENT_MESSAGES: return urgentCallbacks;</span>
+<span class="fc" id="L187">            case  SMALL_MESSAGES: return smallCallbacks;</span>
+<span class="fc" id="L188">            case  LARGE_MESSAGES: return largeCallbacks;</span>
+<span class="nc" id="L189">            case LEGACY_MESSAGES: return legacyCallbacks;</span>
+        }
+
+<span class="nc" id="L192">        throw new IllegalArgumentException();</span>
+    }
+
+    private static InboundMessageCallbacks makeMessageCallbacks(InetAddressAndPort peer, InboundCounters counters, GlobalMetricCallbacks globalMetrics, MessageConsumer messageConsumer)
+    {
+<span class="fc" id="L197">        LatencyConsumer internodeLatency = globalMetrics.internodeLatencyRecorder(peer);</span>
+
+<span class="fc" id="L199">        return new InboundMessageCallbacks()</span>
+<span class="fc" id="L200">        {</span>
+            @Override
+            public void onHeaderArrived(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+                // do not log latency if we are within error bars of zero
+<span class="fc bfc" id="L205" title="All 2 branches covered.">                if (timeElapsed &gt; unit.convert(approxTime.error(), NANOSECONDS))</span>
+<span class="fc" id="L206">                    internodeLatency.accept(timeElapsed, unit);</span>
+<span class="fc" id="L207">            }</span>
+
+            @Override
+            public void onArrived(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+<span class="fc" id="L212">            }</span>
+
+            @Override
+            public void onArrivedExpired(int messageSize, Header header, boolean wasCorrupt, long timeElapsed, TimeUnit unit)
+            {
+<span class="nc" id="L217">                counters.addExpired(messageSize);</span>
+
+<span class="nc" id="L219">                globalMetrics.recordInternodeDroppedMessage(header.verb, timeElapsed, unit);</span>
+<span class="nc" id="L220">            }</span>
+
+            @Override
+            public void onArrivedCorrupt(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+<span class="nc" id="L225">                counters.addError(messageSize);</span>
+
+<span class="nc" id="L227">                messageConsumer.fail(header, new Crc.InvalidCrc(0, 0)); // could use one of the original exceptions?</span>
+<span class="nc" id="L228">            }</span>
+
+            @Override
+            public void onClosedBeforeArrival(int messageSize, Header header, int bytesReceived, boolean wasCorrupt, boolean wasExpired)
+            {
+<span class="nc" id="L233">                counters.addError(messageSize);</span>
+
+<span class="nc" id="L235">                messageConsumer.fail(header, new InvalidSerializedSizeException(header.verb, messageSize, bytesReceived));</span>
+<span class="nc" id="L236">            }</span>
+
+            @Override
+            public void onExpired(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+<span class="nc" id="L241">                counters.addExpired(messageSize);</span>
+
+<span class="nc" id="L243">                globalMetrics.recordInternodeDroppedMessage(header.verb, timeElapsed, unit);</span>
+<span class="nc" id="L244">            }</span>
+
+            @Override
+            public void onFailedDeserialize(int messageSize, Header header, Throwable t)
+            {
+<span class="nc" id="L249">                counters.addError(messageSize);</span>
+
+                /*
+                 * If an exception is caught during deser, return a failure response immediately
+                 * instead of waiting for the callback on the other end to expire.
+                 */
+<span class="nc" id="L255">                messageConsumer.fail(header, t);</span>
+<span class="nc" id="L256">            }</span>
+
+            @Override
+            public void onDispatched(int messageSize, Header header)
+            {
+<span class="fc" id="L261">                counters.addPending(messageSize);</span>
+<span class="fc" id="L262">            }</span>
+
+            @Override
+            public void onExecuting(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+<span class="fc" id="L267">                globalMetrics.recordInternalLatency(header.verb, timeElapsed, unit);</span>
+<span class="fc" id="L268">            }</span>
+
+            @Override
+            public void onExecuted(int messageSize, Header header, long timeElapsed, TimeUnit unit)
+            {
+<span class="fc" id="L273">                counters.removePending(messageSize);</span>
+<span class="fc" id="L274">            }</span>
+
+            @Override
+            public void onProcessed(int messageSize, Header header)
+            {
+<span class="fc" id="L279">                counters.addProcessed(messageSize);</span>
+<span class="fc" id="L280">            }</span>
+        };
+    }
+
+    /*
+     * Aggregated counters
+     */
+
+    InboundCounters countersFor(ConnectionType type)
+    {
+<span class="nc bnc" id="L290" title="All 5 branches missed.">        switch (type)</span>
+        {
+<span class="nc" id="L292">            case URGENT_MESSAGES: return urgentCounters;</span>
+<span class="nc" id="L293">            case  SMALL_MESSAGES: return smallCounters;</span>
+<span class="nc" id="L294">            case  LARGE_MESSAGES: return largeCounters;</span>
+<span class="nc" id="L295">            case LEGACY_MESSAGES: return legacyCounters;</span>
+        }
+
+<span class="nc" id="L298">        throw new IllegalArgumentException();</span>
+    }
+
+    public long receivedCount()
+    {
+<span class="nc" id="L303">        return sumHandlers(h -&gt; h.receivedCount) + closedReceivedCount;</span>
+    }
+
+    public long receivedBytes()
+    {
+<span class="nc" id="L308">        return sumHandlers(h -&gt; h.receivedBytes) + closedReceivedBytes;</span>
+    }
+
+    public long throttledCount()
+    {
+<span class="nc" id="L313">        return sumHandlers(h -&gt; h.throttledCount) + closedThrottledCount;</span>
+    }
+
+    public long throttledNanos()
+    {
+<span class="nc" id="L318">        return sumHandlers(h -&gt; h.throttledNanos) + closedThrottledNanos;</span>
+    }
+
+    public long usingCapacity()
+    {
+<span class="nc" id="L323">        return sumHandlers(h -&gt; h.queueSize);</span>
+    }
+
+    public long usingEndpointReserveCapacity()
+    {
+<span class="nc" id="L328">        return endpointReserveCapacity.using();</span>
+    }
+
+    public long corruptFramesRecovered()
+    {
+<span class="nc" id="L333">        return sumHandlers(h -&gt; h.corruptFramesRecovered) + closedCorruptFramesRecovered;</span>
+    }
+
+    public long corruptFramesUnrecovered()
+    {
+<span class="nc" id="L338">        return sumHandlers(h -&gt; h.corruptFramesUnrecovered) + closedCorruptFramesUnrecovered;</span>
+    }
+
+    public long errorCount()
+    {
+<span class="nc" id="L343">        return sumCounters(InboundCounters::errorCount);</span>
+    }
+
+    public long errorBytes()
+    {
+<span class="nc" id="L348">        return sumCounters(InboundCounters::errorBytes);</span>
+    }
+
+    public long expiredCount()
+    {
+<span class="nc" id="L353">        return sumCounters(InboundCounters::expiredCount);</span>
+    }
+
+    public long expiredBytes()
+    {
+<span class="nc" id="L358">        return sumCounters(InboundCounters::expiredBytes);</span>
+    }
+
+    public long processedCount()
+    {
+<span class="nc" id="L363">        return sumCounters(InboundCounters::processedCount);</span>
+    }
+
+    public long processedBytes()
+    {
+<span class="nc" id="L368">        return sumCounters(InboundCounters::processedBytes);</span>
+    }
+
+    public long scheduledCount()
+    {
+<span class="nc" id="L373">        return sumCounters(InboundCounters::scheduledCount);</span>
+    }
+
+    public long scheduledBytes()
+    {
+<span class="nc" id="L378">        return sumCounters(InboundCounters::scheduledBytes);</span>
+    }
+
+    /*
+     * 'Archived' counter values, combined for all connections that have been closed.
+     */
+
+    private volatile long closedReceivedCount, closedReceivedBytes;
+
+<span class="fc" id="L387">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedReceivedCountUpdater =</span>
+<span class="fc" id="L388">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedReceivedCount&quot;);</span>
+<span class="fc" id="L389">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedReceivedBytesUpdater =</span>
+<span class="fc" id="L390">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedReceivedBytes&quot;);</span>
+
+    private volatile long closedThrottledCount, closedThrottledNanos;
+
+<span class="fc" id="L394">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedThrottledCountUpdater =</span>
+<span class="fc" id="L395">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedThrottledCount&quot;);</span>
+<span class="fc" id="L396">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedThrottledNanosUpdater =</span>
+<span class="fc" id="L397">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedThrottledNanos&quot;);</span>
+
+    private volatile long closedCorruptFramesRecovered, closedCorruptFramesUnrecovered;
+
+<span class="fc" id="L401">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedCorruptFramesRecoveredUpdater =</span>
+<span class="fc" id="L402">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedCorruptFramesRecovered&quot;);</span>
+<span class="fc" id="L403">    private static final AtomicLongFieldUpdater&lt;InboundMessageHandlers&gt; closedCorruptFramesUnrecoveredUpdater =</span>
+<span class="fc" id="L404">        AtomicLongFieldUpdater.newUpdater(InboundMessageHandlers.class, &quot;closedCorruptFramesUnrecovered&quot;);</span>
+
+    private void absorbCounters(InboundMessageHandler handler)
+    {
+<span class="fc" id="L408">        closedReceivedCountUpdater.addAndGet(this, handler.receivedCount);</span>
+<span class="fc" id="L409">        closedReceivedBytesUpdater.addAndGet(this, handler.receivedBytes);</span>
+
+<span class="fc" id="L411">        closedThrottledCountUpdater.addAndGet(this, handler.throttledCount);</span>
+<span class="fc" id="L412">        closedThrottledNanosUpdater.addAndGet(this, handler.throttledNanos);</span>
+
+<span class="fc" id="L414">        closedCorruptFramesRecoveredUpdater.addAndGet(this, handler.corruptFramesRecovered);</span>
+<span class="fc" id="L415">        closedCorruptFramesUnrecoveredUpdater.addAndGet(this, handler.corruptFramesUnrecovered);</span>
+<span class="fc" id="L416">    }</span>
+
+    private long sumHandlers(ToLongFunction&lt;InboundMessageHandler&gt; counter)
+    {
+<span class="nc" id="L420">        long sum = 0L;</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        for (InboundMessageHandler h : handlers)</span>
+<span class="nc" id="L422">            sum += counter.applyAsLong(h);</span>
+<span class="nc" id="L423">        return sum;</span>
+    }
+
+    private long sumCounters(ToLongFunction&lt;InboundCounters&gt; mapping)
+    {
+<span class="nc" id="L428">        return mapping.applyAsLong(urgentCounters)</span>
+<span class="nc" id="L429">             + mapping.applyAsLong(smallCounters)</span>
+<span class="nc" id="L430">             + mapping.applyAsLong(largeCounters)</span>
+<span class="nc" id="L431">             + mapping.applyAsLong(legacyCounters);</span>
+    }
+
+    interface HandlerProvider
+    {
+        InboundMessageHandler provide(FrameDecoder decoder,
+
+                                      ConnectionType type,
+                                      Channel channel,
+                                      InetAddressAndPort self,
+                                      InetAddressAndPort peer,
+                                      int version,
+                                      int largeMessageThreshold,
+
+                                      int queueCapacity,
+                                      ResourceLimits.Limit endpointReserveCapacity,
+                                      ResourceLimits.Limit globalReserveCapacity,
+                                      InboundMessageHandler.WaitQueue endpointWaitQueue,
+                                      InboundMessageHandler.WaitQueue globalWaitQueue,
+
+                                      InboundMessageHandler.OnHandlerClosed onClosed,
+                                      InboundMessageCallbacks callbacks,
+                                      Consumer&lt;Message&lt;?&gt;&gt; consumer);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

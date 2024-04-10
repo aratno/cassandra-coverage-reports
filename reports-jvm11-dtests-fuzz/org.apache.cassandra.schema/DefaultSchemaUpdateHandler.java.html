@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DefaultSchemaUpdateHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.schema</a> &gt; <span class="el_source">DefaultSchemaUpdateHandler.java</span></div><h1>DefaultSchemaUpdateHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.schema;
+
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.SchemaTransformation.SchemaTransformationResult;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Awaitable;
+
+import static org.apache.cassandra.schema.MigrationCoordinator.MAX_OUTSTANDING_VERSION_REQUESTS;
+
+public class DefaultSchemaUpdateHandler implements SchemaUpdateHandler, IEndpointStateChangeSubscriber
+{
+<span class="fc" id="L57">    private static final Logger logger = LoggerFactory.getLogger(DefaultSchemaUpdateHandler.class);</span>
+
+    @VisibleForTesting
+    final MigrationCoordinator migrationCoordinator;
+
+    private final boolean requireSchemas;
+    private final BiConsumer&lt;SchemaTransformationResult, Boolean&gt; updateCallback;
+<span class="fc" id="L64">    private volatile DistributedSchema schema = DistributedSchema.EMPTY;</span>
+
+    private volatile AsyncPromise&lt;Void&gt; requestedReset;
+
+    private MigrationCoordinator createMigrationCoordinator(MessagingService messagingService)
+    {
+<span class="fc" id="L70">        return new MigrationCoordinator(messagingService,</span>
+<span class="fc" id="L71">                                        Stage.MIGRATION.executor(),</span>
+                                        ScheduledExecutors.scheduledTasks,
+                                        MAX_OUTSTANDING_VERSION_REQUESTS,
+                                        Gossiper.instance,
+                                        this::getSchemaVersionForCoordinator,
+                                        this::applyMutationsFromCoordinator);
+    }
+
+    public DefaultSchemaUpdateHandler(BiConsumer&lt;SchemaTransformationResult, Boolean&gt; updateCallback)
+    {
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">        this(null, MessagingService.instance(), !CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK.getBoolean(), updateCallback);</span>
+<span class="fc" id="L82">    }</span>
+
+    public DefaultSchemaUpdateHandler(MigrationCoordinator migrationCoordinator,
+                                      MessagingService messagingService,
+                                      boolean requireSchemas,
+                                      BiConsumer&lt;SchemaTransformationResult, Boolean&gt; updateCallback)
+<span class="fc" id="L88">    {</span>
+<span class="fc" id="L89">        this.requireSchemas = requireSchemas;</span>
+<span class="fc" id="L90">        this.updateCallback = updateCallback;</span>
+<span class="pc bpc" id="L91" title="1 of 2 branches missed.">        this.migrationCoordinator = migrationCoordinator == null ? createMigrationCoordinator(messagingService) : migrationCoordinator;</span>
+<span class="fc" id="L92">        Gossiper.instance.register(this);</span>
+<span class="fc" id="L93">        SchemaPushVerbHandler.instance.register(msg -&gt; {</span>
+<span class="nc" id="L94">            synchronized (this)</span>
+            {
+<span class="nc bnc" id="L96" title="All 2 branches missed.">                if (requestedReset == null)</span>
+<span class="nc" id="L97">                    applyMutations(msg.payload);</span>
+<span class="nc" id="L98">            }</span>
+<span class="nc" id="L99">        });</span>
+<span class="fc" id="L100">        SchemaPullVerbHandler.instance.register(msg -&gt; {</span>
+            try
+            {
+<span class="nc" id="L103">                messagingService.send(msg.responseWith(getSchemaMutations()), msg.from());</span>
+            }
+<span class="nc" id="L105">            catch (RuntimeException ex)</span>
+            {
+<span class="nc" id="L107">                logger.error(&quot;Failed to send schema mutations to &quot; + msg.from(), ex);</span>
+<span class="nc" id="L108">            }</span>
+<span class="nc" id="L109">        });</span>
+<span class="fc" id="L110">    }</span>
+
+    public synchronized void start()
+    {
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (StorageService.instance.isReplacing())</span>
+<span class="nc" id="L115">            onRemove(DatabaseDescriptor.getReplaceAddress());</span>
+
+<span class="nc" id="L117">        SchemaKeyspace.saveSystemKeyspacesSchema();</span>
+
+<span class="nc" id="L119">        migrationCoordinator.start();</span>
+<span class="nc" id="L120">    }</span>
+
+    @Override
+    public boolean waitUntilReady(Duration timeout)
+    {
+<span class="nc" id="L125">        logger.debug(&quot;Waiting for schema to be ready (max {})&quot;, timeout);</span>
+<span class="nc" id="L126">        boolean schemasReceived = migrationCoordinator.awaitSchemaRequests(timeout.toMillis());</span>
+
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (schemasReceived)</span>
+<span class="nc" id="L129">            return true;</span>
+
+<span class="nc" id="L131">        logger.warn(&quot;There are nodes in the cluster with a different schema version than us, from which we did not merge schemas: &quot; +</span>
+                    &quot;our version: ({}), outstanding versions -&gt; endpoints: {}. Use -D{}=true to ignore this, &quot; +
+                    &quot;-D{}=&lt;ep1[,epN]&gt; to skip specific endpoints, or -D{}=&lt;ver1[,verN]&gt; to skip specific schema versions&quot;,
+<span class="nc" id="L134">                    Schema.instance.getVersion(),</span>
+<span class="nc" id="L135">                    migrationCoordinator.outstandingVersions(),</span>
+<span class="nc" id="L136">                    CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK.getKey(),</span>
+<span class="nc" id="L137">                    CassandraRelevantProperties.IGNORED_SCHEMA_CHECK_ENDPOINTS.getKey(),</span>
+<span class="nc" id="L138">                    CassandraRelevantProperties.IGNORED_SCHEMA_CHECK_VERSIONS.getKey());</span>
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (requireSchemas)</span>
+        {
+<span class="nc" id="L142">            logger.error(&quot;Didn't receive schemas for all known versions within the {}. Use -D{}=true to skip this check.&quot;,</span>
+<span class="nc" id="L143">                         timeout, CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK.getKey());</span>
+
+<span class="nc" id="L145">            return false;</span>
+        }
+
+<span class="nc" id="L148">        return true;</span>
+    }
+
+    @Override
+    public void onRemove(InetAddressAndPort endpoint)
+    {
+<span class="nc" id="L154">        migrationCoordinator.removeAndIgnoreEndpoint(endpoint);</span>
+<span class="nc" id="L155">    }</span>
+
+    @Override
+    public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value)
+    {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (state == ApplicationState.SCHEMA)</span>
+        {
+<span class="nc" id="L162">            EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(endpoint);</span>
+<span class="nc bnc" id="L163" title="All 6 branches missed.">            if (epState != null &amp;&amp; !Gossiper.instance.isDeadState(epState) &amp;&amp; StorageService.instance.getTokenMetadata().isMember(endpoint))</span>
+            {
+<span class="nc" id="L165">                migrationCoordinator.reportEndpointVersion(endpoint, UUID.fromString(value.value));</span>
+            }
+        }
+<span class="nc" id="L168">    }</span>
+
+    @Override
+    public void onJoin(InetAddressAndPort endpoint, EndpointState epState)
+    {
+        // no-op
+<span class="nc" id="L174">    }</span>
+
+    @Override
+    public void beforeChange(InetAddressAndPort endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue)
+    {
+        // no-op
+<span class="nc" id="L180">    }</span>
+
+    @Override
+    public void onAlive(InetAddressAndPort endpoint, EndpointState state)
+    {
+        // no-op
+<span class="nc" id="L186">    }</span>
+
+    @Override
+    public void onDead(InetAddressAndPort endpoint, EndpointState state)
+    {
+        // no-op
+<span class="nc" id="L192">    }</span>
+
+    @Override
+    public void onRestart(InetAddressAndPort endpoint, EndpointState state)
+    {
+        // no-op
+<span class="nc" id="L198">    }</span>
+
+    private synchronized SchemaTransformationResult applyMutations(Collection&lt;Mutation&gt; schemaMutations)
+    {
+        // fetch the current state of schema for the affected keyspaces only
+<span class="nc" id="L203">        DistributedSchema before = schema;</span>
+
+        // apply the schema mutations
+<span class="nc" id="L206">        SchemaKeyspace.applyChanges(schemaMutations);</span>
+
+        // only compare the keyspaces affected by this set of schema mutations
+<span class="nc" id="L209">        Set&lt;String&gt; affectedKeyspaces = SchemaKeyspace.affectedKeyspaces(schemaMutations);</span>
+
+        // apply the schema mutations and fetch the new versions of the altered keyspaces
+<span class="nc" id="L212">        Keyspaces updatedKeyspaces = SchemaKeyspace.fetchKeyspaces(affectedKeyspaces);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        Set&lt;String&gt; removedKeyspaces = affectedKeyspaces.stream().filter(ks -&gt; !updatedKeyspaces.containsKeyspace(ks)).collect(Collectors.toSet());</span>
+<span class="nc" id="L214">        Keyspaces afterKeyspaces = before.getKeyspaces().withAddedOrReplaced(updatedKeyspaces).without(removedKeyspaces);</span>
+
+<span class="nc" id="L216">        Keyspaces.KeyspacesDiff diff = Keyspaces.diff(before.getKeyspaces(), afterKeyspaces);</span>
+<span class="nc" id="L217">        UUID version = SchemaKeyspace.calculateSchemaDigest();</span>
+<span class="nc" id="L218">        DistributedSchema after = new DistributedSchema(afterKeyspaces, version);</span>
+<span class="nc" id="L219">        SchemaTransformationResult update = new SchemaTransformationResult(before, after, diff);</span>
+
+<span class="nc" id="L221">        logger.info(&quot;Applying schema change due to received mutations: {}&quot;, update);</span>
+<span class="nc" id="L222">        updateSchema(update, false);</span>
+<span class="nc" id="L223">        return update;</span>
+    }
+
+    @Override
+    public synchronized SchemaTransformationResult apply(SchemaTransformation transformation, boolean local)
+    {
+<span class="fc" id="L229">        DistributedSchema before = schema;</span>
+<span class="fc" id="L230">        Keyspaces afterKeyspaces = transformation.apply(before.getKeyspaces());</span>
+<span class="fc" id="L231">        Keyspaces.KeyspacesDiff diff = Keyspaces.diff(before.getKeyspaces(), afterKeyspaces);</span>
+
+<span class="fc bfc" id="L233" title="All 2 branches covered.">        if (diff.isEmpty())</span>
+<span class="fc" id="L234">            return new SchemaTransformationResult(before, before, diff);</span>
+
+<span class="fc" id="L236">        Collection&lt;Mutation&gt; mutations = SchemaKeyspace.convertSchemaDiffToMutations(diff, transformation.fixedTimestampMicros().orElse(FBUtilities.timestampMicros()));</span>
+<span class="fc" id="L237">        SchemaKeyspace.applyChanges(mutations);</span>
+
+<span class="fc" id="L239">        DistributedSchema after = new DistributedSchema(afterKeyspaces, SchemaKeyspace.calculateSchemaDigest());</span>
+<span class="fc" id="L240">        SchemaTransformationResult update = new SchemaTransformationResult(before, after, diff);</span>
+
+<span class="fc" id="L242">        updateSchema(update, local);</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        if (!local)</span>
+        {
+<span class="nc" id="L245">            migrationCoordinator.executor.submit(() -&gt; {</span>
+<span class="nc" id="L246">                Pair&lt;Set&lt;InetAddressAndPort&gt;, Set&lt;InetAddressAndPort&gt;&gt; endpoints = migrationCoordinator.pushSchemaMutations(mutations);</span>
+<span class="nc" id="L247">                SchemaAnnouncementDiagnostics.schemaTransformationAnnounced(endpoints.left(), endpoints.right(), transformation);</span>
+<span class="nc" id="L248">            });</span>
+        }
+
+<span class="fc" id="L251">        return update;</span>
+    }
+
+    private void updateSchema(SchemaTransformationResult update, boolean local)
+    {
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">        if (!update.diff.isEmpty())</span>
+        {
+<span class="fc" id="L258">            this.schema = update.after;</span>
+<span class="fc" id="L259">            logger.debug(&quot;Schema updated: {}&quot;, update);</span>
+<span class="fc" id="L260">            updateCallback.accept(update, true);</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">            if (!local)</span>
+            {
+<span class="nc" id="L263">                migrationCoordinator.announce(update.after.getVersion());</span>
+            }
+        }
+        else
+        {
+<span class="nc" id="L268">            logger.debug(&quot;Schema update is empty - skipping&quot;);</span>
+        }
+<span class="fc" id="L270">    }</span>
+
+    private synchronized void reload()
+    {
+<span class="nc" id="L274">        DistributedSchema before = this.schema;</span>
+<span class="nc" id="L275">        DistributedSchema after = new DistributedSchema(SchemaKeyspace.fetchNonSystemKeyspaces(), SchemaKeyspace.calculateSchemaDigest());</span>
+<span class="nc" id="L276">        Keyspaces.KeyspacesDiff diff = Keyspaces.diff(before.getKeyspaces(), after.getKeyspaces());</span>
+<span class="nc" id="L277">        SchemaTransformationResult update = new SchemaTransformationResult(before, after, diff);</span>
+
+<span class="nc" id="L279">        updateSchema(update, false);</span>
+<span class="nc" id="L280">    }</span>
+
+    @Override
+    public void reset(boolean local)
+    {
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        if (local)</span>
+        {
+<span class="nc" id="L287">            reload();</span>
+        }
+        else
+        {
+<span class="nc" id="L291">            migrationCoordinator.reset();</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (!migrationCoordinator.awaitSchemaRequests(CassandraRelevantProperties.MIGRATION_DELAY.getLong()))</span>
+            {
+<span class="nc" id="L294">                logger.error(&quot;Timeout exceeded when waiting for schema from other nodes&quot;);</span>
+            }
+        }
+<span class="nc" id="L297">    }</span>
+
+    /**
+     * When clear is called the update handler will flag that the clear was requested. It means that migration
+     * coordinator will think that we have empty schema version and will apply whatever it receives from other nodes.
+     * When a first attempt to apply mutations from other node is called, it will first clear the schema and apply
+     * the mutations on a truncated table. The flag is then reset.
+     * &lt;p&gt;
+     * This way the clear is postponed until we really fetch any schema we can use as a replacement. Otherwise, nothing
+     * will happen. We will simply reset the flag after the timeout and throw exceptions to the caller.
+     *
+     * @return
+     */
+    @Override
+    public Awaitable clear()
+    {
+<span class="nc" id="L313">        synchronized (this)</span>
+        {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (requestedReset == null)</span>
+            {
+<span class="nc" id="L317">                requestedReset = new AsyncPromise&lt;&gt;();</span>
+<span class="nc" id="L318">                migrationCoordinator.reset();</span>
+            }
+<span class="nc" id="L320">            return requestedReset;</span>
+        }
+    }
+
+    private UUID getSchemaVersionForCoordinator()
+    {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        if (requestedReset != null)</span>
+<span class="nc" id="L327">            return SchemaConstants.emptyVersion;</span>
+        else
+<span class="nc" id="L329">            return schema.getVersion();</span>
+    }
+
+    private synchronized void applyMutationsFromCoordinator(InetAddressAndPort from, Collection&lt;Mutation&gt; mutations)
+    {
+<span class="nc bnc" id="L334" title="All 4 branches missed.">        if (requestedReset != null &amp;&amp; !mutations.isEmpty())</span>
+        {
+<span class="nc" id="L336">            schema = DistributedSchema.EMPTY;</span>
+<span class="nc" id="L337">            SchemaKeyspace.truncate();</span>
+<span class="nc" id="L338">            requestedReset.setSuccess(null);</span>
+<span class="nc" id="L339">            requestedReset = null;</span>
+        }
+<span class="nc" id="L341">        applyMutations(mutations);</span>
+<span class="nc" id="L342">    }</span>
+
+    private synchronized Collection&lt;Mutation&gt; getSchemaMutations()
+    {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (requestedReset != null)</span>
+<span class="nc" id="L347">            return Collections.emptyList();</span>
+        else
+<span class="nc" id="L349">            return SchemaKeyspace.convertSchemaToMutations();</span>
+    }
+
+    public Map&lt;UUID, Set&lt;InetAddressAndPort&gt;&gt; getOutstandingSchemaVersions()
+    {
+<span class="nc" id="L354">        return migrationCoordinator.outstandingVersions();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

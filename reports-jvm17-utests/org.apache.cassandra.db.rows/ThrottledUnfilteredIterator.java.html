@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ThrottledUnfilteredIterator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">ThrottledUnfilteredIterator.java</span></div><h1>ThrottledUnfilteredIterator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.CloseableIterator;
+
+/**
+ * A utility class to split the given {@link#UnfilteredRowIterator} into smaller chunks each
+ * having at most {@link #throttle} + 1 unfiltereds.
+ *
+ * Only the first output contains partition level info: {@link UnfilteredRowIterator#partitionLevelDeletion}
+ * and {@link UnfilteredRowIterator#staticRow}.
+ *
+ * Besides splitting, this iterator will also ensure each chunk does not finish with an open tombstone marker,
+ * by closing any opened tombstone markers and re-opening on the next chunk.
+ *
+ * The lifecycle of outputed {{@link UnfilteredRowIterator} only last till next call to {@link #next()}.
+ *
+ * A subsequent {@link #next} call will exhaust the previously returned iterator before computing the next,
+ * effectively skipping unfiltereds up to the throttle size.
+ *
+ * Closing this iterator will close the underlying iterator.
+ *
+ */
+<span class="fc" id="L49">public class ThrottledUnfilteredIterator extends AbstractIterator&lt;UnfilteredRowIterator&gt; implements CloseableIterator&lt;UnfilteredRowIterator&gt;</span>
+{
+    private final UnfilteredRowIterator origin;
+    private final int throttle;
+
+    // internal mutable state
+    private UnfilteredRowIterator throttledItr;
+
+    // extra unfiltereds from previous iteration
+<span class="fc" id="L58">    private Iterator&lt;Unfiltered&gt; overflowed = Collections.emptyIterator();</span>
+
+    @VisibleForTesting
+    ThrottledUnfilteredIterator(UnfilteredRowIterator origin, int throttle)
+<span class="fc" id="L62">    {</span>
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">        assert origin != null;</span>
+<span class="pc bpc" id="L64" title="1 of 2 branches missed.">        assert throttle &gt; 1 : &quot;Throttle size must be higher than 1 to properly support open and close tombstone boundaries.&quot;;</span>
+<span class="fc" id="L65">        this.origin = origin;</span>
+<span class="fc" id="L66">        this.throttle = throttle;</span>
+<span class="fc" id="L67">        this.throttledItr = null;</span>
+<span class="fc" id="L68">    }</span>
+
+    @Override
+    protected UnfilteredRowIterator computeNext()
+    {
+        // exhaust previous throttled iterator
+<span class="fc bfc" id="L74" title="All 4 branches covered.">        while (throttledItr != null &amp;&amp; throttledItr.hasNext())</span>
+<span class="fc" id="L75">            throttledItr.next();</span>
+
+        // The original UnfilteredRowIterator may have only partition deletion or static column but without unfiltereds.
+        // Return the original UnfilteredRowIterator
+<span class="fc bfc" id="L79" title="All 2 branches covered.">        if (!origin.hasNext())</span>
+        {
+<span class="fc bfc" id="L81" title="All 2 branches covered.">            if (throttledItr != null)</span>
+<span class="fc" id="L82">                return endOfData();</span>
+<span class="fc" id="L83">            return throttledItr = origin;</span>
+        }
+
+<span class="fc" id="L86">        throttledItr = new WrappingUnfilteredRowIterator()</span>
+<span class="fc" id="L87">        {</span>
+<span class="fc" id="L88">            private int count = 0;</span>
+<span class="fc bfc" id="L89" title="All 2 branches covered.">            private boolean isFirst = throttledItr == null;</span>
+
+            // current batch's openMarker. if it's generated in previous batch,
+            // it must be consumed as first element of current batch
+            private RangeTombstoneMarker openMarker;
+
+            // current batch's closeMarker.
+            // it must be consumed as last element of current batch
+<span class="fc" id="L97">            private RangeTombstoneMarker closeMarker = null;</span>
+
+            @Override
+            public UnfilteredRowIterator wrapped()
+            {
+<span class="fc" id="L102">                return origin;</span>
+            }
+
+            @Override
+            public boolean hasNext()
+            {
+<span class="fc bfc" id="L108" title="All 6 branches covered.">                return (withinLimit() &amp;&amp; origin.hasNext()) || closeMarker != null;</span>
+            }
+
+            @Override
+            public Unfiltered next()
+            {
+<span class="fc bfc" id="L114" title="All 2 branches covered.">                if (closeMarker != null)</span>
+                {
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">                    assert count == throttle;</span>
+<span class="fc" id="L117">                    Unfiltered toReturn = closeMarker;</span>
+<span class="fc" id="L118">                    closeMarker = null;</span>
+<span class="fc" id="L119">                    return toReturn;</span>
+                }
+
+                Unfiltered next;
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">                assert withinLimit();</span>
+                // in the beginning of the batch, there might be remaining unfiltereds from previous iteration
+<span class="fc bfc" id="L125" title="All 2 branches covered.">                if (overflowed.hasNext())</span>
+<span class="fc" id="L126">                    next = overflowed.next();</span>
+                else
+<span class="fc" id="L128">                    next = origin.next();</span>
+<span class="fc" id="L129">                recordNext(next);</span>
+<span class="fc" id="L130">                return next;</span>
+            }
+
+            private void recordNext(Unfiltered unfiltered)
+            {
+<span class="fc" id="L135">                count++;</span>
+<span class="fc bfc" id="L136" title="All 2 branches covered.">                if (unfiltered.isRangeTombstoneMarker())</span>
+<span class="fc" id="L137">                    updateMarker((RangeTombstoneMarker) unfiltered);</span>
+                // when reach throttle with a remaining openMarker, we need to create corresponding closeMarker.
+<span class="fc bfc" id="L139" title="All 4 branches covered.">                if (count == throttle &amp;&amp; openMarker != null)</span>
+                {
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">                    assert origin.hasNext();</span>
+<span class="fc" id="L142">                    closeOpenMarker(origin.next());</span>
+                }
+<span class="fc" id="L144">            }</span>
+
+            private boolean withinLimit()
+            {
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                return count &lt; throttle;</span>
+            }
+
+            private void updateMarker(RangeTombstoneMarker marker)
+            {
+<span class="fc bfc" id="L153" title="All 2 branches covered.">                openMarker = marker.isOpen(isReverseOrder()) ? marker : null;</span>
+<span class="fc" id="L154">            }</span>
+
+            /**
+             * There 3 cases for next, 1. if it's boundaryMarker, we split it as closeMarker for current batch, next
+             * openMarker for next batch 2. if it's boundMakrer, it must be closeMarker. 3. if it's Row, create
+             * corresponding closeMarker for current batch, and create next openMarker for next batch including current
+             * Row.
+             */
+            private void closeOpenMarker(Unfiltered next)
+            {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">                assert openMarker != null;</span>
+
+<span class="fc bfc" id="L166" title="All 2 branches covered.">                if (next.isRangeTombstoneMarker())</span>
+                {
+<span class="fc" id="L168">                    RangeTombstoneMarker marker = (RangeTombstoneMarker) next;</span>
+                    // if it's boundary, create closeMarker for current batch and openMarker for next batch
+<span class="fc bfc" id="L170" title="All 2 branches covered.">                    if (marker.isBoundary())</span>
+                    {
+<span class="fc" id="L172">                        RangeTombstoneBoundaryMarker boundary = (RangeTombstoneBoundaryMarker) marker;</span>
+<span class="fc" id="L173">                        closeMarker = boundary.createCorrespondingCloseMarker(isReverseOrder());</span>
+<span class="fc" id="L174">                        overflowed = Collections.singleton((Unfiltered)boundary.createCorrespondingOpenMarker(isReverseOrder())).iterator();</span>
+<span class="fc" id="L175">                    }</span>
+                    else
+                    {
+                        // if it's bound, it must be closeMarker.
+<span class="pc bpc" id="L179" title="1 of 2 branches missed.">                        assert marker.isClose(isReverseOrder());</span>
+<span class="fc" id="L180">                        updateMarker(marker);</span>
+<span class="fc" id="L181">                        closeMarker = marker;</span>
+                    }
+<span class="fc" id="L183">                }</span>
+                else
+                {
+                    // it's Row, need to create closeMarker for current batch and openMarker for next batch
+<span class="fc" id="L187">                    DeletionTime openDeletion = openMarker.openDeletionTime(isReverseOrder());</span>
+<span class="fc" id="L188">                    closeMarker = RangeTombstoneBoundMarker.exclusiveClose(isReverseOrder(), next.clustering(), openDeletion);</span>
+
+                    // for next batch
+<span class="fc" id="L191">                    overflowed = Arrays.asList(RangeTombstoneBoundMarker.inclusiveOpen(isReverseOrder(),</span>
+<span class="fc" id="L192">                                                                                       next.clustering(),</span>
+<span class="fc" id="L193">                                                                                       openDeletion), next).iterator();</span>
+                }
+<span class="fc" id="L195">            }</span>
+
+            @Override
+            public DeletionTime partitionLevelDeletion()
+            {
+<span class="fc bfc" id="L200" title="All 2 branches covered.">                return isFirst ? origin.partitionLevelDeletion() : DeletionTime.LIVE;</span>
+            }
+
+            @Override
+            public Row staticRow()
+            {
+<span class="fc bfc" id="L206" title="All 2 branches covered.">                return isFirst ? origin.staticRow() : Rows.EMPTY_STATIC_ROW;</span>
+            }
+
+            @Override
+            public void close()
+            {
+                // no op
+<span class="fc" id="L213">            }</span>
+        };
+<span class="fc" id="L215">        return throttledItr;</span>
+    }
+
+    public void close()
+    {
+<span class="pc bpc" id="L220" title="1 of 2 branches missed.">        if (origin != null)</span>
+<span class="fc" id="L221">            origin.close();</span>
+<span class="fc" id="L222">    }</span>
+
+    /**
+     * Splits a {@link UnfilteredPartitionIterator} in {@link UnfilteredRowIterator} batches with size no higher than
+     * &lt;b&gt;maxBatchSize&lt;/b&gt;
+     *
+     * @param partitionIterator
+     * @param maxBatchSize max number of unfiltereds in the UnfilteredRowIterator. if 0 is given, it means no throttle.
+     * @return
+     */
+    public static CloseableIterator&lt;UnfilteredRowIterator&gt; throttle(UnfilteredPartitionIterator partitionIterator, int maxBatchSize)
+    {
+<span class="fc bfc" id="L234" title="All 2 branches covered.">        if (maxBatchSize == 0) // opt out</span>
+<span class="fc" id="L235">            return partitionIterator;</span>
+
+<span class="fc" id="L237">        return new AbstractIterator&lt;UnfilteredRowIterator&gt;()</span>
+<span class="fc" id="L238">        {</span>
+<span class="fc" id="L239">            ThrottledUnfilteredIterator current = null;</span>
+
+            protected UnfilteredRowIterator computeNext()
+            {
+<span class="fc bfc" id="L243" title="All 4 branches covered.">                if (current != null &amp;&amp; !current.hasNext())</span>
+                {
+<span class="fc" id="L245">                    current.close();</span>
+<span class="fc" id="L246">                    current = null;</span>
+                }
+
+<span class="fc bfc" id="L249" title="All 4 branches covered.">                if (current == null &amp;&amp; partitionIterator.hasNext())</span>
+                {
+<span class="fc" id="L251">                    current = new ThrottledUnfilteredIterator(partitionIterator.next(), maxBatchSize);</span>
+                }
+
+<span class="pc bpc" id="L254" title="1 of 4 branches missed.">                if (current != null &amp;&amp; current.hasNext())</span>
+<span class="fc" id="L255">                    return current.next();</span>
+
+<span class="fc" id="L257">                return endOfData();</span>
+            }
+
+            public void close()
+            {
+<span class="fc bfc" id="L262" title="All 2 branches covered.">                if (current != null)</span>
+<span class="fc" id="L263">                    current.close();</span>
+<span class="fc" id="L264">            }</span>
+        };
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PreV5Handlers.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">PreV5Handlers.java</span></div><h1>PreV5Handlers.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.transport;
+
+import java.util.List;
+
+import com.google.common.base.Predicate;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelConfig;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import io.netty.handler.codec.MessageToMessageEncoder;
+import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.net.ResourceLimits;
+import org.apache.cassandra.transport.messages.ErrorMessage;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+
+import static org.apache.cassandra.transport.CQLMessageHandler.RATE_LIMITER_DELAY_UNIT;
+import static org.apache.cassandra.transport.ClientResourceLimits.GLOBAL_REQUEST_LIMITER;
+
+<span class="nc" id="L49">public class PreV5Handlers</span>
+{
+    /**
+     * Wraps an {@link org.apache.cassandra.transport.Dispatcher} so that it can be used as an
+     * channel inbound handler in pre-V5 pipelines.
+     */
+    public static class LegacyDispatchHandler extends SimpleChannelInboundHandler&lt;Message.Request&gt;
+    {
+<span class="nc" id="L57">        private static final Logger logger = LoggerFactory.getLogger(LegacyDispatchHandler.class);</span>
+
+        private final Dispatcher dispatcher;
+        private final ClientResourceLimits.Allocator endpointPayloadTracker;
+
+        /**
+         * Current count of *request* bytes that are live on the channel.
+         * &lt;p&gt;
+         * Note: should only be accessed while on the netty event loop.
+         */
+        private long channelPayloadBytesInFlight;
+        
+        /** The cause of the current connection pause, or {@link Overload#NONE} if it is unpaused. */
+<span class="nc" id="L70">        private Overload backpressure = Overload.NONE;</span>
+
+        LegacyDispatchHandler(Dispatcher dispatcher, ClientResourceLimits.Allocator endpointPayloadTracker)
+<span class="nc" id="L73">        {</span>
+<span class="nc" id="L74">            this.dispatcher = dispatcher;</span>
+<span class="nc" id="L75">            this.endpointPayloadTracker = endpointPayloadTracker;</span>
+<span class="nc" id="L76">        }</span>
+
+        protected void channelRead0(ChannelHandlerContext ctx, Message.Request request)
+        {
+            // The only reason we won't process this message is if checkLimits() throws an OverloadedException.
+            // (i.e. Even if backpressure is applied, the current request is allowed to finish.)
+<span class="nc" id="L82">            checkLimits(ctx, request);</span>
+<span class="nc" id="L83">            dispatcher.dispatch(ctx.channel(), request, this::toFlushItem, backpressure);</span>
+<span class="nc" id="L84">        }</span>
+
+        // Acts as a Dispatcher.FlushItemConverter
+        private Flusher.FlushItem.Unframed toFlushItem(Channel channel, Message.Request request, Message.Response response)
+        {
+<span class="nc" id="L89">            return new Flusher.FlushItem.Unframed(channel, response, request.getSource(), this::releaseItem);</span>
+        }
+
+        private void releaseItem(Flusher.FlushItem&lt;Message.Response&gt; item)
+        {
+            // Note: in contrast to the equivalent for V5 protocol, CQLMessageHandler::release(FlushItem item),
+            // this does not release the FlushItem's Message.Response. In V4, the buffers for the response's body
+            // and serialised header are emitted directly down the Netty pipeline from Envelope.Encoder, so
+            // releasing them is handled by the pipeline itself.
+<span class="nc" id="L98">            long itemSize = item.request.header.bodySizeInBytes;</span>
+<span class="nc" id="L99">            item.request.release();</span>
+
+            // since the request has been processed, decrement inflight payload at channel, endpoint and global levels
+<span class="nc" id="L102">            channelPayloadBytesInFlight -= itemSize;</span>
+<span class="nc bnc" id="L103" title="All 2 branches missed.">            boolean globalInFlightBytesBelowLimit = endpointPayloadTracker.release(itemSize) == ResourceLimits.Outcome.BELOW_LIMIT;</span>
+
+            // Now check to see if we need to reenable the channel's autoRead.
+            //
+            // If the current payload bytes in flight is zero, we must reenable autoread as
+            // 1) we allow no other thread/channel to do it, and
+            // 2) there are no other events following this one (becuase we're at zero bytes in flight),
+            // so no successive to trigger the other clause in this if-block.
+            //
+            // The only exception to this is if the global request rate limit has been breached, which means
+            // we'll have to wait until a scheduled wakeup task unpauses the connection.
+            //
+            // Note: This path is only relevant when part of a pre-V5 pipeline, as only in this case is
+            // paused ever set to true. In pipelines configured for V5 or later, backpressure and control
+            // over the inbound pipeline's autoread status are handled by the FrameDecoder/FrameProcessor.
+<span class="nc" id="L118">            ChannelConfig config = item.channel.config();</span>
+
+<span class="nc bnc" id="L120" title="All 6 branches missed.">            if (backpressure == Overload.BYTES_IN_FLIGHT &amp;&amp; (channelPayloadBytesInFlight == 0 || globalInFlightBytesBelowLimit))</span>
+            {
+<span class="nc" id="L122">                unpauseConnection(config);</span>
+            }
+<span class="nc" id="L124">        }</span>
+
+        /**
+         * Checks limits on bytes in flight and the request rate limiter (if enabled) to determine whether to drop a
+         * request or trigger backpressure and pause the connection.
+         * &lt;p&gt;
+         * The check for inflight payload to potentially discard the request should have been ideally in one of the
+         * first handlers in the pipeline (Envelope.Decoder::decode()). However, in case of any exception thrown between
+         * that handler (where inflight payload is incremented) and this handler (Dispatcher::channelRead0) (where 
+         * inflight payload in decremented), inflight payload becomes erroneous. ExceptionHandler is not sufficient for 
+         * this purpose since it does not have the message envelope associated with the exception.
+         * &lt;p&gt;
+         * If the connection is configured to throw {@link OverloadedException}, requests that breach the rate limit are
+         * not counted against that limit.
+         * &lt;p&gt;
+         * Note: this method should execute on the netty event loop.
+         * 
+         * @throws ErrorMessage.WrappedException with an {@link OverloadedException} if overload occurs and the 
+         *         connection is configured to throw on overload
+         */
+        private void checkLimits(ChannelHandlerContext ctx, Message.Request request)
+        {
+<span class="nc" id="L146">            long requestSize = request.getSource().header.bodySizeInBytes;</span>
+            
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (request.connection.isThrowOnOverload())</span>
+            {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">                if (endpointPayloadTracker.tryAllocate(requestSize) != ResourceLimits.Outcome.SUCCESS)</span>
+                {
+<span class="nc" id="L152">                    discardAndThrow(request, requestSize, Overload.BYTES_IN_FLIGHT);</span>
+                }
+
+<span class="nc bnc" id="L155" title="All 4 branches missed.">                if (DatabaseDescriptor.getNativeTransportRateLimitingEnabled() &amp;&amp; !GLOBAL_REQUEST_LIMITER.tryReserve())</span>
+                {
+                    // We've already allocated against the payload tracker here, so release those resources.
+<span class="nc" id="L158">                    endpointPayloadTracker.release(requestSize);</span>
+<span class="nc" id="L159">                    discardAndThrow(request, requestSize, Overload.REQUESTS);</span>
+                }
+            }
+            else
+            {
+                // Any request that gets here will be processed, so increment the channel bytes in flight.
+<span class="nc" id="L165">                channelPayloadBytesInFlight += requestSize;</span>
+                
+                // Check for overloaded state by trying to allocate the message size from inflight payload trackers
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                if (endpointPayloadTracker.tryAllocate(requestSize) != ResourceLimits.Outcome.SUCCESS)</span>
+                {
+<span class="nc" id="L170">                    endpointPayloadTracker.allocate(requestSize);</span>
+<span class="nc" id="L171">                    pauseConnection(ctx);</span>
+<span class="nc" id="L172">                    backpressure = Overload.BYTES_IN_FLIGHT;</span>
+                }
+
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                if (DatabaseDescriptor.getNativeTransportRateLimitingEnabled())</span>
+                {
+                    // Reserve a permit even if we've already triggered backpressure on bytes in flight.
+<span class="nc" id="L178">                    long delay = GLOBAL_REQUEST_LIMITER.reserveAndGetDelay(RATE_LIMITER_DELAY_UNIT);</span>
+                    
+                    // If we've already triggered backpressure on bytes in flight, no further action is necessary.
+<span class="nc bnc" id="L181" title="All 4 branches missed.">                    if (backpressure == Overload.NONE &amp;&amp; delay &gt; 0)</span>
+                    {
+<span class="nc" id="L183">                        pauseConnection(ctx);</span>
+                        
+                        // A permit isn't immediately available, so schedule an unpause for when it is.
+<span class="nc" id="L186">                        ctx.channel().eventLoop().schedule(() -&gt; unpauseConnection(ctx.channel().config()), delay, RATE_LIMITER_DELAY_UNIT);</span>
+<span class="nc" id="L187">                        backpressure = Overload.REQUESTS;</span>
+                    }
+                }
+            }
+<span class="nc" id="L191">        }</span>
+
+        private void pauseConnection(ChannelHandlerContext ctx)
+        {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (ctx.channel().config().isAutoRead())</span>
+            {
+<span class="nc" id="L197">                ctx.channel().config().setAutoRead(false);</span>
+<span class="nc" id="L198">                ClientMetrics.instance.pauseConnection();</span>
+            }
+<span class="nc" id="L200">        }</span>
+
+        private void unpauseConnection(ChannelConfig config)
+        {
+<span class="nc" id="L204">            backpressure = Overload.NONE;</span>
+            
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (!config.isAutoRead())</span>
+            {
+<span class="nc" id="L208">                ClientMetrics.instance.unpauseConnection();</span>
+<span class="nc" id="L209">                config.setAutoRead(true);</span>
+            }
+<span class="nc" id="L211">        }</span>
+
+        private void discardAndThrow(Message.Request request, long requestSize, Overload overload)
+        {
+<span class="nc" id="L215">            ClientMetrics.instance.markRequestDiscarded();</span>
+
+<span class="nc" id="L217">            logger.trace(&quot;Discarded request of size {} with {} bytes in flight on channel. {} &quot; + </span>
+                         &quot;Global rate limiter: {} Request: {}&quot;,
+<span class="nc" id="L219">                         requestSize, channelPayloadBytesInFlight, endpointPayloadTracker,</span>
+                         GLOBAL_REQUEST_LIMITER, request);
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            OverloadedException exception = overload == Overload.REQUESTS</span>
+<span class="nc" id="L223">                    ? new OverloadedException(String.format(&quot;Request breached global limit of %d requests/second. Server is &quot; +</span>
+                                                            &quot;currently in an overloaded state and cannot accept more requests.&quot;,
+<span class="nc" id="L225">                                                            GLOBAL_REQUEST_LIMITER.getRate()))</span>
+<span class="nc" id="L226">                    : new OverloadedException(String.format(&quot;Request breached limit on bytes in flight. (%s)) &quot; +</span>
+                                                            &quot;Server is currently in an overloaded state and cannot accept more requests.&quot;,
+
+                    endpointPayloadTracker));
+            
+<span class="nc" id="L231">            throw ErrorMessage.wrap(exception, request.getSource().header.streamId);</span>
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx)
+        {
+<span class="nc" id="L237">            endpointPayloadTracker.release();</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            if (!ctx.channel().config().isAutoRead())</span>
+            {
+<span class="nc" id="L240">                ClientMetrics.instance.unpauseConnection();</span>
+            }
+<span class="nc" id="L242">            ctx.fireChannelInactive();</span>
+<span class="nc" id="L243">        }</span>
+    }
+
+    /**
+     * Simple adaptor to allow {@link org.apache.cassandra.transport.Message.Decoder#decodeMessage(Channel, Envelope)}
+     * to be used as a handler in pre-V5 pipelines
+     */
+    @ChannelHandler.Sharable
+    public static class ProtocolDecoder extends MessageToMessageDecoder&lt;Envelope&gt;
+    {
+<span class="nc" id="L253">        public static final ProtocolDecoder instance = new ProtocolDecoder();</span>
+        private ProtocolDecoder(){}
+
+        public void decode(ChannelHandlerContext ctx, Envelope source, List&lt;Object&gt; results)
+        {
+            try
+            {
+<span class="nc" id="L260">                ProtocolVersion version = getConnectionVersion(ctx);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                if (source.header.version != version)</span>
+                {
+<span class="nc" id="L263">                    throw new ProtocolException(</span>
+<span class="nc" id="L264">                        String.format(&quot;Invalid message version. Got %s but previous &quot; +</span>
+                                      &quot;messages on this connection had version %s&quot;,
+                                      source.header.version, version));
+                }
+<span class="nc" id="L268">                results.add(Message.Decoder.decodeMessage(ctx.channel(), source));</span>
+            }
+<span class="nc" id="L270">            catch (Throwable ex)</span>
+            {
+<span class="nc" id="L272">                source.release();</span>
+                // Remember the streamId
+<span class="nc" id="L274">                throw ErrorMessage.wrap(ex, source.header.streamId);</span>
+<span class="nc" id="L275">            }</span>
+<span class="nc" id="L276">        }</span>
+    }
+
+    /**
+     * Simple adaptor to plug CQL message encoding into pre-V5 pipelines
+     */
+    @ChannelHandler.Sharable
+    public static class ProtocolEncoder extends MessageToMessageEncoder&lt;Message&gt;
+    {
+<span class="nc" id="L285">        public static final ProtocolEncoder instance = new ProtocolEncoder();</span>
+        private ProtocolEncoder(){}
+        public void encode(ChannelHandlerContext ctx, Message source, List&lt;Object&gt; results)
+        {
+<span class="nc" id="L289">            ProtocolVersion version = getConnectionVersion(ctx);</span>
+<span class="nc" id="L290">            results.add(source.encode(version));</span>
+<span class="nc" id="L291">        }</span>
+    }
+
+    /**
+     * Pre-V5 exception handler which closes the connection if an {@link org.apache.cassandra.transport.ProtocolException}
+     * is thrown
+     */
+    @ChannelHandler.Sharable
+    public static final class ExceptionHandler extends ChannelInboundHandlerAdapter
+    {
+<span class="fc" id="L301">        private static final Logger logger = LoggerFactory.getLogger(ExceptionHandler.class);</span>
+
+<span class="fc" id="L303">        public static final ExceptionHandler instance = new ExceptionHandler();</span>
+        private ExceptionHandler(){}
+
+        @Override
+        public void exceptionCaught(final ChannelHandlerContext ctx, Throwable cause)
+        {
+            // Provide error message to client in case channel is still open
+<span class="nc bnc" id="L310" title="All 2 branches missed.">            if (ctx.channel().isOpen())</span>
+            {
+<span class="nc" id="L312">                Predicate&lt;Throwable&gt; handler = ExceptionHandlers.getUnexpectedExceptionHandler(ctx.channel(), false);</span>
+<span class="nc" id="L313">                ErrorMessage errorMessage = ErrorMessage.fromException(cause, handler);</span>
+<span class="nc" id="L314">                ChannelFuture future = ctx.writeAndFlush(errorMessage.encode(getConnectionVersion(ctx)));</span>
+                // On protocol exception, close the channel as soon as the message have been sent.
+                // Most cases of PE are wrapped so the type check below is expected to fail more often than not.
+                // At this moment Fatal exceptions are not thrown in v4, but just as a precaustion we check for them here
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                if (isFatal(cause))</span>
+<span class="nc" id="L319">                    future.addListener((ChannelFutureListener) f -&gt; ctx.close());</span>
+            }
+            
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            if (DatabaseDescriptor.getClientErrorReportingExclusions().contains(ctx.channel().remoteAddress()))</span>
+            {
+                // Sometimes it is desirable to ignore exceptions from specific IPs; such as when security scans are
+                // running.  To avoid polluting logs and metrics, metrics are not updated when the IP is in the exclude
+                // list.
+<span class="nc" id="L327">                logger.debug(&quot;Excluding client exception for {}; address contained in client_error_reporting_exclusions&quot;, ctx.channel().remoteAddress(), cause);</span>
+<span class="nc" id="L328">                return;</span>
+            }
+<span class="nc" id="L330">            ExceptionHandlers.logClientNetworkingExceptions(cause);</span>
+<span class="nc" id="L331">            JVMStabilityInspector.inspectThrowable(cause);</span>
+<span class="nc" id="L332">        }</span>
+
+        private static boolean isFatal(Throwable cause)
+        {
+<span class="nc" id="L336">            return cause instanceof ProtocolException; // this matches previous versions which didn't annotate exceptions as fatal or not</span>
+        }
+    }
+
+    private static ProtocolVersion getConnectionVersion(ChannelHandlerContext ctx)
+    {
+<span class="nc" id="L342">        Connection connection = ctx.channel().attr(Connection.attributeKey).get();</span>
+        // The only case the connection can be null is when we send the initial STARTUP message
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        return connection == null ? ProtocolVersion.CURRENT : connection.getVersion();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SEPExecutor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.concurrent</a> &gt; <span class="el_source">SEPExecutor.java</span></div><h1>SEPExecutor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.concurrent;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.WithResources;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.concurrent.Condition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.metrics.ThreadPoolMetrics;
+
+import static org.apache.cassandra.concurrent.SEPExecutor.TakeTaskPermitResult.*;
+import static org.apache.cassandra.concurrent.SEPWorker.Work;
+import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+
+public class SEPExecutor implements LocalAwareExecutorPlus, SEPExecutorMBean
+{
+<span class="fc" id="L45">    private static final Logger logger = LoggerFactory.getLogger(SEPExecutor.class);</span>
+<span class="fc" id="L46">    private static final TaskFactory taskFactory = TaskFactory.localAware();</span>
+
+    private final SharedExecutorPool pool;
+
+    private final AtomicInteger maximumPoolSize;
+    private final MaximumPoolSizeListener maximumPoolSizeListener;
+    public final String name;
+    private final String mbeanName;
+    @VisibleForTesting
+    public final ThreadPoolMetrics metrics;
+
+    // stores both a set of work permits and task permits:
+    //  bottom 32 bits are number of queued tasks, in the range [0..maxTasksQueued]   (initially 0)
+    //  top 32 bits are number of work permits available in the range [-resizeDelta..maximumPoolSize]   (initially maximumPoolSize)
+<span class="fc" id="L60">    private final AtomicLong permits = new AtomicLong();</span>
+
+<span class="fc" id="L62">    private final AtomicLong completedTasks = new AtomicLong();</span>
+
+<span class="fc" id="L64">    volatile boolean shuttingDown = false;</span>
+<span class="fc" id="L65">    final Condition shutdown = newOneTimeCondition();</span>
+
+    // TODO: see if other queue implementations might improve throughput
+<span class="fc" id="L68">    protected final ConcurrentLinkedQueue&lt;Runnable&gt; tasks = new ConcurrentLinkedQueue&lt;&gt;();</span>
+
+    SEPExecutor(SharedExecutorPool pool, int maximumPoolSize, MaximumPoolSizeListener maximumPoolSizeListener, String jmxPath, String name)
+<span class="fc" id="L71">    {</span>
+<span class="fc" id="L72">        this.pool = pool;</span>
+<span class="fc" id="L73">        this.name = NamedThreadFactory.globalPrefix() + name;</span>
+<span class="fc" id="L74">        this.mbeanName = &quot;org.apache.cassandra.&quot; + jmxPath + &quot;:type=&quot; + name;</span>
+<span class="fc" id="L75">        this.maximumPoolSize = new AtomicInteger(maximumPoolSize);</span>
+<span class="fc" id="L76">        this.maximumPoolSizeListener = maximumPoolSizeListener;</span>
+<span class="fc" id="L77">        this.permits.set(combine(0, maximumPoolSize));</span>
+<span class="fc" id="L78">        this.metrics = new ThreadPoolMetrics(this, jmxPath, name).register();</span>
+<span class="fc" id="L79">        MBeanWrapper.instance.registerMBean(this, mbeanName);</span>
+<span class="fc" id="L80">    }</span>
+
+    protected void onCompletion()
+    {
+<span class="fc" id="L84">        completedTasks.incrementAndGet();</span>
+<span class="fc" id="L85">    }</span>
+
+    @Override
+    public int getMaxTasksQueued()
+    {
+<span class="fc" id="L90">        return Integer.MAX_VALUE;</span>
+    }
+
+    // schedules another worker for this pool if there is work outstanding and there are no spinning threads that
+    // will self-assign to it in the immediate future
+    boolean maybeSchedule()
+    {
+<span class="fc bfc" id="L97" title="All 4 branches covered.">        if (pool.spinningCount.get() &gt; 0 || !takeWorkPermit(true))</span>
+<span class="fc" id="L98">            return false;</span>
+
+<span class="fc" id="L100">        pool.schedule(new Work(this));</span>
+<span class="fc" id="L101">        return true;</span>
+    }
+
+    protected &lt;T extends Runnable&gt; T addTask(T task)
+    {
+        // we add to the queue first, so that when a worker takes a task permit it can be certain there is a task available
+        // this permits us to schedule threads non-spuriously; it also means work is serviced fairly
+<span class="fc" id="L108">        tasks.add(task);</span>
+        int taskPermits;
+        while (true)
+        {
+<span class="fc" id="L112">            long current = permits.get();</span>
+<span class="fc" id="L113">            taskPermits = taskPermits(current);</span>
+            // because there is no difference in practical terms between the work permit being added or not (the work is already in existence)
+            // we always add our permit, but block after the fact if we breached the queue limit
+<span class="fc bfc" id="L116" title="All 2 branches covered.">            if (permits.compareAndSet(current, updateTaskPermits(current, taskPermits + 1)))</span>
+<span class="fc" id="L117">                break;</span>
+<span class="fc" id="L118">        }</span>
+
+<span class="fc bfc" id="L120" title="All 2 branches covered.">        if (taskPermits == 0)</span>
+        {
+            // we only need to schedule a thread if there are no tasks already waiting to be processed, as
+            // the original enqueue will have started a thread to service its work which will have itself
+            // spawned helper workers that would have either exhausted the available tasks or are still being spawned.
+            // to avoid incurring any unnecessary signalling penalties we also do not take any work to hand to the new
+            // worker, we simply start a worker in a spinning state
+<span class="fc" id="L127">            pool.maybeStartSpinningWorker();</span>
+        }
+<span class="fc" id="L129">        return task;</span>
+    }
+
+<span class="fc" id="L132">    public enum TakeTaskPermitResult</span>
+    {
+<span class="fc" id="L134">        NONE_AVAILABLE,        // No task permits available</span>
+<span class="fc" id="L135">        TOOK_PERMIT,           // Took a permit and reduced task permits</span>
+<span class="fc" id="L136">        RETURNED_WORK_PERMIT   // Detected pool shrinking and returned work permit ahead of SEPWorker exit.</span>
+    }
+
+    // takes permission to perform a task, if any are available; once taken it is guaranteed
+    // that a proceeding call to tasks.poll() will return some work
+    TakeTaskPermitResult takeTaskPermit(boolean checkForWorkPermitOvercommit)
+    {
+        TakeTaskPermitResult result;
+        while (true)
+        {
+<span class="fc" id="L146">            long current = permits.get();</span>
+            long updated;
+<span class="fc" id="L148">            int workPermits = workPermits(current);</span>
+<span class="fc" id="L149">            int taskPermits = taskPermits(current);</span>
+<span class="pc bpc" id="L150" title="1 of 4 branches missed.">            if (workPermits &lt; 0 &amp;&amp; checkForWorkPermitOvercommit)</span>
+            {
+                // Work permits are negative when the pool is reducing in size.  Atomically
+                // adjust the number of work permits so there is no race of multiple SEPWorkers
+                // exiting.  On conflicting update, recheck.
+<span class="fc" id="L155">                result = RETURNED_WORK_PERMIT;</span>
+<span class="fc" id="L156">                updated = updateWorkPermits(current, workPermits + 1);</span>
+            }
+            else
+            {
+<span class="fc bfc" id="L160" title="All 2 branches covered.">                if (taskPermits == 0)</span>
+<span class="fc" id="L161">                    return NONE_AVAILABLE;</span>
+<span class="fc" id="L162">                result = TOOK_PERMIT;</span>
+<span class="fc" id="L163">                updated = updateTaskPermits(current, taskPermits - 1);</span>
+            }
+<span class="fc bfc" id="L165" title="All 2 branches covered.">            if (permits.compareAndSet(current, updated))</span>
+            {
+<span class="fc" id="L167">                return result;</span>
+            }
+<span class="fc" id="L169">        }</span>
+    }
+
+    // takes a worker permit and (optionally) a task permit simultaneously; if one of the two is unavailable, returns false
+    boolean takeWorkPermit(boolean takeTaskPermit)
+    {
+<span class="fc bfc" id="L175" title="All 2 branches covered.">        int taskDelta = takeTaskPermit ? 1 : 0;</span>
+        while (true)
+        {
+<span class="fc" id="L178">            long current = permits.get();</span>
+<span class="fc" id="L179">            int workPermits = workPermits(current);</span>
+<span class="fc" id="L180">            int taskPermits = taskPermits(current);</span>
+<span class="fc bfc" id="L181" title="All 4 branches covered.">            if (workPermits &lt;= 0 || taskPermits == 0)</span>
+<span class="fc" id="L182">                return false;</span>
+<span class="fc bfc" id="L183" title="All 2 branches covered.">            if (permits.compareAndSet(current, combine(taskPermits - taskDelta, workPermits - 1)))</span>
+            {
+<span class="fc" id="L185">                return true;</span>
+            }
+<span class="fc" id="L187">        }</span>
+    }
+
+    // gives up a work permit
+    void returnWorkPermit()
+    {
+        while (true)
+        {
+<span class="fc" id="L195">            long current = permits.get();</span>
+<span class="fc" id="L196">            int workPermits = workPermits(current);</span>
+<span class="fc bfc" id="L197" title="All 2 branches covered.">            if (permits.compareAndSet(current, updateWorkPermits(current, workPermits + 1)))</span>
+<span class="fc" id="L198">                return;</span>
+<span class="fc" id="L199">        }</span>
+    }
+
+    @Override
+    public void maybeExecuteImmediately(Runnable task)
+    {
+<span class="fc" id="L205">        task = taskFactory.toExecute(task);</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">        if (!takeWorkPermit(false))</span>
+        {
+<span class="fc" id="L208">            addTask(task);</span>
+        }
+        else
+        {
+            try
+            {
+<span class="fc" id="L214">                task.run();</span>
+            }
+            finally
+            {
+<span class="fc" id="L218">                returnWorkPermit();</span>
+                // we have to maintain our invariant of always scheduling after any work is performed
+                // in this case in particular we are not processing the rest of the queue anyway, and so
+                // the work permit may go wasted if we don't immediately attempt to spawn another worker
+<span class="fc" id="L222">                maybeSchedule();</span>
+            }
+        }
+<span class="fc" id="L225">    }</span>
+
+    @Override
+    public void execute(Runnable run)
+    {
+<span class="fc" id="L230">        addTask(taskFactory.toExecute(run));</span>
+<span class="fc" id="L231">    }</span>
+
+    @Override
+    public void execute(WithResources withResources, Runnable run)
+    {
+<span class="fc" id="L236">        addTask(taskFactory.toExecute(withResources, run));</span>
+<span class="fc" id="L237">    }</span>
+
+    @Override
+    public Future&lt;?&gt; submit(Runnable run)
+    {
+<span class="fc" id="L242">        return addTask(taskFactory.toSubmit(run));</span>
+    }
+
+    @Override
+    public &lt;T&gt; Future&lt;T&gt; submit(Runnable run, T result)
+    {
+<span class="fc" id="L248">        return addTask(taskFactory.toSubmit(run, result));</span>
+    }
+
+    @Override
+    public &lt;T&gt; Future&lt;T&gt; submit(Callable&lt;T&gt; call)
+    {
+<span class="fc" id="L254">        return addTask(taskFactory.toSubmit(call));</span>
+    }
+
+    @Override
+    public &lt;T&gt; Future&lt;T&gt; submit(WithResources withResources, Runnable run, T result)
+    {
+<span class="nc" id="L260">        return addTask(taskFactory.toSubmit(withResources, run, result));</span>
+    }
+
+    @Override
+    public Future&lt;?&gt; submit(WithResources withResources, Runnable run)
+    {
+<span class="nc" id="L266">        return addTask(taskFactory.toSubmit(withResources, run));</span>
+    }
+
+    @Override
+    public &lt;T&gt; Future&lt;T&gt; submit(WithResources withResources, Callable&lt;T&gt; call)
+    {
+<span class="nc" id="L272">        return addTask(taskFactory.toSubmit(withResources, call));</span>
+    }
+
+    @Override
+    public boolean inExecutor()
+    {
+<span class="nc" id="L278">        throw new UnsupportedOperationException();</span>
+    }
+
+    public synchronized void shutdown()
+    {
+<span class="fc bfc" id="L283" title="All 2 branches covered.">        if (shuttingDown)</span>
+<span class="fc" id="L284">            return;</span>
+<span class="fc" id="L285">        shuttingDown = true;</span>
+<span class="fc" id="L286">        pool.executors.remove(this);</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">        if (getActiveTaskCount() == 0)</span>
+<span class="fc" id="L288">            shutdown.signalAll();</span>
+
+        // release metrics
+<span class="fc" id="L291">        metrics.release();</span>
+<span class="fc" id="L292">        MBeanWrapper.instance.unregisterMBean(mbeanName);</span>
+<span class="fc" id="L293">    }</span>
+
+    public synchronized List&lt;Runnable&gt; shutdownNow()
+    {
+<span class="fc" id="L297">        shutdown();</span>
+<span class="fc" id="L298">        List&lt;Runnable&gt; aborted = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L299" title="All 2 branches covered.">        while (takeTaskPermit(false) == TOOK_PERMIT)</span>
+<span class="fc" id="L300">            aborted.add(tasks.poll());</span>
+<span class="fc" id="L301">        return aborted;</span>
+    }
+
+    public boolean isShutdown()
+    {
+<span class="fc" id="L306">        return shuttingDown;</span>
+    }
+
+    public boolean isTerminated()
+    {
+<span class="pc bpc" id="L311" title="1 of 4 branches missed.">        return shuttingDown &amp;&amp; shutdown.isSignalled();</span>
+    }
+
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException
+    {
+<span class="fc" id="L316">        shutdown.await(timeout, unit);</span>
+<span class="fc" id="L317">        return isTerminated();</span>
+    }
+
+    @Override
+    public int getPendingTaskCount()
+    {
+<span class="fc" id="L323">        return taskPermits(permits.get());</span>
+    }
+
+    @Override
+    public long getCompletedTaskCount()
+    {
+<span class="fc" id="L329">        return completedTasks.get();</span>
+    }
+
+    public int getActiveTaskCount()
+    {
+<span class="fc" id="L334">        return maximumPoolSize.get() - workPermits(permits.get());</span>
+    }
+
+    public int getCorePoolSize()
+    {
+<span class="fc" id="L339">        return 0;</span>
+    }
+
+    public void setCorePoolSize(int newCorePoolSize)
+    {
+<span class="nc" id="L344">        throw new IllegalArgumentException(&quot;Cannot resize core pool size of SEPExecutor&quot;);</span>
+    }
+
+    @Override
+    public int getMaximumPoolSize()
+    {
+<span class="fc" id="L350">        return maximumPoolSize.get();</span>
+    }
+
+    @Override
+    public synchronized void setMaximumPoolSize(int newMaximumPoolSize)
+    {
+<span class="fc" id="L356">        final int oldMaximumPoolSize = maximumPoolSize.get();</span>
+
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        if (newMaximumPoolSize &lt; 0)</span>
+        {
+<span class="nc" id="L360">            throw new IllegalArgumentException(&quot;Maximum number of workers must not be negative&quot;);</span>
+        }
+
+<span class="fc" id="L363">        int deltaWorkPermits = newMaximumPoolSize - oldMaximumPoolSize;</span>
+<span class="pc bpc" id="L364" title="1 of 2 branches missed.">        if (!maximumPoolSize.compareAndSet(oldMaximumPoolSize, newMaximumPoolSize))</span>
+        {
+<span class="nc" id="L366">            throw new IllegalStateException(&quot;Maximum pool size has been changed while resizing&quot;);</span>
+        }
+
+<span class="pc bpc" id="L369" title="1 of 2 branches missed.">        if (deltaWorkPermits == 0)</span>
+<span class="nc" id="L370">            return;</span>
+
+<span class="fc" id="L372">        permits.updateAndGet(cur -&gt; updateWorkPermits(cur, workPermits(cur) + deltaWorkPermits));</span>
+<span class="fc" id="L373">        logger.info(&quot;Resized {} maximum pool size from {} to {}&quot;, name, oldMaximumPoolSize, newMaximumPoolSize);</span>
+
+        // If we we have more work permits than before we should spin up a worker now rather than waiting
+        // until either a new task is enqueued (if all workers are descheduled) or a spinning worker calls
+        // maybeSchedule().
+<span class="fc" id="L378">        pool.maybeStartSpinningWorker();</span>
+
+<span class="fc" id="L380">        maximumPoolSizeListener.onUpdateMaximumPoolSize(newMaximumPoolSize);</span>
+<span class="fc" id="L381">    }</span>
+
+    private static int taskPermits(long both)
+    {
+<span class="fc" id="L385">        return (int) both;</span>
+    }
+
+    private static int workPermits(long both) // may be negative if resizing
+    {
+<span class="fc" id="L390">        return (int) (both &gt;&gt; 32); // sign extending right shift</span>
+    }
+
+    private static long updateTaskPermits(long prev, int taskPermits)
+    {
+<span class="fc" id="L395">        return (prev &amp; (-1L &lt;&lt; 32)) | taskPermits;</span>
+    }
+
+    private static long updateWorkPermits(long prev, int workPermits)
+    {
+<span class="fc" id="L400">        return (((long) workPermits) &lt;&lt; 32) | (prev &amp; (-1L &gt;&gt;&gt; 32));</span>
+    }
+
+    private static long combine(int taskPermits, int workPermits)
+    {
+<span class="fc" id="L405">        return (((long) workPermits) &lt;&lt; 32) | taskPermits;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

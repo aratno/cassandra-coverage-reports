@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BlockingPartitionRepair.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads.repair</a> &gt; <span class="el_source">BlockingPartitionRepair.java</span></div><h1>BlockingPartitionRepair.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.reads.repair;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.locator.Replicas;
+import org.apache.cassandra.locator.InOurDc;
+import org.apache.cassandra.metrics.ReadRepairMetrics;
+import org.apache.cassandra.net.RequestCallback;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.net.Verb.*;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
+
+public class BlockingPartitionRepair
+        extends AsyncFuture&lt;Object&gt; implements RequestCallback&lt;Object&gt;
+{
+    private final DecoratedKey key;
+    private final ReplicaPlan.ForWrite writePlan;
+    private final Map&lt;Replica, Mutation&gt; pendingRepairs;
+    private final CountDownLatch latch;
+    private final Predicate&lt;InetAddressAndPort&gt; shouldBlockOn;
+
+    private volatile long mutationsSentTime;
+
+    public BlockingPartitionRepair(DecoratedKey key, Map&lt;Replica, Mutation&gt; repairs, ReplicaPlan.ForWrite writePlan)
+    {
+<span class="fc" id="L73">        this(key, repairs, writePlan,</span>
+<span class="pc bpc" id="L74" title="1 of 2 branches missed.">             writePlan.consistencyLevel().isDatacenterLocal() ? InOurDc.endpoints() : Predicates.alwaysTrue());</span>
+<span class="fc" id="L75">    }</span>
+    public BlockingPartitionRepair(DecoratedKey key, Map&lt;Replica, Mutation&gt; repairs, ReplicaPlan.ForWrite writePlan, Predicate&lt;InetAddressAndPort&gt; shouldBlockOn)
+<span class="fc" id="L77">    {</span>
+<span class="fc" id="L78">        this.key = key;</span>
+<span class="fc" id="L79">        this.pendingRepairs = new ConcurrentHashMap&lt;&gt;(repairs);</span>
+<span class="fc" id="L80">        this.writePlan = writePlan;</span>
+<span class="fc" id="L81">        this.shouldBlockOn = shouldBlockOn;</span>
+
+<span class="fc" id="L83">        int blockFor = writePlan.writeQuorum();</span>
+        // here we remove empty repair mutations from the block for total, since
+        // we're not sending them mutations
+<span class="fc bfc" id="L86" title="All 2 branches covered.">        for (Replica participant : writePlan.contacts())</span>
+        {
+            // remote dcs can sometimes get involved in dc-local reads. We want to repair
+            // them if they do, but they shouldn't interfere with blocking the client read.
+<span class="pc bpc" id="L90" title="1 of 4 branches missed.">            if (!repairs.containsKey(participant) &amp;&amp; shouldBlockOn.test(participant.endpoint()))</span>
+<span class="fc" id="L91">                blockFor--;</span>
+<span class="fc" id="L92">        }</span>
+
+        // there are some cases where logically identical data can return different digests
+        // For read repair, this would result in ReadRepairHandler being called with a map of
+        // empty mutations. If we'd also speculated on either of the read stages, the number
+        // of empty mutations would be greater than blockFor, causing the latch ctor to throw
+        // an illegal argument exception due to a negative start value. So here we clamp it 0
+<span class="fc" id="L99">        latch = newCountDownLatch(Math.max(blockFor, 0));</span>
+<span class="fc" id="L100">    }</span>
+
+    int blockFor()
+    {
+<span class="nc" id="L104">        return writePlan.writeQuorum();</span>
+    }
+
+    @VisibleForTesting
+    int waitingOn()
+    {
+<span class="nc" id="L110">        return (int) latch.count();</span>
+    }
+
+    @VisibleForTesting
+    void ack(InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        if (shouldBlockOn.test(from))</span>
+        {
+<span class="fc" id="L118">            pendingRepairs.remove(writePlan.lookup(from));</span>
+<span class="fc" id="L119">            latch.decrement();</span>
+        }
+<span class="fc" id="L121">    }</span>
+
+    @Override
+    public void onResponse(Message&lt;Object&gt; msg)
+    {
+<span class="fc" id="L126">        ack(msg.from());</span>
+<span class="fc" id="L127">    }</span>
+
+    private static PartitionUpdate extractUpdate(Mutation mutation)
+    {
+<span class="fc" id="L131">        return Iterables.getOnlyElement(mutation.getPartitionUpdates());</span>
+    }
+
+    /**
+     * Combine the contents of any unacked repair into a single update
+     */
+    private PartitionUpdate mergeUnackedUpdates()
+    {
+        // recombinate the updates
+<span class="fc" id="L140">        List&lt;PartitionUpdate&gt; updates = Lists.newArrayList(Iterables.transform(pendingRepairs.values(), BlockingPartitionRepair::extractUpdate));</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        return updates.isEmpty() ? null : PartitionUpdate.merge(updates);</span>
+    }
+
+    @VisibleForTesting
+    protected void sendRR(Message&lt;Mutation&gt; message, InetAddressAndPort endpoint)
+    {
+<span class="fc" id="L147">        MessagingService.instance().sendWithCallback(message, endpoint, this);</span>
+<span class="fc" id="L148">    }</span>
+
+    public void sendInitialRepairs()
+    {
+<span class="fc" id="L152">        mutationsSentTime = nanoTime();</span>
+<span class="fc" id="L153">        Replicas.assertFull(pendingRepairs.keySet());</span>
+
+<span class="fc bfc" id="L155" title="All 2 branches covered.">        for (Map.Entry&lt;Replica, Mutation&gt; entry: pendingRepairs.entrySet())</span>
+        {
+<span class="fc" id="L157">            Replica destination = entry.getKey();</span>
+<span class="fc" id="L158">            Preconditions.checkArgument(destination.isFull(), &quot;Can't send repairs to transient replicas: %s&quot;, destination);</span>
+<span class="fc" id="L159">            Mutation mutation = entry.getValue();</span>
+<span class="fc" id="L160">            TableId tableId = extractUpdate(mutation).metadata().id;</span>
+
+<span class="fc" id="L162">            Tracing.trace(&quot;Sending read-repair-mutation to {}&quot;, destination);</span>
+            // use a separate verb here to avoid writing hints on timeouts
+<span class="fc" id="L164">            sendRR(Message.out(READ_REPAIR_REQ, mutation), destination.endpoint());</span>
+<span class="fc" id="L165">            ColumnFamilyStore.metricsFor(tableId).readRepairRequests.mark();</span>
+
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">            if (!shouldBlockOn.test(destination.endpoint()))</span>
+<span class="nc" id="L168">                pendingRepairs.remove(destination);</span>
+<span class="fc" id="L169">            ReadRepairDiagnostics.sendInitialRepair(this, destination.endpoint(), mutation);</span>
+<span class="fc" id="L170">        }</span>
+<span class="fc" id="L171">    }</span>
+
+    /**
+     * Wait for the repair to complete util a future time
+     * If the {@param timeoutAt} is a past time, the method returns immediately with the repair result.
+     * @param timeoutAt, future time
+     * @param timeUnit, the time unit of the future time
+     * @return true if repair is done; otherwise, false.
+     */
+    public boolean awaitRepairsUntil(long timeoutAt, TimeUnit timeUnit)
+    {
+<span class="fc" id="L182">        long timeoutAtNanos = timeUnit.toNanos(timeoutAt);</span>
+<span class="fc" id="L183">        long remaining = timeoutAtNanos - nanoTime();</span>
+        try
+        {
+<span class="fc" id="L186">            return latch.await(remaining, TimeUnit.NANOSECONDS);</span>
+        }
+<span class="nc" id="L188">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L190">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    private static int msgVersionIdx(int version)
+    {
+<span class="fc" id="L196">        return version - MessagingService.minimum_version;</span>
+    }
+
+    /**
+     * If it looks like we might not receive acks for all the repair mutations we sent out, combine all
+     * the unacked mutations and send them to the minority of nodes not involved in the read repair data
+     * read / write cycle. We will accept acks from them in lieu of acks from the initial mutations sent
+     * out, so long as we receive the same number of acks as repair mutations transmitted. This prevents
+     * misbehaving nodes from killing a quorum read, while continuing to guarantee monotonic quorum reads
+     */
+    public void maybeSendAdditionalWrites(long timeout, TimeUnit timeoutUnit)
+    {
+<span class="fc bfc" id="L208" title="All 2 branches covered.">        if (awaitRepairsUntil(timeout + timeoutUnit.convert(mutationsSentTime, TimeUnit.NANOSECONDS), timeoutUnit))</span>
+<span class="fc" id="L209">            return;</span>
+
+<span class="fc" id="L211">        EndpointsForToken newCandidates = writePlan.liveUncontacted();</span>
+<span class="pc bpc" id="L212" title="1 of 2 branches missed.">        if (newCandidates.isEmpty())</span>
+<span class="nc" id="L213">            return;</span>
+
+<span class="fc" id="L215">        PartitionUpdate update = mergeUnackedUpdates();</span>
+<span class="fc bfc" id="L216" title="All 2 branches covered.">        if (update == null)</span>
+            // final response was received between speculate
+            // timeout and call to get unacked mutation.
+<span class="fc" id="L219">            return;</span>
+
+<span class="fc" id="L221">        ReadRepairMetrics.speculatedWrite.mark();</span>
+
+<span class="fc" id="L223">        Mutation[] versionedMutations = new Mutation[msgVersionIdx(MessagingService.current_version) + 1];</span>
+
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        for (Replica replica : newCandidates)</span>
+        {
+<span class="fc" id="L227">            int versionIdx = msgVersionIdx(MessagingService.instance().versions.get(replica.endpoint()));</span>
+
+<span class="fc" id="L229">            Mutation mutation = versionedMutations[versionIdx];</span>
+
+<span class="pc bpc" id="L231" title="1 of 2 branches missed.">            if (mutation == null)</span>
+            {
+<span class="fc" id="L233">                mutation = BlockingReadRepairs.createRepairMutation(update, writePlan.consistencyLevel(), replica.endpoint(), true);</span>
+<span class="fc" id="L234">                versionedMutations[versionIdx] = mutation;</span>
+            }
+
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">            if (mutation == null)</span>
+            {
+                // the mutation is too large to send.
+<span class="nc" id="L240">                ReadRepairDiagnostics.speculatedWriteOversized(this, replica.endpoint());</span>
+<span class="nc" id="L241">                continue;</span>
+            }
+
+<span class="fc" id="L244">            Tracing.trace(&quot;Sending speculative read-repair-mutation to {}&quot;, replica);</span>
+<span class="fc" id="L245">            sendRR(Message.out(READ_REPAIR_REQ, mutation), replica.endpoint());</span>
+<span class="fc" id="L246">            ReadRepairDiagnostics.speculatedWrite(this, replica.endpoint(), mutation);</span>
+<span class="fc" id="L247">        }</span>
+<span class="fc" id="L248">    }</span>
+
+    Keyspace getKeyspace()
+    {
+<span class="nc" id="L252">        return writePlan.keyspace();</span>
+    }
+
+    DecoratedKey getKey()
+    {
+<span class="nc" id="L257">        return key;</span>
+    }
+
+    ConsistencyLevel getConsistency()
+    {
+<span class="nc" id="L262">        return writePlan.consistencyLevel();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

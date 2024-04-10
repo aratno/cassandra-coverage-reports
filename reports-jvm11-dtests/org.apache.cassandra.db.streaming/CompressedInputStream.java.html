@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompressedInputStream.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.streaming</a> &gt; <span class="el_source">CompressedInputStream.java</span></div><h1>CompressedInputStream.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.streaming;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.DoubleSupplier;
+
+import com.google.common.collect.Iterators;
+import com.google.common.primitives.Ints;
+
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.RebufferingInputStream;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ChecksumType;
+
+import static java.lang.Math.max;
+import static java.lang.String.format;
+
+/**
+ * InputStream which reads compressed chunks from the underlying input stream and deals with decompression
+ * and position tracking.
+ *
+ * The underlying input will be an instance of {@link RebufferingInputStream} except in some unit tests.
+ *
+ * Compressed chunks transferred will be a subset of all chunks in the source streamed sstable - just enough to
+ * deserialize the requested partition position ranges. Correctness of the entire operation depends on provided
+ * partition position ranges and compressed chunks properly matching, and there is no way on the receiving side to
+ * verify if that's the case, which arguably makes this a little brittle.
+ */
+public class CompressedInputStream extends RebufferingInputStream implements AutoCloseable
+{
+    private static final double GROWTH_FACTOR = 1.5;
+
+    private final DataInputPlus input;
+
+    private final Iterator&lt;CompressionMetadata.Chunk&gt; compressedChunks;
+    private final CompressionParams compressionParams;
+
+    private final ChecksumType checksumType;
+    private final DoubleSupplier validateChecksumChance;
+
+    /**
+     * The base offset of the current {@link #buffer} into the original sstable as if it were uncompressed.
+     */
+<span class="fc" id="L67">    private long uncompressedChunkPosition = Long.MIN_VALUE;</span>
+
+    /**
+     * @param input Input input to read compressed data from
+     * @param compressionInfo Compression info
+     */
+    public CompressedInputStream(DataInputPlus input,
+                                 CompressionInfo compressionInfo,
+                                 ChecksumType checksumType,
+                                 DoubleSupplier validateChecksumChance)
+    {
+<span class="fc" id="L78">        super(ByteBuffer.allocateDirect(compressionInfo.parameters().chunkLength()));</span>
+<span class="fc" id="L79">        buffer.limit(0);</span>
+
+<span class="fc" id="L81">        this.input = input;</span>
+<span class="fc" id="L82">        this.checksumType = checksumType;</span>
+<span class="fc" id="L83">        this.validateChecksumChance = validateChecksumChance;</span>
+
+<span class="fc" id="L85">        compressionParams = compressionInfo.parameters();</span>
+<span class="fc" id="L86">        compressedChunks = Iterators.forArray(compressionInfo.chunks());</span>
+<span class="fc" id="L87">        compressedChunk = ByteBuffer.allocateDirect(compressionParams.chunkLength());</span>
+<span class="fc" id="L88">    }</span>
+
+    /**
+     * Invoked when crossing into the next {@link SSTableReader.PartitionPositionBounds} section
+     * in {@link CassandraCompressedStreamReader#read(DataInputPlus)}.
+     * Will skip 1..n compressed chunks of the original sstable.
+     */
+    public void position(long position) throws IOException
+    {
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        if (position &lt; uncompressedChunkPosition + buffer.position())</span>
+<span class="nc" id="L98">            throw new IllegalStateException(&quot;stream can only move forward&quot;);</span>
+
+<span class="fc bfc" id="L100" title="All 2 branches covered.">        if (position &gt;= uncompressedChunkPosition + buffer.limit())</span>
+        {
+<span class="fc" id="L102">            loadNextChunk();</span>
+            // uncompressedChunkPosition = position - (position % compressionParams.chunkLength())
+<span class="fc" id="L104">            uncompressedChunkPosition = position &amp; -compressionParams.chunkLength();</span>
+        }
+
+<span class="fc" id="L107">        buffer.position(Ints.checkedCast(position - uncompressedChunkPosition));</span>
+<span class="fc" id="L108">    }</span>
+
+    @Override
+    protected void reBuffer() throws IOException
+    {
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">        if (uncompressedChunkPosition &lt; 0)</span>
+<span class="nc" id="L114">            throw new IllegalStateException(&quot;position(long position) wasn't called first&quot;);</span>
+
+        /*
+         * reBuffer() will only be called if a partition range spanning multiple (adjacent) compressed chunks
+         * has consumed the current uncompressed buffer, and needs to move to the next adjacent chunk;
+         * uncompressedChunkPosition in this scenario *always* increases by the fixed chunk length.
+         */
+<span class="fc" id="L121">        loadNextChunk();</span>
+<span class="fc" id="L122">        uncompressedChunkPosition += compressionParams.chunkLength();</span>
+<span class="fc" id="L123">    }</span>
+
+    /**
+     * Reads the next chunk, decompresses if necessary, and probabilistically verifies the checksum/CRC.
+     *
+     * Doesn't adjust uncompressedChunkPosition - it's up to the caller to do so.
+     */
+    private void loadNextChunk() throws IOException
+    {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (!compressedChunks.hasNext())</span>
+<span class="nc" id="L133">            throw new EOFException();</span>
+
+<span class="fc" id="L135">        int chunkLength = compressedChunks.next().length;</span>
+<span class="fc" id="L136">        chunkBytesRead += (chunkLength + 4); // chunk length + checksum or CRC length</span>
+
+        /*
+         * uncompress if the buffer size is less than the max chunk size; else, if the buffer size is greater than
+         * or equal to the maxCompressedLength, we assume the buffer is not compressed (see CASSANDRA-10520)
+         */
+<span class="fc bfc" id="L142" title="All 2 branches covered.">        if (chunkLength &lt; compressionParams.maxCompressedLength())</span>
+        {
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            if (compressedChunk.capacity() &lt; chunkLength)</span>
+            {
+                // with poorly compressible data, it's possible for a compressed chunk to be larger than
+                // configured uncompressed chunk size - depending on data, min_compress_ratio, and compressor;
+                // we may need to resize the compressed buffer.
+<span class="nc" id="L149">                FileUtils.clean(compressedChunk);</span>
+<span class="nc" id="L150">                compressedChunk = ByteBuffer.allocateDirect(max((int) (compressedChunk.capacity() * GROWTH_FACTOR), chunkLength));</span>
+            }
+
+<span class="fc" id="L153">            compressedChunk.position(0).limit(chunkLength);</span>
+<span class="fc" id="L154">            readChunk(compressedChunk);</span>
+<span class="fc" id="L155">            compressedChunk.position(0);</span>
+
+<span class="fc" id="L157">            maybeValidateChecksum(compressedChunk, input.readInt());</span>
+
+<span class="fc" id="L159">            buffer.clear();</span>
+<span class="fc" id="L160">            compressionParams.getSstableCompressor().uncompress(compressedChunk, buffer);</span>
+<span class="fc" id="L161">            buffer.flip();</span>
+        }
+        else
+        {
+<span class="fc" id="L165">            buffer.position(0).limit(chunkLength);</span>
+<span class="fc" id="L166">            readChunk(buffer);</span>
+<span class="fc" id="L167">            buffer.position(0);</span>
+
+<span class="fc" id="L169">            maybeValidateChecksum(buffer, input.readInt());</span>
+        }
+<span class="fc" id="L171">    }</span>
+    private ByteBuffer compressedChunk;
+
+    private void readChunk(ByteBuffer dst) throws IOException
+    {
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">        if (input instanceof RebufferingInputStream)</span>
+<span class="fc" id="L177">            ((RebufferingInputStream) input).readFully(dst);</span>
+        else
+<span class="nc" id="L179">            readChunkSlow(dst);</span>
+<span class="fc" id="L180">    }</span>
+
+    // slow path that involves an intermediate copy into a byte array; only used by some of the unit tests
+    private void readChunkSlow(ByteBuffer dst) throws IOException
+    {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (copyArray == null)</span>
+<span class="nc" id="L186">            copyArray = new byte[dst.remaining()];</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        else if (copyArray.length &lt; dst.remaining())</span>
+<span class="nc" id="L188">            copyArray = new byte[max((int)(copyArray.length * GROWTH_FACTOR), dst.remaining())];</span>
+
+<span class="nc" id="L190">        input.readFully(copyArray, 0, dst.remaining());</span>
+<span class="nc" id="L191">        dst.put(copyArray, 0, dst.remaining());</span>
+<span class="nc" id="L192">    }</span>
+    private byte[] copyArray;
+
+    private void maybeValidateChecksum(ByteBuffer buffer, int expectedChecksum) throws IOException
+    {
+<span class="fc" id="L197">        double validateChance = validateChecksumChance.getAsDouble();</span>
+
+<span class="pc bpc" id="L199" title="5 of 6 branches missed.">        if (validateChance &gt;= 1.0d || (validateChance &gt; 0.0d &amp;&amp; validateChance &gt; ThreadLocalRandom.current().nextDouble()))</span>
+        {
+<span class="fc" id="L201">            int position = buffer.position();</span>
+<span class="fc" id="L202">            int actualChecksum = (int) checksumType.of(buffer);</span>
+<span class="fc" id="L203">            buffer.position(position); // checksum calculation consumes the buffer, so we must reset its position afterwards</span>
+
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">            if (expectedChecksum != actualChecksum)</span>
+<span class="nc" id="L206">                throw new IOException(format(&quot;Checksum didn't match (expected: %d, actual: %d)&quot;, expectedChecksum, actualChecksum));</span>
+        }
+<span class="fc" id="L208">    }</span>
+
+    @Override
+    public void close()
+    {
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        if (null != buffer)</span>
+        {
+<span class="fc" id="L215">            FileUtils.clean(buffer);</span>
+<span class="fc" id="L216">            buffer = null;</span>
+        }
+
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">        if (null != compressedChunk)</span>
+        {
+<span class="fc" id="L221">            FileUtils.clean(compressedChunk);</span>
+<span class="fc" id="L222">            compressedChunk = null;</span>
+        }
+<span class="fc" id="L224">    }</span>
+
+    /**
+     * @return accumulated size of all chunks read so far - including checksums
+     */
+    long chunkBytesRead()
+    {
+<span class="fc" id="L231">        return chunkBytesRead;</span>
+    }
+<span class="fc" id="L233">    private long chunkBytesRead = 0;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

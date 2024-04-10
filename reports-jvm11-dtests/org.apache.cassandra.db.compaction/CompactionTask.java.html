@@ -1,0 +1,469 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionTask.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionTask.java</span></div><h1>CompactionTask.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.time.Instant;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.RateLimiter;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
+import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.db.compaction.CompactionHistoryTabularData.COMPACTION_TYPE_PROPERTY;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.FBUtilities.now;
+
+public class CompactionTask extends AbstractCompactionTask
+{
+<span class="fc" id="L60">    protected static final Logger logger = LoggerFactory.getLogger(CompactionTask.class);</span>
+    protected final long gcBefore;
+    protected final boolean keepOriginals;
+<span class="fc" id="L63">    protected static long totalBytesCompacted = 0;</span>
+    private ActiveCompactionsTracker activeCompactions;
+
+    public CompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, long gcBefore)
+    {
+<span class="fc" id="L68">        this(cfs, txn, gcBefore, false);</span>
+<span class="fc" id="L69">    }</span>
+
+    public CompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, long gcBefore, boolean keepOriginals)
+    {
+<span class="fc" id="L73">        super(cfs, txn);</span>
+<span class="fc" id="L74">        this.gcBefore = gcBefore;</span>
+<span class="fc" id="L75">        this.keepOriginals = keepOriginals;</span>
+<span class="fc" id="L76">    }</span>
+
+    public static synchronized long addToTotalBytesCompacted(long bytesCompacted)
+    {
+<span class="nc" id="L80">        return totalBytesCompacted += bytesCompacted;</span>
+    }
+
+    protected int executeInternal(ActiveCompactionsTracker activeCompactions)
+    {
+<span class="pc bpc" id="L85" title="1 of 2 branches missed.">        this.activeCompactions = activeCompactions == null ? ActiveCompactionsTracker.NOOP : activeCompactions;</span>
+<span class="fc" id="L86">        run();</span>
+<span class="fc" id="L87">        return transaction.originals().size();</span>
+    }
+
+    public boolean reduceScopeForLimitedSpace(Set&lt;SSTableReader&gt; nonExpiredSSTables, long expectedSize)
+    {
+<span class="pc bpc" id="L92" title="1 of 4 branches missed.">        if (partialCompactionsAcceptable() &amp;&amp; transaction.originals().size() &gt; 1)</span>
+        {
+            // Try again w/o the largest one.
+<span class="fc" id="L95">            SSTableReader removedSSTable = cfs.getMaxSizeFile(nonExpiredSSTables);</span>
+<span class="fc" id="L96">            logger.warn(&quot;insufficient space to compact all requested files. {}MiB required, {} for compaction {} - removing largest SSTable: {}&quot;,</span>
+<span class="fc" id="L97">                        (float) expectedSize / 1024 / 1024,</span>
+<span class="fc" id="L98">                        StringUtils.join(transaction.originals(), &quot;, &quot;),</span>
+<span class="fc" id="L99">                        transaction.opId(),</span>
+                        removedSSTable);
+            // Note that we have removed files that are still marked as compacting.
+            // This suboptimal but ok since the caller will unmark all the sstables at the end.
+<span class="fc" id="L103">            transaction.cancel(removedSSTable);</span>
+<span class="fc" id="L104">            return true;</span>
+        }
+<span class="fc" id="L106">        return false;</span>
+    }
+
+    /**
+     * For internal use and testing only.  The rest of the system should go through the submit* methods,
+     * which are properly serialized.
+     * Caller is in charge of marking/unmarking the sstables as compacting.
+     */
+    protected void runMayThrow() throws Exception
+    {
+        // The collection of sstables passed may be empty (but not null); even if
+        // it is not empty, it may compact down to nothing if all rows are deleted.
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">        assert transaction != null;</span>
+
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">        if (transaction.originals().isEmpty())</span>
+<span class="nc" id="L121">            return;</span>
+
+        // Note that the current compaction strategy, is not necessarily the one this task was created under.
+        // This should be harmless; see comments to CFS.maybeReloadCompactionStrategy.
+<span class="fc" id="L125">        CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();</span>
+
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">        if (DatabaseDescriptor.isSnapshotBeforeCompaction())</span>
+        {
+<span class="nc" id="L129">            Instant creationTime = now();</span>
+<span class="nc" id="L130">            cfs.snapshotWithoutMemtable(creationTime.toEpochMilli() + &quot;-compact-&quot; + cfs.name, creationTime);</span>
+        }
+
+<span class="fc" id="L133">        try (CompactionController controller = getCompactionController(transaction.originals()))</span>
+        {
+
+<span class="fc" id="L136">            final Set&lt;SSTableReader&gt; fullyExpiredSSTables = controller.getFullyExpiredSSTables();</span>
+
+<span class="fc" id="L138">            TimeUUID taskId = transaction.opId();</span>
+            // select SSTables to compact based on available disk space.
+<span class="fc bfc" id="L140" title="All 2 branches covered.">            if (!buildCompactionCandidatesForAvailableDiskSpace(fullyExpiredSSTables, taskId))</span>
+            {
+                // The set of sstables has changed (one or more were excluded due to limited available disk space).
+                // We need to recompute the overlaps between sstables.
+<span class="fc" id="L144">                controller.refreshOverlaps();</span>
+            }
+
+            // sanity check: all sstables must belong to the same cfs
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">            assert !Iterables.any(transaction.originals(), new Predicate&lt;SSTableReader&gt;()</span>
+<span class="fc" id="L149">            {</span>
+                @Override
+                public boolean apply(SSTableReader sstable)
+                {
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">                    return !sstable.descriptor.cfname.equals(cfs.name);</span>
+                }
+            });
+
+            // new sstables from flush can be added during a compaction, but only the compaction can remove them,
+            // so in our single-threaded compaction world this is a valid way of determining if we're compacting
+            // all the sstables (that existed when we started)
+<span class="fc" id="L160">            StringBuilder ssTableLoggerMsg = new StringBuilder(&quot;[&quot;);</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">            for (SSTableReader sstr : transaction.originals())</span>
+            {
+<span class="fc" id="L163">                ssTableLoggerMsg.append(String.format(&quot;%s:level=%d, &quot;, sstr.getFilename(), sstr.getSSTableLevel()));</span>
+<span class="fc" id="L164">            }</span>
+<span class="fc" id="L165">            ssTableLoggerMsg.append(&quot;]&quot;);</span>
+
+<span class="fc" id="L167">            logger.info(&quot;Compacting ({}) {}&quot;, taskId, ssTableLoggerMsg);</span>
+
+<span class="fc" id="L169">            RateLimiter limiter = CompactionManager.instance.getRateLimiter();</span>
+<span class="fc" id="L170">            long start = nanoTime();</span>
+<span class="fc" id="L171">            long startTime = currentTimeMillis();</span>
+<span class="fc" id="L172">            long totalKeysWritten = 0;</span>
+<span class="fc" id="L173">            long estimatedKeys = 0;</span>
+            long inputSizeBytes;
+            long timeSpentWritingKeys;
+
+<span class="fc" id="L177">            Set&lt;SSTableReader&gt; actuallyCompact = Sets.difference(transaction.originals(), fullyExpiredSSTables);</span>
+            Collection&lt;SSTableReader&gt; newSStables;
+
+            long[] mergedRowCounts;
+            long totalSourceCQLRows;
+
+<span class="fc" id="L183">            long nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="fc" id="L184">            try (Refs&lt;SSTableReader&gt; refs = Refs.ref(actuallyCompact);</span>
+<span class="fc" id="L185">                 AbstractCompactionStrategy.ScannerList scanners = strategy.getScanners(actuallyCompact);</span>
+<span class="fc" id="L186">                 CompactionIterator ci = new CompactionIterator(compactionType, scanners.scanners, controller, nowInSec, taskId))</span>
+            {
+<span class="fc" id="L188">                long lastCheckObsoletion = start;</span>
+<span class="fc" id="L189">                inputSizeBytes = scanners.getTotalCompressedSize();</span>
+<span class="fc" id="L190">                double compressionRatio = scanners.getCompressionRatio();</span>
+<span class="fc bfc" id="L191" title="All 2 branches covered.">                if (compressionRatio == MetadataCollector.NO_COMPRESSION_RATIO)</span>
+<span class="fc" id="L192">                    compressionRatio = 1.0;</span>
+
+<span class="fc" id="L194">                long lastBytesScanned = 0;</span>
+
+<span class="fc" id="L196">                activeCompactions.beginCompaction(ci);</span>
+<span class="fc" id="L197">                try (CompactionAwareWriter writer = getCompactionAwareWriter(cfs, getDirectories(), transaction, actuallyCompact))</span>
+                {
+                    // Note that we need to re-check this flag after calling beginCompaction above to avoid a window
+                    // where the compaction does not exist in activeCompactions but the CSM gets paused.
+                    // We already have the sstables marked compacting here so CompactionManager#waitForCessation will
+                    // block until the below exception is thrown and the transaction is cancelled.
+<span class="fc bfc" id="L203" title="All 2 branches covered.">                    if (!controller.cfs.getCompactionStrategyManager().isActive())</span>
+<span class="fc" id="L204">                        throw new CompactionInterruptedException(ci.getCompactionInfo());</span>
+<span class="fc" id="L205">                    estimatedKeys = writer.estimatedKeys();</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">                    while (ci.hasNext())</span>
+                    {
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">                        if (writer.append(ci.next()))</span>
+<span class="fc" id="L209">                            totalKeysWritten++;</span>
+
+<span class="fc" id="L211">                        ci.setTargetDirectory(writer.getSStableDirectory().path());</span>
+<span class="fc" id="L212">                        long bytesScanned = scanners.getTotalBytesScanned();</span>
+
+                        // Rate limit the scanners, and account for compression
+<span class="fc" id="L215">                        CompactionManager.compactionRateLimiterAcquire(limiter, bytesScanned, lastBytesScanned, compressionRatio);</span>
+
+<span class="fc" id="L217">                        lastBytesScanned = bytesScanned;</span>
+
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">                        if (nanoTime() - lastCheckObsoletion &gt; TimeUnit.MINUTES.toNanos(1L))</span>
+                        {
+<span class="nc" id="L221">                            controller.maybeRefreshOverlaps();</span>
+<span class="nc" id="L222">                            lastCheckObsoletion = nanoTime();</span>
+                        }
+<span class="fc" id="L224">                    }</span>
+<span class="fc" id="L225">                    timeSpentWritingKeys = TimeUnit.NANOSECONDS.toMillis(nanoTime() - start);</span>
+
+                    // point of no return
+<span class="fc" id="L228">                    newSStables = writer.finish();</span>
+                }
+                finally
+                {
+<span class="fc" id="L232">                    activeCompactions.finishCompaction(ci);</span>
+<span class="fc" id="L233">                    mergedRowCounts = ci.getMergedRowCounts();</span>
+<span class="fc" id="L234">                    totalSourceCQLRows = ci.getTotalSourceCQLRows();</span>
+                }
+            }
+
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">            if (transaction.isOffline())</span>
+<span class="nc" id="L239">                return;</span>
+
+            // log a bunch of statistics about the result and save to system table compaction_history
+<span class="fc" id="L242">            long durationInNano = nanoTime() - start;</span>
+<span class="fc" id="L243">            long dTime = TimeUnit.NANOSECONDS.toMillis(durationInNano);</span>
+<span class="fc" id="L244">            long startsize = inputSizeBytes;</span>
+<span class="fc" id="L245">            long endsize = SSTableReader.getTotalBytes(newSStables);</span>
+<span class="fc" id="L246">            double ratio = (double) endsize / (double) startsize;</span>
+
+<span class="fc" id="L248">            StringBuilder newSSTableNames = new StringBuilder();</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">            for (SSTableReader reader : newSStables)</span>
+<span class="fc" id="L250">                newSSTableNames.append(reader.descriptor.baseFile()).append(&quot;,&quot;);</span>
+<span class="fc" id="L251">            long totalSourceRows = 0;</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">            for (int i = 0; i &lt; mergedRowCounts.length; i++)</span>
+<span class="fc" id="L253">                totalSourceRows += mergedRowCounts[i] * (i + 1);</span>
+
+<span class="fc" id="L255">            String mergeSummary = updateCompactionHistory(taskId, cfs.getKeyspaceName(), cfs.getTableName(), mergedRowCounts, startsize, endsize,</span>
+<span class="fc" id="L256">                                                          ImmutableMap.of(COMPACTION_TYPE_PROPERTY, compactionType.type));</span>
+
+<span class="fc" id="L258">            logger.info(String.format(&quot;Compacted (%s) %d sstables to [%s] to level=%d.  %s to %s (~%d%% of original) in %,dms.  Read Throughput = %s, Write Throughput = %s, Row Throughput = ~%,d/s.  %,d total partitions merged to %,d.  Partition merge counts were {%s}. Time spent writing keys = %,dms&quot;,</span>
+                                       taskId,
+<span class="fc" id="L260">                                       transaction.originals().size(),</span>
+<span class="fc" id="L261">                                       newSSTableNames.toString(),</span>
+<span class="fc" id="L262">                                       getLevel(),</span>
+<span class="fc" id="L263">                                       FBUtilities.prettyPrintMemory(startsize),</span>
+<span class="fc" id="L264">                                       FBUtilities.prettyPrintMemory(endsize),</span>
+<span class="fc" id="L265">                                       (int) (ratio * 100),</span>
+<span class="fc" id="L266">                                       dTime,</span>
+<span class="fc" id="L267">                                       FBUtilities.prettyPrintMemoryPerSecond(startsize, durationInNano),</span>
+<span class="fc" id="L268">                                       FBUtilities.prettyPrintMemoryPerSecond(endsize, durationInNano),</span>
+<span class="fc" id="L269">                                       (int) totalSourceCQLRows / (TimeUnit.NANOSECONDS.toSeconds(durationInNano) + 1),</span>
+<span class="fc" id="L270">                                       totalSourceRows,</span>
+<span class="fc" id="L271">                                       totalKeysWritten,</span>
+                                       mergeSummary,
+<span class="fc" id="L273">                                       timeSpentWritingKeys));</span>
+<span class="pc bpc" id="L274" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+            {
+<span class="nc" id="L276">                logger.trace(&quot;CF Total Bytes Compacted: {}&quot;, FBUtilities.prettyPrintMemory(CompactionTask.addToTotalBytesCompacted(endsize)));</span>
+<span class="nc" id="L277">                logger.trace(&quot;Actual #keys: {}, Estimated #keys:{}, Err%: {}&quot;, totalKeysWritten, estimatedKeys, ((double)(totalKeysWritten - estimatedKeys)/totalKeysWritten));</span>
+            }
+<span class="fc" id="L279">            cfs.getCompactionStrategyManager().compactionLogger.compaction(startTime, transaction.originals(), currentTimeMillis(), newSStables);</span>
+
+            // update the metrics
+<span class="fc" id="L282">            cfs.metric.compactionBytesWritten.inc(endsize);</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        }</span>
+<span class="fc" id="L284">    }</span>
+
+    @Override
+    public CompactionAwareWriter getCompactionAwareWriter(ColumnFamilyStore cfs,
+                                                          Directories directories,
+                                                          LifecycleTransaction transaction,
+                                                          Set&lt;SSTableReader&gt; nonExpiredSSTables)
+    {
+<span class="fc" id="L292">        return new DefaultCompactionWriter(cfs, directories, transaction, nonExpiredSSTables, keepOriginals, getLevel());</span>
+    }
+
+    public static String updateCompactionHistory(TimeUUID taskId, String keyspaceName, String columnFamilyName, long[] mergedRowCounts, long startSize, long endSize, Map&lt;String, String&gt; compactionProperties)
+    {
+<span class="fc" id="L297">        StringBuilder mergeSummary = new StringBuilder(mergedRowCounts.length * 10);</span>
+<span class="fc" id="L298">        Map&lt;Integer, Long&gt; mergedRows = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L299" title="All 2 branches covered.">        for (int i = 0; i &lt; mergedRowCounts.length; i++)</span>
+        {
+<span class="fc" id="L301">            long count = mergedRowCounts[i];</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">            if (count == 0)</span>
+<span class="fc" id="L303">                continue;</span>
+
+<span class="fc" id="L305">            int rows = i + 1;</span>
+<span class="fc" id="L306">            mergeSummary.append(String.format(&quot;%d:%d, &quot;, rows, count));</span>
+<span class="fc" id="L307">            mergedRows.put(rows, count);</span>
+        }
+<span class="fc" id="L309">        SystemKeyspace.updateCompactionHistory(taskId, keyspaceName, columnFamilyName, currentTimeMillis(), startSize, endSize, mergedRows, compactionProperties);</span>
+<span class="fc" id="L310">        return mergeSummary.toString();</span>
+    }
+
+    protected Directories getDirectories()
+    {
+<span class="fc" id="L315">        return cfs.getDirectories();</span>
+    }
+
+    public static long getMinRepairedAt(Set&lt;SSTableReader&gt; actuallyCompact)
+    {
+<span class="fc" id="L320">        long minRepairedAt= Long.MAX_VALUE;</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">        for (SSTableReader sstable : actuallyCompact)</span>
+<span class="fc" id="L322">            minRepairedAt = Math.min(minRepairedAt, sstable.getSSTableMetadata().repairedAt);</span>
+<span class="fc bfc" id="L323" title="All 2 branches covered.">        if (minRepairedAt == Long.MAX_VALUE)</span>
+<span class="fc" id="L324">            return ActiveRepairService.UNREPAIRED_SSTABLE;</span>
+<span class="fc" id="L325">        return minRepairedAt;</span>
+    }
+
+    public static TimeUUID getPendingRepair(Set&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc bfc" id="L330" title="All 2 branches covered.">        if (sstables.isEmpty())</span>
+        {
+<span class="fc" id="L332">            return ActiveRepairService.NO_PENDING_REPAIR;</span>
+        }
+<span class="fc" id="L334">        Set&lt;TimeUUID&gt; ids = new HashSet&lt;&gt;();</span>
+<span class="fc bfc" id="L335" title="All 2 branches covered.">        for (SSTableReader sstable: sstables)</span>
+<span class="fc" id="L336">            ids.add(sstable.getSSTableMetadata().pendingRepair);</span>
+
+<span class="pc bpc" id="L338" title="1 of 2 branches missed.">        if (ids.size() != 1)</span>
+<span class="nc" id="L339">            throw new RuntimeException(String.format(&quot;Attempting to compact pending repair sstables with sstables from other repair, or sstables not pending repair: %s&quot;, ids));</span>
+
+<span class="fc" id="L341">        return ids.iterator().next();</span>
+    }
+
+    public static boolean getIsTransient(Set&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        if (sstables.isEmpty())</span>
+        {
+<span class="fc" id="L348">            return false;</span>
+        }
+
+<span class="fc" id="L351">        boolean isTransient = sstables.iterator().next().isTransient();</span>
+
+<span class="pc bpc" id="L353" title="2 of 4 branches missed.">        if (!Iterables.all(sstables, sstable -&gt; sstable.isTransient() == isTransient))</span>
+        {
+<span class="nc" id="L355">            throw new RuntimeException(&quot;Attempting to compact transient sstables with non transient sstables&quot;);</span>
+        }
+
+<span class="fc" id="L358">        return isTransient;</span>
+    }
+
+
+    /*
+     * Checks if we have enough disk space to execute the compaction.  Drops the largest sstable out of the Task until
+     * there's enough space (in theory) to handle the compaction.
+     *
+     * @return true if there is enough disk space to execute the complete compaction, false if some sstables are excluded.
+     */
+    protected boolean buildCompactionCandidatesForAvailableDiskSpace(final Set&lt;SSTableReader&gt; fullyExpiredSSTables, TimeUUID taskId)
+    {
+<span class="pc bpc" id="L370" title="3 of 4 branches missed.">        if(!cfs.isCompactionDiskSpaceCheckEnabled() &amp;&amp; compactionType == OperationType.COMPACTION)</span>
+        {
+<span class="nc" id="L372">            logger.info(&quot;Compaction space check is disabled - trying to compact all sstables&quot;);</span>
+<span class="nc" id="L373">            return true;</span>
+        }
+
+<span class="fc" id="L376">        final Set&lt;SSTableReader&gt; nonExpiredSSTables = Sets.difference(transaction.originals(), fullyExpiredSSTables);</span>
+<span class="fc" id="L377">        CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();</span>
+<span class="fc" id="L378">        int sstablesRemoved = 0;</span>
+
+<span class="fc bfc" id="L380" title="All 2 branches covered.">        while(!nonExpiredSSTables.isEmpty())</span>
+        {
+            // Only consider write size of non expired SSTables
+            long writeSize;
+            try
+            {
+<span class="fc" id="L386">                writeSize = cfs.getExpectedCompactedFileSize(nonExpiredSSTables, compactionType);</span>
+<span class="fc" id="L387">                Map&lt;File, Long&gt; expectedNewWriteSize = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L388">                List&lt;File&gt; newCompactionDatadirs = cfs.getDirectoriesForFiles(nonExpiredSSTables);</span>
+<span class="fc" id="L389">                long writeSizePerOutputDatadir = writeSize / Math.max(newCompactionDatadirs.size(), 1);</span>
+<span class="fc bfc" id="L390" title="All 2 branches covered.">                for (File directory : newCompactionDatadirs)</span>
+<span class="fc" id="L391">                    expectedNewWriteSize.put(directory, writeSizePerOutputDatadir);</span>
+
+<span class="fc" id="L393">                Map&lt;File, Long&gt; expectedWriteSize = CompactionManager.instance.active.estimatedRemainingWriteBytes();</span>
+
+                // todo: abort streams if they block compactions
+<span class="fc bfc" id="L396" title="All 2 branches covered.">                if (cfs.getDirectories().hasDiskSpaceForCompactionsAndStreams(expectedNewWriteSize, expectedWriteSize))</span>
+<span class="fc" id="L397">                    break;</span>
+            }
+<span class="nc" id="L399">            catch (Exception e)</span>
+            {
+<span class="nc" id="L401">                logger.error(&quot;Could not check if there is enough disk space for compaction {}&quot;, taskId, e);</span>
+<span class="nc" id="L402">                break;</span>
+<span class="fc" id="L403">            }</span>
+
+<span class="fc bfc" id="L405" title="All 2 branches covered.">            if (!reduceScopeForLimitedSpace(nonExpiredSSTables, writeSize))</span>
+            {
+                // we end up here if we can't take any more sstables out of the compaction.
+                // usually means we've run out of disk space
+
+                // but we can still compact expired SSTables
+<span class="pc bpc" id="L411" title="2 of 4 branches missed.">                if(partialCompactionsAcceptable() &amp;&amp; fullyExpiredSSTables.size() &gt; 0 )</span>
+                {
+                    // sanity check to make sure we compact only fully expired SSTables.
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                    assert transaction.originals().equals(fullyExpiredSSTables);</span>
+                    break;
+                }
+
+<span class="fc" id="L418">                String msg = String.format(&quot;Not enough space for compaction (%s) of %s.%s, estimated sstables = %d, expected write size = %d&quot;,</span>
+                                           taskId,
+<span class="fc" id="L420">                                           cfs.getKeyspaceName(),</span>
+                                           cfs.name,
+<span class="fc" id="L422">                                           Math.max(1, writeSize / strategy.getMaxSSTableBytes()),</span>
+<span class="fc" id="L423">                                           writeSize);</span>
+<span class="fc" id="L424">                logger.warn(msg);</span>
+<span class="fc" id="L425">                CompactionManager.instance.incrementAborted();</span>
+<span class="fc" id="L426">                throw new RuntimeException(msg);</span>
+            }
+
+<span class="fc" id="L429">            sstablesRemoved++;</span>
+<span class="fc" id="L430">            logger.warn(&quot;Not enough space for compaction {}, {}MiB estimated. Reducing scope.&quot;,</span>
+<span class="fc" id="L431">                        taskId, (float) writeSize / 1024 / 1024);</span>
+<span class="fc" id="L432">        }</span>
+
+<span class="fc bfc" id="L434" title="All 2 branches covered.">        if(sstablesRemoved &gt; 0)</span>
+        {
+<span class="fc" id="L436">            CompactionManager.instance.incrementCompactionsReduced();</span>
+<span class="fc" id="L437">            CompactionManager.instance.incrementSstablesDropppedFromCompactions(sstablesRemoved);</span>
+<span class="fc" id="L438">            return false;</span>
+        }
+<span class="fc" id="L440">        return true;</span>
+    }
+
+    protected int getLevel()
+    {
+<span class="fc" id="L445">        return 0;</span>
+    }
+
+    protected CompactionController getCompactionController(Set&lt;SSTableReader&gt; toCompact)
+    {
+<span class="fc" id="L450">        return new CompactionController(cfs, toCompact, gcBefore);</span>
+    }
+
+    protected boolean partialCompactionsAcceptable()
+    {
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">        return !isUserDefined;</span>
+    }
+
+    public static long getMaxDataAge(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L460">        long max = 0;</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc bfc" id="L463" title="All 2 branches covered.">            if (sstable.maxDataAge &gt; max)</span>
+<span class="fc" id="L464">                max = sstable.maxDataAge;</span>
+<span class="fc" id="L465">        }</span>
+<span class="fc" id="L466">        return max;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

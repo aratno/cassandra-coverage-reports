@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SamplingManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.metrics</a> &gt; <span class="el_source">SamplingManager.java</span></div><h1>SamplingManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.metrics;
+
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.OpenDataException;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.tools.nodetool.ProfileLoad;
+import org.apache.cassandra.tools.nodetool.formatter.TableBuilder;
+import org.apache.cassandra.utils.Pair;
+
+<span class="fc" id="L50">public class SamplingManager</span>
+{
+<span class="fc" id="L52">    private static final Logger logger = LoggerFactory.getLogger(SamplingManager.class);</span>
+
+    /**
+     * Tracks the active scheduled sampling tasks.
+     * The key of the map is a {@link JobId}, which is effectively a keyspace + table abstracted behind some syntactic
+     * sugar so we can use them without peppering Pairs throughout this class. Both keyspace and table are nullable,
+     * a paradigm we inherit from {@link ProfileLoad} so need to accommodate here.
+     *
+     * The value of the map is the current scheduled task.
+     */
+<span class="fc" id="L62">    private final ConcurrentHashMap&lt;JobId, Future&lt;?&gt;&gt; activeSamplingTasks = new ConcurrentHashMap&lt;&gt;();</span>
+
+    /** Tasks that are actively being cancelled */
+<span class="fc" id="L65">    private final Set&lt;JobId&gt; cancelingTasks = ConcurrentHashMap.newKeySet();</span>
+
+    public static String formatResult(ResultBuilder resultBuilder)
+    {
+<span class="fc" id="L69">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="fc" id="L70">        try (PrintStream ps = new PrintStream(baos))</span>
+        {
+<span class="fc bfc" id="L72" title="All 2 branches covered.">            for (Sampler.SamplerType samplerType : Sampler.SamplerType.values())</span>
+            {
+<span class="fc" id="L74">                samplerType.format(resultBuilder, ps);</span>
+            }
+<span class="fc" id="L76">            return baos.toString();</span>
+        }
+    }
+
+    public static Iterable&lt;ColumnFamilyStore&gt; getTables(String ks, String table)
+    {
+        // null KEYSPACE == all the tables
+<span class="fc bfc" id="L83" title="All 2 branches covered.">        if (ks == null)</span>
+<span class="fc" id="L84">            return ColumnFamilyStore.all();</span>
+
+<span class="fc" id="L86">        Keyspace keyspace = Keyspace.open(ks);</span>
+
+        // KEYSPACE defined w/null table == all the tables on that KEYSPACE
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">        if (table == null)</span>
+<span class="nc" id="L90">            return keyspace.getColumnFamilyStores();</span>
+        // Or we just have a specific ks+table combo we're looking to profile
+        else
+<span class="fc" id="L93">            return Collections.singletonList(keyspace.getColumnFamilyStore(table));</span>
+    }
+
+    /**
+     * Register the samplers for the keyspace and table.
+     * @param ks Keyspace. Nullable. If null, the scheduled sampling is on all keyspaces and tables
+     * @param table Nullable. If null, the scheduled sampling is on all tables of the specified keyspace
+     * @param duration Duration of each scheduled sampling job in milliseconds
+     * @param interval Interval of each scheduled sampling job in milliseconds
+     * @param capacity Capacity of the sampler, higher for more accuracy
+     * @param count Number of the top samples to list
+     * @param samplers a list of samplers to enable
+     * @return true if the scheduled sampling is started successfully. Otherwise return fasle
+     */
+    public boolean register(String ks, String table, int duration, int interval, int capacity, int count, List&lt;String&gt; samplers)
+    {
+<span class="fc" id="L109">        JobId jobId = new JobId(ks, table);</span>
+<span class="fc" id="L110">        logger.info(&quot;Registering samplers {} for {}&quot;, samplers, jobId);</span>
+
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        if (!canSchedule(jobId))</span>
+        {
+<span class="fc" id="L114">            logger.info(&quot;Unable to register {} due to existing ongoing sampling.&quot;, jobId);</span>
+<span class="fc" id="L115">            return false;</span>
+        }
+
+        // 'begin' tasks are chained to finish before their paired 'finish'
+<span class="fc" id="L119">        activeSamplingTasks.put(jobId, ScheduledExecutors.optionalTasks.submit(</span>
+<span class="fc" id="L120">        createSamplingBeginRunnable(jobId, getTables(ks, table), duration, interval, capacity, count, samplers)</span>
+        ));
+<span class="fc" id="L122">        return true;</span>
+    }
+
+    public boolean unregister(String ks, String table)
+    {
+        // unregister all
+        // return true when all tasks are cancelled successfully
+<span class="pc bpc" id="L129" title="1 of 4 branches missed.">        if (ks == null &amp;&amp; table == null)</span>
+        {
+<span class="fc" id="L131">            boolean res = true;</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            for (JobId id : activeSamplingTasks.keySet())</span>
+            {
+<span class="fc" id="L134">                res = cancelTask(id) &amp; res;</span>
+<span class="fc" id="L135">            }</span>
+<span class="fc" id="L136">            return res;</span>
+        }
+        else
+        {
+<span class="fc" id="L140">            return cancelTask(new JobId(ks, table));</span>
+        }
+    }
+
+    public List&lt;String&gt; allJobs()
+    {
+<span class="fc" id="L146">        return jobIds().stream()</span>
+<span class="fc" id="L147">                       .map(JobId::toString)</span>
+<span class="fc" id="L148">                       .collect(Collectors.toList());</span>
+    }
+
+    private Set&lt;JobId&gt; jobIds()
+    {
+<span class="fc" id="L153">        Set&lt;JobId&gt; all = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L154">        all.addAll(activeSamplingTasks.keySet());</span>
+<span class="fc" id="L155">        all.addAll(cancelingTasks);</span>
+<span class="fc" id="L156">        return all;</span>
+    }
+
+    /**
+     * Validate if a schedule on the keyspace and table is permitted
+     * @param jobId
+     * @return true if possible, false if there are overlapping tables already being sampled
+     */
+    private boolean canSchedule(JobId jobId)
+    {
+<span class="fc" id="L166">        Set&lt;JobId&gt; allJobIds = jobIds();</span>
+        // There is a schedule that works on all tables. Overlapping guaranteed.
+<span class="pc bpc" id="L168" title="1 of 6 branches missed.">        if (allJobIds.contains(JobId.ALL_KS_AND_TABLES) || (!allJobIds.isEmpty() &amp;&amp; jobId.equals(JobId.ALL_KS_AND_TABLES)))</span>
+<span class="fc" id="L169">            return false;</span>
+        // there is an exactly duplicated schedule
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        else if (allJobIds.contains(jobId))</span>
+<span class="fc" id="L172">            return false;</span>
+        else
+            // make sure has no overlapping tables under the keyspace
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">            return !allJobIds.contains(JobId.createForAllTables(jobId.keyspace));</span>
+    }
+
+    /**
+     * Cancel a task by its id. The corresponding task will be stopped once its final sampling completes.
+     * @param jobId
+     * @return true if the task exists, false if not found
+     */
+    private boolean cancelTask(JobId jobId)
+    {
+<span class="fc" id="L185">        Future&lt;?&gt; task = activeSamplingTasks.remove(jobId);</span>
+<span class="fc bfc" id="L186" title="All 2 branches covered.">        if (task != null)</span>
+<span class="fc" id="L187">            cancelingTasks.add(jobId);</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        return task != null;</span>
+    }
+
+    /**
+     * Begin sampling and schedule a future task to end the sampling task
+     */
+    private Runnable createSamplingBeginRunnable(JobId jobId, Iterable&lt;ColumnFamilyStore&gt; tables, int duration, int interval, int capacity, int count, List&lt;String&gt; samplers)
+    {
+<span class="fc" id="L196">        return () -&gt;</span>
+        {
+<span class="fc" id="L198">            List&lt;String&gt; tableNames = StreamSupport.stream(tables.spliterator(), false)</span>
+<span class="fc" id="L199">                                                   .map(cfs -&gt; String.format(&quot;%s.%s&quot;, cfs.keyspace, cfs.name))</span>
+<span class="fc" id="L200">                                                   .collect(Collectors.toList());</span>
+<span class="fc" id="L201">            logger.info(&quot;Starting to sample tables {} with the samplers {} for {} ms&quot;, tableNames, samplers, duration);</span>
+<span class="fc bfc" id="L202" title="All 2 branches covered.">            for (String sampler : samplers)</span>
+            {
+<span class="fc bfc" id="L204" title="All 2 branches covered.">                for (ColumnFamilyStore cfs : tables)</span>
+                {
+<span class="fc" id="L206">                    cfs.beginLocalSampling(sampler, capacity, duration);</span>
+<span class="fc" id="L207">                }</span>
+<span class="fc" id="L208">            }</span>
+<span class="fc" id="L209">            Future&lt;?&gt; fut = ScheduledExecutors.optionalTasks.schedule(</span>
+<span class="fc" id="L210">                createSamplingEndRunnable(jobId, tables, duration, interval, capacity, count, samplers),</span>
+                interval,
+                TimeUnit.MILLISECONDS);
+            // reached to the end of the current runnable
+            // update the referenced future to SamplingFinish
+<span class="fc" id="L215">            activeSamplingTasks.put(jobId, fut);</span>
+<span class="fc" id="L216">        };</span>
+    }
+
+    /**
+     * Finish the sampling and begin a new one immediately after.
+     *
+     * NOTE: Do not call this outside the context of {@link this#createSamplingBeginRunnable}, as we need to preserve
+     * ordering between a &quot;start&quot; and &quot;end&quot; runnable
+     */
+    private Runnable createSamplingEndRunnable(JobId jobId, Iterable&lt;ColumnFamilyStore&gt; tables, int duration, int interval, int capacity, int count, List&lt;String&gt; samplers)
+    {
+<span class="fc" id="L227">        return () -&gt;</span>
+        {
+<span class="fc" id="L229">            Map&lt;String, List&lt;CompositeData&gt;&gt; results = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            for (String sampler : samplers)</span>
+            {
+<span class="fc" id="L232">                List&lt;CompositeData&gt; topk = new ArrayList&lt;&gt;();</span>
+<span class="fc bfc" id="L233" title="All 2 branches covered.">                for (ColumnFamilyStore cfs : tables)</span>
+                {
+                    try
+                    {
+<span class="fc" id="L237">                        topk.addAll(cfs.finishLocalSampling(sampler, count));</span>
+                    }
+<span class="nc" id="L239">                    catch (OpenDataException e)</span>
+                    {
+<span class="nc" id="L241">                        logger.warn(&quot;Failed to retrieve the sampled data. Abort the background sampling job: {}.&quot;, jobId, e);</span>
+<span class="nc" id="L242">                        activeSamplingTasks.remove(jobId);</span>
+<span class="nc" id="L243">                        cancelingTasks.remove(jobId);</span>
+<span class="nc" id="L244">                        return;</span>
+<span class="fc" id="L245">                    }</span>
+<span class="fc" id="L246">                }</span>
+
+<span class="fc" id="L248">                topk.sort((left, right) -&gt; Long.compare((long) right.get(&quot;count&quot;), (long) left.get(&quot;count&quot;)));</span>
+                // sublist is not serializable for jmx
+<span class="fc" id="L250">                topk = new ArrayList&lt;&gt;(topk.subList(0, Math.min(topk.size(), count)));</span>
+<span class="fc" id="L251">                results.put(sampler, topk);</span>
+<span class="fc" id="L252">            }</span>
+<span class="fc" id="L253">            AtomicBoolean first = new AtomicBoolean(false);</span>
+<span class="fc" id="L254">            ResultBuilder rb = new ResultBuilder(first, results, samplers);</span>
+<span class="fc" id="L255">            logger.info(formatResult(rb));</span>
+
+            // If nobody has canceled us, we ping-pong back to a &quot;begin&quot; runnable to run another profile load
+<span class="fc bfc" id="L258" title="All 2 branches covered.">            if (!cancelingTasks.contains(jobId))</span>
+            {
+<span class="fc" id="L260">                Future&lt;?&gt; fut = ScheduledExecutors.optionalTasks.submit(</span>
+<span class="fc" id="L261">                    createSamplingBeginRunnable(jobId, tables, duration, interval, capacity, count, samplers));</span>
+<span class="fc" id="L262">                activeSamplingTasks.put(jobId, fut);</span>
+<span class="fc" id="L263">            }</span>
+            // If someone *has* canceled us, we need to remove the runnable from activeSampling and also remove the
+            // cancellation sentinel so subsequent re-submits of profiling don't get blocked immediately
+            else
+            {
+<span class="fc" id="L268">                logger.info(&quot;The sampling job {} has been cancelled.&quot;, jobId);</span>
+<span class="fc" id="L269">                activeSamplingTasks.remove(jobId);</span>
+<span class="fc" id="L270">                cancelingTasks.remove(jobId);</span>
+            }
+<span class="fc" id="L272">        };</span>
+    }
+
+    private static class JobId
+    {
+<span class="fc" id="L277">        public static final JobId ALL_KS_AND_TABLES = new JobId(null, null);</span>
+
+        public final String keyspace;
+        public final String table;
+
+        public JobId(String ks, String tb)
+<span class="fc" id="L283">        {</span>
+<span class="fc" id="L284">            keyspace = ks;</span>
+<span class="fc" id="L285">            table = tb;</span>
+<span class="fc" id="L286">        }</span>
+
+        public static JobId createForAllTables(String keyspace)
+        {
+<span class="fc" id="L290">            return new JobId(keyspace, null);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="fc" id="L296">            return maybeWildCard(keyspace) + '.' + maybeWildCard(table);</span>
+        }
+
+        private String maybeWildCard(String input)
+        {
+<span class="fc bfc" id="L301" title="All 2 branches covered.">            return input == null ? &quot;*&quot; : input;</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="pc bpc" id="L308" title="2 of 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+<span class="fc" id="L309">            JobId jobId = (JobId) o;</span>
+<span class="pc bpc" id="L310" title="1 of 4 branches missed.">            return Objects.equals(keyspace, jobId.keyspace) &amp;&amp; Objects.equals(table, jobId.table);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="fc" id="L316">            return Objects.hash(keyspace, table);</span>
+        }
+    }
+
+    public static class ResultBuilder
+    {
+        protected Sampler.SamplerType type;
+        protected String description;
+        protected AtomicBoolean first;
+        protected Map&lt;String, List&lt;CompositeData&gt;&gt; results;
+        protected List&lt;String&gt; targets;
+        protected List&lt;Pair&lt;String, String&gt;&gt; dataKeys;
+
+        public ResultBuilder(AtomicBoolean first, Map&lt;String, List&lt;CompositeData&gt;&gt; results, List&lt;String&gt; targets)
+<span class="fc" id="L330">        {</span>
+<span class="fc" id="L331">            this.first = first;</span>
+<span class="fc" id="L332">            this.results = results;</span>
+<span class="fc" id="L333">            this.targets = targets;</span>
+<span class="fc" id="L334">            this.dataKeys = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L335">            this.dataKeys.add(Pair.create(&quot;  &quot;, &quot;  &quot;));</span>
+<span class="fc" id="L336">        }</span>
+
+        public SamplingManager.ResultBuilder forType(Sampler.SamplerType type, String description)
+        {
+<span class="fc" id="L340">            SamplingManager.ResultBuilder rb = new SamplingManager.ResultBuilder(first, results, targets);</span>
+<span class="fc" id="L341">            rb.type = type;</span>
+<span class="fc" id="L342">            rb.description = description;</span>
+<span class="fc" id="L343">            return rb;</span>
+        }
+
+        public SamplingManager.ResultBuilder addColumn(String title, String key)
+        {
+<span class="fc" id="L348">            this.dataKeys.add(Pair.create(title, key));</span>
+<span class="fc" id="L349">            return this;</span>
+        }
+
+        protected String get(CompositeData cd, String key)
+        {
+<span class="fc bfc" id="L354" title="All 2 branches covered.">            if (cd.containsKey(key))</span>
+<span class="fc" id="L355">                return cd.get(key).toString();</span>
+<span class="fc" id="L356">            return key;</span>
+        }
+
+        public void print(PrintStream ps)
+        {
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            if (targets.contains(type.toString()))</span>
+            {
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">                if (!first.get())</span>
+<span class="fc" id="L364">                    ps.println();</span>
+<span class="fc" id="L365">                first.set(false);</span>
+<span class="fc" id="L366">                ps.println(description + ':');</span>
+<span class="fc" id="L367">                TableBuilder out = new TableBuilder();</span>
+<span class="fc" id="L368">                out.add(dataKeys.stream().map(p -&gt; p.left).collect(Collectors.toList()).toArray(new String[] {}));</span>
+<span class="fc" id="L369">                List&lt;CompositeData&gt; topk = results.get(type.toString());</span>
+<span class="fc bfc" id="L370" title="All 2 branches covered.">                for (CompositeData cd : topk)</span>
+                {
+<span class="fc" id="L372">                    out.add(dataKeys.stream().map(p -&gt; get(cd, p.right)).collect(Collectors.toList()).toArray(new String[] {}));</span>
+<span class="fc" id="L373">                }</span>
+<span class="fc bfc" id="L374" title="All 2 branches covered.">                if (topk.size() == 0)</span>
+                {
+<span class="fc" id="L376">                    ps.println(&quot;   Nothing recorded during sampling period...&quot;);</span>
+                }
+                else
+                {
+<span class="fc" id="L380">                    out.printTo(ps);</span>
+                }
+            }
+<span class="fc" id="L383">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

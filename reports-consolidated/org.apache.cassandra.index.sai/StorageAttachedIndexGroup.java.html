@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StorageAttachedIndexGroup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai</a> &gt; <span class="el_source">StorageAttachedIndexGroup.java</span></div><h1>StorageAttachedIndexGroup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai;
+
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import javax.annotation.concurrent.ThreadSafe;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
+import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.WriteContext;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.sai.disk.SSTableIndex;
+import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.metrics.IndexGroupMetrics;
+import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
+import org.apache.cassandra.index.sai.metrics.TableStateMetrics;
+import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
+import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.notifications.INotification;
+import org.apache.cassandra.notifications.INotificationConsumer;
+import org.apache.cassandra.notifications.MemtableDiscardedNotification;
+import org.apache.cassandra.notifications.MemtableRenewedNotification;
+import org.apache.cassandra.notifications.SSTableAddedNotification;
+import org.apache.cassandra.notifications.SSTableListChangedNotification;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.Throwables;
+
+/**
+ * Orchestrates building of storage-attached indices, and manages lifecycle of resources shared between them.
+ */
+@ThreadSafe
+public class StorageAttachedIndexGroup implements Index.Group, INotificationConsumer
+{
+<span class="fc" id="L76">    private static final Logger logger = LoggerFactory.getLogger(StorageAttachedIndexGroup.class);</span>
+
+    private final TableQueryMetrics queryMetrics;
+    private final TableStateMetrics stateMetrics;
+    private final IndexGroupMetrics groupMetrics;
+<span class="fc" id="L81">    private final Set&lt;StorageAttachedIndex&gt; indexes = Sets.newConcurrentHashSet();</span>
+    private final ColumnFamilyStore baseCfs;
+
+    private final SSTableContextManager contextManager;
+
+    StorageAttachedIndexGroup(ColumnFamilyStore baseCfs)
+<span class="fc" id="L87">    {</span>
+<span class="fc" id="L88">        this.baseCfs = baseCfs;</span>
+<span class="fc" id="L89">        this.queryMetrics = new TableQueryMetrics(baseCfs.metadata());</span>
+<span class="fc" id="L90">        this.stateMetrics = new TableStateMetrics(baseCfs.metadata(), this);</span>
+<span class="fc" id="L91">        this.groupMetrics = new IndexGroupMetrics(baseCfs.metadata(), this);</span>
+<span class="fc" id="L92">        this.contextManager = new SSTableContextManager();</span>
+
+<span class="fc" id="L94">        Tracker tracker = baseCfs.getTracker();</span>
+<span class="fc" id="L95">        tracker.subscribe(this);</span>
+<span class="fc" id="L96">    }</span>
+
+    @Nullable
+    public static StorageAttachedIndexGroup getIndexGroup(ColumnFamilyStore cfs)
+    {
+<span class="fc" id="L101">        return (StorageAttachedIndexGroup) cfs.indexManager.getIndexGroup(StorageAttachedIndexGroup.class);</span>
+    }
+
+    @Override
+    public Set&lt;Index&gt; getIndexes()
+    {
+<span class="fc" id="L107">        return ImmutableSet.copyOf(indexes);</span>
+    }
+
+    @Override
+    public void addIndex(Index index)
+    {
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">        assert index instanceof StorageAttachedIndex;</span>
+<span class="fc" id="L114">        indexes.add((StorageAttachedIndex) index);</span>
+<span class="fc" id="L115">    }</span>
+
+    @Override
+    public void removeIndex(Index index)
+    {
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">        assert index instanceof StorageAttachedIndex;</span>
+<span class="fc" id="L121">        boolean removed = indexes.remove(index);</span>
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">        assert removed : &quot;Cannot remove non-existing index &quot; + index;</span>
+        /*
+         * per index files are dropped via {@link StorageAttachedIndex#getInvalidateTask()}
+         */
+<span class="fc bfc" id="L126" title="All 2 branches covered.">        if (indexes.isEmpty())</span>
+        {
+<span class="fc bfc" id="L128" title="All 2 branches covered.">            for (SSTableReader sstable : contextManager.sstables())</span>
+<span class="fc" id="L129">                sstable.unregisterComponents(IndexDescriptor.create(sstable).getLivePerSSTableComponents(), baseCfs.getTracker());</span>
+<span class="fc" id="L130">            deletePerSSTableFiles(baseCfs.getLiveSSTables());</span>
+<span class="fc" id="L131">            baseCfs.getTracker().unsubscribe(this);</span>
+        }
+<span class="fc" id="L133">    }</span>
+
+    @Override
+    public void invalidate()
+    {
+        // in case of dropping table, sstable contexts should already been removed by SSTableListChangedNotification.
+<span class="fc" id="L139">        queryMetrics.release();</span>
+<span class="fc" id="L140">        groupMetrics.release();</span>
+<span class="fc" id="L141">        stateMetrics.release();</span>
+<span class="fc" id="L142">        baseCfs.getTracker().unsubscribe(this);</span>
+<span class="fc" id="L143">    }</span>
+
+    @Override
+    @SuppressWarnings(&quot;SuspiciousMethodCalls&quot;)
+    public boolean containsIndex(Index index)
+    {
+<span class="fc" id="L149">        return indexes.contains(index);</span>
+    }
+
+    @Override
+    public Index.Indexer indexerFor(Predicate&lt;Index&gt; indexSelector,
+                                    DecoratedKey key,
+                                    RegularAndStaticColumns columns,
+                                    long nowInSec,
+                                    WriteContext ctx,
+                                    IndexTransaction.Type transactionType,
+                                    Memtable memtable)
+    {
+<span class="fc" id="L161">        final Set&lt;Index.Indexer&gt; indexers =</span>
+<span class="fc" id="L162">                indexes.stream().filter(indexSelector)</span>
+<span class="fc" id="L163">                       .map(i -&gt; i.indexerFor(key, columns, nowInSec, ctx, transactionType, memtable))</span>
+<span class="fc" id="L164">                       .filter(Objects::nonNull)</span>
+<span class="fc" id="L165">                       .collect(Collectors.toSet());</span>
+
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        return indexers.isEmpty() ? null : new Index.Indexer()</span>
+<span class="fc" id="L168">        {</span>
+            @Override
+            public void insertRow(Row row)
+            {
+<span class="fc bfc" id="L172" title="All 2 branches covered.">                for (Index.Indexer indexer : indexers)</span>
+<span class="fc" id="L173">                    indexer.insertRow(row);</span>
+<span class="fc" id="L174">            }</span>
+
+            @Override
+            public void updateRow(Row oldRow, Row newRow)
+            {
+<span class="fc bfc" id="L179" title="All 2 branches covered.">                for (Index.Indexer indexer : indexers)</span>
+<span class="fc" id="L180">                    indexer.updateRow(oldRow, newRow);</span>
+<span class="fc" id="L181">            }</span>
+        };
+    }
+
+    @Override
+    public StorageAttachedIndexQueryPlan queryPlanFor(RowFilter rowFilter)
+    {
+<span class="fc" id="L188">        return StorageAttachedIndexQueryPlan.create(baseCfs, queryMetrics, indexes, rowFilter);</span>
+    }
+
+    @Override
+    public SSTableFlushObserver getFlushObserver(Descriptor descriptor, LifecycleNewTracker tracker, TableMetadata tableMetadata)
+    {
+<span class="fc" id="L194">        IndexDescriptor indexDescriptor = IndexDescriptor.create(descriptor, tableMetadata.partitioner, tableMetadata.comparator);</span>
+        try
+        {
+<span class="fc" id="L197">            return StorageAttachedIndexWriter.createFlushObserverWriter(indexDescriptor, indexes, tracker);</span>
+        }
+<span class="nc" id="L199">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L201">            String message = &quot;Unable to create storage-attached index writer on SSTable flush.&quot; +</span>
+                             &quot; All indexes from this table are going to be marked as non-queryable and will need to be rebuilt.&quot;;
+<span class="nc" id="L203">            logger.error(indexDescriptor.logMessage(message), t);</span>
+<span class="nc" id="L204">            indexes.forEach(StorageAttachedIndex::makeIndexNonQueryable);</span>
+<span class="nc" id="L205">            return null;</span>
+        }
+    }
+
+    @Override
+    public boolean handles(IndexTransaction.Type type)
+    {
+        // to skip CleanupGCTransaction and IndexGCTransaction
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        return type == IndexTransaction.Type.UPDATE;</span>
+    }
+
+    @Override
+    public Set&lt;Component&gt; getComponents()
+    {
+<span class="fc" id="L219">        return getComponents(indexes);</span>
+    }
+
+    private Set&lt;Component&gt; getComponents(Collection&lt;StorageAttachedIndex&gt; indices)
+    {
+<span class="fc" id="L224">        Set&lt;Component&gt; components = Version.LATEST.onDiskFormat()</span>
+<span class="fc bfc" id="L225" title="All 2 branches covered.">                                                  .perSSTableIndexComponents(baseCfs.metadata.get().comparator.size() &gt; 0)</span>
+<span class="fc" id="L226">                                                  .stream()</span>
+<span class="fc" id="L227">                                                  .map(Version.LATEST::makePerSSTableComponent)</span>
+<span class="fc" id="L228">                                                  .collect(Collectors.toSet());</span>
+<span class="fc" id="L229">        indices.forEach(index -&gt; components.addAll(index.getComponents()));</span>
+<span class="fc" id="L230">        return components;</span>
+    }
+
+    // This differs from getComponents in that it only returns index components that exist on disk.
+    // It avoids errors being logged by the SSTable.readTOC method when we have an empty index.
+    @VisibleForTesting
+    public static Set&lt;Component&gt; getLiveComponents(SSTableReader sstable, Collection&lt;StorageAttachedIndex&gt; indices)
+    {
+<span class="fc" id="L238">        IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);</span>
+<span class="fc" id="L239">        Set&lt;Component&gt; components = indexDescriptor.getLivePerSSTableComponents();</span>
+<span class="fc" id="L240">        indices.forEach(index -&gt; components.addAll(indexDescriptor.getLivePerIndexComponents(index.getIndexContext())));</span>
+<span class="fc" id="L241">        return components;</span>
+    }
+
+    @Override
+    public void handleNotification(INotification notification, Object sender)
+    {
+        // unfortunately, we can only check the type of notification via instanceof :(
+<span class="fc bfc" id="L248" title="All 2 branches covered.">        if (notification instanceof SSTableAddedNotification)</span>
+        {
+<span class="fc" id="L250">            SSTableAddedNotification notice = (SSTableAddedNotification) notification;</span>
+
+            // Avoid validation for index files just written following Memtable flush. Otherwise, the new SSTables have
+            // come either from import, streaming, or a standalone tool, where they have also already been validated.
+<span class="fc" id="L254">            onSSTableChanged(Collections.emptySet(), notice.added, indexes, IndexValidation.NONE);</span>
+<span class="fc" id="L255">        }</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">        else if (notification instanceof SSTableListChangedNotification)</span>
+        {
+<span class="fc" id="L258">            SSTableListChangedNotification notice = (SSTableListChangedNotification) notification;</span>
+
+            // Avoid validation for index files just written during compaction.
+<span class="fc" id="L261">            onSSTableChanged(notice.removed, notice.added, indexes, IndexValidation.NONE);</span>
+<span class="fc" id="L262">        }</span>
+<span class="fc bfc" id="L263" title="All 2 branches covered.">        else if (notification instanceof MemtableRenewedNotification)</span>
+        {
+<span class="fc" id="L265">            indexes.forEach(index -&gt; index.getIndexContext().getMemtableIndexManager().renewMemtable(((MemtableRenewedNotification) notification).renewed));</span>
+        }
+<span class="fc bfc" id="L267" title="All 2 branches covered.">        else if (notification instanceof MemtableDiscardedNotification)</span>
+        {
+<span class="fc" id="L269">            indexes.forEach(index -&gt; index.getIndexContext().getMemtableIndexManager().discardMemtable(((MemtableDiscardedNotification) notification).memtable));</span>
+        }
+<span class="fc" id="L271">    }</span>
+
+    void deletePerSSTableFiles(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="fc" id="L275">        contextManager.release(sstables);</span>
+<span class="fc" id="L276">        sstables.forEach(sstableReader -&gt; IndexDescriptor.create(sstableReader).deletePerSSTableIndexComponents());</span>
+<span class="fc" id="L277">    }</span>
+
+    void dropIndexSSTables(Collection&lt;SSTableReader&gt; ss, StorageAttachedIndex index)
+    {
+        try
+        {
+<span class="fc" id="L283">            index.getIndexContext().drop(ss);</span>
+        }
+<span class="nc" id="L285">        catch (Throwable t)</span>
+        {
+            // Mark the index non-queryable, as its view may be compromised.
+<span class="nc" id="L288">            index.makeIndexNonQueryable();</span>
+
+<span class="nc" id="L290">            throw Throwables.unchecked(t);</span>
+<span class="fc" id="L291">        }</span>
+<span class="fc" id="L292">    }</span>
+
+    /**
+     * This method is synchronized to avoid concurrent initialization tasks validating same per-SSTable files.
+     *
+     * @return the set of column indexes that were marked as non-queryable as a result of their per-SSTable index
+     * files being corrupt or being unable to successfully update their views
+     */
+    synchronized Set&lt;StorageAttachedIndex&gt; onSSTableChanged(Collection&lt;SSTableReader&gt; removed, Iterable&lt;SSTableReader&gt; added,
+                                                            Set&lt;StorageAttachedIndex&gt; indexes, IndexValidation validation)
+    {
+<span class="fc" id="L303">        Pair&lt;Set&lt;SSTableContext&gt;, Set&lt;SSTableReader&gt;&gt; results = contextManager.update(removed, added, validation);</span>
+
+<span class="fc bfc" id="L305" title="All 2 branches covered.">        if (!results.right.isEmpty())</span>
+        {
+<span class="fc" id="L307">            results.right.forEach(sstable -&gt; {</span>
+<span class="fc" id="L308">                IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);</span>
+<span class="fc" id="L309">                indexDescriptor.deletePerSSTableIndexComponents();</span>
+                // Column indexes are invalid if their SSTable-level components are corrupted so delete
+                // their associated index files and mark them non-queryable.
+<span class="fc" id="L312">                indexes.forEach(index -&gt; {</span>
+<span class="fc" id="L313">                    indexDescriptor.deleteColumnIndex(index.getIndexContext());</span>
+<span class="fc" id="L314">                    index.makeIndexNonQueryable();</span>
+<span class="fc" id="L315">                });</span>
+<span class="fc" id="L316">            });</span>
+<span class="fc" id="L317">            return indexes;</span>
+        }
+
+<span class="fc" id="L320">        Set&lt;StorageAttachedIndex&gt; incomplete = new HashSet&lt;&gt;();</span>
+
+<span class="fc bfc" id="L322" title="All 2 branches covered.">        for (StorageAttachedIndex index : indexes)</span>
+        {
+<span class="fc" id="L324">            Collection&lt;SSTableContext&gt; invalid = index.getIndexContext().onSSTableChanged(removed, results.left, validation);</span>
+
+<span class="fc bfc" id="L326" title="All 2 branches covered.">            if (!invalid.isEmpty())</span>
+            {
+                // Delete the index files and mark the index non-queryable, as its view may be compromised,
+                // and incomplete, for our callers:
+<span class="fc" id="L330">                invalid.forEach(context -&gt; context.indexDescriptor.deleteColumnIndex(index.getIndexContext()));</span>
+<span class="fc" id="L331">                index.makeIndexNonQueryable();</span>
+<span class="fc" id="L332">                incomplete.add(index);</span>
+            }
+<span class="fc" id="L334">        }</span>
+<span class="fc" id="L335">        return incomplete;</span>
+    }
+
+    @Override
+    public boolean validateSSTableAttachedIndexes(Collection&lt;SSTableReader&gt; sstables, boolean throwOnIncomplete)
+    {
+<span class="fc" id="L341">        boolean complete = true;</span>
+
+<span class="fc bfc" id="L343" title="All 2 branches covered.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc" id="L345">            IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);</span>
+
+<span class="fc bfc" id="L347" title="All 2 branches covered.">            if (indexDescriptor.isPerSSTableIndexBuildComplete())</span>
+            {
+<span class="fc" id="L349">                indexDescriptor.checksumPerSSTableComponents();</span>
+
+<span class="fc bfc" id="L351" title="All 2 branches covered.">                for (StorageAttachedIndex index : indexes)</span>
+                {
+<span class="pc bpc" id="L353" title="1 of 2 branches missed.">                    if (indexDescriptor.isPerColumnIndexBuildComplete(index.getIndexContext()))</span>
+<span class="fc" id="L354">                        indexDescriptor.checksumPerIndexComponents(index.getIndexContext());</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                    else if (throwOnIncomplete)</span>
+<span class="nc" id="L356">                        throw new IllegalStateException(indexDescriptor.logMessage(&quot;Incomplete per-column index build&quot;));</span>
+                    else
+<span class="nc" id="L358">                        complete = false;</span>
+<span class="fc" id="L359">                }</span>
+            }
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            else if (throwOnIncomplete)</span>
+            {
+<span class="nc" id="L363">                throw new IllegalStateException(indexDescriptor.logMessage(&quot;Incomplete per-SSTable index build&quot;));</span>
+            }
+            else
+            {
+<span class="fc" id="L367">                complete = false;</span>
+            }
+<span class="fc" id="L369">        }</span>
+
+<span class="fc" id="L371">        return complete;    </span>
+    }
+
+    /**
+     * open index files by checking number of {@link SSTableContext} and {@link SSTableIndex},
+     * so transient open files during validation and files that are still open for in-flight requests will not be tracked.
+     *
+     * @return total number of open files for all {@link StorageAttachedIndex}es.
+     */
+    public int openIndexFiles()
+    {
+<span class="fc" id="L382">        return contextManager.openFiles() + indexes.stream().mapToInt(index -&gt; index.getIndexContext().openPerIndexFiles()).sum();</span>
+    }
+
+    /**
+     * @return total disk usage (in bytes) of all per-sstable index files
+     */
+    public long diskUsage()
+    {
+<span class="fc" id="L390">        return contextManager.diskUsage();</span>
+    }
+
+    /**
+     * @return count of indexes building
+     */
+    public int totalIndexBuildsInProgress()
+    {
+<span class="nc" id="L398">        return (int) indexes.stream().filter(i -&gt; baseCfs.indexManager.isIndexBuilding(i.getIndexMetadata().name)).count();</span>
+    }
+
+    /**
+     * @return count of queryable indexes
+     */
+    public int totalQueryableIndexCount()
+    {
+<span class="fc" id="L406">        return Ints.checkedCast(indexes.stream().filter(baseCfs.indexManager::isIndexQueryable).count());</span>
+    }
+
+    /**
+     * @return count of indexes
+     */
+    public int totalIndexCount()
+    {
+<span class="fc" id="L414">        return indexes.size();</span>
+    }
+
+    /**
+     * @return total disk usage of all per-sstable index files and per-column index files
+     */
+    public long totalDiskUsage()
+    {
+<span class="fc" id="L422">        return diskUsage() + indexes.stream().flatMap(index -&gt; index.getIndexContext().getView().getIndexes().stream())</span>
+<span class="fc" id="L423">                                    .mapToLong(SSTableIndex::sizeOfPerColumnComponents).sum();</span>
+    }
+
+    public TableMetadata metadata()
+    {
+<span class="fc" id="L428">        return baseCfs.metadata();</span>
+    }
+
+    public ColumnFamilyStore table()
+    {
+<span class="fc" id="L433">        return baseCfs;</span>
+    }
+
+    @VisibleForTesting
+    public SSTableContextManager sstableContextManager()
+    {
+<span class="fc" id="L439">        return contextManager;</span>
+    }
+
+    /**
+     * simulate index loading on restart with index file validation
+     */
+    @VisibleForTesting
+    public void unsafeReload()
+    {
+<span class="fc" id="L448">        contextManager.clear();</span>
+<span class="fc" id="L449">        onSSTableChanged(baseCfs.getLiveSSTables(), Collections.emptySet(), indexes, IndexValidation.NONE);</span>
+<span class="fc" id="L450">        onSSTableChanged(Collections.emptySet(), baseCfs.getLiveSSTables(), indexes, IndexValidation.HEADER_FOOTER);</span>
+<span class="fc" id="L451">    }</span>
+
+    /**
+     * Simulate the index going through a restart of node
+     */
+    @VisibleForTesting
+    public void reset()
+    {
+<span class="fc" id="L459">        contextManager.clear();</span>
+<span class="fc" id="L460">        indexes.forEach(StorageAttachedIndex::makeIndexNonQueryable);</span>
+<span class="fc" id="L461">        onSSTableChanged(baseCfs.getLiveSSTables(), Collections.emptySet(), indexes, IndexValidation.NONE);</span>
+<span class="fc" id="L462">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

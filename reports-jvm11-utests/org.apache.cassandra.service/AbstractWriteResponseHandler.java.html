@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractWriteResponseHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">AbstractWriteResponseHandler.java</span></div><h1>AbstractWriteResponseHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
+
+import org.apache.cassandra.db.ConsistencyLevel;
+
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.locator.ReplicaPlan.ForWrite;
+import org.apache.cassandra.utils.concurrent.Condition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.IMutation;
+import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.exceptions.WriteFailureException;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.RequestCallback;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static java.lang.Long.MAX_VALUE;
+import static java.lang.Math.min;
+import static java.util.concurrent.TimeUnit.MICROSECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static java.util.stream.Collectors.toList;
+import static org.apache.cassandra.config.DatabaseDescriptor.getCounterWriteRpcTimeout;
+import static org.apache.cassandra.config.DatabaseDescriptor.getWriteRpcTimeout;
+import static org.apache.cassandra.db.WriteType.COUNTER;
+import static org.apache.cassandra.schema.Schema.instance;
+import static org.apache.cassandra.service.StorageProxy.WritePerformer;
+import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+import static org.apache.cassandra.locator.Replicas.countInOurDc;
+
+
+public abstract class AbstractWriteResponseHandler&lt;T&gt; implements RequestCallback&lt;T&gt;
+{
+<span class="fc" id="L70">    protected static final Logger logger = LoggerFactory.getLogger(AbstractWriteResponseHandler.class);</span>
+
+    //Count down until all responses and expirations have occured before deciding whether the ideal CL was reached.
+    private AtomicInteger responsesAndExpirations;
+<span class="fc" id="L74">    private final Condition condition = newOneTimeCondition();</span>
+    protected final ReplicaPlan.ForWrite replicaPlan;
+
+    protected final Runnable callback;
+    protected final WriteType writeType;
+<span class="fc" id="L79">    private static final AtomicIntegerFieldUpdater&lt;AbstractWriteResponseHandler&gt; failuresUpdater =</span>
+<span class="fc" id="L80">        AtomicIntegerFieldUpdater.newUpdater(AbstractWriteResponseHandler.class, &quot;failures&quot;);</span>
+<span class="fc" id="L81">    private volatile int failures = 0;</span>
+    private final Map&lt;InetAddressAndPort, RequestFailureReason&gt; failureReasonByEndpoint;
+    private final long queryStartNanoTime;
+    private @Nullable final Supplier&lt;Mutation&gt; hintOnFailure;
+
+    /**
+      * Delegate to another WriteResponseHandler or possibly this one to track if the ideal consistency level was reached.
+      * Will be set to null if ideal CL was not configured
+      * Will be set to an AWRH delegate if ideal CL was configured
+      * Will be same as &quot;this&quot; if this AWRH is the ideal consistency level
+      */
+    private AbstractWriteResponseHandler idealCLDelegate;
+
+    /**
+     * We don't want to increment the writeFailedIdealCL if we didn't achieve the original requested CL
+     */
+<span class="fc" id="L97">    private boolean requestedCLAchieved = false;</span>
+
+    /**
+     * @param callback           A callback to be called when the write is successful.
+     * @param hintOnFailure
+     * @param queryStartNanoTime
+     */
+    protected AbstractWriteResponseHandler(ForWrite replicaPlan, Runnable callback, WriteType writeType,
+                                           Supplier&lt;Mutation&gt; hintOnFailure, long queryStartNanoTime)
+<span class="fc" id="L106">    {</span>
+<span class="fc" id="L107">        this.replicaPlan = replicaPlan;</span>
+<span class="fc" id="L108">        this.callback = callback;</span>
+<span class="fc" id="L109">        this.writeType = writeType;</span>
+<span class="fc" id="L110">        this.hintOnFailure = hintOnFailure;</span>
+<span class="fc" id="L111">        this.failureReasonByEndpoint = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L112">        this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L113">    }</span>
+
+    public void get() throws WriteTimeoutException, WriteFailureException
+    {
+<span class="fc" id="L117">        long timeoutNanos = currentTimeoutNanos();</span>
+
+        boolean signaled;
+        try
+        {
+<span class="fc" id="L122">            signaled = condition.await(timeoutNanos, NANOSECONDS);</span>
+        }
+<span class="nc" id="L124">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L126">            throw new UncheckedInterruptedException(e);</span>
+<span class="fc" id="L127">        }</span>
+
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (!signaled)</span>
+<span class="nc" id="L130">            throwTimeout();</span>
+
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">        if (blockFor() + failures &gt; candidateReplicaCount())</span>
+        {
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (RequestCallback.isTimeout(this.failureReasonByEndpoint.keySet().stream()</span>
+<span class="nc" id="L135">                                                                      .filter(this::waitingFor) // DatacenterWriteResponseHandler filters errors from remote DCs</span>
+<span class="nc" id="L136">                                                                      .collect(Collectors.toMap(Function.identity(), this.failureReasonByEndpoint::get))))</span>
+<span class="nc" id="L137">                throwTimeout();</span>
+
+<span class="nc" id="L139">            throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, this.failureReasonByEndpoint);</span>
+        }
+<span class="fc" id="L141">    }</span>
+
+    private void throwTimeout()
+    {
+<span class="fc" id="L145">        int blockedFor = blockFor();</span>
+<span class="fc" id="L146">        int acks = ackCount();</span>
+        // It's pretty unlikely, but we can race between exiting await above and here, so
+        // that we could now have enough acks. In that case, we &quot;lie&quot; on the acks count to
+        // avoid sending confusing info to the user (see CASSANDRA-6491).
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        if (acks &gt;= blockedFor)</span>
+<span class="fc" id="L151">            acks = blockedFor - 1;</span>
+<span class="fc" id="L152">        throw new WriteTimeoutException(writeType, replicaPlan.consistencyLevel(), acks, blockedFor);</span>
+    }
+
+    public final long currentTimeoutNanos()
+    {
+<span class="fc bfc" id="L157" title="All 2 branches covered.">        long requestTimeout = writeType == COUNTER</span>
+<span class="fc" id="L158">                              ? getCounterWriteRpcTimeout(NANOSECONDS)</span>
+<span class="fc" id="L159">                              : getWriteRpcTimeout(NANOSECONDS);</span>
+<span class="fc" id="L160">        return requestTimeout - (nanoTime() - queryStartNanoTime);</span>
+    }
+
+    /**
+     * Set a delegate ideal CL write response handler. Note that this could be the same as this
+     * if the ideal CL and requested CL are the same.
+     */
+    public void setIdealCLResponseHandler(AbstractWriteResponseHandler handler)
+    {
+<span class="fc" id="L169">        this.idealCLDelegate = handler;</span>
+<span class="fc" id="L170">        idealCLDelegate.responsesAndExpirations = new AtomicInteger(replicaPlan.contacts().size());</span>
+<span class="fc" id="L171">    }</span>
+
+    /**
+     * This logs the response but doesn't do any further processing related to this write response handler
+     * on whether the CL was achieved. Only call this after the subclass has completed all it's processing
+     * since the subclass instance may be queried to find out if the CL was achieved.
+     */
+    protected final void logResponseToIdealCLDelegate(Message&lt;T&gt; m)
+    {
+        //Tracking ideal CL was not configured
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        if (idealCLDelegate == null)</span>
+        {
+<span class="fc" id="L183">            return;</span>
+        }
+
+<span class="fc bfc" id="L186" title="All 2 branches covered.">        if (idealCLDelegate == this)</span>
+        {
+            //Processing of the message was already done since this is the handler for the
+            //ideal consistency level. Just decrement the counter.
+<span class="fc" id="L190">            decrementResponseOrExpired();</span>
+        }
+        else
+        {
+            //Let the delegate do full processing, this will loop back into the branch above
+            //with idealCLDelegate == this, because the ideal write handler idealCLDelegate will always
+            //be set to this in the delegate.
+<span class="fc" id="L197">            idealCLDelegate.onResponse(m);</span>
+        }
+<span class="fc" id="L199">    }</span>
+
+    public final void expired()
+    {
+        //Tracking ideal CL was not configured
+<span class="pc bpc" id="L204" title="1 of 2 branches missed.">        if (idealCLDelegate == null)</span>
+        {
+<span class="nc" id="L206">            return;</span>
+        }
+
+        //The requested CL matched ideal CL so reuse this object
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">        if (idealCLDelegate == this)</span>
+        {
+<span class="nc" id="L212">            decrementResponseOrExpired();</span>
+        }
+        else
+        {
+            //Have the delegate track the expired response
+<span class="fc" id="L217">            idealCLDelegate.decrementResponseOrExpired();</span>
+        }
+<span class="fc" id="L219">    }</span>
+
+    /**
+     * @return the minimum number of endpoints that must respond.
+     */
+    protected int blockFor()
+    {
+        // During bootstrap, we have to include the pending endpoints or we may fail the consistency level
+        // guarantees (see #833)
+<span class="fc" id="L228">        return replicaPlan.writeQuorum();</span>
+    }
+
+    /**
+     * TODO: this method is brittle for its purpose of deciding when we should fail a query;
+     *       this needs to be aware of which nodes are live/down
+     * @return the total number of endpoints the request can send to.
+     */
+    protected int candidateReplicaCount()
+    {
+<span class="fc bfc" id="L238" title="All 2 branches covered.">        if (replicaPlan.consistencyLevel().isDatacenterLocal())</span>
+<span class="fc" id="L239">            return countInOurDc(replicaPlan.liveAndDown()).allReplicas();</span>
+
+<span class="fc" id="L241">        return replicaPlan.liveAndDown().size();</span>
+    }
+
+    public ConsistencyLevel consistencyLevel()
+    {
+<span class="nc" id="L246">        return replicaPlan.consistencyLevel();</span>
+    }
+
+    /**
+     * @return true if the message counts towards the blockFor() threshold
+     */
+    protected boolean waitingFor(InetAddressAndPort from)
+    {
+<span class="nc" id="L254">        return true;</span>
+    }
+
+    /**
+     * @return number of responses received
+     */
+    protected abstract int ackCount();
+
+    /**
+     * null message means &quot;response from local write&quot;
+     */
+    public abstract void onResponse(Message&lt;T&gt; msg);
+
+    protected void signal()
+    {
+        //The ideal CL should only count as a strike if the requested CL was achieved.
+        //If the requested CL is not achieved it's fine for the ideal CL to also not be achieved.
+<span class="fc bfc" id="L271" title="All 2 branches covered.">        if (idealCLDelegate != null)</span>
+        {
+<span class="fc" id="L273">            idealCLDelegate.requestedCLAchieved = true;</span>
+        }
+
+<span class="fc" id="L276">        condition.signalAll();</span>
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">        if (callback != null)</span>
+<span class="nc" id="L278">            callback.run();</span>
+<span class="fc" id="L279">    }</span>
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+    {
+<span class="nc" id="L284">        logger.trace(&quot;Got failure from {}&quot;, from);</span>
+
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        int n = waitingFor(from)</span>
+<span class="nc" id="L287">                ? failuresUpdater.incrementAndGet(this)</span>
+<span class="nc" id="L288">                : failures;</span>
+
+<span class="nc" id="L290">        failureReasonByEndpoint.put(from, failureReason);</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">        if (blockFor() + n &gt; candidateReplicaCount())</span>
+<span class="nc" id="L293">            signal();</span>
+
+<span class="nc bnc" id="L295" title="All 4 branches missed.">        if (hintOnFailure != null &amp;&amp; StorageProxy.shouldHint(replicaPlan.lookup(from)))</span>
+<span class="nc" id="L296">            StorageProxy.submitHint(hintOnFailure.get(), replicaPlan.lookup(from), null);</span>
+<span class="nc" id="L297">    }</span>
+
+    @Override
+    public boolean invokeOnFailure()
+    {
+<span class="nc" id="L302">        return true;</span>
+    }
+
+    /**
+     * Decrement the counter for all responses/expirations and if the counter
+     * hits 0 check to see if the ideal consistency level (this write response handler)
+     * was reached using the signal.
+     */
+    private final void decrementResponseOrExpired()
+    {
+<span class="fc" id="L312">        int decrementedValue = responsesAndExpirations.decrementAndGet();</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">        if (decrementedValue == 0)</span>
+        {
+            // The condition being signaled is a valid proxy for the CL being achieved
+            // Only mark it as failed if the requested CL was achieved.
+<span class="fc bfc" id="L317" title="All 4 branches covered.">            if (!condition.isSignalled() &amp;&amp; requestedCLAchieved)</span>
+            {
+<span class="fc" id="L319">                replicaPlan.keyspace().metric.writeFailedIdealCL.inc();</span>
+            }
+            else
+            {
+<span class="fc" id="L323">                replicaPlan.keyspace().metric.idealCLWriteLatency.addNano(nanoTime() - queryStartNanoTime);</span>
+            }
+        }
+<span class="fc" id="L326">    }</span>
+
+    /**
+     * Cheap Quorum backup.  If we failed to reach quorum with our initial (full) nodes, reach out to other nodes.
+     */
+    public void maybeTryAdditionalReplicas(IMutation mutation, WritePerformer writePerformer, String localDC)
+    {
+<span class="fc" id="L333">        EndpointsForToken uncontacted = replicaPlan.liveUncontacted();</span>
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">        if (uncontacted.isEmpty())</span>
+<span class="fc" id="L335">            return;</span>
+
+<span class="nc" id="L337">        long timeout = MAX_VALUE;</span>
+<span class="nc" id="L338">        List&lt;ColumnFamilyStore&gt; cfs = mutation.getTableIds().stream()</span>
+<span class="nc" id="L339">                                              .map(instance::getColumnFamilyStoreInstance)</span>
+<span class="nc" id="L340">                                              .collect(toList());</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        for (ColumnFamilyStore cf : cfs)</span>
+<span class="nc" id="L342">            timeout = min(timeout, cf.additionalWriteLatencyMicros);</span>
+
+        // no latency information, or we're overloaded
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if (timeout &gt; mutation.getTimeout(MICROSECONDS))</span>
+<span class="nc" id="L346">            return;</span>
+
+        try
+        {
+<span class="nc bnc" id="L350" title="All 2 branches missed.">            if (!condition.await(timeout, MICROSECONDS))</span>
+            {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                for (ColumnFamilyStore cf : cfs)</span>
+<span class="nc" id="L353">                    cf.metric.additionalWrites.inc();</span>
+
+<span class="nc" id="L355">                writePerformer.apply(mutation, replicaPlan.withContacts(uncontacted),</span>
+                                     (AbstractWriteResponseHandler&lt;IMutation&gt;) this,
+                                     localDC);
+            }
+        }
+<span class="nc" id="L360">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L362">            throw new UncheckedInterruptedException(e);</span>
+<span class="nc" id="L363">        }</span>
+<span class="nc" id="L364">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

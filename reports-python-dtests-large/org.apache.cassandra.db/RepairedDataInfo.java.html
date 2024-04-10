@@ -1,0 +1,370 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RepairedDataInfo.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db</a> &gt; <span class="el_source">RepairedDataInfo.java</span></div><h1>RepairedDataInfo.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db;
+
+import java.nio.ByteBuffer;
+import java.util.function.LongPredicate;
+import java.util.concurrent.TimeUnit;
+
+import javax.annotation.concurrent.NotThreadSafe;
+
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.PurgeFunction;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.MoreRows;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+@NotThreadSafe
+class RepairedDataInfo
+{
+<span class="fc" id="L44">    public static final RepairedDataInfo NO_OP_REPAIRED_DATA_INFO = new RepairedDataInfo(null)</span>
+<span class="fc" id="L45">    {</span>
+        @Override
+        public UnfilteredPartitionIterator withRepairedDataInfo(UnfilteredPartitionIterator iterator)
+        {
+<span class="nc" id="L49">            return iterator;</span>
+        }
+
+        @Override
+        public UnfilteredRowIterator withRepairedDataInfo(UnfilteredRowIterator iterator)
+        {
+<span class="nc" id="L55">            return iterator;</span>
+        }
+            
+        @Override
+        public UnfilteredPartitionIterator extend(UnfilteredPartitionIterator partitions, DataLimits.Counter limit)
+        {
+<span class="nc" id="L61">           return partitions;</span>
+        }
+    };
+
+    // Keeps a digest of the partition currently being processed. Since we won't know
+    // whether a partition will be fully purged from a read result until it's been
+    // consumed, we buffer this per-partition digest and add it to the final digest
+    // when the partition is closed (if it wasn't fully purged).
+    private Digest perPartitionDigest;
+    private Digest perCommandDigest;
+<span class="fc" id="L71">    private boolean isConclusive = true;</span>
+<span class="fc" id="L72">    private ByteBuffer calculatedDigest = null;</span>
+
+    // Doesn't actually purge from the underlying iterators, but excludes from the digest
+    // the purger can't be initialized until we've iterated all the sstables for the query
+    // as it requires the oldest repaired tombstone
+    private RepairedDataPurger purger;
+<span class="fc" id="L78">    private boolean isFullyPurged = true;</span>
+
+    // Supplies additional partitions from the repaired data set to be consumed when the limit of
+    // executing ReadCommand has been reached. This is to ensure that each replica attempts to
+    // read the same amount of repaired data, otherwise comparisons of the repaired data digests
+    // may be invalidated by varying amounts of repaired data being present on each replica.
+    // This can't be initialized until after the underlying repaired iterators have been merged.
+<span class="fc" id="L85">    private UnfilteredPartitionIterator postLimitPartitions = null;</span>
+    private final DataLimits.Counter repairedCounter;
+    private UnfilteredRowIterator currentPartition;
+    private TableMetrics metrics;
+
+    public RepairedDataInfo(DataLimits.Counter repairedCounter)
+<span class="fc" id="L91">    {</span>
+<span class="fc" id="L92">        this.repairedCounter = repairedCounter;</span>
+<span class="fc" id="L93">    }</span>
+
+    /**
+     * If either repaired status tracking is not active or the command has not yet been
+     * executed, then this digest will be an empty buffer.
+     * Otherwise, it will contain a digest of the repaired data read, or an empty buffer
+     * if no repaired data was read.
+     *
+     * @return a digest of the repaired data read during local execution of a command
+     */
+    ByteBuffer getDigest()
+    {
+<span class="fc bfc" id="L105" title="All 2 branches covered.">        if (calculatedDigest != null)</span>
+<span class="fc" id="L106">            return calculatedDigest;</span>
+
+<span class="fc bfc" id="L108" title="All 2 branches covered.">        calculatedDigest = perCommandDigest == null</span>
+<span class="fc" id="L109">                           ? ByteBufferUtil.EMPTY_BYTE_BUFFER</span>
+<span class="fc" id="L110">                           : ByteBuffer.wrap(perCommandDigest.digest());</span>
+
+<span class="fc" id="L112">        return calculatedDigest;</span>
+    }
+
+    void prepare(ColumnFamilyStore cfs, long nowInSec, long oldestUnrepairedTombstone)
+    {
+<span class="fc" id="L117">        this.purger = new RepairedDataPurger(cfs, nowInSec, oldestUnrepairedTombstone);</span>
+<span class="fc" id="L118">        this.metrics = cfs.metric;</span>
+<span class="fc" id="L119">    }</span>
+
+    void finalize(UnfilteredPartitionIterator postLimitPartitions)
+    {
+<span class="fc" id="L123">        this.postLimitPartitions = postLimitPartitions;</span>
+<span class="fc" id="L124">    }</span>
+
+    /**
+     * Returns a boolean indicating whether any relevant sstables were skipped during the read
+     * that produced the repaired data digest.
+     *
+     * If true, then no pending repair sessions or partition deletes have influenced the extent
+     * of the repaired sstables that went into generating the digest.
+     * This indicates whether or not the digest can reliably be used to infer consistency
+     * issues between the repaired sets across replicas.
+     *
+     * If either repaired status tracking is not active or the command has not yet been
+     * executed, then this will always return true.
+     *
+     * @return boolean to indicate confidence in the whether or not the digest of the repaired data can be
+     *         reliably be used to infer inconsistency issues between the repaired sets across replicas
+     */
+    boolean isConclusive()
+    {
+<span class="fc" id="L143">        return isConclusive;</span>
+    }
+
+    void markInconclusive()
+    {
+<span class="nc" id="L148">        isConclusive = false;</span>
+<span class="nc" id="L149">    }</span>
+
+    private void onNewPartition(UnfilteredRowIterator partition)
+    {
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">        assert purger != null;</span>
+<span class="fc" id="L154">        purger.setCurrentKey(partition.partitionKey());</span>
+<span class="fc" id="L155">        purger.setIsReverseOrder(partition.isReverseOrder());</span>
+<span class="fc" id="L156">        this.currentPartition = partition;</span>
+<span class="fc" id="L157">    }</span>
+
+    private Digest getPerPartitionDigest()
+    {
+<span class="fc bfc" id="L161" title="All 2 branches covered.">        if (perPartitionDigest == null)</span>
+<span class="fc" id="L162">            perPartitionDigest = Digest.forRepairedDataTracking();</span>
+
+<span class="fc" id="L164">        return perPartitionDigest;</span>
+    }
+
+    public UnfilteredPartitionIterator withRepairedDataInfo(final UnfilteredPartitionIterator iterator)
+    {
+<span class="nc" id="L169">        class WithTracking extends Transformation&lt;UnfilteredRowIterator&gt;</span>
+        {
+            protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+            {
+<span class="nc" id="L173">                return withRepairedDataInfo(partition);</span>
+            }
+        }
+<span class="nc" id="L176">        return Transformation.apply(iterator, new WithTracking());</span>
+    }
+
+    public UnfilteredRowIterator withRepairedDataInfo(final UnfilteredRowIterator iterator)
+    {
+<span class="fc" id="L181">        class WithTracking extends Transformation&lt;UnfilteredRowIterator&gt;</span>
+        {
+            protected DecoratedKey applyToPartitionKey(DecoratedKey key)
+            {
+<span class="fc" id="L185">                getPerPartitionDigest().update(key.getKey());</span>
+<span class="fc" id="L186">                return key;</span>
+            }
+
+            protected DeletionTime applyToDeletion(DeletionTime deletionTime)
+            {
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">                if (repairedCounter.isDone())</span>
+<span class="nc" id="L192">                    return deletionTime;</span>
+
+<span class="pc bpc" id="L194" title="1 of 2 branches missed.">                assert purger != null;</span>
+<span class="fc" id="L195">                DeletionTime purged = purger.applyToDeletion(deletionTime);</span>
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">                if (!purged.isLive())</span>
+<span class="nc" id="L197">                    isFullyPurged = false;</span>
+<span class="fc" id="L198">                purged.digest(getPerPartitionDigest());</span>
+<span class="fc" id="L199">                return deletionTime;</span>
+            }
+
+            protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+            {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (repairedCounter.isDone())</span>
+<span class="nc" id="L205">                    return marker;</span>
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                assert purger != null;</span>
+<span class="nc" id="L208">                RangeTombstoneMarker purged = purger.applyToMarker(marker);</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                if (purged != null)</span>
+                {
+<span class="nc" id="L211">                    isFullyPurged = false;</span>
+<span class="nc" id="L212">                    purged.digest(getPerPartitionDigest());</span>
+                }
+<span class="nc" id="L214">                return marker;</span>
+            }
+
+            protected Row applyToStatic(Row row)
+            {
+<span class="fc" id="L219">                return applyToRow(row);</span>
+            }
+
+            protected Row applyToRow(Row row)
+            {
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">                if (repairedCounter.isDone())</span>
+<span class="nc" id="L225">                    return row;</span>
+
+<span class="pc bpc" id="L227" title="1 of 2 branches missed.">                assert purger != null;</span>
+<span class="fc" id="L228">                Row purged = purger.applyToRow(row);</span>
+<span class="pc bpc" id="L229" title="1 of 4 branches missed.">                if (purged != null &amp;&amp; !purged.isEmpty())</span>
+                {
+<span class="fc" id="L231">                    isFullyPurged = false;</span>
+<span class="fc" id="L232">                    purged.digest(getPerPartitionDigest());</span>
+                }
+<span class="fc" id="L234">                return row;</span>
+            }
+
+            protected void onPartitionClose()
+            {
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">                if (perPartitionDigest != null)</span>
+                {
+                    // If the partition wasn't completely emptied by the purger,
+                    // calculate the digest for the partition and use it to
+                    // update the overall digest
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">                    if (!isFullyPurged)</span>
+                    {
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">                        if (perCommandDigest == null)</span>
+<span class="fc" id="L247">                            perCommandDigest = Digest.forRepairedDataTracking();</span>
+
+<span class="fc" id="L249">                        byte[] partitionDigest = perPartitionDigest.digest();</span>
+<span class="fc" id="L250">                        perCommandDigest.update(partitionDigest, 0, partitionDigest.length);</span>
+                    }
+
+<span class="fc" id="L253">                    perPartitionDigest = null;</span>
+                }
+<span class="fc" id="L255">                isFullyPurged = true;</span>
+<span class="fc" id="L256">            }</span>
+        }
+
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">        if (repairedCounter.isDone())</span>
+<span class="nc" id="L260">            return iterator;</span>
+
+<span class="fc" id="L262">        UnfilteredRowIterator tracked = repairedCounter.applyTo(Transformation.apply(iterator, new WithTracking()));</span>
+<span class="fc" id="L263">        onNewPartition(tracked);</span>
+<span class="fc" id="L264">        return tracked;</span>
+    }
+
+    public UnfilteredPartitionIterator extend(final UnfilteredPartitionIterator partitions,
+                                              final DataLimits.Counter limit)
+    {
+<span class="fc" id="L270">        class OverreadRepairedData extends Transformation&lt;UnfilteredRowIterator&gt; implements MoreRows&lt;UnfilteredRowIterator&gt;</span>
+        {
+
+            protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+            {
+<span class="fc" id="L275">                return MoreRows.extend(partition, this, partition.columns());</span>
+            }
+
+            public UnfilteredRowIterator moreContents()
+            {
+                // We don't need to do anything until the DataLimits of the
+                // of the read have been reached
+<span class="pc bpc" id="L282" title="3 of 4 branches missed.">                if (!limit.isDone() || repairedCounter.isDone())</span>
+<span class="fc" id="L283">                    return null;</span>
+
+<span class="nc" id="L285">                long countBeforeOverreads = repairedCounter.counted();</span>
+<span class="nc" id="L286">                long overreadStartTime = nanoTime();</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">                if (currentPartition != null)</span>
+<span class="nc" id="L288">                    consumePartition(currentPartition, repairedCounter);</span>
+
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                if (postLimitPartitions != null)</span>
+<span class="nc bnc" id="L291" title="All 4 branches missed.">                    while (postLimitPartitions.hasNext() &amp;&amp; !repairedCounter.isDone())</span>
+<span class="nc" id="L292">                        consumePartition(postLimitPartitions.next(), repairedCounter);</span>
+
+                // we're not actually providing any more rows, just consuming the repaired data
+<span class="nc" id="L295">                long rows = repairedCounter.counted() - countBeforeOverreads;</span>
+<span class="nc" id="L296">                long nanos = nanoTime() - overreadStartTime;</span>
+<span class="nc" id="L297">                metrics.repairedDataTrackingOverreadRows.update(rows);</span>
+<span class="nc" id="L298">                metrics.repairedDataTrackingOverreadTime.update(nanos, TimeUnit.NANOSECONDS);</span>
+<span class="nc" id="L299">                Tracing.trace(&quot;Read {} additional rows of repaired data for tracking in {}ps&quot;, rows, TimeUnit.NANOSECONDS.toMicros(nanos));</span>
+<span class="nc" id="L300">                return null;</span>
+            }
+
+            private void consumePartition(UnfilteredRowIterator partition, DataLimits.Counter counter)
+            {
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                if (partition == null)</span>
+<span class="nc" id="L306">                    return;</span>
+
+<span class="nc bnc" id="L308" title="All 4 branches missed.">                while (!counter.isDone() &amp;&amp; partition.hasNext())</span>
+<span class="nc" id="L309">                    partition.next();</span>
+
+<span class="nc" id="L311">                partition.close();</span>
+<span class="nc" id="L312">            }</span>
+        }
+        // If the read didn't touch any sstables prepare() hasn't been called and
+        // we can skip this transformation
+<span class="pc bpc" id="L316" title="1 of 4 branches missed.">        if (metrics == null || repairedCounter.isDone())</span>
+<span class="fc" id="L317">            return partitions;</span>
+<span class="fc" id="L318">        return Transformation.apply(partitions, new OverreadRepairedData());</span>
+    }
+
+    /**
+     * Although PurgeFunction extends Transformation, this is never applied to an iterator.
+     * Instead, it is used by RepairedDataInfo during the generation of a repaired data
+     * digest to exclude data which will actually be purged later on in the read pipeline.
+     */
+    private static class RepairedDataPurger extends PurgeFunction
+    {
+        RepairedDataPurger(ColumnFamilyStore cfs,
+                           long nowInSec,
+                           long oldestUnrepairedTombstone)
+        {
+<span class="fc" id="L332">            super(nowInSec,</span>
+<span class="fc" id="L333">                  cfs.gcBefore(nowInSec),</span>
+                  oldestUnrepairedTombstone,
+<span class="fc" id="L335">                  cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones(),</span>
+<span class="fc" id="L336">                  cfs.metadata.get().enforceStrictLiveness());</span>
+<span class="fc" id="L337">        }</span>
+
+        protected LongPredicate getPurgeEvaluator()
+        {
+<span class="nc" id="L341">            return (time) -&gt; true;</span>
+        }
+
+        void setCurrentKey(DecoratedKey key)
+        {
+<span class="fc" id="L346">            super.onNewPartition(key);</span>
+<span class="fc" id="L347">        }</span>
+
+        void setIsReverseOrder(boolean isReverseOrder)
+        {
+<span class="fc" id="L351">            super.setReverseOrder(isReverseOrder);</span>
+<span class="fc" id="L352">        }</span>
+
+        public DeletionTime applyToDeletion(DeletionTime deletionTime)
+        {
+<span class="fc" id="L356">            return super.applyToDeletion(deletionTime);</span>
+        }
+
+        public Row applyToRow(Row row)
+        {
+<span class="fc" id="L361">            return super.applyToRow(row);</span>
+        }
+
+        public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+        {
+<span class="nc" id="L366">            return super.applyToMarker(marker);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

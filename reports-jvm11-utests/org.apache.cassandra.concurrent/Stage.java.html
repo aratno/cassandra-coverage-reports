@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Stage.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.concurrent</a> &gt; <span class="el_source">Stage.java</span></div><h1>Stage.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.concurrent;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.Future;
+
+import static java.util.stream.Collectors.toMap;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+
+<span class="fc" id="L43">public enum Stage</span>
+{
+<span class="fc" id="L45">    READ              (false, &quot;ReadStage&quot;,             &quot;request&quot;,  DatabaseDescriptor::getConcurrentReaders,        DatabaseDescriptor::setConcurrentReaders,        Stage::multiThreadedLowSignalStage),</span>
+<span class="fc" id="L46">    MUTATION          (true,  &quot;MutationStage&quot;,         &quot;request&quot;,  DatabaseDescriptor::getConcurrentWriters,        DatabaseDescriptor::setConcurrentWriters,        Stage::multiThreadedLowSignalStage),</span>
+<span class="fc" id="L47">    COUNTER_MUTATION  (true,  &quot;CounterMutationStage&quot;,  &quot;request&quot;,  DatabaseDescriptor::getConcurrentCounterWriters, DatabaseDescriptor::setConcurrentCounterWriters, Stage::multiThreadedLowSignalStage),</span>
+<span class="fc" id="L48">    VIEW_MUTATION     (true,  &quot;ViewMutationStage&quot;,     &quot;request&quot;,  DatabaseDescriptor::getConcurrentViewWriters,    DatabaseDescriptor::setConcurrentViewWriters,    Stage::multiThreadedLowSignalStage),</span>
+<span class="fc" id="L49">    GOSSIP            (true,  &quot;GossipStage&quot;,           &quot;internal&quot;, () -&gt; 1,                                         null,                                            Stage::singleThreadedStage),</span>
+<span class="fc" id="L50">    REQUEST_RESPONSE  (false, &quot;RequestResponseStage&quot;,  &quot;request&quot;,  FBUtilities::getAvailableProcessors,             null,                                            Stage::multiThreadedLowSignalStage),</span>
+<span class="fc" id="L51">    ANTI_ENTROPY      (false, &quot;AntiEntropyStage&quot;,      &quot;internal&quot;, () -&gt; 1,                                         null,                                            Stage::singleThreadedStage),</span>
+<span class="fc" id="L52">    MIGRATION         (false, &quot;MigrationStage&quot;,        &quot;internal&quot;, () -&gt; 1,                                         null,                                            Stage::migrationStage),</span>
+<span class="fc" id="L53">    MISC              (false, &quot;MiscStage&quot;,             &quot;internal&quot;, () -&gt; 1,                                         null,                                            Stage::singleThreadedStage),</span>
+<span class="fc" id="L54">    TRACING           (false, &quot;TracingStage&quot;,          &quot;internal&quot;, () -&gt; 1,                                         null,                                            Stage::tracingStage),</span>
+<span class="fc" id="L55">    INTERNAL_RESPONSE (false, &quot;InternalResponseStage&quot;, &quot;internal&quot;, FBUtilities::getAvailableProcessors,             null,                                            Stage::multiThreadedStage),</span>
+<span class="fc" id="L56">    IMMEDIATE         (false, &quot;ImmediateStage&quot;,        &quot;internal&quot;, () -&gt; 0,                                         null,                                            Stage::immediateExecutor),</span>
+<span class="fc" id="L57">    PAXOS_REPAIR      (false, &quot;PaxosRepairStage&quot;,      &quot;internal&quot;, FBUtilities::getAvailableProcessors,             null,                                            Stage::multiThreadedStage),</span>
+    ;
+
+    public final String jmxName;
+    private final Supplier&lt;ExecutorPlus&gt; executorSupplier;
+    private volatile ExecutorPlus executor;
+    /** Set true if this executor should be gracefully shutdown before stopping
+     * the commitlog allocator. Tasks on executors that issue mutations may
+     * block indefinitely waiting for a new commitlog segment, preventing a
+     * clean drain/shutdown.
+     */
+    public final boolean shutdownBeforeCommitlog;
+
+    Stage(boolean shutdownBeforeCommitlog, String jmxName, String jmxType, IntSupplier numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize, ExecutorServiceInitialiser executorSupplier)
+<span class="fc" id="L71">    {</span>
+<span class="fc" id="L72">        this.shutdownBeforeCommitlog = shutdownBeforeCommitlog;</span>
+<span class="fc" id="L73">        this.jmxName = jmxName;</span>
+<span class="fc" id="L74">        this.executorSupplier = () -&gt; executorSupplier.init(jmxName, jmxType, numThreads.getAsInt(), onSetMaximumPoolSize);</span>
+<span class="fc" id="L75">    }</span>
+
+    private static String normalizeName(String stageName)
+    {
+        // Handle discrepancy between JMX names and actual pool names
+<span class="fc" id="L80">        String upperStageName = stageName.toUpperCase();</span>
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">        if (upperStageName.endsWith(&quot;STAGE&quot;))</span>
+        {
+<span class="fc" id="L83">            upperStageName = upperStageName.substring(0, stageName.length() - 5);</span>
+        }
+<span class="fc" id="L85">        return upperStageName;</span>
+    }
+
+<span class="fc" id="L88">    private static final Map&lt;String,Stage&gt; nameMap = Arrays.stream(values())</span>
+<span class="fc" id="L89">                                                           .collect(toMap(s -&gt; Stage.normalizeName(s.jmxName),</span>
+<span class="fc" id="L90">                                                                          s -&gt; s));</span>
+
+    public static Stage fromPoolName(String stageName)
+    {
+<span class="nc" id="L94">        String upperStageName = normalizeName(stageName);</span>
+
+<span class="nc" id="L96">        Stage result = nameMap.get(upperStageName);</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        if (result != null)</span>
+<span class="nc" id="L98">            return result;</span>
+
+        try
+        {
+<span class="nc" id="L102">            return valueOf(upperStageName);</span>
+        }
+<span class="nc" id="L104">        catch (IllegalArgumentException e)</span>
+        {
+<span class="nc bnc" id="L106" title="All 5 branches missed.">            switch(upperStageName) // Handle discrepancy between configuration file and stage names</span>
+            {
+                case &quot;CONCURRENT_READS&quot;:
+<span class="nc" id="L109">                    return READ;</span>
+                case &quot;CONCURRENT_WRITERS&quot;:
+<span class="nc" id="L111">                    return MUTATION;</span>
+                case &quot;CONCURRENT_COUNTER_WRITES&quot;:
+<span class="nc" id="L113">                    return COUNTER_MUTATION;</span>
+                case &quot;CONCURRENT_MATERIALIZED_VIEW_WRITES&quot;:
+<span class="nc" id="L115">                    return VIEW_MUTATION;</span>
+                default:
+<span class="nc" id="L117">                    throw new IllegalStateException(&quot;Must be one of &quot; + Arrays.stream(values())</span>
+<span class="nc" id="L118">                                                                              .map(Enum::toString)</span>
+<span class="nc" id="L119">                                                                              .collect(Collectors.joining(&quot;,&quot;)));</span>
+            }
+        }
+    }
+
+    // Convenience functions to execute on this stage
+<span class="fc" id="L125">    public void execute(Runnable task) { executor().execute(task); }</span>
+<span class="fc" id="L126">    public void execute(ExecutorLocals locals, Runnable task) { executor().execute(locals, task); }</span>
+<span class="fc" id="L127">    public void maybeExecuteImmediately(Runnable task) { executor().maybeExecuteImmediately(task); }</span>
+<span class="fc" id="L128">    public &lt;T&gt; Future&lt;T&gt; submit(Callable&lt;T&gt; task) { return executor().submit(task); }</span>
+<span class="fc" id="L129">    public Future&lt;?&gt; submit(Runnable task) { return executor().submit(task); }</span>
+<span class="fc" id="L130">    public &lt;T&gt; Future&lt;T&gt; submit(Runnable task, T result) { return executor().submit(task, result); }</span>
+
+    public ExecutorPlus executor()
+    {
+<span class="fc bfc" id="L134" title="All 2 branches covered.">        if (executor == null)</span>
+        {
+<span class="fc" id="L136">            synchronized (this)</span>
+            {
+<span class="fc bfc" id="L138" title="All 2 branches covered.">                if (executor == null)</span>
+                {
+<span class="fc" id="L140">                    executor = executorSupplier.get();</span>
+                }
+<span class="fc" id="L142">            }</span>
+        }
+<span class="fc" id="L144">        return executor;</span>
+    }
+
+    @VisibleForTesting
+    public void unsafeSetExecutor(ExecutorPlus executor)
+    {
+<span class="fc" id="L150">        this.executor = executor;</span>
+<span class="fc" id="L151">    }</span>
+
+    private static List&lt;ExecutorPlus&gt; executors()
+    {
+<span class="fc" id="L155">        return Stream.of(Stage.values())</span>
+<span class="fc" id="L156">                     .map(Stage::executor)</span>
+<span class="fc" id="L157">                     .collect(Collectors.toList());</span>
+    }
+
+    private static List&lt;ExecutorPlus&gt; mutatingExecutors()
+    {
+<span class="fc" id="L162">        return Stream.of(Stage.values())</span>
+<span class="fc" id="L163">                     .filter(stage -&gt; stage.shutdownBeforeCommitlog)</span>
+<span class="fc" id="L164">                     .map(Stage::executor)</span>
+<span class="fc" id="L165">                     .collect(Collectors.toList());</span>
+    }
+
+    /**
+     * This method shuts down all registered stages.
+     */
+    public static void shutdownNow()
+    {
+<span class="fc" id="L173">        ExecutorUtils.shutdownNow(executors());</span>
+<span class="fc" id="L174">    }</span>
+
+    public static void shutdownAndAwaitMutatingExecutors(boolean interrupt, long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L178">        List&lt;ExecutorPlus&gt; executors = mutatingExecutors();</span>
+<span class="fc" id="L179">        ExecutorUtils.shutdown(interrupt, executors);</span>
+<span class="fc" id="L180">        ExecutorUtils.awaitTermination(timeout, units, executors);</span>
+<span class="fc" id="L181">    }</span>
+
+    public static boolean areMutationExecutorsTerminated()
+    {
+<span class="fc" id="L185">        return mutatingExecutors().stream().allMatch(ExecutorPlus::isTerminated);</span>
+    }
+
+    @VisibleForTesting
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L191">        List&lt;ExecutorPlus&gt; executors = executors();</span>
+<span class="nc" id="L192">        ExecutorUtils.shutdownNow(executors);</span>
+<span class="nc" id="L193">        ExecutorUtils.awaitTermination(timeout, units, executors);</span>
+<span class="nc" id="L194">    }</span>
+
+    private static ExecutorPlus tracingStage(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L198">        return executorFactory()</span>
+<span class="fc" id="L199">                .withJmx(jmxType)</span>
+<span class="fc" id="L200">                .configureSequential(jmxName)</span>
+<span class="fc" id="L201">                .withQueueLimit(1000)</span>
+<span class="pc" id="L202">                .withRejectedExecutionHandler((r, executor) -&gt; MessagingService.instance().metrics.recordSelfDroppedMessage(Verb._TRACE)).build();</span>
+    }
+
+    private static ExecutorPlus migrationStage(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L207">        return executorFactory()</span>
+<span class="fc" id="L208">               .localAware()</span>
+<span class="fc" id="L209">               .withJmx(jmxType)</span>
+<span class="fc" id="L210">               .sequential(jmxName);</span>
+    }
+
+    private static LocalAwareExecutorPlus singleThreadedStage(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L215">        return executorFactory()</span>
+<span class="fc" id="L216">                .localAware()</span>
+<span class="fc" id="L217">                .withJmx(jmxType)</span>
+<span class="fc" id="L218">                .sequential(jmxName);</span>
+    }
+
+    static LocalAwareExecutorPlus multiThreadedStage(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L223">        return executorFactory()</span>
+<span class="fc" id="L224">                .localAware()</span>
+<span class="fc" id="L225">                .withJmx(jmxType)</span>
+<span class="fc" id="L226">                .pooled(jmxName, numThreads);</span>
+    }
+
+    static LocalAwareExecutorPlus multiThreadedLowSignalStage(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L231">        return executorFactory()</span>
+<span class="fc" id="L232">                .localAware()</span>
+<span class="fc" id="L233">                .withJmx(jmxType)</span>
+<span class="fc" id="L234">                .shared(jmxName, numThreads, onSetMaximumPoolSize);</span>
+    }
+
+    static LocalAwareExecutorPlus immediateExecutor(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize)
+    {
+<span class="fc" id="L239">        return ImmediateExecutor.INSTANCE;</span>
+    }
+
+    @FunctionalInterface
+    public interface ExecutorServiceInitialiser
+    {
+        public ExecutorPlus init(String jmxName, String jmxType, int numThreads, LocalAwareExecutorPlus.MaximumPoolSizeListener onSetMaximumPoolSize);
+    }
+
+    /**
+     * Returns core thread pool size
+     */
+    public int getCorePoolSize()
+    {
+<span class="nc" id="L253">        return executor().getCorePoolSize();</span>
+    }
+
+    /**
+     * Allows user to resize core thread pool size
+     */
+    public void setCorePoolSize(int newCorePoolSize)
+    {
+<span class="nc" id="L261">        executor().setCorePoolSize(newCorePoolSize);</span>
+<span class="nc" id="L262">    }</span>
+
+    /**
+     * Returns maximum pool size of thread pool.
+     */
+    public int getMaximumPoolSize()
+    {
+<span class="nc" id="L269">        return executor().getMaximumPoolSize();</span>
+    }
+
+    /**
+     * Allows user to resize maximum size of the thread pool.
+     */
+    public void setMaximumPoolSize(int newMaximumPoolSize)
+    {
+<span class="nc" id="L277">        executor().setMaximumPoolSize(newMaximumPoolSize);</span>
+<span class="nc" id="L278">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

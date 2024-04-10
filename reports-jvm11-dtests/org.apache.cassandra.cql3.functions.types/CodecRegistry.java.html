@@ -1,0 +1,909 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CodecRegistry.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.functions.types</a> &gt; <span class="el_source">CodecRegistry.java</span></div><h1>CodecRegistry.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.functions.types;
+
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+
+import com.google.common.cache.*;
+import com.google.common.reflect.TypeToken;
+import com.google.common.util.concurrent.UncheckedExecutionException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cql3.functions.types.exceptions.CodecNotFoundException;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.cassandra.cql3.functions.types.DataType.Name.*;
+
+/**
+ * A registry for {@link TypeCodec}s. When the driver needs to serialize or deserialize a Java type
+ * to/from CQL, it will lookup in the registry for a suitable codec. The registry is initialized
+ * with default codecs that handle basic conversions (e.g. CQL {@code text} to {@code
+ * java.lang.String}), and users can add their own. Complex codecs can also be generated on-the-fly
+ * from simpler ones (more details below).
+ *
+ * &lt;h3&gt;Creating a registry &lt;/h3&gt;
+ * &lt;p&gt;
+ * By default, the driver uses {@code CodecRegistry#DEFAULT_INSTANCE}, a shareable, JVM-wide
+ * instance initialized with built-in codecs for all the base CQL types. The only reason to create
+ * your own instances is if you have multiple {@code Cluster} objects that use different sets of
+ * codecs. In that case, use {@code
+ * Cluster.Builder#withCodecRegistry(CodecRegistry)} to associate the
+ * registry with the cluster:
+ *
+ * &lt;pre&gt;{@code
+ * CodecRegistry myCodecRegistry = new CodecRegistry();
+ * myCodecRegistry.register(myCodec1, myCodec2, myCodec3);
+ * Cluster cluster = Cluster.builder().withCodecRegistry(myCodecRegistry).build();
+ *
+ * // To retrieve the registry later:
+ * CodecRegistry registry = cluster.getConfiguration().getCodecRegistry();
+ * }&lt;/pre&gt;
+ * &lt;p&gt;
+ * {@code CodecRegistry} instances are thread-safe.
+ *
+ * &lt;p&gt;It is possible to turn on log messages by setting the {@code
+ * CodecRegistry} logger level to {@code TRACE}. Beware that the registry
+ * can be very verbose at this log level.
+ *
+ * &lt;h3&gt;Registering and using custom codecs &lt;/h3&gt;
+ * &lt;p&gt;
+ * To create a custom codec, write a class that extends {@link TypeCodec}, create an instance, and
+ * pass it to one of the {@link #register(TypeCodec) register} methods; for example, one could
+ * create a codec that maps CQL timestamps to JDK8's {@code java.time.LocalDate}:
+ *
+ * &lt;pre&gt;{@code
+ * class LocalDateCodec extends TypeCodec&lt;java.time.LocalDate&gt; {
+ *    ...
+ * }
+ * myCodecRegistry.register(new LocalDateCodec());
+ * }&lt;/pre&gt;
+ * &lt;p&gt;
+ * The conversion will be available to:
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;all driver types that implement {@link GettableByIndexData}, {@link GettableByNameData},
+ * {@link SettableByIndexData} and/or {@link SettableByNameData}. Namely: {@code Row}, {@code
+ * BoundStatement}, {@link UDTValue} and {@link TupleValue};
+ * &lt;li&gt;{@code SimpleStatement#SimpleStatement(String, Object...) simple statements};
+ * &lt;li&gt;statements created with the {@code querybuilder.QueryBuilder Query
+ * builder}.
+ * &lt;/ul&gt;
+ *
+ * &lt;p&gt;Example:
+ *
+ * &lt;pre&gt;{@code
+ * Row row = session.executeQuery(&quot;select date from some_table where pk = 1&quot;).one();
+ * java.time.LocalDate date = row.get(0, java.time.LocalDate.class); // uses LocalDateCodec registered above
+ * }&lt;/pre&gt;
+ * &lt;p&gt;
+ * You can also bypass the codec registry by passing a standalone codec instance to methods such as
+ * {@link GettableByIndexData#get(int, TypeCodec)}.
+ *
+ * &lt;h3&gt;Codec generation &lt;/h3&gt;
+ * &lt;p&gt;
+ * When a {@code CodecRegistry} cannot find a suitable codec among existing ones, it will attempt to
+ * create it on-the-fly. It can manage:
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;collections (lists, sets and maps) of known types. For example, if you registered a codec
+ * for JDK8's {@code java.time.LocalDate} like in the example above, you get {@code
+ * List&lt;LocalDate&gt;&gt;} and {@code Set&lt;LocalDate&gt;&gt;} handled for free, as well as all {@code Map}
+ * types whose keys and/or values are {@code java.time.LocalDate}. This works recursively for
+ * nested collections;
+ * &lt;li&gt;{@link UserType user types}, mapped to {@link UDTValue} objects. Custom codecs are
+ * available recursively to the UDT's fields, so if one of your fields is a {@code timestamp}
+ * you can use your {@code LocalDateCodec} to retrieve it as a {@code java.time.LocalDate};
+ * &lt;li&gt;{@link TupleType tuple types}, mapped to {@link TupleValue} (with the same rules for nested
+ * fields);
+ * &lt;li&gt;{@link DataType.CustomType custom types}, mapped to {@code
+ * ByteBuffer}.
+ * &lt;/ul&gt;
+ * &lt;p&gt;
+ * If the codec registry encounters a mapping that it can't handle automatically, a {@link
+ * CodecNotFoundException} is thrown; you'll need to register a custom codec for it.
+ *
+ * &lt;h3&gt;Performance and caching &lt;/h3&gt;
+ * &lt;p&gt;
+ * Whenever possible, the registry will cache the result of a codec lookup for a specific type
+ * mapping, including any generated codec. For example, if you registered {@code LocalDateCodec} and
+ * ask the registry for a codec to convert a CQL {@code list&lt;timestamp&gt;} to a Java {@code
+ * List&lt;LocalDate&gt;}:
+ *
+ * &lt;ol&gt;
+ * &lt;li&gt;the first lookup will generate a {@code TypeCodec&lt;List&lt;LocalDate&gt;&gt;} from {@code
+ * LocalDateCodec}, and put it in the cache;
+ * &lt;li&gt;the second lookup will hit the cache directly, and reuse the previously generated instance.
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ * The javadoc for each {@link #codecFor(DataType) codecFor} variant specifies whether the result
+ * can be cached or not.
+ *
+ * &lt;h3&gt;Codec order &lt;/h3&gt;
+ * &lt;p&gt;
+ * When the registry looks up a codec, the rules of precedence are:
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;if a result was previously cached for that mapping, it is returned;
+ * &lt;li&gt;otherwise, the registry checks the list of built-in codecs – the default ones – and the
+ * ones that were explicitly registered (in the order that they were registered). It calls
+ * each codec's {@code accepts} methods to determine if it can handle the mapping, and if so
+ * returns it;
+ * &lt;li&gt;otherwise, the registry tries to generate a codec, according to the rules outlined above.
+ * &lt;/ul&gt;
+ * &lt;p&gt;
+ * It is currently impossible to override an existing codec. If you try to do so, {@link
+ * #register(TypeCodec)} will log a warning and ignore it.
+ */
+public final class CodecRegistry
+{
+
+<span class="fc" id="L161">    private static final Logger logger = LoggerFactory.getLogger(CodecRegistry.class);</span>
+
+<span class="fc" id="L163">    private static final Map&lt;DataType.Name, TypeCodec&lt;?&gt;&gt; BUILT_IN_CODECS_MAP =</span>
+    new EnumMap&lt;&gt;(DataType.Name.class);
+
+    static
+    {
+<span class="fc" id="L168">        BUILT_IN_CODECS_MAP.put(ASCII, TypeCodec.ascii());</span>
+<span class="fc" id="L169">        BUILT_IN_CODECS_MAP.put(BIGINT, TypeCodec.bigint());</span>
+<span class="fc" id="L170">        BUILT_IN_CODECS_MAP.put(BLOB, TypeCodec.blob());</span>
+<span class="fc" id="L171">        BUILT_IN_CODECS_MAP.put(BOOLEAN, TypeCodec.cboolean());</span>
+<span class="fc" id="L172">        BUILT_IN_CODECS_MAP.put(COUNTER, TypeCodec.counter());</span>
+<span class="fc" id="L173">        BUILT_IN_CODECS_MAP.put(DECIMAL, TypeCodec.decimal());</span>
+<span class="fc" id="L174">        BUILT_IN_CODECS_MAP.put(DOUBLE, TypeCodec.cdouble());</span>
+<span class="fc" id="L175">        BUILT_IN_CODECS_MAP.put(FLOAT, TypeCodec.cfloat());</span>
+<span class="fc" id="L176">        BUILT_IN_CODECS_MAP.put(INET, TypeCodec.inet());</span>
+<span class="fc" id="L177">        BUILT_IN_CODECS_MAP.put(INT, TypeCodec.cint());</span>
+<span class="fc" id="L178">        BUILT_IN_CODECS_MAP.put(TEXT, TypeCodec.varchar());</span>
+<span class="fc" id="L179">        BUILT_IN_CODECS_MAP.put(TIMESTAMP, TypeCodec.timestamp());</span>
+<span class="fc" id="L180">        BUILT_IN_CODECS_MAP.put(UUID, TypeCodec.uuid());</span>
+<span class="fc" id="L181">        BUILT_IN_CODECS_MAP.put(VARCHAR, TypeCodec.varchar());</span>
+<span class="fc" id="L182">        BUILT_IN_CODECS_MAP.put(VARINT, TypeCodec.varint());</span>
+<span class="fc" id="L183">        BUILT_IN_CODECS_MAP.put(TIMEUUID, TypeCodec.timeUUID());</span>
+<span class="fc" id="L184">        BUILT_IN_CODECS_MAP.put(SMALLINT, TypeCodec.smallInt());</span>
+<span class="fc" id="L185">        BUILT_IN_CODECS_MAP.put(TINYINT, TypeCodec.tinyInt());</span>
+<span class="fc" id="L186">        BUILT_IN_CODECS_MAP.put(DATE, TypeCodec.date());</span>
+<span class="fc" id="L187">        BUILT_IN_CODECS_MAP.put(TIME, TypeCodec.time());</span>
+<span class="fc" id="L188">        BUILT_IN_CODECS_MAP.put(DURATION, TypeCodec.duration());</span>
+    }
+
+    // roughly sorted by popularity
+<span class="fc" id="L192">    private static final TypeCodec&lt;?&gt;[] BUILT_IN_CODECS =</span>
+    new TypeCodec&lt;?&gt;[]{
+    TypeCodec
+<span class="fc" id="L195">    .varchar(), // must be declared before AsciiCodec so it gets chosen when CQL type not</span>
+    // available
+    TypeCodec
+<span class="fc" id="L198">    .uuid(), // must be declared before TimeUUIDCodec so it gets chosen when CQL type not</span>
+    // available
+<span class="fc" id="L200">    TypeCodec.timeUUID(),</span>
+<span class="fc" id="L201">    TypeCodec.timestamp(),</span>
+<span class="fc" id="L202">    TypeCodec.cint(),</span>
+<span class="fc" id="L203">    TypeCodec.bigint(),</span>
+<span class="fc" id="L204">    TypeCodec.blob(),</span>
+<span class="fc" id="L205">    TypeCodec.cdouble(),</span>
+<span class="fc" id="L206">    TypeCodec.cfloat(),</span>
+<span class="fc" id="L207">    TypeCodec.decimal(),</span>
+<span class="fc" id="L208">    TypeCodec.varint(),</span>
+<span class="fc" id="L209">    TypeCodec.inet(),</span>
+<span class="fc" id="L210">    TypeCodec.cboolean(),</span>
+<span class="fc" id="L211">    TypeCodec.smallInt(),</span>
+<span class="fc" id="L212">    TypeCodec.tinyInt(),</span>
+<span class="fc" id="L213">    TypeCodec.date(),</span>
+<span class="fc" id="L214">    TypeCodec.time(),</span>
+<span class="fc" id="L215">    TypeCodec.duration(),</span>
+<span class="fc" id="L216">    TypeCodec.counter(),</span>
+<span class="fc" id="L217">    TypeCodec.ascii()</span>
+    };
+
+    /**
+     * Cache key for the codecs cache.
+     */
+    private static final class CacheKey
+    {
+
+        private final DataType cqlType;
+
+        private final TypeToken&lt;?&gt; javaType;
+
+        CacheKey(DataType cqlType, TypeToken&lt;?&gt; javaType)
+        {
+            this.javaType = javaType;
+            this.cqlType = cqlType;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CacheKey cacheKey = (CacheKey) o;
+            return Objects.equals(cqlType, cacheKey.cqlType)
+                   &amp;&amp; Objects.equals(javaType, cacheKey.javaType);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(cqlType, javaType);
+        }
+    }
+
+    /**
+     * Cache loader for the codecs cache.
+     */
+<span class="fc" id="L256">    private class TypeCodecCacheLoader extends CacheLoader&lt;CacheKey, TypeCodec&lt;?&gt;&gt;</span>
+    {
+        @Override
+        public TypeCodec&lt;?&gt; load(CacheKey cacheKey)
+        {
+<span class="nc" id="L261">            checkNotNull(cacheKey.cqlType, &quot;Parameter cqlType cannot be null&quot;);</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L263">                logger.trace(</span>
+                &quot;Loading codec into cache: [{} &lt;-&gt; {}]&quot;,
+<span class="nc" id="L265">                CodecRegistry.toString(cacheKey.cqlType),</span>
+<span class="nc" id="L266">                CodecRegistry.toString(cacheKey.javaType));</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            for (TypeCodec&lt;?&gt; codec : codecs)</span>
+            {
+<span class="nc bnc" id="L269" title="All 4 branches missed.">                if (codec.accepts(cacheKey.cqlType)</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                    &amp;&amp; (cacheKey.javaType == null || codec.accepts(cacheKey.javaType)))</span>
+                {
+<span class="nc" id="L272">                    logger.trace(&quot;Already existing codec found: {}&quot;, codec);</span>
+<span class="nc" id="L273">                    return codec;</span>
+                }
+<span class="nc" id="L275">            }</span>
+<span class="nc" id="L276">            return createCodec(cacheKey.cqlType, cacheKey.javaType);</span>
+        }
+    }
+
+    /**
+     * A complexity-based weigher for the codecs cache. Weights are computed mainly according to the
+     * CQL type:
+     *
+     * &lt;ol&gt;
+     * &lt;li&gt;Manually-registered codecs always weigh 0;
+     * &lt;li&gt;Codecs for primitive types weigh 0;
+     * &lt;li&gt;Codecs for collections weigh the total weight of their inner types + the weight of their
+     * level of deepness;
+     * &lt;li&gt;Codecs for UDTs and tuples weigh the total weight of their inner types + the weight of
+     * their level of deepness, but cannot weigh less than 1;
+     * &lt;li&gt;Codecs for custom (non-CQL) types weigh 1.
+     * &lt;/ol&gt;
+     * &lt;p&gt;
+     * A consequence of this algorithm is that codecs for primitive types and codecs for all &quot;shallow&quot;
+     * collections thereof are never evicted.
+     */
+<span class="fc" id="L297">    private class TypeCodecWeigher implements Weigher&lt;CacheKey, TypeCodec&lt;?&gt;&gt;</span>
+    {
+
+        @Override
+        public int weigh(CacheKey key, TypeCodec&lt;?&gt; value)
+        {
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            return codecs.contains(value) ? 0 : weigh(value.cqlType, 0);</span>
+        }
+
+        private int weigh(DataType cqlType, int level)
+        {
+<span class="nc bnc" id="L308" title="All 6 branches missed.">            switch (cqlType.getName())</span>
+            {
+                case LIST:
+                case SET:
+                case MAP:
+                {
+<span class="nc" id="L314">                    int weight = level;</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                    for (DataType eltType : cqlType.getTypeArguments())</span>
+                    {
+<span class="nc" id="L317">                        weight += weigh(eltType, level + 1);</span>
+<span class="nc" id="L318">                    }</span>
+<span class="nc" id="L319">                    return weight;</span>
+                }
+                case VECTOR:
+                {
+<span class="nc" id="L323">                    int weight = level;</span>
+<span class="nc" id="L324">                    DataType eltType = cqlType.getTypeArguments().get(0);</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                    if (eltType != null)</span>
+                    {
+<span class="nc" id="L327">                        weight += weigh(eltType, level + 1);</span>
+                    }
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                    return weight == 0 ? 1 : weight;</span>
+                }
+                case UDT:
+                {
+<span class="nc" id="L333">                    int weight = level;</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                    for (UserType.Field field : ((UserType) cqlType))</span>
+                    {
+<span class="nc" id="L336">                        weight += weigh(field.getType(), level + 1);</span>
+<span class="nc" id="L337">                    }</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                    return weight == 0 ? 1 : weight;</span>
+                }
+                case TUPLE:
+                {
+<span class="nc" id="L342">                    int weight = level;</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    for (DataType componentType : ((TupleType) cqlType).getComponentTypes())</span>
+                    {
+<span class="nc" id="L345">                        weight += weigh(componentType, level + 1);</span>
+<span class="nc" id="L346">                    }</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">                    return weight == 0 ? 1 : weight;</span>
+                }
+                case CUSTOM:
+<span class="nc" id="L350">                    return 1;</span>
+                default:
+<span class="nc" id="L352">                    return 0;</span>
+            }
+        }
+    }
+
+    /**
+     * Simple removal listener for the codec cache (can be used for debugging purposes by setting the
+     * {@code CodecRegistry} logger level to {@code TRACE}.
+     */
+    private static class TypeCodecRemovalListener implements RemovalListener&lt;CacheKey, TypeCodec&lt;?&gt;&gt;
+    {
+        @Override
+        public void onRemoval(RemovalNotification&lt;CacheKey, TypeCodec&lt;?&gt;&gt; notification)
+        {
+            logger.trace(
+            &quot;Evicting codec from cache: {} (cause: {})&quot;,
+            notification.getValue(),
+            notification.getCause());
+        }
+    }
+
+    /**
+     * The list of user-registered codecs.
+     */
+    private final CopyOnWriteArrayList&lt;TypeCodec&lt;?&gt;&gt; codecs;
+
+    /**
+     * A LoadingCache to serve requests for codecs whenever possible. The cache can be used as long as
+     * at least the CQL type is known.
+     */
+    private final LoadingCache&lt;CacheKey, TypeCodec&lt;?&gt;&gt; cache;
+
+    /**
+     * Creates a new instance initialized with built-in codecs for all the base CQL types.
+     */
+    public CodecRegistry()
+<span class="fc" id="L388">    {</span>
+<span class="fc" id="L389">        this.codecs = new CopyOnWriteArrayList&lt;&gt;();</span>
+<span class="fc" id="L390">        this.cache = defaultCacheBuilder().build(new TypeCodecCacheLoader());</span>
+<span class="fc" id="L391">    }</span>
+
+    private CacheBuilder&lt;CacheKey, TypeCodec&lt;?&gt;&gt; defaultCacheBuilder()
+    {
+        CacheBuilder&lt;CacheKey, TypeCodec&lt;?&gt;&gt; builder =
+<span class="fc" id="L396">        CacheBuilder.newBuilder()</span>
+                    // lists, sets and maps of 20 primitive types = 20 + 20 + 20*20 = 440 codecs,
+                    // so let's start with roughly 1/4 of that
+<span class="fc" id="L399">                    .initialCapacity(100)</span>
+<span class="fc" id="L400">                    .maximumWeight(1000)</span>
+<span class="fc" id="L401">                    .weigher(new TypeCodecWeigher());</span>
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+            // do not bother adding a listener if it will be ineffective
+<span class="nc" id="L404">            builder = builder.removalListener(new TypeCodecRemovalListener());</span>
+<span class="fc" id="L405">        return builder;</span>
+    }
+
+    /**
+     * Register the given codec with this registry.
+     *
+     * &lt;p&gt;This method will log a warning and ignore the codec if it collides with a previously
+     * registered one. Note that this check is not done in a completely thread-safe manner; codecs
+     * should typically be registered at application startup, not in a highly concurrent context (if a
+     * race condition occurs, the worst possible outcome is that no warning gets logged, and the codec
+     * gets registered but will never actually be used).
+     *
+     * @param newCodec The codec to add to the registry.
+     * @return this CodecRegistry (for method chaining).
+     */
+    public CodecRegistry register(TypeCodec&lt;?&gt; newCodec)
+    {
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; oldCodec : BUILT_IN_CODECS)</span>
+        {
+<span class="nc bnc" id="L424" title="All 4 branches missed.">            if (oldCodec.accepts(newCodec.getCqlType()) &amp;&amp; oldCodec.accepts(newCodec.getJavaType()))</span>
+            {
+<span class="nc" id="L426">                logger.warn(</span>
+                &quot;Ignoring codec {} because it collides with previously registered codec {}&quot;,
+                newCodec,
+                oldCodec);
+<span class="nc" id="L430">                return this;</span>
+            }
+        }
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; oldCodec : codecs)</span>
+        {
+<span class="nc bnc" id="L435" title="All 4 branches missed.">            if (oldCodec.accepts(newCodec.getCqlType()) &amp;&amp; oldCodec.accepts(newCodec.getJavaType()))</span>
+            {
+<span class="nc" id="L437">                logger.warn(</span>
+                &quot;Ignoring codec {} because it collides with previously registered codec {}&quot;,
+                newCodec,
+                oldCodec);
+<span class="nc" id="L441">                return this;</span>
+            }
+<span class="nc" id="L443">        }</span>
+<span class="nc" id="L444">        CacheKey key = new CacheKey(newCodec.getCqlType(), newCodec.getJavaType());</span>
+<span class="nc" id="L445">        TypeCodec&lt;?&gt; existing = cache.getIfPresent(key);</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">        if (existing != null)</span>
+        {
+<span class="nc" id="L448">            logger.warn(</span>
+            &quot;Ignoring codec {} because it collides with previously generated codec {}&quot;,
+            newCodec,
+            existing);
+<span class="nc" id="L452">            return this;</span>
+        }
+<span class="nc" id="L454">        this.codecs.add(newCodec);</span>
+<span class="nc" id="L455">        return this;</span>
+    }
+
+    /**
+     * Register the given codecs with this registry.
+     *
+     * @param codecs The codecs to add to the registry.
+     * @return this CodecRegistry (for method chaining).
+     * @see #register(TypeCodec)
+     */
+    public CodecRegistry register(TypeCodec&lt;?&gt;... codecs)
+    {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : codecs) register(codec);</span>
+<span class="nc" id="L468">        return this;</span>
+    }
+
+    /**
+     * Register the given codecs with this registry.
+     *
+     * @param codecs The codecs to add to the registry.
+     * @return this CodecRegistry (for method chaining).
+     * @see #register(TypeCodec)
+     */
+    public CodecRegistry register(Iterable&lt;? extends TypeCodec&lt;?&gt;&gt; codecs)
+    {
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : codecs) register(codec);</span>
+<span class="nc" id="L481">        return this;</span>
+    }
+
+    /**
+     * Returns a {@link TypeCodec codec} that accepts the given value.
+     *
+     * &lt;p&gt;This method takes an arbitrary Java object and tries to locate a suitable codec for it.
+     * Codecs must perform a {@link TypeCodec#accepts(Object) runtime inspection} of the object to
+     * determine if they can accept it or not, which, depending on the implementations, can be
+     * expensive; besides, the resulting codec cannot be cached. Therefore there might be a
+     * performance penalty when using this method.
+     *
+     * &lt;p&gt;Furthermore, this method returns the first matching codec, regardless of its accepted CQL
+     * type. It should be reserved for situations where the target CQL type is not available or
+     * unknown. In the Java driver, this happens mainly when serializing a value in a {@code
+     * SimpleStatement#SimpleStatement(String, Object...) SimpleStatement} or in the {@code
+     * querybuilder.QueryBuilder}, where no CQL type information is
+     * available.
+     *
+     * &lt;p&gt;Codecs returned by this method are &lt;em&gt;NOT&lt;/em&gt; cached (see the {@link CodecRegistry
+     * top-level documentation} of this class for more explanations about caching).
+     *
+     * @param value The value the codec should accept; must not be {@code null}.
+     * @return A suitable codec.
+     * @throws CodecNotFoundException if a suitable codec cannot be found.
+     */
+    public &lt;T&gt; TypeCodec&lt;T&gt; codecFor(T value)
+    {
+<span class="nc" id="L509">        return findCodec(null, value);</span>
+    }
+
+    /**
+     * Returns a {@link TypeCodec codec} that accepts the given {@link DataType CQL type}.
+     *
+     * &lt;p&gt;This method returns the first matching codec, regardless of its accepted Java type. It
+     * should be reserved for situations where the Java type is not available or unknown. In the Java
+     * driver, this happens mainly when deserializing a value using the {@link
+     * GettableByIndexData#getObject(int) getObject} method.
+     *
+     * &lt;p&gt;Codecs returned by this method are cached (see the {@link CodecRegistry top-level
+     * documentation} of this class for more explanations about caching).
+     *
+     * @param cqlType The {@link DataType CQL type} the codec should accept; must not be {@code null}.
+     * @return A suitable codec.
+     * @throws CodecNotFoundException if a suitable codec cannot be found.
+     */
+    public &lt;T&gt; TypeCodec&lt;T&gt; codecFor(DataType cqlType) throws CodecNotFoundException
+    {
+<span class="fc" id="L529">        return lookupCodec(cqlType, null);</span>
+    }
+
+    /**
+     * Returns a {@link TypeCodec codec} that accepts the given {@link DataType CQL type} and the
+     * given Java class.
+     *
+     * &lt;p&gt;This method can only handle raw (non-parameterized) Java types. For parameterized types, use
+     * {@link #codecFor(DataType, TypeToken)} instead.
+     *
+     * &lt;p&gt;Codecs returned by this method are cached (see the {@link CodecRegistry top-level
+     * documentation} of this class for more explanations about caching).
+     *
+     * @param cqlType  The {@link DataType CQL type} the codec should accept; must not be {@code null}.
+     * @param javaType The Java type the codec should accept; can be {@code null}.
+     * @return A suitable codec.
+     * @throws CodecNotFoundException if a suitable codec cannot be found.
+     */
+    public &lt;T&gt; TypeCodec&lt;T&gt; codecFor(DataType cqlType, Class&lt;T&gt; javaType)
+    throws CodecNotFoundException
+    {
+<span class="nc" id="L550">        return codecFor(cqlType, TypeToken.of(javaType));</span>
+    }
+
+    /**
+     * Returns a {@link TypeCodec codec} that accepts the given {@link DataType CQL type} and the
+     * given Java type.
+     *
+     * &lt;p&gt;This method handles parameterized types thanks to Guava's {@link TypeToken} API.
+     *
+     * &lt;p&gt;Codecs returned by this method are cached (see the {@link CodecRegistry top-level
+     * documentation} of this class for more explanations about caching).
+     *
+     * @param cqlType  The {@link DataType CQL type} the codec should accept; must not be {@code null}.
+     * @param javaType The {@link TypeToken Java type} the codec should accept; can be {@code null}.
+     * @return A suitable codec.
+     * @throws CodecNotFoundException if a suitable codec cannot be found.
+     */
+    public &lt;T&gt; TypeCodec&lt;T&gt; codecFor(DataType cqlType, TypeToken&lt;T&gt; javaType)
+    throws CodecNotFoundException
+    {
+<span class="nc" id="L570">        return lookupCodec(cqlType, javaType);</span>
+    }
+
+    /**
+     * Returns a {@link TypeCodec codec} that accepts the given {@link DataType CQL type} and the
+     * given value.
+     *
+     * &lt;p&gt;This method takes an arbitrary Java object and tries to locate a suitable codec for it.
+     * Codecs must perform a {@link TypeCodec#accepts(Object) runtime inspection} of the object to
+     * determine if they can accept it or not, which, depending on the implementations, can be
+     * expensive; besides, the resulting codec cannot be cached. Therefore there might be a
+     * performance penalty when using this method.
+     *
+     * &lt;p&gt;Codecs returned by this method are &lt;em&gt;NOT&lt;/em&gt; cached (see the {@link CodecRegistry
+     * top-level documentation} of this class for more explanations about caching).
+     *
+     * @param cqlType The {@link DataType CQL type} the codec should accept; can be {@code null}.
+     * @param value   The value the codec should accept; must not be {@code null}.
+     * @return A suitable codec.
+     * @throws CodecNotFoundException if a suitable codec cannot be found.
+     */
+    public &lt;T&gt; TypeCodec&lt;T&gt; codecFor(DataType cqlType, T value)
+    {
+<span class="nc" id="L593">        return findCodec(cqlType, value);</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; TypeCodec&lt;T&gt; lookupCodec(DataType cqlType, TypeToken&lt;T&gt; javaType)
+    {
+<span class="fc" id="L599">        checkNotNull(cqlType, &quot;Parameter cqlType cannot be null&quot;);</span>
+<span class="fc" id="L600">        TypeCodec&lt;?&gt; codec = BUILT_IN_CODECS_MAP.get(cqlType.getName());</span>
+<span class="pc bpc" id="L601" title="4 of 6 branches missed.">        if (codec != null &amp;&amp; (javaType == null || codec.accepts(javaType)))</span>
+        {
+<span class="fc" id="L603">            logger.trace(&quot;Returning built-in codec {}&quot;, codec);</span>
+<span class="fc" id="L604">            return (TypeCodec&lt;T&gt;) codec;</span>
+        }
+<span class="nc bnc" id="L606" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L607">            logger.trace(&quot;Querying cache for codec [{} &lt;-&gt; {}]&quot;, toString(cqlType), toString(javaType));</span>
+        try
+        {
+<span class="nc" id="L610">            CacheKey cacheKey = new CacheKey(cqlType, javaType);</span>
+<span class="nc" id="L611">            codec = cache.get(cacheKey);</span>
+        }
+<span class="nc" id="L613">        catch (UncheckedExecutionException e)</span>
+        {
+<span class="nc bnc" id="L615" title="All 2 branches missed.">            if (e.getCause() instanceof CodecNotFoundException)</span>
+            {
+<span class="nc" id="L617">                throw (CodecNotFoundException) e.getCause();</span>
+            }
+<span class="nc" id="L619">            throw new CodecNotFoundException(e.getCause());</span>
+        }
+<span class="nc" id="L621">        catch (RuntimeException | ExecutionException e)</span>
+        {
+<span class="nc" id="L623">            throw new CodecNotFoundException(e.getCause());</span>
+<span class="nc" id="L624">        }</span>
+<span class="nc" id="L625">        logger.trace(&quot;Returning cached codec {}&quot;, codec);</span>
+<span class="nc" id="L626">        return (TypeCodec&lt;T&gt;) codec;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; TypeCodec&lt;T&gt; findCodec(DataType cqlType, TypeToken&lt;T&gt; javaType)
+    {
+<span class="nc" id="L632">        checkNotNull(cqlType, &quot;Parameter cqlType cannot be null&quot;);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L634">            logger.trace(&quot;Looking for codec [{} &lt;-&gt; {}]&quot;, toString(cqlType), toString(javaType));</span>
+
+        // Look at the built-in codecs first
+<span class="nc bnc" id="L637" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : BUILT_IN_CODECS)</span>
+        {
+<span class="nc bnc" id="L639" title="All 6 branches missed.">            if (codec.accepts(cqlType) &amp;&amp; (javaType == null || codec.accepts(javaType)))</span>
+            {
+<span class="nc" id="L641">                logger.trace(&quot;Built-in codec found: {}&quot;, codec);</span>
+<span class="nc" id="L642">                return (TypeCodec&lt;T&gt;) codec;</span>
+            }
+        }
+
+        // Look at the user-registered codecs next
+<span class="nc bnc" id="L647" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : codecs)</span>
+        {
+<span class="nc bnc" id="L649" title="All 6 branches missed.">            if (codec.accepts(cqlType) &amp;&amp; (javaType == null || codec.accepts(javaType)))</span>
+            {
+<span class="nc" id="L651">                logger.trace(&quot;Already registered codec found: {}&quot;, codec);</span>
+<span class="nc" id="L652">                return (TypeCodec&lt;T&gt;) codec;</span>
+            }
+<span class="nc" id="L654">        }</span>
+<span class="nc" id="L655">        return createCodec(cqlType, javaType);</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; TypeCodec&lt;T&gt; findCodec(DataType cqlType, T value)
+    {
+<span class="nc" id="L661">        checkNotNull(value, &quot;Parameter value cannot be null&quot;);</span>
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L663">            logger.trace(&quot;Looking for codec [{} &lt;-&gt; {}]&quot;, toString(cqlType), value.getClass());</span>
+
+        // Look at the built-in codecs first
+<span class="nc bnc" id="L666" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : BUILT_IN_CODECS)</span>
+        {
+<span class="nc bnc" id="L668" title="All 6 branches missed.">            if ((cqlType == null || codec.accepts(cqlType)) &amp;&amp; codec.accepts(value))</span>
+            {
+<span class="nc" id="L670">                logger.trace(&quot;Built-in codec found: {}&quot;, codec);</span>
+<span class="nc" id="L671">                return (TypeCodec&lt;T&gt;) codec;</span>
+            }
+        }
+
+        // Look at the user-registered codecs next
+<span class="nc bnc" id="L676" title="All 2 branches missed.">        for (TypeCodec&lt;?&gt; codec : codecs)</span>
+        {
+<span class="nc bnc" id="L678" title="All 6 branches missed.">            if ((cqlType == null || codec.accepts(cqlType)) &amp;&amp; codec.accepts(value))</span>
+            {
+<span class="nc" id="L680">                logger.trace(&quot;Already registered codec found: {}&quot;, codec);</span>
+<span class="nc" id="L681">                return (TypeCodec&lt;T&gt;) codec;</span>
+            }
+<span class="nc" id="L683">        }</span>
+<span class="nc" id="L684">        return createCodec(cqlType, value);</span>
+    }
+
+    private &lt;T&gt; TypeCodec&lt;T&gt; createCodec(DataType cqlType, TypeToken&lt;T&gt; javaType)
+    {
+<span class="nc" id="L689">        TypeCodec&lt;T&gt; codec = maybeCreateCodec(cqlType, javaType);</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        if (codec == null) throw notFound(cqlType, javaType);</span>
+        // double-check that the created codec satisfies the initial request
+        // this check can fail specially when creating codecs for collections
+        // e.g. if B extends A and there is a codec registered for A and
+        // we request a codec for List&lt;B&gt;, the registry would generate a codec for List&lt;A&gt;
+<span class="nc bnc" id="L695" title="All 6 branches missed.">        if (!codec.accepts(cqlType) || (javaType != null &amp;&amp; !codec.accepts(javaType)))</span>
+<span class="nc" id="L696">            throw notFound(cqlType, javaType);</span>
+<span class="nc" id="L697">        logger.trace(&quot;Codec created: {}&quot;, codec);</span>
+<span class="nc" id="L698">        return codec;</span>
+    }
+
+    private &lt;T&gt; TypeCodec&lt;T&gt; createCodec(DataType cqlType, T value)
+    {
+<span class="nc" id="L703">        TypeCodec&lt;T&gt; codec = maybeCreateCodec(cqlType, value);</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        if (codec == null) throw notFound(cqlType, TypeToken.of(value.getClass()));</span>
+        // double-check that the created codec satisfies the initial request
+<span class="nc bnc" id="L706" title="All 6 branches missed.">        if ((cqlType != null &amp;&amp; !codec.accepts(cqlType)) || !codec.accepts(value))</span>
+<span class="nc" id="L707">            throw notFound(cqlType, TypeToken.of(value.getClass()));</span>
+<span class="nc" id="L708">        logger.trace(&quot;Codec created: {}&quot;, codec);</span>
+<span class="nc" id="L709">        return codec;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private &lt;T&gt; TypeCodec&lt;T&gt; maybeCreateCodec(DataType cqlType, TypeToken&lt;T&gt; javaType)
+    {
+<span class="nc" id="L715">        checkNotNull(cqlType);</span>
+
+<span class="nc bnc" id="L717" title="All 4 branches missed.">        if (cqlType.getName() == LIST</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">            &amp;&amp; (javaType == null || List.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L720">            TypeToken&lt;?&gt; elementType = null;</span>
+<span class="nc bnc" id="L721" title="All 4 branches missed.">            if (javaType != null &amp;&amp; javaType.getType() instanceof ParameterizedType)</span>
+            {
+<span class="nc" id="L723">                Type[] typeArguments = ((ParameterizedType) javaType.getType()).getActualTypeArguments();</span>
+<span class="nc" id="L724">                elementType = TypeToken.of(typeArguments[0]);</span>
+            }
+<span class="nc" id="L726">            TypeCodec&lt;?&gt; eltCodec = findCodec(cqlType.getTypeArguments().get(0), elementType);</span>
+<span class="nc" id="L727">            return (TypeCodec&lt;T&gt;) TypeCodec.list(eltCodec);</span>
+        }
+
+<span class="nc bnc" id="L730" title="All 4 branches missed.">        if (cqlType.getName() == SET</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            &amp;&amp; (javaType == null || Set.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L733">            TypeToken&lt;?&gt; elementType = null;</span>
+<span class="nc bnc" id="L734" title="All 4 branches missed.">            if (javaType != null &amp;&amp; javaType.getType() instanceof ParameterizedType)</span>
+            {
+<span class="nc" id="L736">                Type[] typeArguments = ((ParameterizedType) javaType.getType()).getActualTypeArguments();</span>
+<span class="nc" id="L737">                elementType = TypeToken.of(typeArguments[0]);</span>
+            }
+<span class="nc" id="L739">            TypeCodec&lt;?&gt; eltCodec = findCodec(cqlType.getTypeArguments().get(0), elementType);</span>
+<span class="nc" id="L740">            return (TypeCodec&lt;T&gt;) TypeCodec.set(eltCodec);</span>
+        }
+
+<span class="nc bnc" id="L743" title="All 4 branches missed.">        if (cqlType.getName() == MAP</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">            &amp;&amp; (javaType == null || Map.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L746">            TypeToken&lt;?&gt; keyType = null;</span>
+<span class="nc" id="L747">            TypeToken&lt;?&gt; valueType = null;</span>
+<span class="nc bnc" id="L748" title="All 4 branches missed.">            if (javaType != null &amp;&amp; javaType.getType() instanceof ParameterizedType)</span>
+            {
+<span class="nc" id="L750">                Type[] typeArguments = ((ParameterizedType) javaType.getType()).getActualTypeArguments();</span>
+<span class="nc" id="L751">                keyType = TypeToken.of(typeArguments[0]);</span>
+<span class="nc" id="L752">                valueType = TypeToken.of(typeArguments[1]);</span>
+            }
+<span class="nc" id="L754">            TypeCodec&lt;?&gt; keyCodec = findCodec(cqlType.getTypeArguments().get(0), keyType);</span>
+<span class="nc" id="L755">            TypeCodec&lt;?&gt; valueCodec = findCodec(cqlType.getTypeArguments().get(1), valueType);</span>
+<span class="nc" id="L756">            return (TypeCodec&lt;T&gt;) TypeCodec.map(keyCodec, valueCodec);</span>
+        }
+
+<span class="nc bnc" id="L759" title="All 4 branches missed.">        if (cqlType instanceof VectorType</span>
+<span class="nc bnc" id="L760" title="All 2 branches missed.">            &amp;&amp; (javaType == null || List.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L762">            VectorType type = (VectorType) cqlType;</span>
+<span class="nc" id="L763">            return (TypeCodec&lt;T&gt;) TypeCodec.vector(type, findCodec(type.getSubtype(), null));</span>
+        }
+
+<span class="nc bnc" id="L766" title="All 4 branches missed.">        if (cqlType instanceof TupleType</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">            &amp;&amp; (javaType == null || TupleValue.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L769">            return (TypeCodec&lt;T&gt;) TypeCodec.tuple((TupleType) cqlType);</span>
+        }
+
+<span class="nc bnc" id="L772" title="All 4 branches missed.">        if (cqlType instanceof UserType</span>
+<span class="nc bnc" id="L773" title="All 2 branches missed.">            &amp;&amp; (javaType == null || UDTValue.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L775">            return (TypeCodec&lt;T&gt;) TypeCodec.userType((UserType) cqlType);</span>
+        }
+
+<span class="nc bnc" id="L778" title="All 4 branches missed.">        if (cqlType instanceof DataType.CustomType</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">            &amp;&amp; (javaType == null || ByteBuffer.class.isAssignableFrom(javaType.getRawType())))</span>
+        {
+<span class="nc" id="L781">            return (TypeCodec&lt;T&gt;) TypeCodec.custom((DataType.CustomType) cqlType);</span>
+        }
+
+<span class="nc" id="L784">        return null;</span>
+    }
+
+    @SuppressWarnings({ &quot;unchecked&quot;, &quot;rawtypes&quot; })
+    private &lt;T&gt; TypeCodec&lt;T&gt; maybeCreateCodec(DataType cqlType, T value)
+    {
+<span class="nc" id="L790">        checkNotNull(value);</span>
+
+<span class="nc bnc" id="L792" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == LIST) &amp;&amp; value instanceof List)</span>
+        {
+<span class="nc" id="L794">            List list = (List) value;</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">            if (list.isEmpty())</span>
+            {
+                DataType elementType =
+<span class="nc bnc" id="L798" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().isEmpty())</span>
+<span class="nc" id="L799">                ? DataType.blob()</span>
+<span class="nc" id="L800">                : cqlType.getTypeArguments().get(0);</span>
+<span class="nc" id="L801">                return (TypeCodec&lt;T&gt;) TypeCodec.list(findCodec(elementType, (TypeToken) null));</span>
+            }
+            else
+            {
+                DataType elementType =
+<span class="nc bnc" id="L806" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().isEmpty())</span>
+<span class="nc" id="L807">                ? null</span>
+<span class="nc" id="L808">                : cqlType.getTypeArguments().get(0);</span>
+<span class="nc" id="L809">                return (TypeCodec&lt;T&gt;) TypeCodec.list(findCodec(elementType, list.iterator().next()));</span>
+            }
+        }
+
+<span class="nc bnc" id="L813" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == SET) &amp;&amp; value instanceof Set)</span>
+        {
+<span class="nc" id="L815">            Set set = (Set) value;</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">            if (set.isEmpty())</span>
+            {
+                DataType elementType =
+<span class="nc bnc" id="L819" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().isEmpty())</span>
+<span class="nc" id="L820">                ? DataType.blob()</span>
+<span class="nc" id="L821">                : cqlType.getTypeArguments().get(0);</span>
+<span class="nc" id="L822">                return (TypeCodec&lt;T&gt;) TypeCodec.set(findCodec(elementType, (TypeToken) null));</span>
+            }
+            else
+            {
+                DataType elementType =
+<span class="nc bnc" id="L827" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().isEmpty())</span>
+<span class="nc" id="L828">                ? null</span>
+<span class="nc" id="L829">                : cqlType.getTypeArguments().get(0);</span>
+<span class="nc" id="L830">                return (TypeCodec&lt;T&gt;) TypeCodec.set(findCodec(elementType, set.iterator().next()));</span>
+            }
+        }
+
+<span class="nc bnc" id="L834" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == MAP) &amp;&amp; value instanceof Map)</span>
+        {
+<span class="nc" id="L836">            Map map = (Map) value;</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            if (map.isEmpty())</span>
+            {
+                DataType keyType =
+<span class="nc bnc" id="L840" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().size() &lt; 1)</span>
+<span class="nc" id="L841">                ? DataType.blob()</span>
+<span class="nc" id="L842">                : cqlType.getTypeArguments().get(0);</span>
+                DataType valueType =
+<span class="nc bnc" id="L844" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().size() &lt; 2)</span>
+<span class="nc" id="L845">                ? DataType.blob()</span>
+<span class="nc" id="L846">                : cqlType.getTypeArguments().get(1);</span>
+<span class="nc" id="L847">                return (TypeCodec&lt;T&gt;) TypeCodec.map(</span>
+<span class="nc" id="L848">                findCodec(keyType, (TypeToken) null), findCodec(valueType, (TypeToken) null));</span>
+            }
+            else
+            {
+                DataType keyType =
+<span class="nc bnc" id="L853" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().size() &lt; 1)</span>
+<span class="nc" id="L854">                ? null</span>
+<span class="nc" id="L855">                : cqlType.getTypeArguments().get(0);</span>
+                DataType valueType =
+<span class="nc bnc" id="L857" title="All 4 branches missed.">                (cqlType == null || cqlType.getTypeArguments().size() &lt; 2)</span>
+<span class="nc" id="L858">                ? null</span>
+<span class="nc" id="L859">                : cqlType.getTypeArguments().get(1);</span>
+<span class="nc" id="L860">                Map.Entry entry = (Map.Entry) map.entrySet().iterator().next();</span>
+<span class="nc" id="L861">                return (TypeCodec&lt;T&gt;)</span>
+<span class="nc" id="L862">                       TypeCodec.map(</span>
+<span class="nc" id="L863">                       findCodec(keyType, entry.getKey()), findCodec(valueType, entry.getValue()));</span>
+            }
+        }
+
+<span class="nc bnc" id="L867" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == VECTOR) &amp;&amp; value instanceof List)</span>
+        {
+<span class="nc" id="L869">            VectorType type = (VectorType) cqlType;</span>
+<span class="nc" id="L870">            return (TypeCodec&lt;T&gt;) TypeCodec.vector(type, findCodec(type.getSubtype(), null));</span>
+        }
+
+<span class="nc bnc" id="L873" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == TUPLE)</span>
+            &amp;&amp; value instanceof TupleValue)
+        {
+<span class="nc" id="L876">            return (TypeCodec&lt;T&gt;)</span>
+<span class="nc bnc" id="L877" title="All 2 branches missed.">                   TypeCodec.tuple(cqlType == null ? ((TupleValue) value).getType() : (TupleType) cqlType);</span>
+        }
+
+<span class="nc bnc" id="L880" title="All 6 branches missed.">        if ((cqlType == null || cqlType.getName() == UDT) &amp;&amp; value instanceof UDTValue)</span>
+        {
+<span class="nc" id="L882">            return (TypeCodec&lt;T&gt;)</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">                   TypeCodec.userType(cqlType == null ? ((UDTValue) value).getType() : (UserType) cqlType);</span>
+        }
+
+<span class="nc bnc" id="L886" title="All 4 branches missed.">        if ((cqlType instanceof DataType.CustomType)</span>
+            &amp;&amp; value instanceof ByteBuffer)
+        {
+<span class="nc" id="L889">            return (TypeCodec&lt;T&gt;) TypeCodec.custom((DataType.CustomType) cqlType);</span>
+        }
+
+<span class="nc" id="L892">        return null;</span>
+    }
+
+    private static CodecNotFoundException notFound(DataType cqlType, TypeToken&lt;?&gt; javaType)
+    {
+<span class="nc" id="L897">        String msg =</span>
+<span class="nc" id="L898">        String.format(</span>
+        &quot;Codec not found for requested operation: [%s &lt;-&gt; %s]&quot;,
+<span class="nc" id="L900">        toString(cqlType), toString(javaType));</span>
+<span class="nc" id="L901">        return new CodecNotFoundException(msg);</span>
+    }
+
+    private static String toString(Object value)
+    {
+<span class="nc bnc" id="L906" title="All 2 branches missed.">        return value == null ? &quot;ANY&quot; : value.toString();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

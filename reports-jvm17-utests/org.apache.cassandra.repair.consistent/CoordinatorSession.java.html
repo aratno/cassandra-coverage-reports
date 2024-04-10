@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CoordinatorSession.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair.consistent</a> &gt; <span class="el_source">CoordinatorSession.java</span></div><h1>CoordinatorSession.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.repair.consistent;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.concurrent.ImmediateExecutor;
+import org.apache.cassandra.repair.SharedContext;
+import org.apache.cassandra.repair.CoordinatedRepairResult;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+
+import org.apache.commons.lang3.time.DurationFormatUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.exceptions.RepairException;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.repair.SomeRepairFailedException;
+import org.apache.cassandra.repair.messages.FailSession;
+import org.apache.cassandra.repair.messages.FinalizeCommit;
+import org.apache.cassandra.repair.messages.FinalizePropose;
+import org.apache.cassandra.repair.messages.PrepareConsistentRequest;
+import org.apache.cassandra.repair.messages.RepairMessage;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+
+/**
+ * Coordinator side logic and state of a consistent repair session. Like {@link ActiveRepairService.ParentRepairSession},
+ * there is only one {@code CoordinatorSession} per user repair command, regardless of the number of tables and token
+ * ranges involved.
+ */
+public class CoordinatorSession extends ConsistentSession
+{
+<span class="fc" id="L61">    private static final Logger logger = LoggerFactory.getLogger(CoordinatorSession.class);</span>
+
+    private final SharedContext ctx;
+<span class="fc" id="L64">    private final Map&lt;InetAddressAndPort, State&gt; participantStates = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L65">    private final AsyncPromise&lt;Void&gt; prepareFuture = AsyncPromise.uncancellable();</span>
+<span class="fc" id="L66">    private final AsyncPromise&lt;Void&gt; finalizeProposeFuture = AsyncPromise.uncancellable();</span>
+
+<span class="fc" id="L68">    private volatile long sessionStart = Long.MIN_VALUE;</span>
+<span class="fc" id="L69">    private volatile long repairStart = Long.MIN_VALUE;</span>
+<span class="fc" id="L70">    private volatile long finalizeStart = Long.MIN_VALUE;</span>
+
+    public CoordinatorSession(Builder builder)
+    {
+<span class="fc" id="L74">        super(builder);</span>
+<span class="fc bfc" id="L75" title="All 2 branches covered.">        ctx = builder.ctx == null ? SharedContext.Global.instance : builder.ctx;</span>
+<span class="fc bfc" id="L76" title="All 2 branches covered.">        for (InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc" id="L78">            participantStates.put(participant, State.PREPARING);</span>
+<span class="fc" id="L79">        }</span>
+<span class="fc" id="L80">    }</span>
+
+    public static class Builder extends AbstractBuilder
+    {
+        private SharedContext ctx;
+
+        public Builder(SharedContext ctx)
+        {
+<span class="fc" id="L88">            super(ctx);</span>
+<span class="fc" id="L89">        }</span>
+
+        public Builder withContext(SharedContext ctx)
+        {
+<span class="fc" id="L93">            this.ctx = ctx;</span>
+<span class="fc" id="L94">            return this;</span>
+        }
+
+        public CoordinatorSession build()
+        {
+<span class="fc" id="L99">            validate();</span>
+<span class="fc" id="L100">            return new CoordinatorSession(this);</span>
+        }
+    }
+
+    public static Builder builder(SharedContext ctx)
+    {
+<span class="fc" id="L106">        return new Builder(ctx);</span>
+    }
+
+    public void setState(State state)
+    {
+<span class="fc" id="L111">        logger.trace(&quot;Setting coordinator state to {} for repair {}&quot;, state, sessionID);</span>
+<span class="fc" id="L112">        super.setState(state);</span>
+<span class="fc" id="L113">    }</span>
+
+    @VisibleForTesting
+    synchronized State getParticipantState(InetAddressAndPort participant)
+    {
+<span class="fc" id="L118">        return participantStates.get(participant);</span>
+    }
+
+    public synchronized void setParticipantState(InetAddressAndPort participant, State state)
+    {
+<span class="fc" id="L123">        logger.trace(&quot;Setting participant {} to state {} for repair {}&quot;, participant, state, sessionID);</span>
+<span class="fc" id="L124">        Preconditions.checkArgument(participantStates.containsKey(participant),</span>
+                                    &quot;Session %s doesn't include %s&quot;,
+                                    sessionID, participant);
+<span class="fc" id="L127">        Preconditions.checkArgument(participantStates.get(participant).canTransitionTo(state),</span>
+                                    &quot;Invalid state transition %s -&gt; %s&quot;,
+<span class="fc" id="L129">                                    participantStates.get(participant), state);</span>
+<span class="fc" id="L130">        participantStates.put(participant, state);</span>
+
+        // update coordinator state if all participants are at the value being set
+<span class="fc bfc" id="L133" title="All 4 branches covered.">        if (Iterables.all(participantStates.values(), s -&gt; s == state))</span>
+        {
+<span class="fc" id="L135">            setState(state);</span>
+        }
+<span class="fc" id="L137">    }</span>
+
+    synchronized void setAll(State state)
+    {
+<span class="fc bfc" id="L141" title="All 2 branches covered.">        for (InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc" id="L143">            setParticipantState(participant, state);</span>
+<span class="fc" id="L144">        }</span>
+<span class="fc" id="L145">    }</span>
+
+    synchronized boolean allStates(State state)
+    {
+<span class="pc bpc" id="L149" title="3 of 6 branches missed.">        return getState() == state &amp;&amp; Iterables.all(participantStates.values(), v -&gt; v == state);</span>
+    }
+
+    synchronized boolean hasFailed()
+    {
+<span class="fc bfc" id="L154" title="All 6 branches covered.">        return getState() == State.FAILED || Iterables.any(participantStates.values(), v -&gt; v == State.FAILED);</span>
+    }
+
+    protected void sendMessage(InetAddressAndPort destination, Message&lt;RepairMessage&gt; message)
+    {
+<span class="fc" id="L159">        logger.trace(&quot;Sending {} to {}&quot;, message.payload, destination);</span>
+
+<span class="fc" id="L161">        ctx.messaging().send(message, destination);</span>
+<span class="fc" id="L162">    }</span>
+
+    public Future&lt;Void&gt; prepare()
+    {
+<span class="fc" id="L166">        Preconditions.checkArgument(allStates(State.PREPARING));</span>
+
+<span class="fc" id="L168">        logger.info(&quot;Beginning prepare phase of incremental repair session {}&quot;, sessionID);</span>
+<span class="fc" id="L169">        Message&lt;RepairMessage&gt; message =</span>
+<span class="fc" id="L170">            Message.out(Verb.PREPARE_CONSISTENT_REQ, new PrepareConsistentRequest(sessionID, coordinator, participants));</span>
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        for (final InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc" id="L173">            sendMessage(participant, message);</span>
+<span class="fc" id="L174">        }</span>
+<span class="fc" id="L175">        return prepareFuture;</span>
+    }
+
+    public synchronized void handlePrepareResponse(InetAddressAndPort participant, boolean success)
+    {
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">        if (getState() == State.FAILED)</span>
+        {
+<span class="nc" id="L182">            logger.trace(&quot;Incremental repair {} has failed, ignoring prepare response from {}&quot;, sessionID, participant);</span>
+<span class="nc" id="L183">            return;</span>
+        }
+<span class="fc bfc" id="L185" title="All 2 branches covered.">        if (!success)</span>
+        {
+<span class="fc" id="L187">            logger.warn(&quot;{} failed the prepare phase for incremental repair session {}&quot;, participant, sessionID);</span>
+<span class="fc" id="L188">            sendFailureMessageToParticipants();</span>
+<span class="fc" id="L189">            setParticipantState(participant, State.FAILED);</span>
+        }
+        else
+        {
+<span class="fc" id="L193">            logger.trace(&quot;Successful prepare response received from {} for repair session {}&quot;, participant, sessionID);</span>
+<span class="fc" id="L194">            setParticipantState(participant, State.PREPARED);</span>
+        }
+
+        // don't progress until we've heard from all replicas
+<span class="fc bfc" id="L198" title="All 4 branches covered.">        if(Iterables.any(participantStates.values(), v -&gt; v == State.PREPARING))</span>
+<span class="fc" id="L199">            return;</span>
+
+<span class="fc bfc" id="L201" title="All 2 branches covered.">        if (getState() == State.PREPARED)</span>
+        {
+<span class="fc" id="L203">            logger.info(&quot;Incremental repair session {} successfully prepared.&quot;, sessionID);</span>
+<span class="fc" id="L204">            prepareFuture.trySuccess(null);</span>
+        }
+        else
+        {
+<span class="fc" id="L208">            fail();</span>
+        }
+<span class="fc" id="L210">    }</span>
+
+    public synchronized void setRepairing()
+    {
+<span class="fc" id="L214">        setAll(State.REPAIRING);</span>
+<span class="fc" id="L215">    }</span>
+
+    public synchronized Future&lt;Void&gt; finalizePropose()
+    {
+<span class="fc" id="L219">        Preconditions.checkArgument(allStates(State.REPAIRING));</span>
+<span class="fc" id="L220">        logger.info(&quot;Proposing finalization of repair session {}&quot;, sessionID);</span>
+<span class="fc" id="L221">        Message&lt;RepairMessage&gt; message = Message.out(Verb.FINALIZE_PROPOSE_MSG, new FinalizePropose(sessionID));</span>
+<span class="fc bfc" id="L222" title="All 2 branches covered.">        for (final InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc" id="L224">            sendMessage(participant, message);</span>
+<span class="fc" id="L225">        }</span>
+<span class="fc" id="L226">        return finalizeProposeFuture;</span>
+    }
+
+    public synchronized void handleFinalizePromise(InetAddressAndPort participant, boolean success)
+    {
+<span class="fc bfc" id="L231" title="All 2 branches covered.">        if (getState() == State.FAILED)</span>
+        {
+<span class="fc" id="L233">            logger.trace(&quot;Incremental repair {} has failed, ignoring finalize promise from {}&quot;, sessionID, participant);</span>
+        }
+<span class="fc bfc" id="L235" title="All 2 branches covered.">        else if (!success)</span>
+        {
+<span class="fc" id="L237">            logger.warn(&quot;Finalization proposal of session {} rejected by {}. Aborting session&quot;, sessionID, participant);</span>
+<span class="fc" id="L238">            fail();</span>
+        }
+        else
+        {
+<span class="fc" id="L242">            logger.trace(&quot;Successful finalize promise received from {} for repair session {}&quot;, participant, sessionID);</span>
+<span class="fc" id="L243">            setParticipantState(participant, State.FINALIZE_PROMISED);</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">            if (getState() == State.FINALIZE_PROMISED)</span>
+            {
+<span class="fc" id="L246">                logger.info(&quot;Finalization proposal for repair session {} accepted by all participants.&quot;, sessionID);</span>
+<span class="fc" id="L247">                finalizeProposeFuture.trySuccess(null);</span>
+            }
+        }
+<span class="fc" id="L250">    }</span>
+
+    public synchronized void finalizeCommit()
+    {
+<span class="fc" id="L254">        Preconditions.checkArgument(allStates(State.FINALIZE_PROMISED));</span>
+<span class="fc" id="L255">        logger.info(&quot;Committing finalization of repair session {}&quot;, sessionID);</span>
+<span class="fc" id="L256">        Message&lt;RepairMessage&gt; message = Message.out(Verb.FINALIZE_COMMIT_MSG, new FinalizeCommit(sessionID));</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        for (final InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc" id="L259">            sendMessage(participant, message);</span>
+<span class="fc" id="L260">        }</span>
+<span class="fc" id="L261">        setAll(State.FINALIZED);</span>
+<span class="fc" id="L262">        logger.info(&quot;Incremental repair session {} completed&quot;, sessionID);</span>
+<span class="fc" id="L263">    }</span>
+
+    private void sendFailureMessageToParticipants()
+    {
+<span class="fc" id="L267">        Message&lt;RepairMessage&gt; message = Message.out(Verb.FAILED_SESSION_MSG, new FailSession(sessionID));</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">        for (final InetAddressAndPort participant : participants)</span>
+        {
+<span class="fc bfc" id="L270" title="All 2 branches covered.">            if (participantStates.get(participant) != State.FAILED)</span>
+            {
+<span class="fc" id="L272">                sendMessage(participant, message);</span>
+            }
+<span class="fc" id="L274">        }</span>
+<span class="fc" id="L275">    }</span>
+
+    public synchronized void fail()
+    {
+<span class="fc" id="L279">        Set&lt;Map.Entry&lt;InetAddressAndPort, State&gt;&gt; cantFail = participantStates.entrySet()</span>
+<span class="fc" id="L280">                                                                              .stream()</span>
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">                                                                              .filter(entry -&gt; !entry.getValue().canTransitionTo(State.FAILED))</span>
+<span class="fc" id="L282">                                                                              .collect(Collectors.toSet());</span>
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (!cantFail.isEmpty())</span>
+        {
+<span class="nc" id="L285">            logger.error(&quot;Can't transition endpoints {} to FAILED&quot;, cantFail, new RuntimeException());</span>
+<span class="nc" id="L286">            return;</span>
+        }
+<span class="fc" id="L288">        logger.info(&quot;Incremental repair session {} failed&quot;, sessionID);</span>
+<span class="fc" id="L289">        sendFailureMessageToParticipants();</span>
+<span class="fc" id="L290">        setAll(State.FAILED);</span>
+
+<span class="fc" id="L292">        String exceptionMsg = String.format(&quot;Incremental repair session %s has failed&quot;, sessionID);</span>
+<span class="fc" id="L293">        finalizeProposeFuture.tryFailure(RepairException.warn(exceptionMsg));</span>
+<span class="fc" id="L294">        prepareFuture.tryFailure(RepairException.warn(exceptionMsg));</span>
+<span class="fc" id="L295">    }</span>
+
+    private static String formatDuration(long then, long now)
+    {
+<span class="pc bpc" id="L299" title="2 of 4 branches missed.">        if (then == Long.MIN_VALUE || now == Long.MIN_VALUE)</span>
+        {
+            // if neither of the times were initially set, don't return a non-sensical answer
+<span class="nc" id="L302">            return &quot;n/a&quot;;</span>
+        }
+<span class="fc" id="L304">        return DurationFormatUtils.formatDurationWords(now - then, true, true);</span>
+    }
+
+    /**
+     * Runs the asynchronous consistent repair session. Actual repair sessions are scheduled via a submitter to make unit testing easier
+     */
+    public Future&lt;CoordinatedRepairResult&gt; execute(Supplier&lt;Future&lt;CoordinatedRepairResult&gt;&gt; sessionSubmitter)
+    {
+<span class="fc" id="L312">        logger.info(&quot;Beginning coordination of incremental repair session {}&quot;, sessionID);</span>
+
+<span class="fc" id="L314">        sessionStart = ctx.clock().currentTimeMillis();</span>
+<span class="fc" id="L315">        Future&lt;Void&gt; prepareResult = prepare();</span>
+
+        // run repair sessions normally
+<span class="fc" id="L318">        Future&lt;CoordinatedRepairResult&gt; repairSessionResults = prepareResult.flatMap(ignore -&gt; {</span>
+<span class="fc" id="L319">            repairStart = ctx.clock().currentTimeMillis();</span>
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="fc" id="L321">                logger.debug(&quot;Incremental repair {} prepare phase completed in {}&quot;, sessionID, formatDuration(sessionStart, repairStart));</span>
+<span class="fc" id="L322">            setRepairing();</span>
+<span class="fc" id="L323">            return sessionSubmitter.get();</span>
+        });
+
+        // if any session failed, then fail the future
+<span class="fc" id="L327">        Future&lt;CoordinatedRepairResult&gt; onlySuccessSessionResults = repairSessionResults.flatMap(result -&gt; {</span>
+<span class="fc" id="L328">            finalizeStart = ctx.clock().currentTimeMillis();</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">            if (result.hasFailed())</span>
+            {
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">                if (logger.isDebugEnabled())</span>
+<span class="fc" id="L332">                    logger.debug(&quot;Incremental repair {} validation/stream phase completed in {}&quot;, sessionID, formatDuration(repairStart, finalizeStart));</span>
+<span class="fc" id="L333">                return ImmediateFuture.failure(SomeRepairFailedException.INSTANCE);</span>
+            }
+<span class="fc" id="L335">            return ImmediateFuture.success(result);</span>
+        });
+
+        // mark propose finalization and commit
+<span class="fc" id="L339">        Future&lt;CoordinatedRepairResult&gt; proposeFuture = onlySuccessSessionResults.flatMap(results -&gt; finalizePropose().map(ignore -&gt; {</span>
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="fc" id="L341">                logger.debug(&quot;Incremental repair {} finalization phase completed in {}&quot;, sessionID, formatDuration(finalizeStart, ctx.clock().currentTimeMillis()));</span>
+<span class="fc" id="L342">            finalizeCommit();</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">            if (logger.isDebugEnabled())</span>
+<span class="fc" id="L344">                logger.debug(&quot;Incremental repair {} phase completed in {}&quot;, sessionID, formatDuration(sessionStart, ctx.clock().currentTimeMillis()));</span>
+<span class="fc" id="L345">            return results;</span>
+        }));
+
+<span class="fc" id="L348">        return proposeFuture.addCallback((ignore, failure) -&gt; {</span>
+<span class="fc bfc" id="L349" title="All 2 branches covered.">            if (failure != null)</span>
+            {
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">                if (logger.isDebugEnabled())</span>
+<span class="fc" id="L352">                    logger.debug(&quot;Incremental repair {} phase failed in {}&quot;, sessionID, formatDuration(sessionStart, ctx.clock().currentTimeMillis()));</span>
+<span class="fc" id="L353">                fail();</span>
+            }
+<span class="fc" id="L355">        }, ImmediateExecutor.INSTANCE);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

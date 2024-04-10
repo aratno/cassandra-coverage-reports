@@ -1,0 +1,326 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsStore.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsStore.java</span></div><h1>HintsStore.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.Predicate;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import org.apache.cassandra.io.util.File;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.SyncUtil;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+/**
+ * Encapsulates the state of a peer's hints: the queue of hints files for dispatch, and the current writer (if any).
+ *
+ * The queue for dispatch is multi-threading safe.
+ *
+ * The writer MUST only be accessed by {@link HintsWriteExecutor}.
+ */
+final class HintsStore
+{
+<span class="fc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(HintsStore.class);</span>
+
+    public final UUID hostId;
+    private final File hintsDirectory;
+    private final ImmutableMap&lt;String, Object&gt; writerParams;
+
+    private final Map&lt;HintsDescriptor, InputPosition&gt; dispatchPositions;
+    private final Deque&lt;HintsDescriptor&gt; dispatchDequeue;
+    private final Queue&lt;HintsDescriptor&gt; corruptedFiles;
+    private final Map&lt;HintsDescriptor, Long&gt; hintsExpirations;
+
+    // last timestamp used in a descriptor; make sure to not reuse the same timestamp for new descriptors.
+    private volatile long lastUsedTimestamp;
+    private volatile HintsWriter hintsWriter;
+
+    private HintsStore(UUID hostId, File hintsDirectory, ImmutableMap&lt;String, Object&gt; writerParams, List&lt;HintsDescriptor&gt; descriptors)
+<span class="fc" id="L70">    {</span>
+<span class="fc" id="L71">        this.hostId = hostId;</span>
+<span class="fc" id="L72">        this.hintsDirectory = hintsDirectory;</span>
+<span class="fc" id="L73">        this.writerParams = writerParams;</span>
+
+<span class="fc" id="L75">        dispatchPositions = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L76">        dispatchDequeue = new ConcurrentLinkedDeque&lt;&gt;(descriptors);</span>
+<span class="fc" id="L77">        corruptedFiles = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L78">        hintsExpirations = new ConcurrentHashMap&lt;&gt;();</span>
+
+        //noinspection resource
+<span class="fc" id="L81">        lastUsedTimestamp = descriptors.stream().mapToLong(d -&gt; d.timestamp).max().orElse(0L);</span>
+<span class="fc" id="L82">    }</span>
+
+    static HintsStore create(UUID hostId, File hintsDirectory, ImmutableMap&lt;String, Object&gt; writerParams, List&lt;HintsDescriptor&gt; descriptors)
+    {
+<span class="fc" id="L86">        descriptors.sort((d1, d2) -&gt; Long.compare(d1.timestamp, d2.timestamp));</span>
+<span class="fc" id="L87">        return new HintsStore(hostId, hintsDirectory, writerParams, descriptors);</span>
+    }
+
+    @VisibleForTesting
+    int getDispatchQueueSize()
+    {
+<span class="fc" id="L93">        return dispatchDequeue.size();</span>
+    }
+
+    @VisibleForTesting
+    int getHintsExpirationsMapSize()
+    {
+<span class="fc" id="L99">        return hintsExpirations.size();</span>
+    }
+
+    InetAddressAndPort address()
+    {
+<span class="fc" id="L104">        return StorageService.instance.getEndpointForHostId(hostId);</span>
+    }
+
+    @Nullable
+    PendingHintsInfo getPendingHintsInfo()
+    {
+<span class="fc" id="L110">        Iterator&lt;HintsDescriptor&gt; descriptors = dispatchDequeue.iterator();</span>
+<span class="fc" id="L111">        int queueSize = 0;</span>
+<span class="fc" id="L112">        long minTimestamp = Long.MAX_VALUE;</span>
+<span class="fc" id="L113">        long maxTimestamp = Long.MIN_VALUE;</span>
+<span class="fc bfc" id="L114" title="All 2 branches covered.">        while (descriptors.hasNext())</span>
+        {
+<span class="fc" id="L116">            HintsDescriptor descriptor = descriptors.next();</span>
+<span class="fc" id="L117">            minTimestamp = Math.min(minTimestamp, descriptor.timestamp);</span>
+<span class="fc" id="L118">            maxTimestamp = Math.max(maxTimestamp, descriptor.timestamp);</span>
+<span class="fc" id="L119">            queueSize++;</span>
+<span class="fc" id="L120">        }</span>
+
+<span class="fc bfc" id="L122" title="All 2 branches covered.">        if (queueSize == 0)</span>
+<span class="fc" id="L123">            return null;</span>
+<span class="fc" id="L124">        return new PendingHintsInfo(hostId, queueSize, minTimestamp, maxTimestamp);</span>
+    }
+
+    boolean isLive()
+    {
+<span class="fc" id="L129">        InetAddressAndPort address = address();</span>
+<span class="fc bfc" id="L130" title="All 4 branches covered.">        return address != null &amp;&amp; FailureDetector.instance.isAlive(address);</span>
+    }
+
+    HintsDescriptor poll()
+    {
+<span class="fc" id="L135">        return dispatchDequeue.poll();</span>
+    }
+
+    void offerFirst(HintsDescriptor descriptor)
+    {
+<span class="fc" id="L140">        dispatchDequeue.offerFirst(descriptor);</span>
+<span class="fc" id="L141">    }</span>
+
+    void offerLast(HintsDescriptor descriptor)
+    {
+<span class="fc" id="L145">        dispatchDequeue.offerLast(descriptor);</span>
+<span class="fc" id="L146">    }</span>
+
+    void deleteAllHints()
+    {
+        HintsDescriptor descriptor;
+<span class="fc bfc" id="L151" title="All 2 branches covered.">        while ((descriptor = poll()) != null)</span>
+        {
+<span class="fc" id="L153">            cleanUp(descriptor);</span>
+<span class="fc" id="L154">            delete(descriptor);</span>
+        }
+
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">        while ((descriptor = corruptedFiles.poll()) != null)</span>
+        {
+<span class="nc" id="L159">            cleanUp(descriptor);</span>
+<span class="nc" id="L160">            delete(descriptor);</span>
+        }
+<span class="fc" id="L162">    }</span>
+
+    void deleteExpiredHints(long now)
+    {
+<span class="fc" id="L166">        deleteHints(it -&gt; hasExpired(it, now));</span>
+<span class="fc" id="L167">    }</span>
+
+    private boolean hasExpired(HintsDescriptor descriptor, long now)
+    {
+<span class="fc" id="L171">        Long cachedExpiresAt = hintsExpirations.get(descriptor);</span>
+<span class="fc bfc" id="L172" title="All 2 branches covered.">        if (null != cachedExpiresAt)</span>
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">            return cachedExpiresAt &lt;= now;</span>
+
+<span class="fc" id="L175">        File hintFile = new File(hintsDirectory, descriptor.fileName());</span>
+        // the file does not exist or if an I/O error occurs
+<span class="fc bfc" id="L177" title="All 4 branches covered.">        if (!hintFile.exists() || hintFile.lastModified() == 0)</span>
+<span class="fc" id="L178">            return false;</span>
+
+        // 'lastModified' can be considered as the upper bound of the hint creation time.
+        // So the TTL upper bound of all hints in the file can be estimated by lastModified + maxGcgs of all tables
+<span class="fc" id="L182">        long ttl = hintFile.lastModified() + Schema.instance.largestGcgs();</span>
+<span class="fc" id="L183">        hintsExpirations.put(descriptor, ttl);</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">        return ttl &lt;= now;</span>
+    }
+
+    private void deleteHints(Predicate&lt;HintsDescriptor&gt; predicate)
+    {
+<span class="fc" id="L189">        Set&lt;HintsDescriptor&gt; removeSet = new HashSet&lt;&gt;();</span>
+        try
+        {
+<span class="fc bfc" id="L192" title="All 2 branches covered.">            for (HintsDescriptor descriptor : Iterables.concat(dispatchDequeue, corruptedFiles))</span>
+            {
+<span class="fc bfc" id="L194" title="All 2 branches covered.">                if (predicate.test(descriptor))</span>
+                {
+<span class="fc" id="L196">                    cleanUp(descriptor);</span>
+<span class="fc" id="L197">                    delete(descriptor);</span>
+<span class="fc" id="L198">                    removeSet.add(descriptor);</span>
+                }
+<span class="fc" id="L200">            }</span>
+        }
+        finally // remove the already deleted hints from internal queues in case of exception
+        {
+<span class="fc" id="L204">            dispatchDequeue.removeAll(removeSet);</span>
+<span class="fc" id="L205">            corruptedFiles.removeAll(removeSet);</span>
+        }
+<span class="fc" id="L207">    }</span>
+
+    void delete(HintsDescriptor descriptor)
+    {
+<span class="fc" id="L211">        File hintsFile = descriptor.file(hintsDirectory);</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        if (hintsFile.tryDelete())</span>
+<span class="fc" id="L213">            logger.info(&quot;Deleted hint file {}&quot;, descriptor.fileName());</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">        else if (hintsFile.exists())</span>
+<span class="nc" id="L215">            logger.error(&quot;Failed to delete hint file {}&quot;, descriptor.fileName());</span>
+        else
+<span class="fc" id="L217">            logger.info(&quot;Already deleted hint file {}&quot;, descriptor.fileName());</span>
+
+        //noinspection ResultOfMethodCallIgnored
+<span class="fc" id="L220">        descriptor.checksumFile(hintsDirectory).tryDelete();</span>
+<span class="fc" id="L221">    }</span>
+
+    boolean hasFiles()
+    {
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        return !dispatchDequeue.isEmpty();</span>
+    }
+
+    InputPosition getDispatchOffset(HintsDescriptor descriptor)
+    {
+<span class="fc" id="L230">        return dispatchPositions.get(descriptor);</span>
+    }
+
+    void markDispatchOffset(HintsDescriptor descriptor, InputPosition inputPosition)
+    {
+<span class="fc" id="L235">        dispatchPositions.put(descriptor, inputPosition);</span>
+<span class="fc" id="L236">    }</span>
+
+
+    /**
+     * @return the total size of all files belonging to the hints store, in bytes.
+     */
+    long getTotalFileSize()
+    {
+<span class="fc" id="L244">        long total = 0;</span>
+<span class="fc bfc" id="L245" title="All 2 branches covered.">        for (HintsDescriptor descriptor : Iterables.concat(dispatchDequeue, corruptedFiles))</span>
+        {
+<span class="fc" id="L247">            total += descriptor.file(hintsDirectory).length();</span>
+<span class="fc" id="L248">        }</span>
+<span class="fc" id="L249">        return total;</span>
+    }
+
+    void cleanUp(HintsDescriptor descriptor)
+    {
+<span class="fc" id="L254">        dispatchPositions.remove(descriptor);</span>
+<span class="fc" id="L255">        hintsExpirations.remove(descriptor);</span>
+<span class="fc" id="L256">    }</span>
+
+    void markCorrupted(HintsDescriptor descriptor)
+    {
+<span class="nc" id="L260">        corruptedFiles.add(descriptor);</span>
+<span class="nc" id="L261">    }</span>
+
+    /**
+     * @return a copy of the first {@link HintsDescriptor} in the queue for dispatch or {@code null} if queue is empty.
+     */
+    HintsDescriptor getFirstDescriptor()
+    {
+<span class="fc" id="L268">        return dispatchDequeue.peekFirst();</span>
+    }
+
+    /*
+     * Methods dealing with HintsWriter.
+     *
+     * All of these, with the exception of isWriting(), are for exclusively single-threaded use by HintsWriteExecutor.
+     */
+
+    boolean isWriting()
+    {
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        return hintsWriter != null;</span>
+    }
+
+    HintsWriter getOrOpenWriter()
+    {
+<span class="fc bfc" id="L284" title="All 2 branches covered.">        if (hintsWriter == null)</span>
+<span class="fc" id="L285">            hintsWriter = openWriter();</span>
+<span class="fc" id="L286">        return hintsWriter;</span>
+    }
+
+    HintsWriter getWriter()
+    {
+<span class="nc" id="L291">        return hintsWriter;</span>
+    }
+
+    private HintsWriter openWriter()
+    {
+<span class="fc" id="L296">        lastUsedTimestamp = Math.max(currentTimeMillis(), lastUsedTimestamp + 1);</span>
+<span class="fc" id="L297">        HintsDescriptor descriptor = new HintsDescriptor(hostId, lastUsedTimestamp, writerParams);</span>
+
+        try
+        {
+<span class="fc" id="L301">            return HintsWriter.create(hintsDirectory, descriptor);</span>
+        }
+<span class="nc" id="L303">        catch (IOException e)</span>
+        {
+<span class="nc" id="L305">            throw new FSWriteError(e, descriptor.fileName());</span>
+        }
+    }
+
+    void closeWriter()
+    {
+<span class="fc bfc" id="L311" title="All 2 branches covered.">        if (hintsWriter != null)</span>
+        {
+<span class="fc" id="L313">            hintsWriter.close();</span>
+<span class="fc" id="L314">            offerLast(hintsWriter.descriptor());</span>
+<span class="fc" id="L315">            hintsWriter = null;</span>
+<span class="fc" id="L316">            SyncUtil.trySyncDir(hintsDirectory);</span>
+        }
+<span class="fc" id="L318">    }</span>
+
+    void fsyncWriter()
+    {
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">        if (hintsWriter != null)</span>
+<span class="fc" id="L323">            hintsWriter.fsync();</span>
+<span class="fc" id="L324">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

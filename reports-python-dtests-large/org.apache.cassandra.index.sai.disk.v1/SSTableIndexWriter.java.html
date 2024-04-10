@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableIndexWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1</a> &gt; <span class="el_source">SSTableIndexWriter.java</span></div><h1>SSTableIndexWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai.disk.v1;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.base.Stopwatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.disk.PerColumnIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.IndexComponent;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.v1.segment.SegmentBuilder;
+import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
+import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
+import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_FROZEN_TERM_SIZE;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_STRING_TERM_SIZE;
+
+/**
+ * Column index writer that accumulates (on-heap) indexed data from a compacted SSTable as it's being flushed to disk.
+ */
+@NotThreadSafe
+public class SSTableIndexWriter implements PerColumnIndexWriter
+{
+<span class="nc" id="L58">    private static final Logger logger = LoggerFactory.getLogger(SSTableIndexWriter.class);</span>
+<span class="nc" id="L59">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+
+<span class="nc" id="L61">    public static final int MAX_STRING_TERM_SIZE = SAI_MAX_STRING_TERM_SIZE.getInt() * 1024;</span>
+<span class="nc" id="L62">    public static final int MAX_FROZEN_TERM_SIZE = SAI_MAX_FROZEN_TERM_SIZE.getInt() * 1024;</span>
+    public static final String TERM_OVERSIZE_MESSAGE = &quot;Can't add term of column {} to index for key: {}, term size {} &quot; +
+                                                       &quot;max allowed size {}, use analyzed = true (if not yet set) for that column.&quot;;
+
+    private final IndexDescriptor indexDescriptor;
+    private final IndexContext indexContext;
+<span class="nc" id="L68">    private final long nowInSec = FBUtilities.nowInSeconds();</span>
+    private final AbstractAnalyzer analyzer;
+    private final NamedMemoryLimiter limiter;
+    private final int maxTermSize;
+    private final BooleanSupplier isIndexValid;
+<span class="nc" id="L73">    private final List&lt;SegmentMetadata&gt; segments = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L75">    private boolean aborted = false;</span>
+    private SegmentBuilder currentBuilder;
+
+    public SSTableIndexWriter(IndexDescriptor indexDescriptor, IndexContext indexContext, NamedMemoryLimiter limiter, BooleanSupplier isIndexValid)
+<span class="nc" id="L79">    {</span>
+<span class="nc" id="L80">        this.indexDescriptor = indexDescriptor;</span>
+<span class="nc" id="L81">        this.indexContext = indexContext;</span>
+<span class="nc" id="L82">        this.analyzer = indexContext.getAnalyzerFactory().create();</span>
+<span class="nc" id="L83">        this.limiter = limiter;</span>
+<span class="nc" id="L84">        this.isIndexValid = isIndexValid;</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        this.maxTermSize = indexContext.isFrozen() ? MAX_FROZEN_TERM_SIZE : MAX_STRING_TERM_SIZE;</span>
+<span class="nc" id="L86">    }</span>
+
+    @Override
+    public void addRow(PrimaryKey key, Row row, long sstableRowId) throws IOException
+    {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">        if (maybeAbort())</span>
+<span class="nc" id="L92">            return;</span>
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (indexContext.isNonFrozenCollection())</span>
+        {
+<span class="nc" id="L96">            Iterator&lt;ByteBuffer&gt; valueIterator = indexContext.getValuesOf(row, nowInSec);</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (valueIterator != null)</span>
+            {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">                while (valueIterator.hasNext())</span>
+                {
+<span class="nc" id="L101">                    ByteBuffer value = valueIterator.next();</span>
+<span class="nc" id="L102">                    addTerm(TypeUtil.asIndexBytes(value.duplicate(), indexContext.getValidator()), key, sstableRowId, indexContext.getValidator());</span>
+<span class="nc" id="L103">                }</span>
+            }
+<span class="nc" id="L105">        }</span>
+        else
+        {
+<span class="nc" id="L108">            ByteBuffer value = indexContext.getValueOf(key.partitionKey(), row, nowInSec);</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            if (value != null)</span>
+<span class="nc" id="L110">                addTerm(TypeUtil.asIndexBytes(value.duplicate(), indexContext.getValidator()), key, sstableRowId, indexContext.getValidator());</span>
+        }
+<span class="nc" id="L112">    }</span>
+
+    @Override
+    public void complete(Stopwatch stopwatch) throws IOException
+    {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        if (maybeAbort())</span>
+<span class="nc" id="L118">            return;</span>
+
+<span class="nc" id="L120">        long start = stopwatch.elapsed(TimeUnit.MILLISECONDS);</span>
+        long elapsed;
+
+<span class="nc bnc" id="L123" title="All 4 branches missed.">        boolean emptySegment = currentBuilder == null || currentBuilder.isEmpty();</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        logger.debug(indexContext.logMessage(&quot;Completing index flush with {}buffered data...&quot;), emptySegment ? &quot;no &quot; : &quot;&quot;);</span>
+
+        try
+        {
+            // parts are present but there is something still in memory, let's flush that inline
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            if (!emptySegment)</span>
+            {
+<span class="nc" id="L131">                flushSegment();</span>
+<span class="nc" id="L132">                elapsed = stopwatch.elapsed(TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L133">                logger.debug(indexContext.logMessage(&quot;Completed flush of final segment for SSTable {}. Duration: {} ms. Total elapsed: {} ms&quot;),</span>
+                             indexDescriptor.sstableDescriptor,
+<span class="nc" id="L135">                             elapsed - start,</span>
+<span class="nc" id="L136">                             elapsed);</span>
+            }
+
+            // Even an empty segment may carry some fixed memory, so remove it:
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if (currentBuilder != null)</span>
+            {
+<span class="nc" id="L142">                long bytesAllocated = currentBuilder.totalBytesAllocated();</span>
+<span class="nc" id="L143">                long globalBytesUsed = currentBuilder.release(indexContext);</span>
+<span class="nc" id="L144">                logger.debug(indexContext.logMessage(&quot;Flushing final segment for SSTable {} released {}. Global segment memory usage now at {}.&quot;),</span>
+<span class="nc" id="L145">                             indexDescriptor.sstableDescriptor, FBUtilities.prettyPrintMemory(bytesAllocated), FBUtilities.prettyPrintMemory(globalBytesUsed));</span>
+            }
+
+<span class="nc" id="L148">            writeSegmentsMetadata();</span>
+<span class="nc" id="L149">            indexDescriptor.createComponentOnDisk(IndexComponent.COLUMN_COMPLETION_MARKER, indexContext);</span>
+        }
+        finally
+        {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if (indexContext.getIndexMetrics() != null)</span>
+            {
+<span class="nc" id="L155">                indexContext.getIndexMetrics().segmentsPerCompaction.update(segments.size());</span>
+<span class="nc" id="L156">                segments.clear();</span>
+<span class="nc" id="L157">                indexContext.getIndexMetrics().compactionCount.inc();</span>
+            }
+        }
+<span class="nc" id="L160">    }</span>
+
+    @Override
+    public void abort(Throwable cause)
+    {
+<span class="nc" id="L165">        aborted = true;</span>
+
+<span class="nc" id="L167">        logger.warn(indexContext.logMessage(&quot;Aborting SSTable index flush for {}...&quot;), indexDescriptor.sstableDescriptor, cause);</span>
+
+        // It's possible for the current builder to be unassigned after we flush a final segment.
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (currentBuilder != null)</span>
+        {
+            // If an exception is thrown out of any writer operation prior to successful segment
+            // flush, we will end up here, and we need to free up builder memory tracked by the limiter:
+<span class="nc" id="L174">            long allocated = currentBuilder.totalBytesAllocated();</span>
+<span class="nc" id="L175">            long globalBytesUsed = currentBuilder.release(indexContext);</span>
+<span class="nc" id="L176">            logger.debug(indexContext.logMessage(&quot;Aborting index writer for SSTable {} released {}. Global segment memory usage now at {}.&quot;),</span>
+<span class="nc" id="L177">                         indexDescriptor.sstableDescriptor, FBUtilities.prettyPrintMemory(allocated), FBUtilities.prettyPrintMemory(globalBytesUsed));</span>
+        }
+
+<span class="nc" id="L180">        indexDescriptor.deleteColumnIndex(indexContext);</span>
+<span class="nc" id="L181">    }</span>
+
+    /**
+     * abort current write if index is dropped
+     *
+     * @return true if current write is aborted.
+     */
+    private boolean maybeAbort()
+    {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (aborted)</span>
+<span class="nc" id="L191">            return true;</span>
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (isIndexValid.getAsBoolean())</span>
+<span class="nc" id="L194">            return false;</span>
+
+<span class="nc" id="L196">        abort(new RuntimeException(String.format(&quot;index %s is dropped&quot;, indexContext.getIndexName())));</span>
+<span class="nc" id="L197">        return true;</span>
+    }
+
+    private void addTerm(ByteBuffer term, PrimaryKey key, long sstableRowId, AbstractType&lt;?&gt; type) throws IOException
+    {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (term.remaining() &gt;= maxTermSize)</span>
+        {
+<span class="nc" id="L204">            noSpamLogger.warn(indexContext.logMessage(TERM_OVERSIZE_MESSAGE),</span>
+<span class="nc" id="L205">                              indexContext.getColumnName(),</span>
+<span class="nc" id="L206">                              indexContext.keyValidator().getString(key.partitionKey().getKey()),</span>
+<span class="nc" id="L207">                              FBUtilities.prettyPrintMemory(term.remaining()),</span>
+<span class="nc" id="L208">                              FBUtilities.prettyPrintMemory(maxTermSize));</span>
+<span class="nc" id="L209">            return;</span>
+        }
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (currentBuilder == null)</span>
+        {
+<span class="nc" id="L214">            currentBuilder = newSegmentBuilder();</span>
+        }
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        else if (shouldFlush(sstableRowId))</span>
+        {
+<span class="nc" id="L218">            flushSegment();</span>
+<span class="nc" id="L219">            currentBuilder = newSegmentBuilder();</span>
+        }
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        if (term.remaining() == 0) return;</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (!TypeUtil.isLiteral(type))</span>
+        {
+<span class="nc" id="L226">            limiter.increment(currentBuilder.add(term, key, sstableRowId));</span>
+        }
+        else
+        {
+<span class="nc" id="L230">            analyzer.reset(term);</span>
+            try
+            {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">                while (analyzer.hasNext())</span>
+                {
+<span class="nc" id="L235">                    ByteBuffer tokenTerm = analyzer.next();</span>
+<span class="nc" id="L236">                    limiter.increment(currentBuilder.add(tokenTerm, key, sstableRowId));</span>
+<span class="nc" id="L237">                }</span>
+            }
+            finally
+            {
+<span class="nc" id="L241">                analyzer.end();</span>
+            }
+        }
+<span class="nc" id="L244">    }</span>
+
+    private boolean shouldFlush(long sstableRowId)
+    {
+        // If we've hit the minimum flush size and, we've breached the global limit, flush a new segment:
+<span class="nc bnc" id="L249" title="All 4 branches missed.">        boolean reachMemoryLimit = limiter.usageExceedsLimit() &amp;&amp; currentBuilder.hasReachedMinimumFlushSize();</span>
+
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (reachMemoryLimit)</span>
+        {
+<span class="nc" id="L253">            logger.debug(indexContext.logMessage(&quot;Global limit of {} and minimum flush size of {} exceeded. &quot; +</span>
+                                            &quot;Current builder usage is {} for {} cells. Global Usage is {}. Flushing...&quot;),
+<span class="nc" id="L255">                         FBUtilities.prettyPrintMemory(limiter.limitBytes()),</span>
+<span class="nc" id="L256">                         FBUtilities.prettyPrintMemory(currentBuilder.getMinimumFlushBytes()),</span>
+<span class="nc" id="L257">                         FBUtilities.prettyPrintMemory(currentBuilder.totalBytesAllocated()),</span>
+<span class="nc" id="L258">                         currentBuilder.getRowCount(),</span>
+<span class="nc" id="L259">                         FBUtilities.prettyPrintMemory(limiter.currentBytesUsed()));</span>
+        }
+
+<span class="nc bnc" id="L262" title="All 4 branches missed.">        return reachMemoryLimit || currentBuilder.exceedsSegmentLimit(sstableRowId);</span>
+    }
+
+    private void flushSegment() throws IOException
+    {
+<span class="nc" id="L267">        long start = Clock.Global.nanoTime();</span>
+
+        try
+        {
+<span class="nc" id="L271">            long bytesAllocated = currentBuilder.totalBytesAllocated();</span>
+
+<span class="nc" id="L273">            SegmentMetadata segmentMetadata = currentBuilder.flush(indexDescriptor, indexContext);</span>
+
+<span class="nc" id="L275">            long flushMillis = Math.max(1, TimeUnit.NANOSECONDS.toMillis(Clock.Global.nanoTime() - start));</span>
+
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (segmentMetadata != null)</span>
+            {
+<span class="nc" id="L279">                segments.add(segmentMetadata);</span>
+
+<span class="nc" id="L281">                double rowCount = segmentMetadata.numRows;</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">                if (indexContext.getIndexMetrics() != null)</span>
+<span class="nc" id="L283">                    indexContext.getIndexMetrics().compactionSegmentCellsPerSecond.update((long)(rowCount / flushMillis * 1000.0));</span>
+
+<span class="nc" id="L285">                double segmentBytes = segmentMetadata.componentMetadatas.indexSize();</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                if (indexContext.getIndexMetrics() != null)</span>
+<span class="nc" id="L287">                    indexContext.getIndexMetrics().compactionSegmentBytesPerSecond.update((long)(segmentBytes / flushMillis * 1000.0));</span>
+
+<span class="nc" id="L289">                logger.debug(indexContext.logMessage(&quot;Flushed segment with {} cells for a total of {} in {} ms.&quot;),</span>
+<span class="nc" id="L290">                             (long) rowCount, FBUtilities.prettyPrintMemory((long) segmentBytes), flushMillis);</span>
+            }
+
+            // Builder memory is released against the limiter at the conclusion of a successful
+            // flush. Note that any failure that occurs before this (even in term addition) will
+            // actuate this column writer's abort logic from the parent SSTable-level writer, and
+            // that abort logic will release the current builder's memory against the limiter.
+<span class="nc" id="L297">            long globalBytesUsed = currentBuilder.release(indexContext);</span>
+<span class="nc" id="L298">            currentBuilder = null;</span>
+<span class="nc" id="L299">            logger.debug(indexContext.logMessage(&quot;Flushing index segment for SSTable {} released {}. Global segment memory usage now at {}.&quot;),</span>
+<span class="nc" id="L300">                         indexDescriptor.sstableDescriptor, FBUtilities.prettyPrintMemory(bytesAllocated), FBUtilities.prettyPrintMemory(globalBytesUsed));</span>
+
+        }
+<span class="nc" id="L303">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L305">            logger.error(indexContext.logMessage(&quot;Failed to build index for SSTable {}.&quot;), indexDescriptor.sstableDescriptor, t);</span>
+<span class="nc" id="L306">            indexDescriptor.deleteColumnIndex(indexContext);</span>
+<span class="nc" id="L307">            indexContext.getIndexMetrics().segmentFlushErrors.inc();</span>
+<span class="nc" id="L308">            throw t;</span>
+<span class="nc" id="L309">        }</span>
+<span class="nc" id="L310">    }</span>
+
+    private void writeSegmentsMetadata() throws IOException
+    {
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (segments.isEmpty())</span>
+<span class="nc" id="L315">            return;</span>
+
+<span class="nc" id="L317">        try (MetadataWriter writer = new MetadataWriter(indexDescriptor.openPerIndexOutput(IndexComponent.META, indexContext)))</span>
+        {
+<span class="nc" id="L319">            SegmentMetadata.write(writer, segments);</span>
+        }
+<span class="nc" id="L321">        catch (IOException e)</span>
+        {
+<span class="nc" id="L323">            abort(e);</span>
+<span class="nc" id="L324">            throw e;</span>
+<span class="nc" id="L325">        }</span>
+<span class="nc" id="L326">    }</span>
+
+    private SegmentBuilder newSegmentBuilder()
+    {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        SegmentBuilder builder = TypeUtil.isLiteral(indexContext.getValidator())</span>
+<span class="nc" id="L331">                                 ? new SegmentBuilder.RAMStringSegmentBuilder(indexContext.getValidator(), limiter)</span>
+<span class="nc" id="L332">                                 : new SegmentBuilder.BlockBalancedTreeSegmentBuilder(indexContext.getValidator(), limiter);</span>
+
+<span class="nc" id="L334">        long globalBytesUsed = limiter.increment(builder.totalBytesAllocated());</span>
+<span class="nc" id="L335">        logger.debug(indexContext.logMessage(&quot;Created new segment builder while flushing SSTable {}. Global segment memory usage now at {}.&quot;),</span>
+                     indexDescriptor.sstableDescriptor,
+<span class="nc" id="L337">                     FBUtilities.prettyPrintMemory(globalBytesUsed));</span>
+
+<span class="nc" id="L339">        return builder;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

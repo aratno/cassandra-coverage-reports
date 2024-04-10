@@ -1,0 +1,796 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Schema.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.schema</a> &gt; <span class="el_source">Schema.java</span></div><h1>Schema.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.schema;
+
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.MapDifference;
+import org.apache.commons.lang3.ObjectUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.functions.UserFunction;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.KeyspaceNotDefinedException;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.LocalStrategy;
+import org.apache.cassandra.schema.KeyspaceMetadata.KeyspaceDiff;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.schema.SchemaTransformation.SchemaTransformationResult;
+import org.apache.cassandra.service.PendingRangeCalculatorService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.Awaitable;
+import org.apache.cassandra.utils.concurrent.LoadingMap;
+
+import static com.google.common.collect.Iterables.size;
+import static java.lang.String.format;
+import static org.apache.cassandra.config.DatabaseDescriptor.isDaemonInitialized;
+import static org.apache.cassandra.config.DatabaseDescriptor.isToolInitialized;
+
+/**
+ * Manages shared schema, keyspace instances and table metadata refs. Provides methods to initialize, modify and query
+ * both the shared and local schema, as well as to register listeners.
+ * &lt;p&gt;
+ * This class should be the only entity used to query and manage schema. Internal details should not be access in
+ * production code (would be great if they were not accessed in the test code as well).
+ * &lt;p&gt;
+ * TL;DR: All modifications are made using the implementation of {@link SchemaUpdateHandler} obtained from the provided
+ * factory. After each modification, the internally managed table metadata refs and keyspaces instances are updated and
+ * notifications are sent to the registered listeners.
+ * When the schema change is applied by the update handler (regardless it is initiated locally or received from outside),
+ * the registered callback is executed which performs the remaining updates for tables metadata refs and keyspace
+ * instances (see {@link #mergeAndUpdateVersion(SchemaTransformationResult, boolean)}).
+ */
+public class Schema implements SchemaProvider
+{
+<span class="fc" id="L87">    private static final Logger logger = LoggerFactory.getLogger(Schema.class);</span>
+
+<span class="fc" id="L89">    public static final Schema instance = new Schema();</span>
+
+<span class="pc" id="L91">    private volatile Keyspaces distributedKeyspaces = Keyspaces.none();</span>
+    private volatile Keyspaces distributedAndLocalKeyspaces;
+
+    private final Keyspaces localKeyspaces;
+
+<span class="pc" id="L96">    private volatile TableMetadataRefCache tableMetadataRefCache = TableMetadataRefCache.EMPTY;</span>
+
+    // Keyspace objects, one per keyspace. Only one instance should ever exist for any given keyspace.
+    // We operate on loading map because we need to achieve atomic initialization with at-most-once semantics for
+    // loadFunction. Although it seems that this is a valid case for using ConcurrentHashMap.computeIfAbsent,
+    // we should not use it because we have no knowledge about the loadFunction and in fact that load function may
+    // do some nested calls to maybeAddKeyspaceInstance, also using different threads, and in a blocking manner.
+    // This may lead to a deadlock. The documentation of ConcurrentHashMap says that manipulating other keys inside
+    // the lambda passed to the computeIfAbsent method is prohibited.
+<span class="pc" id="L105">    private final LoadingMap&lt;String, Keyspace&gt; keyspaceInstances = new LoadingMap&lt;&gt;();</span>
+
+<span class="pc" id="L107">    private volatile UUID version = SchemaConstants.emptyVersion;</span>
+
+<span class="pc" id="L109">    private final SchemaChangeNotifier schemaChangeNotifier = new SchemaChangeNotifier();</span>
+
+    public final SchemaUpdateHandler updateHandler;
+
+    private final boolean online;
+
+    /**
+     * Initialize empty schema object and load the hardcoded system tables
+     */
+    private Schema()
+<span class="fc" id="L119">    {</span>
+<span class="fc" id="L120">        this.online = isDaemonInitialized();</span>
+<span class="pc bpc" id="L121" title="4 of 6 branches missed.">        this.localKeyspaces = (CassandraRelevantProperties.FORCE_LOAD_LOCAL_KEYSPACES.getBoolean() || isDaemonInitialized() || isToolInitialized())</span>
+<span class="fc" id="L122">                              ? Keyspaces.of(SchemaKeyspace.metadata(), SystemKeyspace.metadata())</span>
+<span class="pc" id="L123">                              : Keyspaces.none();</span>
+<span class="fc" id="L124">        this.distributedAndLocalKeyspaces = this.localKeyspaces;</span>
+
+<span class="fc" id="L126">        this.localKeyspaces.forEach(this::loadNew);</span>
+<span class="fc" id="L127">        this.updateHandler = SchemaUpdateHandlerFactoryProvider.instance.get().getSchemaUpdateHandler(online, this::mergeAndUpdateVersion);</span>
+<span class="fc" id="L128">    }</span>
+
+    @VisibleForTesting
+    public Schema(boolean online, Keyspaces localKeyspaces, SchemaUpdateHandler updateHandler)
+<span class="nc" id="L132">    {</span>
+<span class="nc" id="L133">        this.online = online;</span>
+<span class="nc" id="L134">        this.localKeyspaces = localKeyspaces;</span>
+<span class="nc" id="L135">        this.distributedAndLocalKeyspaces = this.localKeyspaces;</span>
+<span class="nc" id="L136">        this.updateHandler = updateHandler;</span>
+<span class="nc" id="L137">    }</span>
+
+    public void startSync()
+    {
+<span class="fc" id="L141">        logger.debug(&quot;Starting update handler&quot;);</span>
+<span class="fc" id="L142">        updateHandler.start();</span>
+<span class="fc" id="L143">    }</span>
+
+    public boolean waitUntilReady(Duration timeout)
+    {
+<span class="fc" id="L147">        logger.debug(&quot;Waiting for update handler to be ready...&quot;);</span>
+<span class="fc" id="L148">        return updateHandler.waitUntilReady(timeout);</span>
+    }
+
+    /**
+     * Load keyspaces definitions from local storage, see {@link SchemaUpdateHandler#reset(boolean)}.
+     */
+    public void loadFromDisk()
+    {
+<span class="fc" id="L156">        SchemaDiagnostics.schemaLoading(this);</span>
+<span class="fc" id="L157">        updateHandler.reset(true);</span>
+<span class="fc" id="L158">        SchemaDiagnostics.schemaLoaded(this);</span>
+<span class="fc" id="L159">    }</span>
+
+    /**
+     * Update (or insert) new keyspace definition
+     *
+     * @param ksm The metadata about keyspace
+     */
+    private synchronized void load(KeyspaceMetadata ksm)
+    {
+<span class="pc bpc" id="L168" title="1 of 2 branches missed.">        Preconditions.checkArgument(!SchemaConstants.isLocalSystemKeyspace(ksm.name));</span>
+<span class="fc" id="L169">        KeyspaceMetadata previous = distributedKeyspaces.getNullable(ksm.name);</span>
+
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        if (previous == null)</span>
+<span class="fc" id="L172">            loadNew(ksm);</span>
+        else
+<span class="fc" id="L174">            reload(previous, ksm);</span>
+
+<span class="fc" id="L176">        distributedKeyspaces = distributedKeyspaces.withAddedOrUpdated(ksm);</span>
+<span class="fc" id="L177">        distributedAndLocalKeyspaces = distributedAndLocalKeyspaces.withAddedOrUpdated(ksm);</span>
+<span class="fc" id="L178">    }</span>
+
+    private synchronized void loadNew(KeyspaceMetadata ksm)
+    {
+<span class="fc" id="L182">        this.tableMetadataRefCache = tableMetadataRefCache.withNewRefs(ksm);</span>
+
+<span class="fc" id="L184">        SchemaDiagnostics.metadataInitialized(this, ksm);</span>
+<span class="fc" id="L185">    }</span>
+
+    private synchronized void reload(KeyspaceMetadata previous, KeyspaceMetadata updated)
+    {
+<span class="fc" id="L189">        Keyspace keyspace = getKeyspaceInstance(updated.name);</span>
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">        if (null != keyspace)</span>
+<span class="fc" id="L191">            keyspace.setMetadata(updated);</span>
+
+<span class="fc" id="L193">        Tables.TablesDiff tablesDiff = Tables.diff(previous.tables, updated.tables);</span>
+<span class="fc" id="L194">        Views.ViewsDiff viewsDiff = Views.diff(previous.views, updated.views);</span>
+
+<span class="fc" id="L196">        MapDifference&lt;String, TableMetadata&gt; indexesDiff = previous.tables.indexesDiff(updated.tables);</span>
+
+<span class="fc" id="L198">        this.tableMetadataRefCache = tableMetadataRefCache.withUpdatedRefs(previous, updated);</span>
+
+<span class="fc" id="L200">        SchemaDiagnostics.metadataReloaded(this, previous, updated, tablesDiff, viewsDiff, indexesDiff);</span>
+<span class="fc" id="L201">    }</span>
+
+    public void registerListener(SchemaChangeListener listener)
+    {
+<span class="fc" id="L205">        schemaChangeNotifier.registerListener(listener);</span>
+<span class="fc" id="L206">    }</span>
+
+    @SuppressWarnings(&quot;unused&quot;)
+    public void unregisterListener(SchemaChangeListener listener)
+    {
+<span class="nc" id="L211">        schemaChangeNotifier.unregisterListener(listener);</span>
+<span class="nc" id="L212">    }</span>
+
+    /**
+     * Get keyspace instance by name
+     *
+     * @param keyspaceName The name of the keyspace
+     *
+     * @return Keyspace object or null if keyspace was not found
+     */
+    @Override
+    public Keyspace getKeyspaceInstance(String keyspaceName)
+    {
+<span class="fc" id="L224">        return keyspaceInstances.getIfReady(keyspaceName);</span>
+    }
+
+    /**
+     * Returns {@link ColumnFamilyStore} by the table identifier. Note that though, if called for {@link TableMetadata#id},
+     * when metadata points to a secondary index table, the {@link TableMetadata#id} denotes the identifier of the main
+     * table, not the index table. Thus, this method will return CFS of the main table rather than, probably expected,
+     * CFS for the index backing table.
+     */
+    public ColumnFamilyStore getColumnFamilyStoreInstance(TableId id)
+    {
+<span class="fc" id="L235">        TableMetadata metadata = getTableMetadata(id);</span>
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">        if (metadata == null)</span>
+<span class="nc" id="L237">            return null;</span>
+
+<span class="fc" id="L239">        Keyspace instance = getKeyspaceInstance(metadata.keyspace);</span>
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">        if (instance == null)</span>
+<span class="nc" id="L241">            return null;</span>
+
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        return instance.hasColumnFamilyStore(metadata.id)</span>
+<span class="fc" id="L244">               ? instance.getColumnFamilyStore(metadata.id)</span>
+<span class="nc" id="L245">               : null;</span>
+    }
+
+    @Override
+    public Keyspace maybeAddKeyspaceInstance(String keyspaceName, Supplier&lt;Keyspace&gt; loadFunction)
+    {
+<span class="fc" id="L251">        return keyspaceInstances.blockingLoadIfAbsent(keyspaceName, loadFunction);</span>
+    }
+
+    private Keyspace maybeRemoveKeyspaceInstance(String keyspaceName, Consumer&lt;Keyspace&gt; unloadFunction)
+    {
+        try
+        {
+<span class="nc" id="L258">            return keyspaceInstances.blockingUnloadIfPresent(keyspaceName, unloadFunction);</span>
+        }
+<span class="nc" id="L260">        catch (LoadingMap.UnloadExecutionException e)</span>
+        {
+<span class="nc" id="L262">            throw new AssertionError(&quot;Failed to unload the keyspace &quot; + keyspaceName, e);</span>
+        }
+    }
+
+    public Keyspaces distributedAndLocalKeyspaces()
+    {
+<span class="fc" id="L268">        return distributedAndLocalKeyspaces;</span>
+    }
+
+    public Keyspaces distributedKeyspaces()
+    {
+<span class="nc" id="L273">        return distributedKeyspaces;</span>
+    }
+
+    /**
+     * Compute the largest gc grace seconds amongst all the tables
+     * @return the largest gcgs.
+     */
+    public int largestGcgs()
+    {
+<span class="nc" id="L282">        return distributedAndLocalKeyspaces().stream()</span>
+<span class="nc" id="L283">                                             .flatMap(ksm -&gt; ksm.tables.stream())</span>
+<span class="nc" id="L284">                                             .mapToInt(tm -&gt; tm.params.gcGraceSeconds)</span>
+<span class="nc" id="L285">                                             .max()</span>
+<span class="nc" id="L286">                                             .orElse(Integer.MIN_VALUE);</span>
+    }
+
+    /**
+     * Remove keyspace definition from system
+     *
+     * @param ksm The keyspace definition to remove
+     */
+    private synchronized void unload(KeyspaceMetadata ksm)
+    {
+<span class="nc" id="L296">        distributedKeyspaces = distributedKeyspaces.without(ksm.name);</span>
+<span class="nc" id="L297">        distributedAndLocalKeyspaces = distributedAndLocalKeyspaces.without(ksm.name);</span>
+
+<span class="nc" id="L299">        this.tableMetadataRefCache = tableMetadataRefCache.withRemovedRefs(ksm);</span>
+
+<span class="nc" id="L301">        SchemaDiagnostics.metadataRemoved(this, ksm);</span>
+<span class="nc" id="L302">    }</span>
+
+    public int getNumberOfTables()
+    {
+<span class="nc" id="L306">        return distributedAndLocalKeyspaces().stream().mapToInt(k -&gt; size(k.tablesAndViews())).sum();</span>
+    }
+
+    public ViewMetadata getView(String keyspaceName, String viewName)
+    {
+<span class="pc bpc" id="L311" title="1 of 2 branches missed.">        assert keyspaceName != null;</span>
+<span class="fc" id="L312">        KeyspaceMetadata ksm = distributedAndLocalKeyspaces().getNullable(keyspaceName);</span>
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">        return (ksm == null) ? null : ksm.views.getNullable(viewName);</span>
+    }
+
+    /**
+     * Get metadata about keyspace by its name
+     *
+     * @param keyspaceName The name of the keyspace
+     *
+     * @return The keyspace metadata or null if it wasn't found
+     */
+    @Override
+    public KeyspaceMetadata getKeyspaceMetadata(String keyspaceName)
+    {
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">        assert keyspaceName != null;</span>
+<span class="fc" id="L327">        KeyspaceMetadata keyspace = distributedAndLocalKeyspaces().getNullable(keyspaceName);</span>
+<span class="fc bfc" id="L328" title="All 2 branches covered.">        return null != keyspace ? keyspace : VirtualKeyspaceRegistry.instance.getKeyspaceMetadataNullable(keyspaceName);</span>
+    }
+
+    /**
+     * Returns all non-local keyspaces, that is, all but {@link SchemaConstants#LOCAL_SYSTEM_KEYSPACE_NAMES}
+     * or virtual keyspaces.
+     * @deprecated use {@link #distributedKeyspaces()}
+     */
+    @Deprecated
+    public Keyspaces getNonSystemKeyspaces()
+    {
+<span class="nc" id="L339">        return distributedKeyspaces;</span>
+    }
+
+    /**
+     * Returns all non-local keyspaces whose replication strategy is not {@link LocalStrategy}.
+     */
+    public Keyspaces getNonLocalStrategyKeyspaces()
+    {
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">        return distributedKeyspaces.filter(keyspace -&gt; keyspace.params.replication.klass != LocalStrategy.class);</span>
+    }
+
+    /**
+     * Returns user keyspaces, that is all but {@link SchemaConstants#LOCAL_SYSTEM_KEYSPACE_NAMES},
+     * {@link SchemaConstants#REPLICATED_SYSTEM_KEYSPACE_NAMES} or virtual keyspaces.
+     */
+    public Keyspaces getUserKeyspaces()
+    {
+<span class="fc" id="L356">        return distributedKeyspaces.without(SchemaConstants.REPLICATED_SYSTEM_KEYSPACE_NAMES);</span>
+    }
+
+    /**
+     * Get metadata about keyspace inner ColumnFamilies
+     *
+     * @param keyspaceName The name of the keyspace
+     * @return metadata about ColumnFamilies the belong to the given keyspace
+     */
+    public Iterable&lt;TableMetadata&gt; getTablesAndViews(String keyspaceName)
+    {
+<span class="fc" id="L367">        Preconditions.checkNotNull(keyspaceName);</span>
+<span class="fc" id="L368">        KeyspaceMetadata ksm = ObjectUtils.getFirstNonNull(() -&gt; distributedKeyspaces.getNullable(keyspaceName),</span>
+<span class="fc" id="L369">                                                           () -&gt; localKeyspaces.getNullable(keyspaceName));</span>
+<span class="fc" id="L370">        Preconditions.checkNotNull(ksm, &quot;Keyspace %s not found&quot;, keyspaceName);</span>
+<span class="fc" id="L371">        return ksm.tablesAndViews();</span>
+    }
+
+    /**
+     * @return collection of the all keyspace names registered in the system (system and non-system)
+     */
+    public ImmutableSet&lt;String&gt; getKeyspaces()
+    {
+<span class="fc" id="L379">        return distributedAndLocalKeyspaces().names();</span>
+    }
+
+    public Keyspaces getLocalKeyspaces()
+    {
+<span class="nc" id="L384">        return localKeyspaces;</span>
+    }
+
+    /* TableMetadata/Ref query/control methods */
+
+    /**
+     * Given a keyspace name and table/view name, get the table metadata
+     * reference. If the keyspace name or table/view name is not present
+     * this method returns null.
+     *
+     * @return TableMetadataRef object or null if it wasn't found
+     */
+    @Override
+    public TableMetadataRef getTableMetadataRef(String keyspace, String table)
+    {
+<span class="fc" id="L399">        return tableMetadataRefCache.getTableMetadataRef(keyspace, table);</span>
+    }
+
+    public TableMetadataRef getIndexTableMetadataRef(String keyspace, String index)
+    {
+<span class="nc" id="L404">        return tableMetadataRefCache.getIndexTableMetadataRef(keyspace, index);</span>
+    }
+
+    /**
+     * Get Table metadata by its identifier
+     *
+     * @param id table or view identifier
+     * @return metadata about Table or View
+     */
+    @Override
+    public TableMetadataRef getTableMetadataRef(TableId id)
+    {
+<span class="fc" id="L416">        return tableMetadataRefCache.getTableMetadataRef(id);</span>
+    }
+
+    @Override
+    public TableMetadataRef getTableMetadataRef(Descriptor descriptor)
+    {
+<span class="fc" id="L422">        return getTableMetadataRef(descriptor.ksname, descriptor.cfname);</span>
+    }
+
+    /**
+     * Given a keyspace name and table name, get the table
+     * meta data. If the keyspace name or table name is not valid
+     * this function returns null.
+     *
+     * @param keyspace The keyspace name
+     * @param table    The table name
+     * @return TableMetadata object or null if it wasn't found
+     */
+    public TableMetadata getTableMetadata(String keyspace, String table)
+    {
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">        assert keyspace != null;</span>
+<span class="pc bpc" id="L437" title="1 of 2 branches missed.">        assert table != null;</span>
+
+<span class="fc" id="L439">        KeyspaceMetadata ksm = getKeyspaceMetadata(keyspace);</span>
+<span class="pc bpc" id="L440" title="1 of 2 branches missed.">        return ksm == null</span>
+<span class="nc" id="L441">               ? null</span>
+<span class="fc" id="L442">               : ksm.getTableOrViewNullable(table);</span>
+    }
+
+    @Override
+    public TableMetadata getTableMetadata(TableId id)
+    {
+<span class="fc" id="L448">        return ObjectUtils.getFirstNonNull(() -&gt; distributedKeyspaces.getTableOrViewNullable(id),</span>
+<span class="fc" id="L449">                                           () -&gt; localKeyspaces.getTableOrViewNullable(id),</span>
+<span class="nc" id="L450">                                           () -&gt; VirtualKeyspaceRegistry.instance.getTableMetadataNullable(id));</span>
+    }
+
+    public TableMetadata validateTable(String keyspaceName, String tableName)
+    {
+<span class="pc bpc" id="L455" title="1 of 2 branches missed.">        if (tableName.isEmpty())</span>
+<span class="nc" id="L456">            throw new InvalidRequestException(&quot;non-empty table is required&quot;);</span>
+
+<span class="fc" id="L458">        KeyspaceMetadata keyspace = getKeyspaceMetadata(keyspaceName);</span>
+<span class="pc bpc" id="L459" title="1 of 2 branches missed.">        if (keyspace == null)</span>
+<span class="nc" id="L460">            throw new KeyspaceNotDefinedException(format(&quot;keyspace %s does not exist&quot;, keyspaceName));</span>
+
+<span class="fc" id="L462">        TableMetadata metadata = keyspace.getTableOrViewNullable(tableName);</span>
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">        if (metadata == null)</span>
+<span class="nc" id="L464">            throw new InvalidRequestException(format(&quot;table %s does not exist&quot;, tableName));</span>
+
+<span class="fc" id="L466">        return metadata;</span>
+    }
+
+    public TableMetadata getTableMetadata(Descriptor descriptor)
+    {
+<span class="nc" id="L471">        return getTableMetadata(descriptor.ksname, descriptor.cfname);</span>
+    }
+
+    /* Function helpers */
+
+    /**
+     * Get all user-defined function overloads with the specified name.
+     *
+     * @param name fully qualified function name
+     * @return an empty list if the keyspace or the function name are not found;
+     *         a non-empty collection of {@link UserFunction} otherwise
+     */
+    public Collection&lt;UserFunction&gt; getUserFunctions(FunctionName name)
+    {
+<span class="pc bpc" id="L485" title="1 of 2 branches missed.">        if (!name.hasKeyspace())</span>
+<span class="nc" id="L486">            throw new IllegalArgumentException(String.format(&quot;Function name must be fully qualified: got %s&quot;, name));</span>
+
+<span class="fc" id="L488">        KeyspaceMetadata ksm = getKeyspaceMetadata(name.keyspace);</span>
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">        return ksm == null</span>
+<span class="nc" id="L490">               ? Collections.emptyList()</span>
+<span class="fc" id="L491">               : ksm.userFunctions.get(name);</span>
+    }
+
+    /**
+     * Find the function with the specified name and arguments.
+     *
+     * @param name     fully qualified function name
+     * @param argTypes function argument types
+     * @return an empty {@link Optional} if the keyspace or the function name are not found;
+     *         a non-empty optional of {@link Function} otherwise
+     */
+    public Optional&lt;UserFunction&gt; findUserFunction(FunctionName name, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+    {
+<span class="nc bnc" id="L504" title="All 2 branches missed.">        if (!name.hasKeyspace())</span>
+<span class="nc" id="L505">            throw new IllegalArgumentException(String.format(&quot;Function name must be fully quallified: got %s&quot;, name));</span>
+
+<span class="nc" id="L507">        return Optional.ofNullable(getKeyspaceMetadata(name.keyspace))</span>
+<span class="nc" id="L508">                       .flatMap(ksm -&gt; ksm.userFunctions.find(name, argTypes));</span>
+    }
+
+    /* Version control */
+
+    /**
+     * @return current schema version
+     */
+    public UUID getVersion()
+    {
+<span class="nc" id="L518">        return version;</span>
+    }
+
+    /**
+     * Checks whether the given schema version is the same as the current local schema.
+     */
+    public boolean isSameVersion(UUID schemaVersion)
+    {
+<span class="pc bpc" id="L526" title="1 of 4 branches missed.">        return schemaVersion != null &amp;&amp; schemaVersion.equals(version);</span>
+    }
+
+    /**
+     * Checks whether the current schema is empty.
+     */
+    public boolean isEmpty()
+    {
+<span class="fc" id="L534">        return SchemaConstants.emptyVersion.equals(version);</span>
+    }
+
+    /**
+     * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
+     * will be converted into UUID which would act as content-based version of the schema.
+     *
+     * See CASSANDRA-16856/16996. Make sure schema pulls are synchronized to prevent concurrent schema pull/writes
+     */
+    private synchronized void updateVersion(UUID version)
+    {
+<span class="fc" id="L545">        this.version = version;</span>
+<span class="fc" id="L546">        SchemaDiagnostics.versionUpdated(this);</span>
+<span class="fc" id="L547">    }</span>
+
+    /**
+     * When we receive {@link SchemaTransformationResult} in a callback invocation, the transformation result includes
+     * pre-transformation and post-transformation schema metadata and versions, and a diff between them. Basically
+     * we expect that the local image of the schema metadata ({@link #distributedKeyspaces}) and version ({@link #version})
+     * are the same as pre-transformation. However, it might not always be true because some changes might not be
+     * applied completely due to some errors. This methods is to emit warning in such case and recalculate diff so that
+     * it contains the changes between the local schema image ({@link #distributedKeyspaces} and the post-transformation
+     * schema. That recalculation allows the following updates in the callback to recover the schema.
+     *
+     * @param result the incoming transformation result
+     * @return recalculated transformation result if needed, otherwise the provided incoming result
+     */
+    private synchronized SchemaTransformationResult localDiff(SchemaTransformationResult result)
+    {
+<span class="fc" id="L563">        Keyspaces localBefore = distributedKeyspaces;</span>
+<span class="fc" id="L564">        UUID localVersion = version;</span>
+<span class="fc" id="L565">        boolean needNewDiff = false;</span>
+
+<span class="pc bpc" id="L567" title="1 of 2 branches missed.">        if (!Objects.equals(localBefore, result.before.getKeyspaces()))</span>
+        {
+<span class="nc" id="L569">            logger.info(&quot;Schema was different to what we expected: {}&quot;, Keyspaces.diff(result.before.getKeyspaces(), localBefore));</span>
+<span class="nc" id="L570">            needNewDiff = true;</span>
+        }
+
+<span class="pc bpc" id="L573" title="1 of 2 branches missed.">        if (!Objects.equals(localVersion, result.before.getVersion()))</span>
+        {
+<span class="nc" id="L575">            logger.info(&quot;Schema version was different to what we expected: {} != {}&quot;, result.before.getVersion(), localVersion);</span>
+<span class="nc" id="L576">            needNewDiff = true;</span>
+        }
+
+<span class="pc bpc" id="L579" title="1 of 2 branches missed.">        if (needNewDiff)</span>
+<span class="nc" id="L580">            return new SchemaTransformationResult(new DistributedSchema(localBefore, localVersion),</span>
+                                                  result.after,
+<span class="nc" id="L582">                                                  Keyspaces.diff(localBefore, result.after.getKeyspaces()));</span>
+
+<span class="fc" id="L584">        return result;</span>
+    }
+
+    /*
+     * Reload schema from local disk. Useful if a user made changes to schema tables by hand, or has suspicion that
+     * in-memory representation got out of sync somehow with what's on disk.
+     */
+    public void reloadSchemaAndAnnounceVersion()
+    {
+<span class="nc" id="L593">        updateHandler.reset(true);</span>
+<span class="nc" id="L594">    }</span>
+
+    /**
+     * Merge remote schema in form of mutations with local and mutate ks/cf metadata objects
+     * (which also involves fs operations on add/drop ks/cf)
+     *
+     * @throws ConfigurationException If one of metadata attributes has invalid value
+     */
+    @VisibleForTesting
+    public synchronized void mergeAndUpdateVersion(SchemaTransformationResult result, boolean dropData)
+    {
+<span class="fc" id="L605">        result = localDiff(result);</span>
+<span class="fc" id="L606">        schemaChangeNotifier.notifyPreChanges(result);</span>
+<span class="fc" id="L607">        merge(result.diff, dropData);</span>
+<span class="fc" id="L608">        updateVersion(result.after.getVersion());</span>
+<span class="pc bpc" id="L609" title="1 of 2 branches missed.">        if (online)</span>
+<span class="fc" id="L610">            SystemKeyspace.updateSchemaVersion(result.after.getVersion());</span>
+<span class="fc" id="L611">    }</span>
+
+    public SchemaTransformationResult transform(SchemaTransformation transformation)
+    {
+<span class="fc" id="L615">        return transform(transformation, false);</span>
+    }
+
+    public SchemaTransformationResult transform(SchemaTransformation transformation, boolean local)
+    {
+<span class="fc" id="L620">        return updateHandler.apply(transformation, local);</span>
+    }
+
+    /**
+     * Clear all locally stored schema information and fetch schema from another node.
+     * Called by user (via JMX) who wants to get rid of schema disagreement.
+     */
+    public void resetLocalSchema()
+    {
+<span class="nc" id="L629">        logger.debug(&quot;Clearing local schema...&quot;);</span>
+
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (Gossiper.instance.getLiveMembers().stream().allMatch(ep -&gt; FBUtilities.getBroadcastAddressAndPort().equals(ep)))</span>
+<span class="nc" id="L632">            throw new InvalidRequestException(&quot;Cannot reset local schema when there are no other live nodes&quot;);</span>
+
+<span class="nc" id="L634">        Awaitable clearCompletion = updateHandler.clear();</span>
+        try
+        {
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            if (!clearCompletion.await(StorageService.SCHEMA_DELAY_MILLIS, TimeUnit.MILLISECONDS))</span>
+            {
+<span class="nc" id="L639">                throw new RuntimeException(&quot;Schema reset failed - no schema received from other nodes&quot;);</span>
+            }
+        }
+<span class="nc" id="L642">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L644">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L645">            throw new RuntimeException(&quot;Failed to reset schema - the thread has been interrupted&quot;);</span>
+<span class="nc" id="L646">        }</span>
+<span class="nc" id="L647">        SchemaDiagnostics.schemaCleared(this);</span>
+<span class="nc" id="L648">        logger.info(&quot;Local schema reset completed&quot;);</span>
+<span class="nc" id="L649">    }</span>
+
+    private void merge(KeyspacesDiff diff, boolean removeData)
+    {
+<span class="pc" id="L653">        diff.dropped.forEach(keyspace -&gt; dropKeyspace(keyspace, removeData));</span>
+<span class="fc" id="L654">        diff.created.forEach(this::createKeyspace);</span>
+<span class="fc" id="L655">        diff.altered.forEach(delta -&gt; alterKeyspace(delta, removeData));</span>
+<span class="fc" id="L656">    }</span>
+
+    private void alterKeyspace(KeyspaceDiff delta, boolean dropData)
+    {
+<span class="fc" id="L660">        SchemaDiagnostics.keyspaceAltering(this, delta);</span>
+
+<span class="fc" id="L662">        boolean initialized = Keyspace.isInitialized();</span>
+
+<span class="pc bpc" id="L664" title="1 of 2 branches missed.">        Keyspace keyspace = initialized ? getKeyspaceInstance(delta.before.name) : null;</span>
+<span class="pc bpc" id="L665" title="1 of 2 branches missed.">        if (initialized)</span>
+        {
+<span class="pc bpc" id="L667" title="1 of 2 branches missed.">            assert keyspace != null;</span>
+<span class="pc bpc" id="L668" title="1 of 2 branches missed.">            assert delta.before.name.equals(delta.after.name);</span>
+
+            // drop tables and views
+<span class="pc" id="L671">            delta.views.dropped.forEach(v -&gt; dropView(keyspace, v, dropData));</span>
+<span class="pc" id="L672">            delta.tables.dropped.forEach(t -&gt; dropTable(keyspace, t, dropData));</span>
+        }
+
+<span class="fc" id="L675">        load(delta.after);</span>
+
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">        if (initialized)</span>
+        {
+            // add tables and views
+<span class="fc" id="L680">            delta.tables.created.forEach(t -&gt; createTable(keyspace, t));</span>
+<span class="pc" id="L681">            delta.views.created.forEach(v -&gt; createView(keyspace, v));</span>
+
+            // update tables and views
+<span class="pc" id="L684">            delta.tables.altered.forEach(diff -&gt; alterTable(keyspace, diff.after));</span>
+<span class="pc" id="L685">            delta.views.altered.forEach(diff -&gt; alterView(keyspace, diff.after));</span>
+
+            // deal with all added, and altered views
+<span class="fc" id="L688">            Keyspace.open(delta.after.name, this, true).viewManager.reload(true);</span>
+        }
+
+<span class="fc" id="L691">        schemaChangeNotifier.notifyKeyspaceAltered(delta, dropData);</span>
+<span class="fc" id="L692">        SchemaDiagnostics.keyspaceAltered(this, delta);</span>
+<span class="fc" id="L693">    }</span>
+
+    private void createKeyspace(KeyspaceMetadata keyspace)
+    {
+<span class="fc" id="L697">        SchemaDiagnostics.keyspaceCreating(this, keyspace);</span>
+<span class="fc" id="L698">        load(keyspace);</span>
+<span class="fc bfc" id="L699" title="All 2 branches covered.">        if (Keyspace.isInitialized())</span>
+        {
+<span class="fc" id="L701">            Keyspace.open(keyspace.name, this, true);</span>
+        }
+
+<span class="fc" id="L704">        schemaChangeNotifier.notifyKeyspaceCreated(keyspace);</span>
+<span class="fc" id="L705">        SchemaDiagnostics.keyspaceCreated(this, keyspace);</span>
+
+        // If keyspace has been added, we need to recalculate pending ranges to make sure
+        // we send mutations to the correct set of bootstrapping nodes. Refer CASSANDRA-15433.
+<span class="pc bpc" id="L709" title="1 of 4 branches missed.">        if (keyspace.params.replication.klass != LocalStrategy.class &amp;&amp; Keyspace.isInitialized())</span>
+        {
+<span class="fc" id="L711">            PendingRangeCalculatorService.calculatePendingRanges(Keyspace.open(keyspace.name, this, true).getReplicationStrategy(), keyspace.name);</span>
+        }
+<span class="fc" id="L713">    }</span>
+
+    private void dropKeyspace(KeyspaceMetadata keyspaceMetadata, boolean dropData)
+    {
+<span class="nc" id="L717">        SchemaDiagnostics.keyspaceDropping(this, keyspaceMetadata);</span>
+
+<span class="nc" id="L719">        boolean initialized = Keyspace.isInitialized();</span>
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        Keyspace keyspace = initialized ? Keyspace.open(keyspaceMetadata.name, this, false) : null;</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        if (initialized)</span>
+        {
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (keyspace == null)</span>
+<span class="nc" id="L724">                return;</span>
+
+<span class="nc" id="L726">            keyspaceMetadata.views.forEach(v -&gt; dropView(keyspace, v, dropData));</span>
+<span class="nc" id="L727">            keyspaceMetadata.tables.forEach(t -&gt; dropTable(keyspace, t, dropData));</span>
+
+            // remove the keyspace from the static instances
+<span class="nc" id="L730">            Keyspace unloadedKeyspace = maybeRemoveKeyspaceInstance(keyspaceMetadata.name, ks -&gt; {</span>
+<span class="nc" id="L731">                ks.unload(dropData);</span>
+<span class="nc" id="L732">                unload(keyspaceMetadata);</span>
+<span class="nc" id="L733">            });</span>
+<span class="nc bnc" id="L734" title="All 2 branches missed.">            assert unloadedKeyspace == keyspace;</span>
+
+<span class="nc" id="L736">            Keyspace.writeOrder.awaitNewBarrier();</span>
+<span class="nc" id="L737">        }</span>
+        else
+        {
+<span class="nc" id="L740">            unload(keyspaceMetadata);</span>
+        }
+
+<span class="nc" id="L743">        schemaChangeNotifier.notifyKeyspaceDropped(keyspaceMetadata, dropData);</span>
+<span class="nc" id="L744">        SchemaDiagnostics.keyspaceDropped(this, keyspaceMetadata);</span>
+<span class="nc" id="L745">    }</span>
+
+    private void dropView(Keyspace keyspace, ViewMetadata metadata, boolean dropData)
+    {
+<span class="nc" id="L749">        keyspace.viewManager.dropView(metadata.name());</span>
+<span class="nc" id="L750">        dropTable(keyspace, metadata.metadata, dropData);</span>
+<span class="nc" id="L751">    }</span>
+
+    private void dropTable(Keyspace keyspace, TableMetadata metadata, boolean dropData)
+    {
+<span class="nc" id="L755">        SchemaDiagnostics.tableDropping(this, metadata);</span>
+<span class="nc" id="L756">        keyspace.dropCf(metadata.id, dropData);</span>
+<span class="nc" id="L757">        SchemaDiagnostics.tableDropped(this, metadata);</span>
+<span class="nc" id="L758">    }</span>
+
+    private void createTable(Keyspace keyspace, TableMetadata table)
+    {
+<span class="fc" id="L762">        SchemaDiagnostics.tableCreating(this, table);</span>
+<span class="fc" id="L763">        keyspace.initCf(tableMetadataRefCache.getTableMetadataRef(table.id), true);</span>
+<span class="fc" id="L764">        SchemaDiagnostics.tableCreated(this, table);</span>
+<span class="fc" id="L765">    }</span>
+
+    private void createView(Keyspace keyspace, ViewMetadata view)
+    {
+<span class="nc" id="L769">        SchemaDiagnostics.tableCreating(this, view.metadata);</span>
+<span class="nc" id="L770">        keyspace.initCf(tableMetadataRefCache.getTableMetadataRef(view.metadata.id), true);</span>
+<span class="nc" id="L771">        SchemaDiagnostics.tableCreated(this, view.metadata);</span>
+<span class="nc" id="L772">    }</span>
+
+    private void alterTable(Keyspace keyspace, TableMetadata updated)
+    {
+<span class="nc" id="L776">        SchemaDiagnostics.tableAltering(this, updated);</span>
+<span class="nc" id="L777">        keyspace.getColumnFamilyStore(updated.name).reload();</span>
+<span class="nc" id="L778">        SchemaDiagnostics.tableAltered(this, updated);</span>
+<span class="nc" id="L779">    }</span>
+
+    private void alterView(Keyspace keyspace, ViewMetadata updated)
+    {
+<span class="nc" id="L783">        SchemaDiagnostics.tableAltering(this, updated.metadata);</span>
+<span class="nc" id="L784">        keyspace.getColumnFamilyStore(updated.name()).reload();</span>
+<span class="nc" id="L785">        SchemaDiagnostics.tableAltered(this, updated.metadata);</span>
+<span class="nc" id="L786">    }</span>
+
+    public Map&lt;UUID, Set&lt;InetAddressAndPort&gt;&gt; getOutstandingSchemaVersions()
+    {
+<span class="nc bnc" id="L790" title="All 2 branches missed.">        return updateHandler instanceof DefaultSchemaUpdateHandler</span>
+<span class="nc" id="L791">               ? ((DefaultSchemaUpdateHandler) updateHandler).getOutstandingSchemaVersions()</span>
+<span class="nc" id="L792">               : Collections.emptyMap();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

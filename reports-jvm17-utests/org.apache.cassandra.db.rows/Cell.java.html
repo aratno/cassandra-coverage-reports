@@ -1,0 +1,406 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Cell.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.rows</a> &gt; <span class="el_source">Cell.java</span></div><h1>Cell.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.rows;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Comparator;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.LivenessInfo;
+import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.marshal.ValueAccessor;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.utils.CassandraUInt;
+import org.apache.cassandra.utils.memory.ByteBufferCloner;
+import org.apache.cassandra.utils.memory.Cloner;
+
+/**
+ * A cell is our atomic unit for a single value of a single column.
+ * &lt;p&gt;
+ * A cell always holds at least a timestamp that gives us how the cell reconcile. We then
+ * have 3 main types of cells:
+ *   1) live regular cells: those will also have a value and, if for a complex column, a path.
+ *   2) expiring cells: on top of regular cells, those have a ttl and a local deletion time (when they are expired).
+ *   3) tombstone cells: those won't have value, but they have a local deletion time (when the tombstone was created).
+ */
+public abstract class Cell&lt;V&gt; extends ColumnData
+{
+    public static final int NO_TTL = 0;
+    public static final long NO_DELETION_TIME = Long.MAX_VALUE;
+<span class="fc" id="L50">    public static final int NO_DELETION_TIME_UNSIGNED_INTEGER = CassandraUInt.MAX_VALUE_UINT;</span>
+<span class="fc" id="L51">    public static final long MAX_DELETION_TIME = CassandraUInt.MAX_VALUE_LONG - 2;</span>
+<span class="fc" id="L52">    public static final int MAX_DELETION_TIME_UNSIGNED_INTEGER = CassandraUInt.fromLong(MAX_DELETION_TIME);</span>
+
+    // Since C14227 we only support Uints, negative ldts (corruption, overflow) get converted to this
+<span class="fc" id="L55">    public static final long INVALID_DELETION_TIME = CassandraUInt.MAX_VALUE_LONG - 1;</span>
+    // Do not use. Only for legacy ser/deser pre CASSANDRA-14227 and backwards compatible CAP policies
+    public static final int MAX_DELETION_TIME_2038_LEGACY_CAP = Integer.MAX_VALUE - 1;
+
+<span class="fc" id="L59">    public final static Comparator&lt;Cell&lt;?&gt;&gt; comparator = (c1, c2) -&gt;</span>
+    {
+<span class="fc" id="L61">        int cmp = c1.column().compareTo(c2.column());</span>
+<span class="pc bpc" id="L62" title="1 of 2 branches missed.">        if (cmp != 0)</span>
+<span class="nc" id="L63">            return cmp;</span>
+
+<span class="fc" id="L65">        Comparator&lt;CellPath&gt; pathComparator = c1.column().cellPathComparator();</span>
+<span class="pc bpc" id="L66" title="1 of 2 branches missed.">        return pathComparator == null ? 0 : pathComparator.compare(c1.path(), c2.path());</span>
+    };
+
+<span class="fc" id="L69">    public static final Serializer serializer = new BufferCell.Serializer();</span>
+
+    public interface Factory&lt;V&gt;
+    {
+        Cell&lt;V&gt; create(ColumnMetadata column, long timestamp, int ttl, long localDeletionTime, V value, CellPath path);
+    }
+
+    protected Cell(ColumnMetadata column)
+    {
+<span class="fc" id="L78">        super(column);</span>
+<span class="fc" id="L79">    }</span>
+
+    public static int deletionTimeLongToUnsignedInteger(long deletionTime)
+    {
+<span class="fc bfc" id="L83" title="All 2 branches covered.">        return deletionTime == NO_DELETION_TIME ? NO_DELETION_TIME_UNSIGNED_INTEGER : CassandraUInt.fromLong(deletionTime);</span>
+    }
+
+    public static long deletionTimeUnsignedIntegerToLong(int deletionTimeUnsignedInteger)
+    {
+<span class="fc bfc" id="L88" title="All 2 branches covered.">        return deletionTimeUnsignedInteger == NO_DELETION_TIME_UNSIGNED_INTEGER ? NO_DELETION_TIME : CassandraUInt.toLong(deletionTimeUnsignedInteger);</span>
+    }
+
+    public static long getVersionedMaxDeletiontionTime()
+    {
+<span class="pc bpc" id="L93" title="1 of 2 branches missed.">        if (DatabaseDescriptor.getStorageCompatibilityMode().disabled())</span>
+            // The whole cluster is 2016, we're out of the 2038/2106 mixed cluster scenario. Shortcut to avoid the 'minClusterVersion' volatile read
+<span class="nc" id="L95">            return Cell.MAX_DELETION_TIME;</span>
+        else
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">            return MessagingService.instance().versions.minClusterVersion &gt;= MessagingService.VERSION_50</span>
+<span class="nc" id="L98">                   ? Cell.MAX_DELETION_TIME</span>
+<span class="fc" id="L99">                   : Cell.MAX_DELETION_TIME_2038_LEGACY_CAP;</span>
+    }
+
+    /**
+     * Whether the cell is a counter cell or not.CassandraUInt
+     *
+     * @return whether the cell is a counter cell or not.
+     */
+    public abstract boolean isCounterCell();
+
+    public abstract V value();
+
+    public abstract ValueAccessor&lt;V&gt; accessor();
+
+    public int valueSize()
+    {
+<span class="fc" id="L115">        return accessor().size(value());</span>
+    }
+
+    public ByteBuffer buffer()
+    {
+<span class="fc" id="L120">        return accessor().toBuffer(value());</span>
+    }
+
+    /**
+     * The cell timestamp.
+     * &lt;p&gt;
+     * @return the cell timestamp.
+     */
+    public abstract long timestamp();
+
+    /**
+     * The cell ttl.
+     *
+     * @return the cell ttl, or {@code NO_TTL} if the cell isn't an expiring one.
+     */
+    public abstract int ttl();
+
+    /**
+     * The cell local deletion time.
+     *
+     * @return the cell local deletion time, or {@code NO_DELETION_TIME} if the cell is neither
+     * a tombstone nor an expiring one.
+     */
+    public long localDeletionTime()
+    {
+<span class="fc" id="L145">        return deletionTimeUnsignedIntegerToLong(localDeletionTimeAsUnsignedInt());</span>
+    }
+
+    /**
+     * Whether the cell is a tombstone or not.
+     *
+     * @return whether the cell is a tombstone or not.
+     */
+    public abstract boolean isTombstone();
+
+    /**
+     * Whether the cell is an expiring one or not.
+     * &lt;p&gt;
+     * Note that this only correspond to whether the cell liveness info
+     * have a TTL or not, but doesn't tells whether the cell is already expired
+     * or not. You should use {@link #isLive} for that latter information.
+     *
+     * @return whether the cell is an expiring one or not.
+     */
+    public abstract boolean isExpiring();
+
+    /**
+     * Whether the cell is live or not given the current time.
+     *
+     * @param nowInSec the current time in seconds. This is used to
+     * decide if an expiring cell is expired or live.
+     * @return whether the cell is live or not at {@code nowInSec}.
+     */
+    public abstract boolean isLive(long nowInSec);
+
+    /**
+     * For cells belonging to complex types (non-frozen collection and UDT), the
+     * path to the cell.
+     *
+     * @return the cell path for cells of complex column, and {@code null} for other cells.
+     */
+    public abstract CellPath path();
+
+    public abstract Cell&lt;?&gt; withUpdatedColumn(ColumnMetadata newColumn);
+
+    public abstract Cell&lt;?&gt; withUpdatedValue(ByteBuffer newValue);
+
+    public abstract Cell&lt;?&gt; withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime);
+
+    /**
+     * Used to apply the same optimization as in {@link Cell.Serializer#deserialize} when
+     * the column is not queried but eventhough it's used for digest calculation.
+     * @return a cell with an empty buffer as value
+     */
+    public abstract Cell&lt;?&gt; withSkippedValue();
+
+    @Override
+    public final Cell&lt;?&gt; clone(Cloner cloner)
+    {
+<span class="fc" id="L199">        return cloner.clone(this);</span>
+    }
+
+    public abstract Cell&lt;?&gt; clone(ByteBufferCloner cloner);
+
+    @Override
+    // Overrides super type to provide a more precise return type.
+    public abstract Cell&lt;?&gt; markCounterLocalToBeCleared();
+
+    @Override
+    // Overrides super type to provide a more precise return type.
+    public abstract Cell&lt;?&gt; purge(DeletionPurger purger, long nowInSec);
+
+    @Override
+    // Overrides super type to provide a more precise return type.
+    public abstract Cell&lt;?&gt; purgeDataOlderThan(long timestamp);
+    
+    protected abstract int localDeletionTimeAsUnsignedInt();
+
+    /**
+     * Handle unsigned encoding and potentially invalid localDeletionTime.
+     */
+    public static long decodeLocalDeletionTime(long localDeletionTime, int ttl, DeserializationHelper helper)
+    {
+<span class="fc bfc" id="L223" title="All 2 branches covered.">        if (localDeletionTime &gt;= ttl)</span>
+<span class="fc" id="L224">            return localDeletionTime;   // fast path, positive and valid signed 32-bit integer</span>
+
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        if (localDeletionTime &lt; 0)</span>
+        {
+            // Overflown signed int, decode to long. The result is guaranteed &gt; ttl (and any signed int)
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">            return helper.version &lt; MessagingService.VERSION_50</span>
+<span class="fc" id="L230">                   ? INVALID_DELETION_TIME</span>
+<span class="nc" id="L231">                   : deletionTimeUnsignedIntegerToLong((int) localDeletionTime);</span>
+        }
+
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">        if (ttl == LivenessInfo.EXPIRED_LIVENESS_TTL)</span>
+<span class="fc" id="L235">            return localDeletionTime;   // ttl is already expired, localDeletionTime is valid</span>
+        else
+<span class="nc" id="L237">            return INVALID_DELETION_TIME;  // Invalid as it can't occur without corruption and would cause negative</span>
+                                           // timestamp on expiry.
+    }
+
+    /**
+     * The serialization format for cell is:
+     *     [ flags ][ timestamp ][ deletion time ][    ttl    ][ path size ][ path ][ value size ][ value ]
+     *     [   1b  ][ 8b (vint) ][   4b (vint)   ][ 4b (vint) ][ 4b (vint) ][  arb ][  4b (vint) ][  arb  ]
+     *
+     * where not all field are always present (in fact, only the [ flags ] are guaranteed to be present). The fields have the following
+     * meaning:
+     *   - [ flags ] is the cell flags. It is a byte for which each bit represents a flag whose meaning is explained below (*_MASK constants)
+     *   - [ timestamp ] is the cell timestamp. Present unless the cell has the USE_TIMESTAMP_MASK.
+     *   - [ deletion time]: the local deletion time for the cell. Present if either the cell is deleted (IS_DELETED_MASK)
+     *       or it is expiring (IS_EXPIRING_MASK) but doesn't have the USE_ROW_TTL_MASK.
+     *   - [ ttl ]: the ttl for the cell. Present if the row is expiring (IS_EXPIRING_MASK) but doesn't have the
+     *       USE_ROW_TTL_MASK.
+     *   - [ value size ] is the size of the [ value ] field. It's present unless either the cell has the HAS_EMPTY_VALUE_MASK, or the value
+     *       for columns of this type have a fixed length.
+     *   - [ path size ] is the size of the [ path ] field. Present iff this is the cell of a complex column.
+     *   - [ value ]: the cell value, unless it has the HAS_EMPTY_VALUE_MASK.
+     *   - [ path ]: the cell path if the column this is a cell of is complex.
+     */
+<span class="fc" id="L260">    static class Serializer</span>
+    {
+        private final static int IS_DELETED_MASK             = 0x01; // Whether the cell is a tombstone or not.
+        private final static int IS_EXPIRING_MASK            = 0x02; // Whether the cell is expiring.
+        private final static int HAS_EMPTY_VALUE_MASK        = 0x04; // Wether the cell has an empty value. This will be the case for tombstone in particular.
+        private final static int USE_ROW_TIMESTAMP_MASK      = 0x08; // Wether the cell has the same timestamp than the row this is a cell of.
+        private final static int USE_ROW_TTL_MASK            = 0x10; // Wether the cell has the same ttl than the row this is a cell of.
+
+        public &lt;T&gt; void serialize(Cell&lt;T&gt; cell, ColumnMetadata column, DataOutputPlus out, LivenessInfo rowLiveness, SerializationHeader header) throws IOException
+        {
+<span class="pc bpc" id="L270" title="1 of 2 branches missed.">            assert cell != null;</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">            boolean hasValue = cell.valueSize() &gt; 0;</span>
+<span class="fc" id="L272">            boolean isDeleted = cell.isTombstone();</span>
+<span class="fc" id="L273">            boolean isExpiring = cell.isExpiring();</span>
+<span class="fc bfc" id="L274" title="All 4 branches covered.">            boolean useRowTimestamp = !rowLiveness.isEmpty() &amp;&amp; cell.timestamp() == rowLiveness.timestamp();</span>
+<span class="pc bpc" id="L275" title="1 of 8 branches missed.">            boolean useRowTTL = isExpiring &amp;&amp; rowLiveness.isExpiring() &amp;&amp; cell.ttl() == rowLiveness.ttl() &amp;&amp; cell.localDeletionTime() == rowLiveness.localExpirationTime();</span>
+<span class="fc" id="L276">            int flags = 0;</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">            if (!hasValue)</span>
+<span class="fc" id="L278">                flags |= HAS_EMPTY_VALUE_MASK;</span>
+
+<span class="fc bfc" id="L280" title="All 2 branches covered.">            if (isDeleted)</span>
+<span class="fc" id="L281">                flags |= IS_DELETED_MASK;</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">            else if (isExpiring)</span>
+<span class="fc" id="L283">                flags |= IS_EXPIRING_MASK;</span>
+
+<span class="fc bfc" id="L285" title="All 2 branches covered.">            if (useRowTimestamp)</span>
+<span class="fc" id="L286">                flags |= USE_ROW_TIMESTAMP_MASK;</span>
+<span class="fc bfc" id="L287" title="All 2 branches covered.">            if (useRowTTL)</span>
+<span class="fc" id="L288">                flags |= USE_ROW_TTL_MASK;</span>
+
+<span class="fc" id="L290">            out.writeByte((byte)flags);</span>
+
+<span class="fc bfc" id="L292" title="All 2 branches covered.">            if (!useRowTimestamp)</span>
+<span class="fc" id="L293">                header.writeTimestamp(cell.timestamp(), out);</span>
+
+<span class="fc bfc" id="L295" title="All 6 branches covered.">            if ((isDeleted || isExpiring) &amp;&amp; !useRowTTL)</span>
+<span class="fc" id="L296">                header.writeLocalDeletionTime(cell.localDeletionTime(), out);</span>
+<span class="fc bfc" id="L297" title="All 4 branches covered.">            if (isExpiring &amp;&amp; !useRowTTL)</span>
+<span class="fc" id="L298">                header.writeTTL(cell.ttl(), out);</span>
+
+<span class="fc bfc" id="L300" title="All 2 branches covered.">            if (column.isComplex())</span>
+<span class="fc" id="L301">                column.cellPathSerializer().serialize(cell.path(), out);</span>
+
+<span class="fc bfc" id="L303" title="All 2 branches covered.">            if (hasValue)</span>
+<span class="fc" id="L304">                header.getType(column).writeValue(cell.value(), cell.accessor(), out);</span>
+<span class="fc" id="L305">        }</span>
+
+        public &lt;V&gt; Cell&lt;V&gt; deserialize(DataInputPlus in, LivenessInfo rowLiveness, ColumnMetadata column, SerializationHeader header, DeserializationHelper helper, ValueAccessor&lt;V&gt; accessor) throws IOException
+        {
+<span class="fc" id="L309">            int flags = in.readUnsignedByte();</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">            boolean hasValue = (flags &amp; HAS_EMPTY_VALUE_MASK) == 0;</span>
+<span class="fc bfc" id="L311" title="All 2 branches covered.">            boolean isDeleted = (flags &amp; IS_DELETED_MASK) != 0;</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            boolean isExpiring = (flags &amp; IS_EXPIRING_MASK) != 0;</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">            boolean useRowTimestamp = (flags &amp; USE_ROW_TIMESTAMP_MASK) != 0;</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">            boolean useRowTTL = (flags &amp; USE_ROW_TTL_MASK) != 0;</span>
+
+<span class="fc bfc" id="L316" title="All 2 branches covered.">            long timestamp = useRowTimestamp ? rowLiveness.timestamp() : header.readTimestamp(in);</span>
+
+<span class="fc bfc" id="L318" title="All 2 branches covered.">            long localDeletionTime = useRowTTL</span>
+<span class="fc" id="L319">                                    ? rowLiveness.localExpirationTime()</span>
+<span class="fc bfc" id="L320" title="All 4 branches covered.">                                    : (isDeleted || isExpiring ? header.readLocalDeletionTime(in) : NO_DELETION_TIME);</span>
+
+<span class="fc bfc" id="L322" title="All 4 branches covered.">            int ttl = useRowTTL ? rowLiveness.ttl() : (isExpiring ? header.readTTL(in) : NO_TTL);</span>
+
+<span class="fc bfc" id="L324" title="All 2 branches covered.">            CellPath path = column.isComplex()</span>
+<span class="fc" id="L325">                            ? column.cellPathSerializer().deserialize(in)</span>
+<span class="fc" id="L326">                            : null;</span>
+
+<span class="fc" id="L328">            V value = accessor.empty();</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">            if (hasValue)</span>
+            {
+<span class="fc bfc" id="L331" title="All 6 branches covered.">                if (helper.canSkipValue(column) || (path != null &amp;&amp; helper.canSkipValue(path)))</span>
+                {
+<span class="fc" id="L333">                    header.getType(column).skipValue(in);</span>
+                }
+                else
+                {
+<span class="fc bfc" id="L337" title="All 4 branches covered.">                    boolean isCounter = localDeletionTime == NO_DELETION_TIME &amp;&amp; column.type.isCounter();</span>
+
+<span class="fc" id="L339">                    value = header.getType(column).read(accessor, in, DatabaseDescriptor.getMaxValueSize());</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">                    if (isCounter)</span>
+<span class="fc" id="L341">                        value = helper.maybeClearCounterValue(value, accessor);</span>
+                }
+            }
+
+<span class="pc bpc" id="L345" title="1 of 2 branches missed.">            if (ttl &lt; 0)</span>
+<span class="nc" id="L346">                throw new IOException(&quot;Invalid TTL: &quot; + ttl);</span>
+<span class="fc" id="L347">            localDeletionTime = decodeLocalDeletionTime(localDeletionTime, ttl, helper);</span>
+<span class="fc" id="L348">            return accessor.factory().cell(column, timestamp, ttl, localDeletionTime, value, path);</span>
+        }
+
+        public &lt;T&gt; long serializedSize(Cell&lt;T&gt; cell, ColumnMetadata column, LivenessInfo rowLiveness, SerializationHeader header)
+        {
+<span class="fc" id="L353">            long size = 1; // flags</span>
+<span class="fc bfc" id="L354" title="All 2 branches covered.">            boolean hasValue = cell.valueSize() &gt; 0;</span>
+<span class="fc" id="L355">            boolean isDeleted = cell.isTombstone();</span>
+<span class="fc" id="L356">            boolean isExpiring = cell.isExpiring();</span>
+<span class="fc bfc" id="L357" title="All 4 branches covered.">            boolean useRowTimestamp = !rowLiveness.isEmpty() &amp;&amp; cell.timestamp() == rowLiveness.timestamp();</span>
+<span class="pc bpc" id="L358" title="2 of 8 branches missed.">            boolean useRowTTL = isExpiring &amp;&amp; rowLiveness.isExpiring() &amp;&amp; cell.ttl() == rowLiveness.ttl() &amp;&amp; cell.localDeletionTime() == rowLiveness.localExpirationTime();</span>
+
+<span class="fc bfc" id="L360" title="All 2 branches covered.">            if (!useRowTimestamp)</span>
+<span class="fc" id="L361">                size += header.timestampSerializedSize(cell.timestamp());</span>
+
+<span class="fc bfc" id="L363" title="All 6 branches covered.">            if ((isDeleted || isExpiring) &amp;&amp; !useRowTTL)</span>
+<span class="fc" id="L364">                size += header.localDeletionTimeSerializedSize(cell.localDeletionTime());</span>
+<span class="fc bfc" id="L365" title="All 4 branches covered.">            if (isExpiring &amp;&amp; !useRowTTL)</span>
+<span class="fc" id="L366">                size += header.ttlSerializedSize(cell.ttl());</span>
+
+<span class="fc bfc" id="L368" title="All 2 branches covered.">            if (column.isComplex())</span>
+<span class="fc" id="L369">                size += column.cellPathSerializer().serializedSize(cell.path());</span>
+
+<span class="fc bfc" id="L371" title="All 2 branches covered.">            if (hasValue)</span>
+<span class="fc" id="L372">                size += header.getType(column).writtenLength(cell.value(), cell.accessor());</span>
+
+<span class="fc" id="L374">            return size;</span>
+        }
+
+        // Returns if the skipped cell was an actual cell (i.e. it had its presence flag).
+        public boolean skip(DataInputPlus in, ColumnMetadata column, SerializationHeader header) throws IOException
+        {
+<span class="fc" id="L380">            int flags = in.readUnsignedByte();</span>
+<span class="fc bfc" id="L381" title="All 2 branches covered.">            boolean hasValue = (flags &amp; HAS_EMPTY_VALUE_MASK) == 0;</span>
+<span class="fc bfc" id="L382" title="All 2 branches covered.">            boolean isDeleted = (flags &amp; IS_DELETED_MASK) != 0;</span>
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">            boolean isExpiring = (flags &amp; IS_EXPIRING_MASK) != 0;</span>
+<span class="fc bfc" id="L384" title="All 2 branches covered.">            boolean useRowTimestamp = (flags &amp; USE_ROW_TIMESTAMP_MASK) != 0;</span>
+<span class="pc bpc" id="L385" title="1 of 2 branches missed.">            boolean useRowTTL = (flags &amp; USE_ROW_TTL_MASK) != 0;</span>
+
+<span class="fc bfc" id="L387" title="All 2 branches covered.">            if (!useRowTimestamp)</span>
+<span class="fc" id="L388">                header.skipTimestamp(in);</span>
+
+<span class="pc bpc" id="L390" title="2 of 6 branches missed.">            if (!useRowTTL &amp;&amp; (isDeleted || isExpiring))</span>
+<span class="fc" id="L391">                header.skipLocalDeletionTime(in);</span>
+
+<span class="pc bpc" id="L393" title="2 of 4 branches missed.">            if (!useRowTTL &amp;&amp; isExpiring)</span>
+<span class="nc" id="L394">                header.skipTTL(in);</span>
+
+<span class="fc bfc" id="L396" title="All 2 branches covered.">            if (column.isComplex())</span>
+<span class="fc" id="L397">                column.cellPathSerializer().skip(in);</span>
+
+<span class="fc bfc" id="L399" title="All 2 branches covered.">            if (hasValue)</span>
+<span class="fc" id="L400">                header.getType(column).skipValue(in);</span>
+
+<span class="fc" id="L402">            return true;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

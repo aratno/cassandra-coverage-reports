@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LiteralIndexSegmentTermsReader.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1.segment</a> &gt; <span class="el_source">LiteralIndexSegmentTermsReader.java</span></div><h1>LiteralIndexSegmentTermsReader.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai.disk.v1.segment;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.exceptions.QueryCancelledException;
+import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.QueryContext;
+import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
+import org.apache.cassandra.index.sai.disk.v1.postings.PostingsReader;
+import org.apache.cassandra.index.sai.disk.v1.trie.TrieTermsDictionaryReader;
+import org.apache.cassandra.index.sai.metrics.QueryEventListener;
+import org.apache.cassandra.index.sai.postings.PostingList;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.lucene.store.IndexInput;
+
+import static org.apache.cassandra.index.sai.disk.v1.SAICodecUtils.validate;
+
+/**
+ * Synchronous reader of terms dictionary and postings lists to produce a {@link PostingList} with matching row ids.
+ *
+ * {@link #exactMatch(ByteComparable, QueryEventListener.TrieIndexEventListener, QueryContext)} does:
+ * &lt;ul&gt;
+ * &lt;li&gt;{@link TermQuery#lookupPostingsOffset(ByteComparable)}: does term dictionary lookup to find the posting list file
+ * position&lt;/li&gt;
+ * &lt;li&gt;{@link TermQuery#getPostingsReader(long)}: reads posting list block summary and initializes posting read which
+ * reads the first block of the posting list into memory&lt;/li&gt;
+ * &lt;/ul&gt;
+ */
+public class LiteralIndexSegmentTermsReader implements Closeable
+{
+<span class="fc" id="L58">    private static final Logger logger = LoggerFactory.getLogger(LiteralIndexSegmentTermsReader.class);</span>
+
+    private final IndexContext indexContext;
+    private final FileHandle termDictionaryFile;
+    private final FileHandle postingsFile;
+    private final long termDictionaryRoot;
+
+    public LiteralIndexSegmentTermsReader(IndexContext indexContext,
+                                          FileHandle termsData,
+                                          FileHandle postingLists,
+                                          long root,
+                                          long termsFooterPointer) throws IOException
+<span class="fc" id="L70">    {</span>
+<span class="fc" id="L71">        this.indexContext = indexContext;</span>
+<span class="fc" id="L72">        termDictionaryFile = termsData;</span>
+<span class="fc" id="L73">        postingsFile = postingLists;</span>
+<span class="fc" id="L74">        termDictionaryRoot = root;</span>
+
+<span class="fc" id="L76">        try (final IndexInput indexInput = IndexFileUtils.instance.openInput(termDictionaryFile))</span>
+        {
+<span class="fc" id="L78">            validate(indexInput, termsFooterPointer);</span>
+        }
+
+<span class="fc" id="L81">        try (final IndexInput indexInput = IndexFileUtils.instance.openInput(postingsFile))</span>
+        {
+<span class="fc" id="L83">            validate(indexInput);</span>
+        }
+<span class="fc" id="L85">    }</span>
+
+    @Override
+    public void close()
+    {
+<span class="fc" id="L90">        FileUtils.closeQuietly(termDictionaryFile);</span>
+<span class="fc" id="L91">        FileUtils.closeQuietly(postingsFile);</span>
+<span class="fc" id="L92">    }</span>
+
+    public PostingList exactMatch(ByteComparable term, QueryEventListener.TrieIndexEventListener perQueryEventListener, QueryContext context)
+    {
+<span class="fc" id="L96">        perQueryEventListener.onSegmentHit();</span>
+<span class="fc" id="L97">        return new TermQuery(term, perQueryEventListener, context).execute();</span>
+    }
+
+    @VisibleForTesting
+    public class TermQuery
+    {
+        private final IndexInput postingsInput;
+        private final IndexInput postingsSummaryInput;
+        private final QueryEventListener.TrieIndexEventListener listener;
+        private final long lookupStartTime;
+        private final QueryContext context;
+        private final ByteComparable term;
+
+        TermQuery(ByteComparable term, QueryEventListener.TrieIndexEventListener listener, QueryContext context)
+<span class="fc" id="L111">        {</span>
+<span class="fc" id="L112">            this.listener = listener;</span>
+<span class="fc" id="L113">            postingsInput = IndexFileUtils.instance.openInput(postingsFile);</span>
+<span class="fc" id="L114">            postingsSummaryInput = IndexFileUtils.instance.openInput(postingsFile);</span>
+<span class="fc" id="L115">            this.term = term;</span>
+<span class="fc" id="L116">            lookupStartTime = Clock.Global.nanoTime();</span>
+<span class="fc" id="L117">            this.context = context;</span>
+<span class="fc" id="L118">        }</span>
+
+        public PostingList execute()
+        {
+            try
+            {
+<span class="fc" id="L124">                long postingOffset = lookupPostingsOffset(term);</span>
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">                if (postingOffset == PostingList.OFFSET_NOT_FOUND)</span>
+                {
+<span class="nc" id="L127">                    FileUtils.closeQuietly(postingsInput);</span>
+<span class="nc" id="L128">                    FileUtils.closeQuietly(postingsSummaryInput);</span>
+<span class="nc" id="L129">                    return null;</span>
+                }
+
+<span class="fc" id="L132">                context.checkpoint();</span>
+
+                // when posting is found, resources will be closed when posting reader is closed.
+<span class="fc" id="L135">                return getPostingsReader(postingOffset);</span>
+            }
+<span class="nc" id="L137">            catch (Throwable e)</span>
+            {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">                if (!(e instanceof QueryCancelledException))</span>
+<span class="nc" id="L140">                    logger.error(indexContext.logMessage(&quot;Failed to execute term query&quot;), e);</span>
+
+<span class="nc" id="L142">                closeOnException();</span>
+<span class="nc" id="L143">                throw Throwables.cleaned(e);</span>
+            }
+        }
+
+        private void closeOnException()
+        {
+<span class="nc" id="L149">            FileUtils.closeQuietly(postingsInput);</span>
+<span class="nc" id="L150">            FileUtils.closeQuietly(postingsSummaryInput);</span>
+<span class="nc" id="L151">        }</span>
+
+        public long lookupPostingsOffset(ByteComparable term)
+        {
+<span class="fc" id="L155">            try (TrieTermsDictionaryReader reader = new TrieTermsDictionaryReader(termDictionaryFile.instantiateRebufferer(null), termDictionaryRoot))</span>
+            {
+<span class="fc" id="L157">                final long offset = reader.exactMatch(term);</span>
+
+<span class="fc" id="L159">                listener.onTraversalComplete(Clock.Global.nanoTime() - lookupStartTime, TimeUnit.NANOSECONDS);</span>
+
+<span class="pc bpc" id="L161" title="1 of 2 branches missed.">                if (offset == TrieTermsDictionaryReader.NOT_FOUND)</span>
+<span class="nc" id="L162">                    return PostingList.OFFSET_NOT_FOUND;</span>
+
+<span class="fc" id="L164">                return offset;</span>
+<span class="nc" id="L165">            }</span>
+        }
+
+        public PostingsReader getPostingsReader(long offset) throws IOException
+        {
+<span class="fc" id="L170">            PostingsReader.BlocksSummary header = new PostingsReader.BlocksSummary(postingsSummaryInput, offset);</span>
+
+<span class="fc" id="L172">            return new PostingsReader(postingsInput, header, listener.postingListEventListener());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

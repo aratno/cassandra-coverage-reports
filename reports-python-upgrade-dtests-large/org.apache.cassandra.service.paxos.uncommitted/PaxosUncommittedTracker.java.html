@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosUncommittedTracker.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.uncommitted</a> &gt; <span class="el_source">PaxosUncommittedTracker.java</span></div><h1>PaxosUncommittedTracker.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.uncommitted;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Sets;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.paxos.cleanup.PaxosTableRepairs;
+import org.apache.cassandra.utils.CloseableIterator;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.AUTO_REPAIR_FREQUENCY_SECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DISABLE_PAXOS_AUTO_REPAIRS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DISABLE_PAXOS_STATE_FLUSH;
+import static org.apache.cassandra.config.DatabaseDescriptor.paxosRepairEnabled;
+import static org.apache.cassandra.service.paxos.uncommitted.PaxosKeyState.mergeUncommitted;
+
+/**
+ * Tracks uncommitted paxos operations to enable operation completion as part of repair by returning an iterator of
+ * partition keys with uncommitted paxos operations (and their consistency levels) for a given table and token range(s)
+ *
+ * There are 2 parts to the uncommitted states it tracks: operations flushed to disk, and updates still in memory. This
+ * class handles merging these two sources for queries and for merging states as part of flush. In practice, in memory
+ * updates are the contents of the system.paxos memtables, although this has been generalized into an &quot;UpdateSupplier&quot;
+ * interface to accomodate testing.
+ */
+public class PaxosUncommittedTracker
+{
+<span class="fc" id="L69">    private static final Logger logger = LoggerFactory.getLogger(PaxosUncommittedTracker.class);</span>
+<span class="fc" id="L70">    private static final Range&lt;Token&gt; FULL_RANGE = new Range&lt;&gt;(DatabaseDescriptor.getPartitioner().getMinimumToken(),</span>
+<span class="fc" id="L71">                                                               DatabaseDescriptor.getPartitioner().getMinimumToken());</span>
+
+    private static volatile UpdateSupplier updateSupplier;
+
+<span class="pc bpc" id="L75" title="1 of 2 branches missed.">    private volatile boolean autoRepairsEnabled = !DISABLE_PAXOS_AUTO_REPAIRS.getBoolean();</span>
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">    private volatile boolean stateFlushEnabled = !DISABLE_PAXOS_STATE_FLUSH.getBoolean();</span>
+
+<span class="fc" id="L78">    private boolean started = false;</span>
+<span class="fc" id="L79">    private boolean autoRepairStarted = false;</span>
+
+<span class="fc" id="L81">    private final Set&lt;TableId&gt; autoRepairTableIds = Sets.newConcurrentHashSet();</span>
+
+    public interface UpdateSupplier
+    {
+        CloseableIterator&lt;PaxosKeyState&gt; repairIterator(TableId tableId, Collection&lt;Range&lt;Token&gt;&gt; ranges);
+        CloseableIterator&lt;PaxosKeyState&gt; flushIterator(Memtable paxos);
+    }
+
+    private final File dataDirectory;
+    private volatile ImmutableMap&lt;TableId, UncommittedTableData&gt; tableStates;
+
+    public PaxosUncommittedTracker(File dataDirectory, ImmutableMap&lt;TableId, UncommittedTableData&gt; tableStates)
+<span class="fc" id="L93">    {</span>
+<span class="fc" id="L94">        this.dataDirectory = dataDirectory;</span>
+<span class="fc" id="L95">        this.tableStates = tableStates;</span>
+<span class="fc" id="L96">    }</span>
+
+    public PaxosUncommittedTracker(File dataDirectory)
+    {
+<span class="nc" id="L100">        this(dataDirectory, ImmutableMap.of());</span>
+<span class="nc" id="L101">    }</span>
+
+    public File getDirectory()
+    {
+<span class="nc" id="L105">        return dataDirectory;</span>
+    }
+
+    public static void truncate(File dataDirectory)
+    {
+<span class="nc" id="L110">        logger.info(&quot;truncating paxos uncommitted metadata in {}&quot;, dataDirectory);</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        for (File file : dataDirectory.tryList())</span>
+        {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (file.name().equals(PaxosBallotTracker.FNAME))</span>
+<span class="nc" id="L114">                continue;</span>
+
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            if (file.isDirectory())</span>
+<span class="nc" id="L117">                FileUtils.deleteRecursive(file);</span>
+            else
+<span class="nc" id="L119">                FileUtils.deleteWithConfirm(file);</span>
+        }
+<span class="nc" id="L121">    }</span>
+
+    public static PaxosUncommittedTracker load(File dataDirectory)
+    {
+<span class="fc" id="L125">        ImmutableMap.Builder&lt;TableId, UncommittedTableData&gt; builder = ImmutableMap.builder();</span>
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        for (TableId tableId : UncommittedTableData.listTableIds(dataDirectory))</span>
+        {
+<span class="nc" id="L128">            builder.put(tableId, UncommittedTableData.load(dataDirectory, tableId));</span>
+<span class="nc" id="L129">        }</span>
+
+<span class="fc" id="L131">        return new PaxosUncommittedTracker(dataDirectory, builder.build());</span>
+    }
+
+    @VisibleForTesting
+    UncommittedTableData getOrCreateTableState(TableId tableId)
+    {
+<span class="nc" id="L137">        UncommittedTableData state = tableStates.get(tableId);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (state == null)</span>
+        {
+<span class="nc" id="L140">            synchronized (this)</span>
+            {
+<span class="nc" id="L142">                state = tableStates.get(tableId);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                if (state != null)</span>
+<span class="nc" id="L144">                    return state;</span>
+
+<span class="nc" id="L146">                state = UncommittedTableData.load(dataDirectory, tableId);</span>
+<span class="nc" id="L147">                tableStates = ImmutableMap.&lt;TableId, UncommittedTableData&gt;builder()</span>
+<span class="nc" id="L148">                              .putAll(tableStates).put(tableId, state)</span>
+<span class="nc" id="L149">                              .build();</span>
+<span class="nc" id="L150">            }</span>
+        }
+<span class="nc" id="L152">        return state;</span>
+    }
+
+    synchronized void flushUpdates(Memtable paxos) throws IOException
+    {
+<span class="nc bnc" id="L157" title="All 4 branches missed.">        if (!stateFlushEnabled || !started)</span>
+<span class="nc" id="L158">            return;</span>
+
+<span class="nc" id="L160">        Map&lt;TableId, UncommittedTableData.FlushWriter&gt; flushWriters = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L161">        try (CloseableIterator&lt;PaxosKeyState&gt; iterator = updateSupplier.flushIterator(paxos))</span>
+        {
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            while (iterator.hasNext())</span>
+            {
+<span class="nc" id="L165">                PaxosKeyState next = iterator.next();</span>
+<span class="nc" id="L166">                UncommittedTableData.FlushWriter writer = flushWriters.get(next.tableId);</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                if (writer == null)</span>
+                {
+<span class="nc" id="L169">                    writer = getOrCreateTableState(next.tableId).flushWriter();</span>
+<span class="nc" id="L170">                    flushWriters.put(next.tableId, writer);</span>
+                }
+<span class="nc" id="L172">                writer.append(next);</span>
+<span class="nc" id="L173">            }</span>
+        }
+<span class="nc" id="L175">        catch (Throwable t)</span>
+        {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            for (UncommittedTableData.FlushWriter writer : flushWriters.values())</span>
+<span class="nc" id="L178">                t = writer.abort(t);</span>
+<span class="nc" id="L179">            throw new IOException(t);</span>
+<span class="nc" id="L180">        }</span>
+
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        for (UncommittedTableData.FlushWriter writer : flushWriters.values())</span>
+<span class="nc" id="L183">            writer.finish();</span>
+<span class="nc" id="L184">    }</span>
+
+    @VisibleForTesting
+    UncommittedTableData getTableState(TableId tableId)
+    {
+<span class="nc" id="L189">        return tableStates.get(tableId);</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public CloseableIterator&lt;UncommittedPaxosKey&gt; uncommittedKeyIterator(TableId tableId, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc bnc" id="L195" title="All 4 branches missed.">        ranges = (ranges == null || ranges.isEmpty()) ? Collections.singleton(FULL_RANGE) : Range.normalize(ranges);</span>
+<span class="nc" id="L196">        CloseableIterator&lt;PaxosKeyState&gt; updates = updateSupplier.repairIterator(tableId, ranges);</span>
+
+        try
+        {
+<span class="nc" id="L200">            UncommittedTableData state = tableStates.get(tableId);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (state == null)</span>
+<span class="nc" id="L202">                return PaxosKeyState.toUncommittedInfo(updates);</span>
+
+<span class="nc" id="L204">            CloseableIterator&lt;PaxosKeyState&gt; fileIter = state.iterator(ranges);</span>
+            try
+            {
+<span class="nc" id="L207">                @SuppressWarnings(&quot;unchecked&quot;) CloseableIterator&lt;PaxosKeyState&gt; merged = mergeUncommitted(updates, fileIter);</span>
+
+<span class="nc" id="L209">                return PaxosKeyState.toUncommittedInfo(merged);</span>
+            }
+<span class="nc" id="L211">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L213">                fileIter.close();</span>
+<span class="nc" id="L214">                throw t;</span>
+            }
+        }
+<span class="nc" id="L217">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L219">            updates.close();</span>
+<span class="nc" id="L220">            throw t;</span>
+        }
+    }
+
+    synchronized void truncate()
+    {
+<span class="fc" id="L226">        logger.info(&quot;truncating paxos uncommitted info&quot;);</span>
+<span class="fc" id="L227">        tableStates.values().forEach(UncommittedTableData::truncate);</span>
+<span class="fc" id="L228">        tableStates = ImmutableMap.of();</span>
+<span class="fc" id="L229">    }</span>
+
+    public synchronized void start()
+    {
+<span class="fc bfc" id="L233" title="All 2 branches covered.">        if (started)</span>
+<span class="fc" id="L234">            return;</span>
+
+<span class="fc" id="L236">        logger.info(&quot;enabling PaxosUncommittedTracker&quot;);</span>
+<span class="fc" id="L237">        started = true;</span>
+<span class="fc" id="L238">    }</span>
+
+    public synchronized void rebuild(Iterator&lt;PaxosKeyState&gt; iterator) throws IOException
+    {
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        Preconditions.checkState(!started);</span>
+<span class="fc" id="L243">        truncate();</span>
+
+<span class="fc" id="L245">        Map&lt;TableId, UncommittedTableData.FlushWriter&gt; flushWriters = new HashMap&lt;&gt;();</span>
+        try
+        {
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">            while (iterator.hasNext())</span>
+            {
+<span class="nc" id="L250">                PaxosKeyState next = iterator.next();</span>
+<span class="nc" id="L251">                UncommittedTableData.FlushWriter writer = flushWriters.get(next.tableId);</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                if (writer == null)</span>
+                {
+<span class="nc" id="L254">                    writer = getOrCreateTableState(next.tableId).rebuildWriter();</span>
+<span class="nc" id="L255">                    flushWriters.put(next.tableId, writer);</span>
+                }
+<span class="nc" id="L257">                writer.append(next);</span>
+<span class="nc" id="L258">            }</span>
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">            for (UncommittedTableData.FlushWriter writer : flushWriters.values())</span>
+<span class="nc" id="L260">                writer.finish();</span>
+        }
+<span class="nc" id="L262">        catch (Throwable t)</span>
+        {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">            for (UncommittedTableData.FlushWriter writer : flushWriters.values())</span>
+<span class="nc" id="L265">                t = writer.abort(t);</span>
+<span class="nc" id="L266">            throw new IOException(t);</span>
+<span class="fc" id="L267">        }</span>
+
+<span class="fc" id="L269">        start();</span>
+<span class="fc" id="L270">    }</span>
+
+    synchronized void consolidateFiles()
+    {
+<span class="fc" id="L274">        tableStates.values().forEach(UncommittedTableData::maybeScheduleMerge);</span>
+<span class="fc" id="L275">    }</span>
+
+    synchronized void schedulePaxosAutoRepairs()
+    {
+<span class="pc bpc" id="L279" title="2 of 4 branches missed.">        if (!paxosRepairEnabled() || !autoRepairsEnabled)</span>
+<span class="nc" id="L280">            return;</span>
+
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">        for (UncommittedTableData tableData : tableStates.values())</span>
+        {
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if (tableData.numFiles() == 0)</span>
+<span class="nc" id="L285">                continue;</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">            if (SchemaConstants.REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(tableData.keyspace()))</span>
+<span class="nc" id="L288">                continue;</span>
+
+<span class="nc" id="L290">            TableId tableId = tableData.tableId();</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (Schema.instance.getTableMetadata(tableId) == null)</span>
+<span class="nc" id="L292">                continue;</span>
+
+<span class="nc" id="L294">            logger.debug(&quot;Starting paxos auto repair for {}.{}&quot;, tableData.keyspace(), tableData.table());</span>
+
+<span class="nc bnc" id="L296" title="All 2 branches missed.">            if (!autoRepairTableIds.add(tableId))</span>
+            {
+<span class="nc" id="L298">                logger.debug(&quot;Skipping paxos auto repair for {}.{}, another auto repair is already in progress&quot;, tableData.keyspace(), tableData.table());</span>
+<span class="nc" id="L299">                continue;</span>
+            }
+
+<span class="nc" id="L302">            StorageService.instance.autoRepairPaxos(tableId).addCallback((success, failure) -&gt; {</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if (failure != null) logger.error(&quot;Paxos auto repair for {}.{} failed&quot;, tableData.keyspace(), tableData.table(), failure);</span>
+<span class="nc" id="L304">                else logger.debug(&quot;Paxos auto repair for {}.{} completed&quot;, tableData.keyspace(), tableData.table());</span>
+<span class="nc" id="L305">                autoRepairTableIds.remove(tableId);</span>
+<span class="nc" id="L306">            });</span>
+<span class="nc" id="L307">        }</span>
+<span class="fc" id="L308">    }</span>
+
+    private static void runAndLogException(String desc, Runnable runnable)
+    {
+        try
+        {
+<span class="fc" id="L314">            runnable.run();</span>
+        }
+<span class="nc" id="L316">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L318">            logger.error(&quot;Unhandled exception running &quot; + desc, t);</span>
+<span class="fc" id="L319">        }</span>
+<span class="fc" id="L320">    }</span>
+
+    void maintenance()
+    {
+<span class="fc" id="L324">        runAndLogException(&quot;file consolidation&quot;, this::consolidateFiles);</span>
+<span class="fc" id="L325">        runAndLogException(&quot;schedule auto repairs&quot;, this::schedulePaxosAutoRepairs);</span>
+<span class="fc" id="L326">        runAndLogException(&quot;evict hung repairs&quot;, PaxosTableRepairs::evictHungRepairs);</span>
+<span class="fc" id="L327">    }</span>
+
+    public synchronized void startAutoRepairs()
+    {
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">        if (autoRepairStarted)</span>
+<span class="nc" id="L332">            return;</span>
+<span class="fc" id="L333">        int seconds = AUTO_REPAIR_FREQUENCY_SECONDS.getInt();</span>
+<span class="fc" id="L334">        ScheduledExecutors.scheduledTasks.scheduleAtFixedRate(this::maintenance, seconds, seconds, TimeUnit.SECONDS);</span>
+<span class="fc" id="L335">        autoRepairStarted = true;</span>
+<span class="fc" id="L336">    }</span>
+
+    @VisibleForTesting
+    public boolean hasInflightAutoRepairs()
+    {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        return !autoRepairTableIds.isEmpty();</span>
+    }
+
+    public boolean isAutoRepairsEnabled()
+    {
+<span class="nc" id="L346">        return autoRepairsEnabled;</span>
+    }
+
+    public void setAutoRepairsEnabled(boolean autoRepairsEnabled)
+    {
+<span class="nc" id="L351">        this.autoRepairsEnabled = autoRepairsEnabled;</span>
+<span class="nc" id="L352">    }</span>
+
+    public boolean isStateFlushEnabled()
+    {
+<span class="nc" id="L356">        return stateFlushEnabled;</span>
+    }
+
+    public void setStateFlushEnabled(boolean enabled)
+    {
+<span class="nc" id="L361">        this.stateFlushEnabled = enabled;</span>
+<span class="nc" id="L362">    }</span>
+
+    public Set&lt;TableId&gt; tableIds()
+    {
+<span class="nc" id="L366">        return tableStates.keySet();</span>
+    }
+
+    public static UpdateSupplier unsafGetUpdateSupplier()
+    {
+<span class="nc" id="L371">        return updateSupplier;</span>
+    }
+
+    public static void unsafSetUpdateSupplier(UpdateSupplier updateSupplier)
+    {
+<span class="pc bpc" id="L376" title="1 of 2 branches missed.">        Preconditions.checkArgument(updateSupplier != null);</span>
+<span class="fc" id="L377">        PaxosUncommittedTracker.updateSupplier = updateSupplier;</span>
+<span class="fc" id="L378">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,614 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ClientState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">ClientState.java</span></div><h1>ClientState.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.auth.*;
+import org.apache.cassandra.db.virtual.VirtualSchemaKeyspace;
+import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaKeyspaceTables;
+import org.apache.cassandra.cql3.QueryHandler;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.dht.Datacenters;
+import org.apache.cassandra.exceptions.AuthenticationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.MD5Digest;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.CUSTOM_QUERY_HANDLER_CLASS;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+/**
+ * State related to a client connection.
+ */
+public class ClientState
+{
+<span class="fc" id="L69">    private static final Logger logger = LoggerFactory.getLogger(ClientState.class);</span>
+
+<span class="fc" id="L71">    private static final Set&lt;IResource&gt; READABLE_SYSTEM_RESOURCES = new HashSet&lt;&gt;();</span>
+<span class="fc" id="L72">    private static final Set&lt;IResource&gt; PROTECTED_AUTH_RESOURCES = new HashSet&lt;&gt;();</span>
+
+    static
+    {
+        // We want these system cfs to be always readable to authenticated users since many tools rely on them
+        // (nodetool, cqlsh, bulkloader, etc.)
+<span class="fc bfc" id="L78" title="All 2 branches covered.">        for (String cf : Arrays.asList(SystemKeyspace.LOCAL, SystemKeyspace.LEGACY_PEERS, SystemKeyspace.PEERS_V2))</span>
+<span class="fc" id="L79">            READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaConstants.SYSTEM_KEYSPACE_NAME, cf));</span>
+
+        // make all schema tables readable by default (required by the drivers)
+<span class="fc" id="L82">        SchemaKeyspaceTables.ALL.forEach(table -&gt; READABLE_SYSTEM_RESOURCES.add(DataResource.table(SchemaConstants.SCHEMA_KEYSPACE_NAME, table)));</span>
+
+        // make all virtual schema tables readable by default as well
+<span class="fc" id="L85">        VirtualSchemaKeyspace.instance.tables().forEach(t -&gt; READABLE_SYSTEM_RESOURCES.add(t.metadata().resource));</span>
+
+        // neither clients nor tools need authentication/authorization
+<span class="pc bpc" id="L88" title="1 of 2 branches missed.">        if (DatabaseDescriptor.isDaemonInitialized())</span>
+        {
+<span class="fc" id="L90">            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthenticator().protectedResources());</span>
+<span class="fc" id="L91">            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getAuthorizer().protectedResources());</span>
+<span class="fc" id="L92">            PROTECTED_AUTH_RESOURCES.addAll(DatabaseDescriptor.getRoleManager().protectedResources());</span>
+        }
+    }
+
+    // Current user for the session
+    private volatile AuthenticatedUser user;
+    private volatile String keyspace;
+    private volatile boolean issuedPreparedStatementsUseWarning;
+
+    private static final QueryHandler cqlQueryHandler;
+    static
+    {
+<span class="fc" id="L104">        QueryHandler handler = QueryProcessor.instance;</span>
+<span class="fc" id="L105">        String customHandlerClass = CUSTOM_QUERY_HANDLER_CLASS.getString();</span>
+<span class="pc bpc" id="L106" title="1 of 2 branches missed.">        if (customHandlerClass != null)</span>
+        {
+            try
+            {
+<span class="nc" id="L110">                handler = FBUtilities.construct(customHandlerClass, &quot;QueryHandler&quot;);</span>
+<span class="nc" id="L111">                logger.info(&quot;Using {} as a query handler for native protocol queries (as requested by the {} system property)&quot;,</span>
+<span class="nc" id="L112">                            customHandlerClass, CUSTOM_QUERY_HANDLER_CLASS.getKey());</span>
+            }
+<span class="nc" id="L114">            catch (Exception e)</span>
+            {
+<span class="nc" id="L116">                logger.error(&quot;Cannot use class {} as query handler&quot;, customHandlerClass, e);</span>
+<span class="nc" id="L117">                JVMStabilityInspector.killCurrentJVM(e, true);</span>
+<span class="nc" id="L118">            }</span>
+        }
+<span class="fc" id="L120">        cqlQueryHandler = handler;</span>
+    }
+
+    // isInternal is used to mark ClientState as used by some internal component
+    // that should have an ability to modify system keyspace.
+    public final boolean isInternal;
+
+    // The remote address of the client - null for internal clients.
+    private final InetSocketAddress remoteAddress;
+
+    // Driver String for the client
+    private volatile String driverName;
+    private volatile String driverVersion;
+    
+    // Options provided by the client
+    private volatile Map&lt;String,String&gt; clientOptions;
+
+    // The biggest timestamp that was returned by getTimestamp/assigned to a query. This is global to ensure that the
+    // timestamp assigned are strictly monotonic on a node, which is likely what user expect intuitively (more likely,
+    // most new user will intuitively expect timestamp to be strictly monotonic cluster-wise, but while that last part
+    // is unrealistic expectation, doing it node-wise is easy).
+<span class="fc" id="L141">    private static final AtomicLong lastTimestampMicros = new AtomicLong(0);</span>
+
+    @VisibleForTesting
+    public static void resetLastTimestamp(long nowMillis)
+    {
+<span class="nc" id="L146">        long nowMicros = TimeUnit.MILLISECONDS.toMicros(nowMillis);</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (lastTimestampMicros.get() &gt; nowMicros)</span>
+<span class="nc" id="L148">            lastTimestampMicros.set(nowMicros);</span>
+<span class="nc" id="L149">    }</span>
+
+    /**
+     * Construct a new, empty ClientState for internal calls.
+     */
+    private ClientState()
+<span class="fc" id="L155">    {</span>
+<span class="fc" id="L156">        this.isInternal = true;</span>
+<span class="fc" id="L157">        this.remoteAddress = null;</span>
+<span class="fc" id="L158">    }</span>
+
+    protected ClientState(InetSocketAddress remoteAddress)
+<span class="fc" id="L161">    {</span>
+<span class="fc" id="L162">        this.isInternal = false;</span>
+<span class="fc" id="L163">        this.remoteAddress = remoteAddress;</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.getAuthenticator().requireAuthentication())</span>
+<span class="fc" id="L165">            this.user = AuthenticatedUser.ANONYMOUS_USER;</span>
+<span class="fc" id="L166">    }</span>
+
+    protected ClientState(ClientState source)
+<span class="nc" id="L169">    {</span>
+<span class="nc" id="L170">        this.isInternal = source.isInternal;</span>
+<span class="nc" id="L171">        this.remoteAddress = source.remoteAddress;</span>
+<span class="nc" id="L172">        this.user = source.user;</span>
+<span class="nc" id="L173">        this.keyspace = source.keyspace;</span>
+<span class="nc" id="L174">        this.driverName = source.driverName;</span>
+<span class="nc" id="L175">        this.driverVersion = source.driverVersion;</span>
+<span class="nc" id="L176">        this.clientOptions = source.clientOptions;</span>
+<span class="nc" id="L177">    }</span>
+
+    /**
+     * @return a ClientState object for internal C* calls (not limited by any kind of auth).
+     */
+    public static ClientState forInternalCalls()
+    {
+<span class="fc" id="L184">        return new ClientState();</span>
+    }
+
+    public static ClientState forInternalCalls(String keyspace)
+    {
+<span class="fc" id="L189">        ClientState state = new ClientState();</span>
+<span class="fc" id="L190">        state.setKeyspace(keyspace);</span>
+<span class="fc" id="L191">        return state;</span>
+    }
+
+    /**
+     * @return a ClientState object for external clients (native protocol users).
+     */
+    public static ClientState forExternalCalls(SocketAddress remoteAddress)
+    {
+<span class="fc" id="L199">        return new ClientState((InetSocketAddress)remoteAddress);</span>
+    }
+
+    /**
+     * Clone this ClientState object, but use the provided keyspace instead of the
+     * keyspace in this ClientState object.
+     *
+     * @return a new ClientState object if the keyspace argument is non-null. Otherwise do not clone
+     *   and return this ClientState object.
+     */
+    public ClientState cloneWithKeyspaceIfSet(String keyspace)
+    {
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">        if (keyspace == null)</span>
+<span class="fc" id="L212">            return this;</span>
+<span class="nc" id="L213">        ClientState clientState = new ClientState(this);</span>
+<span class="nc" id="L214">        clientState.setKeyspace(keyspace);</span>
+<span class="nc" id="L215">        return clientState;</span>
+    }
+
+    /**
+     * This clock guarantees that updates for the same ClientState will be ordered
+     * in the sequence seen, even if multiple updates happen in the same millisecond.
+     */
+    public static long getTimestamp()
+    {
+        while (true)
+        {
+<span class="fc" id="L226">            long current = currentTimeMillis() * 1000;</span>
+<span class="fc" id="L227">            long last = lastTimestampMicros.get();</span>
+<span class="fc bfc" id="L228" title="All 2 branches covered.">            long tstamp = last &gt;= current ? last + 1 : current;</span>
+<span class="fc bfc" id="L229" title="All 2 branches covered.">            if (lastTimestampMicros.compareAndSet(last, tstamp))</span>
+<span class="fc" id="L230">                return tstamp;</span>
+<span class="fc" id="L231">        }</span>
+    }
+
+    /**
+     * Returns a timestamp suitable for paxos given the timestamp of the last known commit (or in progress update).
+     * &lt;p&gt;
+     * Paxos ensures that the timestamp it uses for commits respects the serial order of those commits. It does so
+     * by having each replica reject any proposal whose timestamp is not strictly greater than the last proposal it
+     * accepted. So in practice, which timestamp we use for a given proposal doesn't affect correctness but it does
+     * affect the chance of making progress (if we pick a timestamp lower than what has been proposed before, our
+     * new proposal will just get rejected).
+     * &lt;p&gt;
+     * As during the prepared phase replica send us the last propose they accepted, a first option would be to take
+     * the maximum of those last accepted proposal timestamp plus 1 (and use a default value, say 0, if it's the
+     * first known proposal for the partition). This would most work (giving commits the timestamp 0, 1, 2, ...
+     * in the order they are commited) up to 2 important caveats:
+     *   1) it would give a very poor experience when Paxos and non-Paxos updates are mixed in the same partition,
+     *      since paxos operations wouldn't be using microseconds timestamps. And while you shouldn't theoretically
+     *      mix the 2 kind of operations, this would still be pretty unintuitive. And what if you started writing
+     *      normal updates and realize later you should switch to Paxos to enforce a property you want?
+     *   2) this wouldn't actually be safe due to the expiration set on the Paxos state table.
+     * &lt;p&gt;
+     * So instead, we initially chose to use the current time in microseconds as for normal update. Which works in
+     * general but mean that clock skew creates unavailability periods for Paxos updates (either a node has his clock
+     * in the past and he may no be able to get commit accepted until its clock catch up, or a node has his clock in
+     * the future and then once one of its commit his accepted, other nodes ones won't be until they catch up). This
+     * is ok for small clock skew (few ms) but can be pretty bad for large one.
+     * &lt;p&gt;
+     * Hence our current solution: we mix both approaches. That is, we compare the timestamp of the last known
+     * accepted proposal and the local time. If the local time is greater, we use it, thus keeping paxos timestamps
+     * locked to the current time in general (making mixing Paxos and non-Paxos more friendly, and behaving correctly
+     * when the paxos state expire (as long as your maximum clock skew is lower than the Paxos state expiration
+     * time)). Otherwise (the local time is lower than the last proposal, meaning that this last proposal was done
+     * with a clock in the future compared to the local one), we use the last proposal timestamp plus 1, ensuring
+     * progress.
+     *
+     * @param minUnixMicros the max timestamp of the last proposal accepted by replica having responded
+     * to the prepare phase of the paxos round this is for. In practice, that's the minimum timestamp this method
+     * may return.
+     * @return a timestamp suitable for a Paxos proposal (using the reasoning described above). Note that
+     * contrarily to the {@link #getTimestamp()} method, the return value is not guaranteed to be unique (nor
+     * monotonic) across calls since it can return it's argument (so if the same argument is passed multiple times,
+     * it may be returned multiple times). Note that we still ensure Paxos &quot;ballot&quot; are unique (for different
+     * proposal) by (securely) randomizing the non-timestamp part of the UUID.
+     */
+    public static long getTimestampForPaxos(long minUnixMicros)
+    {
+        while (true)
+        {
+<span class="nc" id="L280">            long current = Math.max(currentTimeMillis() * 1000, minUnixMicros);</span>
+<span class="nc" id="L281">            long last = lastTimestampMicros.get();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">            long tstamp = last &gt;= current ? last + 1 : current;</span>
+            // Note that if we ended up picking minTimestampMicrosToUse (it was &quot;in the future&quot;), we don't
+            // want to change the local clock, otherwise a single node in the future could corrupt the clock
+            // of all nodes and for all inserts (since non-paxos inserts also use lastTimestampMicros).
+            // See CASSANDRA-11991
+<span class="nc bnc" id="L287" title="All 4 branches missed.">            if (tstamp == minUnixMicros || lastTimestampMicros.compareAndSet(last, tstamp))</span>
+<span class="nc" id="L288">                return tstamp;</span>
+<span class="nc" id="L289">        }</span>
+    }
+
+    public static long getLastTimestampMicros()
+    {
+<span class="nc" id="L294">        return lastTimestampMicros.get();</span>
+    }
+
+    public Optional&lt;String&gt; getDriverName()
+    {
+<span class="nc" id="L299">        return Optional.ofNullable(driverName);</span>
+    }
+
+    public Optional&lt;String&gt; getDriverVersion()
+    {
+<span class="nc" id="L304">        return Optional.ofNullable(driverVersion);</span>
+    }
+
+    public Optional&lt;Map&lt;String,String&gt;&gt; getClientOptions()
+    {
+<span class="nc" id="L309">        return Optional.ofNullable(clientOptions);</span>
+    }
+
+    public void setDriverName(String driverName)
+    {
+<span class="fc" id="L314">        this.driverName = driverName;</span>
+<span class="fc" id="L315">    }</span>
+
+    public void setDriverVersion(String driverVersion)
+    {
+<span class="fc" id="L319">        this.driverVersion = driverVersion;</span>
+<span class="fc" id="L320">    }</span>
+    
+    public void setClientOptions(Map&lt;String,String&gt; clientOptions)
+    {
+<span class="fc" id="L324">        this.clientOptions = ImmutableMap.copyOf(clientOptions);</span>
+<span class="fc" id="L325">    }</span>
+
+    public static QueryHandler getCQLQueryHandler()
+    {
+<span class="fc" id="L329">        return cqlQueryHandler;</span>
+    }
+
+    public InetSocketAddress getRemoteAddress()
+    {
+<span class="nc" id="L334">        return remoteAddress;</span>
+    }
+
+    InetAddress getClientAddress()
+    {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        return isInternal ? null : remoteAddress.getAddress();</span>
+    }
+
+    public String getRawKeyspace()
+    {
+<span class="fc" id="L344">        return keyspace;</span>
+    }
+
+    public String getKeyspace() throws InvalidRequestException
+    {
+<span class="fc bfc" id="L349" title="All 2 branches covered.">        if (keyspace == null)</span>
+<span class="fc" id="L350">            throw new InvalidRequestException(&quot;No keyspace has been specified. USE a keyspace, or explicitly specify keyspace.tablename&quot;);</span>
+<span class="fc" id="L351">        return keyspace;</span>
+    }
+
+    public void setKeyspace(String ks)
+    {
+        // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
+        // call set_keyspace() before calling login(), and we have to handle that.
+<span class="pc bpc" id="L358" title="1 of 4 branches missed.">        if (user != null &amp;&amp; Schema.instance.getKeyspaceMetadata(ks) == null)</span>
+<span class="nc" id="L359">            throw new InvalidRequestException(&quot;Keyspace '&quot; + ks + &quot;' does not exist&quot;);</span>
+<span class="fc" id="L360">        keyspace = ks;</span>
+<span class="fc" id="L361">    }</span>
+
+    /**
+     * Attempts to login the given user.
+     */
+    public void login(AuthenticatedUser user)
+    {
+<span class="nc bnc" id="L368" title="All 4 branches missed.">        if (user.isAnonymous() || canLogin(user))</span>
+<span class="nc" id="L369">            this.user = user;</span>
+        else
+<span class="nc" id="L371">            throw new AuthenticationException(String.format(&quot;%s is not permitted to log in&quot;, user.getName()));</span>
+<span class="nc" id="L372">    }</span>
+
+    private boolean canLogin(AuthenticatedUser user)
+    {
+        try
+        {
+<span class="nc" id="L378">            return user.canLogin();</span>
+        }
+<span class="nc" id="L380">        catch (RequestExecutionException | RequestValidationException e)</span>
+        {
+<span class="nc" id="L382">            throw new AuthenticationException(&quot;Unable to perform authentication: &quot; + e.getMessage(), e);</span>
+        }
+    }
+
+    public void ensureAllKeyspacesPermission(Permission perm)
+    {
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">        if (isInternal)</span>
+<span class="nc" id="L389">            return;</span>
+<span class="fc" id="L390">        validateLogin();</span>
+<span class="fc" id="L391">        ensurePermission(perm, DataResource.root());</span>
+<span class="fc" id="L392">    }</span>
+
+    public void ensureKeyspacePermission(String keyspace, Permission perm)
+    {
+<span class="nc" id="L396">        ensurePermission(keyspace, perm, DataResource.keyspace(keyspace));</span>
+<span class="nc" id="L397">    }</span>
+
+    public void ensureAllTablesPermission(String keyspace, Permission perm)
+    {
+<span class="fc" id="L401">        ensurePermission(keyspace, perm, DataResource.allTables(keyspace));</span>
+<span class="fc" id="L402">    }</span>
+
+    public void ensureTablePermission(String keyspace, String table, Permission perm)
+    {
+<span class="fc" id="L406">        ensurePermission(keyspace, perm, DataResource.table(keyspace, table));</span>
+<span class="fc" id="L407">    }</span>
+
+    public void ensureTablePermission(TableMetadataRef tableRef, Permission perm)
+    {
+<span class="nc" id="L411">        ensureTablePermission(tableRef.get(), perm);</span>
+<span class="nc" id="L412">    }</span>
+
+    public void ensureTablePermission(TableMetadata table, Permission perm)
+    {
+<span class="fc" id="L416">        ensurePermission(table.keyspace, perm, table.resource);</span>
+<span class="fc" id="L417">    }</span>
+
+    public boolean hasTablePermission(TableMetadata table, Permission perm)
+    {
+<span class="fc bfc" id="L421" title="All 2 branches covered.">        if (isInternal)</span>
+<span class="fc" id="L422">            return true;</span>
+
+<span class="fc" id="L424">        validateLogin();</span>
+
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())</span>
+<span class="fc" id="L427">            return true;</span>
+
+<span class="nc" id="L429">        List&lt;? extends IResource&gt; resources = Resources.chain(table.resource);</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        if (DatabaseDescriptor.getAuthFromRoot())</span>
+<span class="nc" id="L431">            resources = Lists.reverse(resources);</span>
+
+<span class="nc bnc" id="L433" title="All 2 branches missed.">        for (IResource r : resources)</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">            if (authorize(r).contains(perm))</span>
+<span class="nc" id="L435">                return true;</span>
+
+<span class="nc" id="L437">        return false;</span>
+    }
+
+    private void ensurePermission(String keyspace, Permission perm, DataResource resource)
+    {
+<span class="fc" id="L442">        validateKeyspace(keyspace);</span>
+
+<span class="fc bfc" id="L444" title="All 2 branches covered.">        if (isInternal)</span>
+<span class="fc" id="L445">            return;</span>
+
+<span class="fc" id="L447">        validateLogin();</span>
+
+<span class="fc" id="L449">        preventSystemKSSchemaModification(keyspace, resource, perm);</span>
+
+<span class="fc bfc" id="L451" title="All 4 branches covered.">        if ((perm == Permission.SELECT) &amp;&amp; READABLE_SYSTEM_RESOURCES.contains(resource))</span>
+<span class="fc" id="L452">            return;</span>
+
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">        if (PROTECTED_AUTH_RESOURCES.contains(resource))</span>
+<span class="nc bnc" id="L455" title="All 6 branches missed.">            if ((perm == Permission.CREATE) || (perm == Permission.ALTER) || (perm == Permission.DROP))</span>
+<span class="nc" id="L456">                throw new UnauthorizedException(String.format(&quot;%s schema is protected&quot;, resource));</span>
+<span class="fc" id="L457">        ensurePermission(perm, resource);</span>
+<span class="fc" id="L458">    }</span>
+
+    public void ensurePermission(Permission perm, IResource resource)
+    {
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())</span>
+<span class="fc" id="L463">            return;</span>
+
+        // Access to built in functions is unrestricted
+<span class="nc bnc" id="L466" title="All 4 branches missed.">        if(resource instanceof FunctionResource &amp;&amp; resource.hasParent())</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">            if (((FunctionResource)resource).getKeyspace().equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))</span>
+<span class="nc" id="L468">                return;</span>
+
+<span class="nc" id="L470">        ensurePermissionOnResourceChain(perm, resource);</span>
+<span class="nc" id="L471">    }</span>
+
+    // Convenience method called from authorize method of CQLStatement
+    // Also avoids needlessly creating lots of FunctionResource objects
+    public void ensurePermission(Permission permission, Function function)
+    {
+        // Save creating a FunctionResource is we don't need to
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">        if (!DatabaseDescriptor.getAuthorizer().requireAuthorization())</span>
+<span class="fc" id="L479">            return;</span>
+
+        // built in functions are always available to all
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (function.isNative())</span>
+<span class="nc" id="L483">            return;</span>
+
+<span class="nc" id="L485">        ensurePermissionOnResourceChain(permission, FunctionResource.function(function.name().keyspace,</span>
+<span class="nc" id="L486">                                                                              function.name().name,</span>
+<span class="nc" id="L487">                                                                              function.argTypes()));</span>
+<span class="nc" id="L488">    }</span>
+
+    private void ensurePermissionOnResourceChain(Permission perm, IResource resource)
+    {
+<span class="nc" id="L492">        List&lt;? extends IResource&gt; resources = Resources.chain(resource);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if (DatabaseDescriptor.getAuthFromRoot())</span>
+<span class="nc" id="L494">            resources = Lists.reverse(resources);</span>
+
+<span class="nc bnc" id="L496" title="All 2 branches missed.">        for (IResource r : resources)</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">            if (authorize(r).contains(perm))</span>
+<span class="nc" id="L498">                return;</span>
+
+<span class="nc" id="L500">        throw new UnauthorizedException(String.format(&quot;User %s has no %s permission on %s or any of its parents&quot;,</span>
+<span class="nc" id="L501">                                                      user.getName(),</span>
+                                                      perm,
+                                                      resource));
+    }
+
+    private void preventSystemKSSchemaModification(String keyspace, DataResource resource, Permission perm)
+    {
+        // we only care about DDL statements
+<span class="pc bpc" id="L509" title="1 of 6 branches missed.">        if (perm != Permission.ALTER &amp;&amp; perm != Permission.DROP &amp;&amp; perm != Permission.CREATE)</span>
+<span class="fc" id="L510">            return;</span>
+
+        // prevent ALL local system keyspace modification
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">        if (SchemaConstants.isLocalSystemKeyspace(keyspace))</span>
+<span class="nc" id="L514">            throw new UnauthorizedException(keyspace + &quot; keyspace is not user-modifiable.&quot;);</span>
+
+<span class="pc bpc" id="L516" title="1 of 2 branches missed.">        if (SchemaConstants.isReplicatedSystemKeyspace(keyspace))</span>
+        {
+            // allow users with sufficient privileges to alter replication params of replicated system keyspaces
+<span class="nc bnc" id="L519" title="All 4 branches missed.">            if (perm == Permission.ALTER &amp;&amp; resource.isKeyspaceLevel())</span>
+<span class="nc" id="L520">                return;</span>
+
+            // prevent all other modifications of replicated system keyspaces
+<span class="nc" id="L523">            throw new UnauthorizedException(String.format(&quot;Cannot %s %s&quot;, perm, resource));</span>
+        }
+<span class="fc" id="L525">    }</span>
+
+    public void validateLogin()
+    {
+<span class="pc bpc" id="L529" title="1 of 2 branches missed.">        if (user == null)</span>
+        {
+<span class="nc" id="L531">            throw new UnauthorizedException(&quot;You have not logged in&quot;);</span>
+        }
+<span class="pc bpc" id="L533" title="1 of 2 branches missed.">        else if (!user.hasLocalAccess())</span>
+        {
+<span class="nc" id="L535">            throw new UnauthorizedException(String.format(&quot;You do not have access to this datacenter (%s)&quot;, Datacenters.thisDatacenter()));</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L539" title="2 of 4 branches missed.">            if (remoteAddress != null &amp;&amp; !user.hasAccessFromIp(remoteAddress))</span>
+<span class="nc" id="L540">                throw new UnauthorizedException(&quot;You do not have access from this IP &quot; + remoteAddress.getHostString());</span>
+        }
+<span class="fc" id="L542">    }</span>
+
+    public void ensureNotAnonymous()
+    {
+<span class="nc" id="L546">        validateLogin();</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">        if (user.isAnonymous())</span>
+<span class="nc" id="L548">            throw new UnauthorizedException(&quot;You have to be logged in and not anonymous to perform this request&quot;);</span>
+<span class="nc" id="L549">    }</span>
+
+    /**
+     * Checks if this user is an ordinary user (not a super or system user).
+     *
+     * @return {@code true} if this user is an ordinary user, {@code false} otherwise.
+     */
+    public boolean isOrdinaryUser()
+    {
+<span class="pc bpc" id="L558" title="3 of 4 branches missed.">        return !isSuper() &amp;&amp; !isSystem();</span>
+    }
+
+    /**
+     * Checks if this user is a super user.
+     */
+    public boolean isSuper()
+    {
+<span class="pc bpc" id="L566" title="5 of 6 branches missed.">        return !DatabaseDescriptor.getAuthenticator().requireAuthentication() || (user != null &amp;&amp; user.isSuper());</span>
+    }
+
+    /**
+     * Checks if the user is the system user.
+     *
+     * @return {@code true} if this user is the system user, {@code false} otherwise.
+     */
+    public boolean isSystem()
+    {
+<span class="nc" id="L576">        return isInternal;</span>
+    }
+
+    public void ensureIsSuperuser(String message)
+    {
+<span class="nc bnc" id="L581" title="All 2 branches missed.">        if (!isSuper())</span>
+<span class="nc" id="L582">            throw new UnauthorizedException(message);</span>
+<span class="nc" id="L583">    }</span>
+
+    public void warnAboutUseWithPreparedStatements(MD5Digest statementId, String preparedKeyspace)
+    {
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">        if (!issuedPreparedStatementsUseWarning)</span>
+        {
+<span class="fc" id="L589">            ClientWarn.instance.warn(String.format(&quot;`USE &lt;keyspace&gt;` with prepared statements is considered to be an anti-pattern due to ambiguity in non-qualified table names. &quot; +</span>
+                                                   &quot;Please consider removing instances of `Session#setKeyspace(&lt;keyspace&gt;)`, `Session#execute(\&quot;USE &lt;keyspace&gt;\&quot;)` and `cluster.newSession(&lt;keyspace&gt;)` from your code, and &quot; +
+                                                   &quot;always use fully qualified table names (e.g. &lt;keyspace&gt;.&lt;table&gt;). &quot; +
+<span class="fc" id="L592">                                                   &quot;Keyspace used: %s, statement keyspace: %s, statement id: %s&quot;, getRawKeyspace(), preparedKeyspace, statementId));</span>
+<span class="fc" id="L593">            issuedPreparedStatementsUseWarning = true;</span>
+        }
+<span class="fc" id="L595">    }</span>
+
+    private static void validateKeyspace(String keyspace)
+    {
+<span class="pc bpc" id="L599" title="1 of 2 branches missed.">        if (keyspace == null)</span>
+<span class="nc" id="L600">            throw new InvalidRequestException(&quot;You have not set a keyspace for this session&quot;);</span>
+<span class="fc" id="L601">    }</span>
+
+    public AuthenticatedUser getUser()
+    {
+<span class="fc" id="L605">        return user;</span>
+    }
+
+    private Set&lt;Permission&gt; authorize(IResource resource)
+    {
+<span class="nc" id="L610">        return user.getPermissions(resource);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosCleanup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.cleanup</a> &gt; <span class="el_source">PaxosCleanup.java</span></div><h1>PaxosCleanup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.cleanup;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.function.Consumer;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.paxos.Ballot;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
+import org.apache.cassandra.utils.concurrent.Future;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.cassandra.config.DatabaseDescriptor.getCasContentionTimeout;
+import static org.apache.cassandra.config.DatabaseDescriptor.getWriteRpcTimeout;
+import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
+
+public class PaxosCleanup extends AsyncFuture&lt;Void&gt; implements Runnable
+{
+<span class="fc" id="L56">    private static final Logger logger = LoggerFactory.getLogger(PaxosCleanup.class);</span>
+
+    private final Collection&lt;InetAddressAndPort&gt; endpoints;
+    private final TableMetadata table;
+    private final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+    private final boolean skippedReplicas;
+    private final Executor executor;
+
+    // references kept for debugging
+    private PaxosStartPrepareCleanup startPrepare;
+    private PaxosFinishPrepareCleanup finishPrepare;
+    private PaxosCleanupSession session;
+    private PaxosCleanupComplete complete;
+
+    public PaxosCleanup(Collection&lt;InetAddressAndPort&gt; endpoints, TableMetadata table, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean skippedReplicas, Executor executor)
+<span class="fc" id="L71">    {</span>
+<span class="fc" id="L72">        this.endpoints = endpoints;</span>
+<span class="fc" id="L73">        this.table = table;</span>
+<span class="fc" id="L74">        this.ranges = ranges;</span>
+<span class="fc" id="L75">        this.skippedReplicas = skippedReplicas;</span>
+<span class="fc" id="L76">        this.executor = executor;</span>
+<span class="fc" id="L77">    }</span>
+
+    private &lt;T&gt; void addCallback(Future&lt;T&gt; future, Consumer&lt;T&gt; onComplete)
+    {
+<span class="fc" id="L81">        future.addCallback(onComplete, this::tryFailure);</span>
+<span class="fc" id="L82">    }</span>
+
+    public static PaxosCleanup cleanup(Collection&lt;InetAddressAndPort&gt; endpoints, TableMetadata table, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean skippedReplicas, Executor executor)
+    {
+<span class="fc" id="L86">        PaxosCleanup cleanup = new PaxosCleanup(endpoints, table, ranges, skippedReplicas, executor);</span>
+<span class="fc" id="L87">        executor.execute(cleanup);</span>
+<span class="fc" id="L88">        return cleanup;</span>
+    }
+
+    public void run()
+    {
+<span class="fc" id="L93">        EndpointState localEpState = Gossiper.instance.getEndpointStateForEndpoint(getBroadcastAddressAndPort());</span>
+<span class="fc" id="L94">        startPrepare = PaxosStartPrepareCleanup.prepare(table.id, endpoints, localEpState, ranges);</span>
+<span class="fc" id="L95">        addCallback(startPrepare, this::finishPrepare);</span>
+<span class="fc" id="L96">    }</span>
+
+    private void finishPrepare(PaxosCleanupHistory result)
+    {
+<span class="fc" id="L100">        ScheduledExecutors.nonPeriodicTasks.schedule(() -&gt; {</span>
+<span class="fc" id="L101">            finishPrepare = PaxosFinishPrepareCleanup.finish(endpoints, result);</span>
+<span class="fc" id="L102">            addCallback(finishPrepare, (v) -&gt; startSession(result.highBound));</span>
+<span class="fc" id="L103">        }, Math.min(getCasContentionTimeout(MILLISECONDS), getWriteRpcTimeout(MILLISECONDS)), MILLISECONDS);</span>
+<span class="fc" id="L104">    }</span>
+
+    private void startSession(Ballot lowBound)
+    {
+<span class="fc" id="L108">        session = new PaxosCleanupSession(endpoints, table.id, ranges);</span>
+<span class="fc" id="L109">        addCallback(session, (v) -&gt; finish(lowBound));</span>
+<span class="fc" id="L110">        executor.execute(session);</span>
+<span class="fc" id="L111">    }</span>
+
+    private void finish(Ballot lowBound)
+    {
+<span class="fc" id="L115">        complete = new PaxosCleanupComplete(endpoints, table.id, ranges, lowBound, skippedReplicas);</span>
+<span class="fc" id="L116">        addCallback(complete, this::trySuccess);</span>
+<span class="fc" id="L117">        executor.execute(complete);</span>
+<span class="fc" id="L118">    }</span>
+
+    private static boolean isOutOfRange(String ksName, Collection&lt;Range&lt;Token&gt;&gt; repairRanges)
+    {
+<span class="fc" id="L122">        Keyspace keyspace = Keyspace.open(ksName);</span>
+<span class="fc" id="L123">        List&lt;Range&lt;Token&gt;&gt; localRanges = Range.normalize(keyspace.getReplicationStrategy()</span>
+<span class="fc" id="L124">                                                                 .getAddressReplicas()</span>
+<span class="fc" id="L125">                                                                 .get(FBUtilities.getBroadcastAddressAndPort())</span>
+<span class="fc" id="L126">                                                                 .ranges());</span>
+
+<span class="fc" id="L128">        RangesAtEndpoint pendingRanges = StorageService.instance.getTokenMetadata().getPendingRanges(ksName, FBUtilities.getBroadcastAddressAndPort());</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (!pendingRanges.isEmpty())</span>
+        {
+<span class="fc" id="L131">            localRanges.addAll(pendingRanges.ranges());</span>
+<span class="fc" id="L132">            localRanges = Range.normalize(localRanges);</span>
+        }
+
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        for (Range&lt;Token&gt; repairRange : Range.normalize(repairRanges))</span>
+        {
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">            if (!Iterables.any(localRanges, localRange -&gt; localRange.contains(repairRange)))</span>
+<span class="nc" id="L138">                return true;</span>
+<span class="fc" id="L139">        }</span>
+<span class="fc" id="L140">        return false;</span>
+    }
+
+    static boolean isInRangeAndShouldProcess(Collection&lt;Range&lt;Token&gt;&gt; ranges, TableId tableId)
+    {
+<span class="fc" id="L145">        TableMetadata metadata = Schema.instance.getTableMetadata(tableId);</span>
+
+<span class="fc" id="L147">        Keyspace keyspace = Keyspace.open(metadata.keyspace);</span>
+<span class="fc" id="L148">        Preconditions.checkNotNull(keyspace);</span>
+
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        if (!isOutOfRange(metadata.keyspace, ranges))</span>
+<span class="fc" id="L151">            return true;</span>
+
+<span class="nc" id="L153">        logger.warn(&quot;Out of range PaxosCleanup request for {}: {}&quot;, metadata, ranges);</span>
+<span class="nc" id="L154">        return false;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

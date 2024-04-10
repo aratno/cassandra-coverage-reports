@@ -1,0 +1,561 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CacheService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">CacheService.java</span></div><h1>CacheService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+
+import org.apache.commons.lang3.tuple.ImmutableTriple;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.cache.AutoSavingCache;
+import org.apache.cassandra.cache.AutoSavingCache.CacheSerializer;
+import org.apache.cassandra.cache.CacheProvider;
+import org.apache.cassandra.cache.CaffeineCache;
+import org.apache.cassandra.cache.CounterCacheKey;
+import org.apache.cassandra.cache.ICache;
+import org.apache.cassandra.cache.IRowCacheEntry;
+import org.apache.cassandra.cache.KeyCacheKey;
+import org.apache.cassandra.cache.RowCacheKey;
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ClockAndCount;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.partitions.CachedBTreePartition;
+import org.apache.cassandra.db.partitions.CachedPartition;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableId;
+import org.apache.cassandra.io.sstable.SSTableIdFactory;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.keycache.KeyCacheSupport;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.ByteArrayUtil;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+
+public class CacheService implements CacheServiceMBean
+{
+<span class="fc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(CacheService.class);</span>
+
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.db:type=Caches&quot;;
+
+<span class="fc" id="L82">    public enum CacheType</span>
+    {
+<span class="fc" id="L84">        KEY_CACHE(&quot;KeyCache&quot;),</span>
+<span class="fc" id="L85">        ROW_CACHE(&quot;RowCache&quot;),</span>
+<span class="fc" id="L86">        COUNTER_CACHE(&quot;CounterCache&quot;);</span>
+
+        private final String name;
+
+        CacheType(String typeName)
+<span class="fc" id="L91">        {</span>
+<span class="fc" id="L92">            name = typeName;</span>
+<span class="fc" id="L93">        }</span>
+
+        public String toString()
+        {
+<span class="fc" id="L97">            return name;</span>
+        }
+    }
+
+<span class="fc" id="L101">    public final static CacheService instance = new CacheService();</span>
+
+    public final AutoSavingCache&lt;KeyCacheKey, AbstractRowIndexEntry&gt; keyCache;
+    public final AutoSavingCache&lt;RowCacheKey, IRowCacheEntry&gt; rowCache;
+    public final AutoSavingCache&lt;CounterCacheKey, ClockAndCount&gt; counterCache;
+
+    private CacheService()
+<span class="fc" id="L108">    {</span>
+<span class="fc" id="L109">        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);</span>
+
+<span class="fc" id="L111">        keyCache = initKeyCache();</span>
+<span class="fc" id="L112">        rowCache = initRowCache();</span>
+<span class="fc" id="L113">        counterCache = initCounterCache();</span>
+<span class="fc" id="L114">    }</span>
+
+    /**
+     * @return auto saving cache object
+     */
+    private AutoSavingCache&lt;KeyCacheKey, AbstractRowIndexEntry&gt; initKeyCache()
+    {
+<span class="fc" id="L121">        logger.info(&quot;Initializing key cache with capacity of {} MiBs.&quot;, DatabaseDescriptor.getKeyCacheSizeInMiB());</span>
+
+<span class="fc" id="L123">        long keyCacheInMemoryCapacity = DatabaseDescriptor.getKeyCacheSizeInMiB() * 1024 * 1024;</span>
+
+        // as values are constant size we can use singleton weigher
+        // where 48 = 40 bytes (average size of the key) + 8 bytes (size of value)
+        ICache&lt;KeyCacheKey, AbstractRowIndexEntry&gt; kc;
+<span class="fc" id="L128">        kc = CaffeineCache.create(keyCacheInMemoryCapacity);</span>
+<span class="fc" id="L129">        AutoSavingCache&lt;KeyCacheKey, AbstractRowIndexEntry&gt; keyCache = new AutoSavingCache&lt;&gt;(kc, CacheType.KEY_CACHE, new KeyCacheSerializer());</span>
+
+<span class="fc" id="L131">        int keyCacheKeysToSave = DatabaseDescriptor.getKeyCacheKeysToSave();</span>
+
+<span class="fc" id="L133">        keyCache.scheduleSaving(DatabaseDescriptor.getKeyCacheSavePeriod(), keyCacheKeysToSave);</span>
+
+<span class="fc" id="L135">        return keyCache;</span>
+    }
+
+    /**
+     * @return initialized row cache
+     */
+    private AutoSavingCache&lt;RowCacheKey, IRowCacheEntry&gt; initRowCache()
+    {
+<span class="fc" id="L143">        logger.info(&quot;Initializing row cache with capacity of {} MiBs&quot;, DatabaseDescriptor.getRowCacheSizeInMiB());</span>
+
+        CacheProvider&lt;RowCacheKey, IRowCacheEntry&gt; cacheProvider;
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        String cacheProviderClassName = DatabaseDescriptor.getRowCacheSizeInMiB() &gt; 0</span>
+<span class="pc" id="L147">                                        ? DatabaseDescriptor.getRowCacheClassName() : &quot;org.apache.cassandra.cache.NopCacheProvider&quot;;</span>
+        try
+        {
+<span class="fc" id="L150">            Class&lt;CacheProvider&lt;RowCacheKey, IRowCacheEntry&gt;&gt; cacheProviderClass =</span>
+<span class="fc" id="L151">                (Class&lt;CacheProvider&lt;RowCacheKey, IRowCacheEntry&gt;&gt;) Class.forName(cacheProviderClassName);</span>
+<span class="fc" id="L152">            cacheProvider = cacheProviderClass.newInstance();</span>
+        }
+<span class="nc" id="L154">        catch (Exception e)</span>
+        {
+<span class="nc" id="L156">            throw new RuntimeException(&quot;Cannot find configured row cache provider class &quot; + DatabaseDescriptor.getRowCacheClassName());</span>
+<span class="fc" id="L157">        }</span>
+
+        // cache object
+<span class="fc" id="L160">        ICache&lt;RowCacheKey, IRowCacheEntry&gt; rc = cacheProvider.create();</span>
+<span class="fc" id="L161">        AutoSavingCache&lt;RowCacheKey, IRowCacheEntry&gt; rowCache = new AutoSavingCache&lt;&gt;(rc, CacheType.ROW_CACHE, new RowCacheSerializer());</span>
+
+<span class="fc" id="L163">        int rowCacheKeysToSave = DatabaseDescriptor.getRowCacheKeysToSave();</span>
+
+<span class="fc" id="L165">        rowCache.scheduleSaving(DatabaseDescriptor.getRowCacheSavePeriod(), rowCacheKeysToSave);</span>
+
+<span class="fc" id="L167">        return rowCache;</span>
+    }
+
+    private AutoSavingCache&lt;CounterCacheKey, ClockAndCount&gt; initCounterCache()
+    {
+<span class="fc" id="L172">        logger.info(&quot;Initializing counter cache with capacity of {} MiBs&quot;, DatabaseDescriptor.getCounterCacheSizeInMiB());</span>
+
+<span class="fc" id="L174">        long capacity = DatabaseDescriptor.getCounterCacheSizeInMiB() * 1024 * 1024;</span>
+
+<span class="fc" id="L176">        AutoSavingCache&lt;CounterCacheKey, ClockAndCount&gt; cache =</span>
+<span class="fc" id="L177">            new AutoSavingCache&lt;&gt;(CaffeineCache.create(capacity),</span>
+                                  CacheType.COUNTER_CACHE,
+                                  new CounterCacheSerializer());
+
+<span class="fc" id="L181">        int keysToSave = DatabaseDescriptor.getCounterCacheKeysToSave();</span>
+
+<span class="fc" id="L183">        logger.info(&quot;Scheduling counter cache save to every {} seconds (going to save {} keys).&quot;,</span>
+<span class="fc" id="L184">                    DatabaseDescriptor.getCounterCacheSavePeriod(),</span>
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">                    keysToSave == Integer.MAX_VALUE ? &quot;all&quot; : keysToSave);</span>
+
+<span class="fc" id="L187">        cache.scheduleSaving(DatabaseDescriptor.getCounterCacheSavePeriod(), keysToSave);</span>
+
+<span class="fc" id="L189">        return cache;</span>
+    }
+
+
+    public int getRowCacheSavePeriodInSeconds()
+    {
+<span class="nc" id="L195">        return DatabaseDescriptor.getRowCacheSavePeriod();</span>
+    }
+
+    public void setRowCacheSavePeriodInSeconds(int seconds)
+    {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (seconds &lt; 0)</span>
+<span class="nc" id="L201">            throw new RuntimeException(&quot;RowCacheSavePeriodInSeconds must be non-negative.&quot;);</span>
+
+<span class="nc" id="L203">        DatabaseDescriptor.setRowCacheSavePeriod(seconds);</span>
+<span class="nc" id="L204">        rowCache.scheduleSaving(seconds, DatabaseDescriptor.getRowCacheKeysToSave());</span>
+<span class="nc" id="L205">    }</span>
+
+    public int getKeyCacheSavePeriodInSeconds()
+    {
+<span class="nc" id="L209">        return DatabaseDescriptor.getKeyCacheSavePeriod();</span>
+    }
+
+    public void setKeyCacheSavePeriodInSeconds(int seconds)
+    {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        if (seconds &lt; 0)</span>
+<span class="nc" id="L215">            throw new RuntimeException(&quot;KeyCacheSavePeriodInSeconds must be non-negative.&quot;);</span>
+
+<span class="nc" id="L217">        DatabaseDescriptor.setKeyCacheSavePeriod(seconds);</span>
+<span class="nc" id="L218">        keyCache.scheduleSaving(seconds, DatabaseDescriptor.getKeyCacheKeysToSave());</span>
+<span class="nc" id="L219">    }</span>
+
+    public int getCounterCacheSavePeriodInSeconds()
+    {
+<span class="nc" id="L223">        return DatabaseDescriptor.getCounterCacheSavePeriod();</span>
+    }
+
+    public void setCounterCacheSavePeriodInSeconds(int seconds)
+    {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if (seconds &lt; 0)</span>
+<span class="nc" id="L229">            throw new RuntimeException(&quot;CounterCacheSavePeriodInSeconds must be non-negative.&quot;);</span>
+
+<span class="nc" id="L231">        DatabaseDescriptor.setCounterCacheSavePeriod(seconds);</span>
+<span class="nc" id="L232">        counterCache.scheduleSaving(seconds, DatabaseDescriptor.getCounterCacheKeysToSave());</span>
+<span class="nc" id="L233">    }</span>
+
+    public int getRowCacheKeysToSave()
+    {
+<span class="nc" id="L237">        return DatabaseDescriptor.getRowCacheKeysToSave();</span>
+    }
+
+    public void setRowCacheKeysToSave(int count)
+    {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">        if (count &lt; 0)</span>
+<span class="nc" id="L243">            throw new RuntimeException(&quot;RowCacheKeysToSave must be non-negative.&quot;);</span>
+<span class="nc" id="L244">        DatabaseDescriptor.setRowCacheKeysToSave(count);</span>
+<span class="nc" id="L245">        rowCache.scheduleSaving(getRowCacheSavePeriodInSeconds(), count);</span>
+<span class="nc" id="L246">    }</span>
+
+    public int getKeyCacheKeysToSave()
+    {
+<span class="nc" id="L250">        return DatabaseDescriptor.getKeyCacheKeysToSave();</span>
+    }
+
+    public void setKeyCacheKeysToSave(int count)
+    {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (count &lt; 0)</span>
+<span class="nc" id="L256">            throw new RuntimeException(&quot;KeyCacheKeysToSave must be non-negative.&quot;);</span>
+<span class="nc" id="L257">        DatabaseDescriptor.setKeyCacheKeysToSave(count);</span>
+<span class="nc" id="L258">        keyCache.scheduleSaving(getKeyCacheSavePeriodInSeconds(), count);</span>
+<span class="nc" id="L259">    }</span>
+
+    public int getCounterCacheKeysToSave()
+    {
+<span class="nc" id="L263">        return DatabaseDescriptor.getCounterCacheKeysToSave();</span>
+    }
+
+    public void setCounterCacheKeysToSave(int count)
+    {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if (count &lt; 0)</span>
+<span class="nc" id="L269">            throw new RuntimeException(&quot;CounterCacheKeysToSave must be non-negative.&quot;);</span>
+<span class="nc" id="L270">        DatabaseDescriptor.setCounterCacheKeysToSave(count);</span>
+<span class="nc" id="L271">        counterCache.scheduleSaving(getCounterCacheSavePeriodInSeconds(), count);</span>
+<span class="nc" id="L272">    }</span>
+
+    public void invalidateKeyCache()
+    {
+<span class="nc" id="L276">        keyCache.clear();</span>
+<span class="nc" id="L277">    }</span>
+
+    public void invalidateKeyCacheForCf(TableMetadata tableMetadata)
+    {
+<span class="nc" id="L281">        Iterator&lt;KeyCacheKey&gt; keyCacheIterator = keyCache.keyIterator();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        while (keyCacheIterator.hasNext())</span>
+        {
+<span class="nc" id="L284">            KeyCacheKey key = keyCacheIterator.next();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (key.sameTable(tableMetadata))</span>
+<span class="nc" id="L286">                keyCacheIterator.remove();</span>
+<span class="nc" id="L287">        }</span>
+<span class="nc" id="L288">    }</span>
+
+    public void invalidateRowCache()
+    {
+<span class="nc" id="L292">        rowCache.clear();</span>
+<span class="nc" id="L293">    }</span>
+
+    public void invalidateRowCacheForCf(TableMetadata tableMetadata)
+    {
+<span class="nc" id="L297">        Iterator&lt;RowCacheKey&gt; rowCacheIterator = rowCache.keyIterator();</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        while (rowCacheIterator.hasNext())</span>
+        {
+<span class="nc" id="L300">            RowCacheKey key = rowCacheIterator.next();</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (key.sameTable(tableMetadata))</span>
+<span class="nc" id="L302">                rowCacheIterator.remove();</span>
+<span class="nc" id="L303">        }</span>
+<span class="nc" id="L304">    }</span>
+
+    public void invalidateCounterCacheForCf(TableMetadata tableMetadata)
+    {
+<span class="nc" id="L308">        Iterator&lt;CounterCacheKey&gt; counterCacheIterator = counterCache.keyIterator();</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        while (counterCacheIterator.hasNext())</span>
+        {
+<span class="nc" id="L311">            CounterCacheKey key = counterCacheIterator.next();</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (key.sameTable(tableMetadata))</span>
+<span class="nc" id="L313">                counterCacheIterator.remove();</span>
+<span class="nc" id="L314">        }</span>
+<span class="nc" id="L315">    }</span>
+
+    public void invalidateCounterCache()
+    {
+<span class="nc" id="L319">        counterCache.clear();</span>
+<span class="nc" id="L320">    }</span>
+
+
+
+
+    public void setRowCacheCapacityInMB(long capacity)
+    {
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        if (capacity &lt; 0)</span>
+<span class="nc" id="L328">            throw new RuntimeException(&quot;capacity should not be negative.&quot;);</span>
+
+<span class="nc" id="L330">        rowCache.setCapacity(capacity * 1024 * 1024);</span>
+<span class="nc" id="L331">    }</span>
+
+
+    public void setKeyCacheCapacityInMB(long capacity)
+    {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (capacity &lt; 0)</span>
+<span class="nc" id="L337">            throw new RuntimeException(&quot;capacity should not be negative.&quot;);</span>
+
+<span class="nc" id="L339">        keyCache.setCapacity(capacity * 1024 * 1024);</span>
+<span class="nc" id="L340">    }</span>
+
+    public void setCounterCacheCapacityInMB(long capacity)
+    {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (capacity &lt; 0)</span>
+<span class="nc" id="L345">            throw new RuntimeException(&quot;capacity should not be negative.&quot;);</span>
+
+<span class="nc" id="L347">        counterCache.setCapacity(capacity * 1024 * 1024);</span>
+<span class="nc" id="L348">    }</span>
+
+    public void saveCaches() throws ExecutionException, InterruptedException
+    {
+<span class="nc" id="L352">        List&lt;Future&lt;?&gt;&gt; futures = new ArrayList&lt;&gt;(3);</span>
+<span class="nc" id="L353">        logger.debug(&quot;submitting cache saves&quot;);</span>
+
+<span class="nc" id="L355">        futures.add(keyCache.submitWrite(DatabaseDescriptor.getKeyCacheKeysToSave()));</span>
+<span class="nc" id="L356">        futures.add(rowCache.submitWrite(DatabaseDescriptor.getRowCacheKeysToSave()));</span>
+<span class="nc" id="L357">        futures.add(counterCache.submitWrite(DatabaseDescriptor.getCounterCacheKeysToSave()));</span>
+
+<span class="nc" id="L359">        FBUtilities.waitOnFutures(futures);</span>
+<span class="nc" id="L360">        logger.debug(&quot;cache saves completed&quot;);</span>
+<span class="nc" id="L361">    }</span>
+
+<span class="fc" id="L363">    public static class CounterCacheSerializer extends CacheSerializer&lt;CounterCacheKey, ClockAndCount&gt;</span>
+    {
+        public void serialize(CounterCacheKey key, DataOutputPlus out, ColumnFamilyStore cfs) throws IOException
+        {
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            assert(cfs.metadata().isCounter());</span>
+<span class="nc" id="L368">            writeCFS(out, cfs);</span>
+<span class="nc" id="L369">            key.write(out);</span>
+<span class="nc" id="L370">        }</span>
+
+        public Future&lt;Pair&lt;CounterCacheKey, ClockAndCount&gt;&gt; deserialize(DataInputPlus in) throws IOException
+        {
+            //Keyspace and CF name are deserialized by AutoSaving cache and used to fetch the CFS provided as a
+            //parameter so they aren't deserialized here, even though they are serialized by this serializer
+<span class="nc" id="L376">            ColumnFamilyStore cfs = readCFS(in);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (cfs == null)</span>
+<span class="nc" id="L378">                return null;</span>
+<span class="nc" id="L379">            final CounterCacheKey cacheKey = CounterCacheKey.read(cfs.metadata(), in);</span>
+<span class="nc bnc" id="L380" title="All 4 branches missed.">            if (!cfs.metadata().isCounter() || !cfs.isCounterCacheEnabled())</span>
+<span class="nc" id="L381">                return null;</span>
+
+<span class="nc" id="L383">            return Stage.READ.submit(() -&gt; {</span>
+<span class="nc" id="L384">                ByteBuffer value = cacheKey.readCounterValue(cfs);</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">                return value == null</span>
+<span class="nc" id="L386">                     ? null</span>
+<span class="nc" id="L387">                     : Pair.create(cacheKey, CounterContext.instance().getLocalClockAndCount(value));</span>
+            });
+        }
+    }
+
+<span class="fc" id="L392">    public static class RowCacheSerializer extends CacheSerializer&lt;RowCacheKey, IRowCacheEntry&gt;</span>
+    {
+        public void serialize(RowCacheKey key, DataOutputPlus out, ColumnFamilyStore cfs) throws IOException
+        {
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            assert(!cfs.isIndex());//Shouldn't have row cache entries for indexes</span>
+<span class="nc" id="L397">            writeCFS(out, cfs);</span>
+<span class="nc" id="L398">            ByteArrayUtil.writeWithLength(key.key, out);</span>
+<span class="nc" id="L399">        }</span>
+
+        public Future&lt;Pair&lt;RowCacheKey, IRowCacheEntry&gt;&gt; deserialize(DataInputPlus in) throws IOException
+        {
+            //Keyspace and CF name are deserialized by AutoSaving cache and used to fetch the CFS provided as a
+            //parameter so they aren't deserialized here, even though they are serialized by this serializer
+<span class="nc" id="L405">            ColumnFamilyStore cfs = readCFS(in);</span>
+<span class="nc" id="L406">            final ByteBuffer buffer = ByteBufferUtil.readWithLength(in);</span>
+<span class="nc bnc" id="L407" title="All 4 branches missed.">            if (cfs == null  || !cfs.isRowCacheEnabled())</span>
+<span class="nc" id="L408">                return null;</span>
+<span class="nc" id="L409">            final int rowsToCache = cfs.metadata().params.caching.rowsPerPartitionToCache();</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            assert(!cfs.isIndex());//Shouldn't have row cache entries for indexes</span>
+
+<span class="nc" id="L412">            return Stage.READ.submit(() -&gt; {</span>
+<span class="nc" id="L413">                DecoratedKey key = cfs.decorateKey(buffer);</span>
+<span class="nc" id="L414">                long nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L415">                SinglePartitionReadCommand cmd = SinglePartitionReadCommand.fullPartitionRead(cfs.metadata(), nowInSec, key);</span>
+<span class="nc" id="L416">                try (ReadExecutionController controller = cmd.executionController(); UnfilteredRowIterator iter = cmd.queryMemtableAndDisk(cfs, controller))</span>
+                {
+<span class="nc" id="L418">                    CachedPartition toCache = CachedBTreePartition.create(DataLimits.cqlLimits(rowsToCache).filter(iter, nowInSec, true), nowInSec);</span>
+<span class="nc" id="L419">                    return Pair.create(new RowCacheKey(cfs.metadata(), key), toCache);</span>
+                }
+            });
+        }
+    }
+
+<span class="fc" id="L425">    public static class KeyCacheSerializer extends CacheSerializer&lt;KeyCacheKey, AbstractRowIndexEntry&gt;</span>
+    {
+<span class="fc" id="L427">        private final ArrayList&lt;Pair&lt;KeyCacheSupport&lt;?&gt;, SSTableFormat&lt;?, ?&gt;&gt;&gt; readers = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L428">        private final LinkedHashMap&lt;Descriptor, Pair&lt;Integer, ColumnFamilyStore&gt;&gt; readerOrdinals = new LinkedHashMap&lt;&gt;();</span>
+
+        @Override
+        public void serializeMetadata(DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L433">            super.serializeMetadata(out);</span>
+<span class="nc" id="L434">            out.writeUnsignedVInt32(readerOrdinals.size());</span>
+            Descriptor desc;
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            for (Map.Entry&lt;Descriptor, Pair&lt;Integer, ColumnFamilyStore&gt;&gt; table : readerOrdinals.entrySet())</span>
+            {
+<span class="nc" id="L438">                desc = table.getKey();</span>
+<span class="nc" id="L439">                ColumnFamilyStore cfs = table.getValue().right;</span>
+<span class="nc" id="L440">                super.writeCFS(out, cfs);</span>
+<span class="nc" id="L441">                out.writeUTF(desc.version.format.name());</span>
+<span class="nc" id="L442">                out.writeUTF(desc.version.toString());</span>
+<span class="nc" id="L443">                ByteBufferUtil.writeWithShortLength(desc.id.asBytes(), out);</span>
+<span class="nc" id="L444">            }</span>
+<span class="nc" id="L445">        }</span>
+
+        @Override
+        public void deserializeMetadata(DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L450">            super.deserializeMetadata(in);</span>
+<span class="nc" id="L451">            Map&lt;ColumnFamilyStore, Map&lt;ImmutableTriple&lt;SSTableId, String, SSTableFormat&lt;?, ?&gt;&gt;, SSTableReader&gt;&gt; tmpReaders = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L452">            int sstablesNum = in.readUnsignedVInt32();</span>
+<span class="nc" id="L453">            readers.clear();</span>
+<span class="nc" id="L454">            readers.ensureCapacity(sstablesNum);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            for (int i = 0; i &lt; sstablesNum; i++)</span>
+            {
+<span class="nc" id="L457">                ColumnFamilyStore cfs = readCFS(in);</span>
+<span class="nc" id="L458">                String formatName = in.readUTF();</span>
+<span class="nc" id="L459">                SSTableFormat&lt;?, ?&gt; format = Objects.requireNonNull(DatabaseDescriptor.getSSTableFormats().get(formatName), &quot;Unknown SSTable format: &quot; + formatName);</span>
+<span class="nc" id="L460">                String version = in.readUTF();</span>
+<span class="nc" id="L461">                SSTableId id = SSTableIdFactory.instance.fromBytes(ByteBufferUtil.readWithShortLength(in));</span>
+
+<span class="nc" id="L463">                SSTableReader reader = null;</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                if (cfs != null)</span>
+                {
+<span class="nc" id="L466">                    Map&lt;ImmutableTriple&lt;SSTableId, String, SSTableFormat&lt;?, ?&gt;&gt;, SSTableReader&gt; readersMap = tmpReaders.get(cfs);</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                    if (readersMap == null)</span>
+                    {
+<span class="nc" id="L469">                        Set&lt;SSTableReader&gt; liveReaders = cfs.getLiveSSTables();</span>
+<span class="nc" id="L470">                        readersMap = new HashMap&lt;&gt;(liveReaders.size());</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                        for (SSTableReader r : liveReaders)</span>
+<span class="nc" id="L472">                            readersMap.put(ImmutableTriple.of(r.descriptor.id, r.descriptor.version.toString(), r.descriptor.version.format), r);</span>
+<span class="nc" id="L473">                        tmpReaders.put(cfs, readersMap);</span>
+                    }
+<span class="nc" id="L475">                    reader = readersMap.get(ImmutableTriple.of(id, version, format));</span>
+                }
+<span class="nc bnc" id="L477" title="All 2 branches missed.">                if (reader instanceof KeyCacheSupport&lt;?&gt;)</span>
+<span class="nc" id="L478">                    readers.add(Pair.create((KeyCacheSupport&lt;?&gt;) reader, format));</span>
+                else
+<span class="nc" id="L480">                    readers.add(Pair.create(null, format));</span>
+            }
+<span class="nc" id="L482">        }</span>
+
+        public void serialize(KeyCacheKey key, DataOutputPlus out, ColumnFamilyStore cfs) throws IOException
+        {
+<span class="nc" id="L486">            AbstractRowIndexEntry entry = CacheService.instance.keyCache.getInternal(key);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (entry == null)</span>
+<span class="nc" id="L488">                return;</span>
+
+<span class="nc" id="L490">            writeSSTable(cfs, key.desc, out);</span>
+<span class="nc" id="L491">            out.writeInt(key.key.length);</span>
+<span class="nc" id="L492">            out.write(key.key);</span>
+<span class="nc" id="L493">            entry.serializeForCache(out);</span>
+<span class="nc" id="L494">        }</span>
+
+        public Future&lt;Pair&lt;KeyCacheKey, AbstractRowIndexEntry&gt;&gt; deserialize(DataInputPlus input) throws IOException
+        {
+<span class="nc" id="L498">            Pair&lt;KeyCacheSupport&lt;?&gt;, SSTableFormat&lt;?, ?&gt;&gt; reader = readSSTable(input);</span>
+<span class="nc bnc" id="L499" title="All 4 branches missed.">            boolean skipEntry = reader.left == null || !reader.left.getKeyCache().isEnabled();</span>
+
+<span class="nc" id="L501">            int keyLength = input.readInt();</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">            if (keyLength &gt; FBUtilities.MAX_UNSIGNED_SHORT)</span>
+<span class="nc" id="L503">                throw new IOException(String.format(&quot;Corrupted key cache. Key length of %d is longer than maximum of %d&quot;,</span>
+<span class="nc" id="L504">                                                    keyLength, FBUtilities.MAX_UNSIGNED_SHORT));</span>
+<span class="nc" id="L505">            ByteBuffer key = ByteBufferUtil.read(input, keyLength);</span>
+
+<span class="nc bnc" id="L507" title="All 2 branches missed.">            if (skipEntry)</span>
+            {
+                // The sstable doesn't exist anymore, so we can't be sure of the exact version and assume its the current version. The only case where we'll be
+                // wrong is during upgrade, in which case we fail at deserialization. This is not a huge deal however since 1) this is unlikely enough that
+                // this won't affect many users (if any) and only once, 2) this doesn't prevent the node from starting and 3) CASSANDRA-10219 shows that this
+                // part of the code has been broken for a while without anyone noticing (it is, btw, still broken until CASSANDRA-10219 is fixed).
+<span class="nc" id="L513">                SSTableFormat.KeyCacheValueSerializer&lt;?, ?&gt; serializer = reader.right.getKeyCacheValueSerializer();</span>
+
+<span class="nc" id="L515">                serializer.skip(input);</span>
+<span class="nc" id="L516">                return null;</span>
+            }
+<span class="nc" id="L518">            long pos = ((RandomAccessReader) input).getPosition();</span>
+            AbstractRowIndexEntry cacheValue;
+            try
+            {
+<span class="nc" id="L522">                cacheValue = reader.left.deserializeKeyCacheValue(input);</span>
+<span class="nc" id="L523">            } catch (RuntimeException | Error ex)</span>
+            {
+<span class="nc" id="L525">                logger.error(&quot;Deserializing key cache entry at {} for {}&quot;, pos, reader.left);</span>
+<span class="nc" id="L526">                throw ex;</span>
+<span class="nc" id="L527">            }</span>
+<span class="nc" id="L528">            KeyCacheKey cacheKey = reader.left.getCacheKey(key);</span>
+<span class="nc" id="L529">            return ImmediateFuture.success(Pair.create(cacheKey, cacheValue));</span>
+        }
+
+        private void writeSSTable(ColumnFamilyStore cfs, Descriptor desc, DataOutputPlus out) throws IOException
+        {
+<span class="nc" id="L534">            getOrCreateCFSOrdinal(cfs);</span>
+<span class="nc" id="L535">            Pair&lt;Integer, ColumnFamilyStore&gt; existing = readerOrdinals.putIfAbsent(desc, Pair.create(readerOrdinals.size(), cfs));</span>
+<span class="nc bnc" id="L536" title="All 2 branches missed.">            int ordinal = existing == null ? readerOrdinals.size() - 1 : existing.left;</span>
+<span class="nc" id="L537">            out.writeUnsignedVInt32(ordinal);</span>
+<span class="nc" id="L538">        }</span>
+
+        private Pair&lt;KeyCacheSupport&lt;?&gt;, SSTableFormat&lt;?, ?&gt;&gt; readSSTable(DataInputPlus input) throws IOException
+        {
+<span class="nc" id="L542">            int ordinal = input.readUnsignedVInt32();</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">            if (ordinal &gt;= readers.size())</span>
+<span class="nc" id="L544">                throw new IOException(&quot;Corrupted key cache. Failed to deserialize key of key cache - invalid sstable ordinal &quot; + ordinal);</span>
+<span class="nc" id="L545">            return readers.get(ordinal);</span>
+        }
+
+        public void cleanupAfterDeserialize()
+        {
+<span class="nc" id="L550">            super.cleanupAfterDeserialize();</span>
+<span class="nc" id="L551">            readers.clear();</span>
+<span class="nc" id="L552">        }</span>
+
+        public void cleanupAfterSerialize()
+        {
+<span class="nc" id="L556">            super.cleanupAfterSerialize();</span>
+<span class="nc" id="L557">            readerOrdinals.clear();</span>
+<span class="nc" id="L558">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

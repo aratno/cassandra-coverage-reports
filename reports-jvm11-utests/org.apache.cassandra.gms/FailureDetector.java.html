@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FailureDetector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.gms</a> &gt; <span class="el_source">FailureDetector.java</span></div><h1>FailureDetector.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.gms;
+
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import javax.management.openmbean.CompositeData;
+import javax.management.openmbean.CompositeDataSupport;
+import javax.management.openmbean.CompositeType;
+import javax.management.openmbean.OpenDataException;
+import javax.management.openmbean.OpenType;
+import javax.management.openmbean.SimpleType;
+import javax.management.openmbean.TabularData;
+import javax.management.openmbean.TabularDataSupport;
+import javax.management.openmbean.TabularType;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.FD_INITIAL_VALUE_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.FD_MAX_INTERVAL_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.LINE_SEPARATOR;
+import static org.apache.cassandra.config.CassandraRelevantProperties.MAX_LOCAL_PAUSE_IN_MS;
+import static org.apache.cassandra.config.DatabaseDescriptor.newFailureDetector;
+import static org.apache.cassandra.utils.MonotonicClock.Global.preciseTime;
+
+/**
+ * This FailureDetector is an implementation of the paper titled
+ * &quot;The Phi Accrual Failure Detector&quot; by Hayashibara.
+ * Check the paper and the &lt;i&gt;IFailureDetector&lt;/i&gt; interface for details.
+ */
+public class FailureDetector implements IFailureDetector, FailureDetectorMBean
+{
+<span class="fc" id="L70">    private static final Logger logger = LoggerFactory.getLogger(FailureDetector.class);</span>
+    public static final String MBEAN_NAME = &quot;org.apache.cassandra.net:type=FailureDetector&quot;;
+    private static final int SAMPLE_SIZE = 1000;
+<span class="fc" id="L73">    protected static final long INITIAL_VALUE_NANOS = TimeUnit.NANOSECONDS.convert(getInitialValue(), TimeUnit.MILLISECONDS);</span>
+    private static final int DEBUG_PERCENTAGE = 80; // if the phi is larger than this percentage of the max, log a debug message
+<span class="fc" id="L75">    private static final long MAX_LOCAL_PAUSE_IN_NANOS = getMaxLocalPause();</span>
+<span class="fc" id="L76">    private long lastInterpret = preciseTime.now();</span>
+<span class="fc" id="L77">    private long lastPause = 0L;</span>
+
+    private static long getMaxLocalPause()
+    {
+<span class="fc" id="L81">        long pause = MAX_LOCAL_PAUSE_IN_MS.getLong();</span>
+
+<span class="fc bfc" id="L83" title="All 2 branches covered.">        if (!String.valueOf(pause).equals(MAX_LOCAL_PAUSE_IN_MS.getDefaultValue()))</span>
+<span class="fc" id="L84">            logger.warn(&quot;Overriding {} max local pause time from {}ms to {}ms&quot;,</span>
+<span class="fc" id="L85">                        MAX_LOCAL_PAUSE_IN_MS.getKey(), MAX_LOCAL_PAUSE_IN_MS.getDefaultValue(), pause);</span>
+
+<span class="fc" id="L87">        return pause * 1000000L;</span>
+    }
+
+<span class="fc" id="L90">    public static final IFailureDetector instance = newFailureDetector();</span>
+<span class="fc" id="L91">    public static final Predicate&lt;InetAddressAndPort&gt; isEndpointAlive = instance::isAlive;</span>
+<span class="fc" id="L92">    public static final Predicate&lt;Replica&gt; isReplicaAlive = r -&gt; isEndpointAlive.test(r.endpoint());</span>
+
+    // this is useless except to provide backwards compatibility in phi_convict_threshold,
+    // because everyone seems pretty accustomed to the default of 8, and users who have
+    // already tuned their phi_convict_threshold for their own environments won't need to
+    // change.
+<span class="fc" id="L98">    private final double PHI_FACTOR = 1.0 / Math.log(10.0); // 0.434...</span>
+
+<span class="fc" id="L100">    private final ConcurrentHashMap&lt;InetAddressAndPort, ArrivalWindow&gt; arrivalSamples = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L101">    private final List&lt;IFailureDetectionEventListener&gt; fdEvntListeners = new CopyOnWriteArrayList&lt;&gt;();</span>
+
+    public FailureDetector()
+<span class="fc" id="L104">    {</span>
+        // Register this instance with JMX
+<span class="fc" id="L106">        MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);</span>
+<span class="fc" id="L107">    }</span>
+
+    private static long getInitialValue()
+    {
+<span class="fc" id="L111">        long newValue = FD_INITIAL_VALUE_MS.getLong(Gossiper.intervalInMillis * 2L);</span>
+
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">        if (newValue != Gossiper.intervalInMillis * 2)</span>
+<span class="nc" id="L114">            logger.info(&quot;Overriding {} from {}ms to {}ms&quot;, FD_INITIAL_VALUE_MS.getKey(), Gossiper.intervalInMillis * 2, newValue);</span>
+
+<span class="fc" id="L116">        return newValue;</span>
+    }
+
+    public String getAllEndpointStates()
+    {
+<span class="fc" id="L121">        return getAllEndpointStates(false, false);</span>
+    }
+
+    public String getAllEndpointStatesWithResolveIp()
+    {
+<span class="fc" id="L126">        return getAllEndpointStates(false, true);</span>
+    }
+
+    public String getAllEndpointStatesWithPort()
+    {
+<span class="fc" id="L131">        return getAllEndpointStates(true, false);</span>
+    }
+
+    public String getAllEndpointStatesWithPortAndResolveIp()
+    {
+<span class="fc" id="L136">        return getAllEndpointStates(true, true);</span>
+    }
+
+    public String getAllEndpointStates(boolean withPort)
+    {
+<span class="nc" id="L141">        return getAllEndpointStates(withPort, false);</span>
+    }
+
+    public String getAllEndpointStates(boolean withPort, boolean resolveIp)
+    {
+<span class="fc" id="L146">        StringBuilder sb = new StringBuilder();</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, EndpointState&gt; entry : Gossiper.instance.endpointStateMap.entrySet())</span>
+        {
+<span class="fc bfc" id="L149" title="All 2 branches covered.">            sb.append(resolveIp ? entry.getKey().getHostName(withPort) : entry.getKey().toString(withPort)).append(&quot;\n&quot;);</span>
+<span class="fc" id="L150">            appendEndpointState(sb, entry.getValue());</span>
+<span class="fc" id="L151">        }</span>
+<span class="fc" id="L152">        return sb.toString();</span>
+    }
+
+    public Map&lt;String, String&gt; getSimpleStates()
+    {
+<span class="nc" id="L157">        return getSimpleStates(false);</span>
+    }
+
+    public Map&lt;String, String&gt; getSimpleStatesWithPort()
+    {
+<span class="nc" id="L162">        return getSimpleStates(true);</span>
+    }
+
+    private Map&lt;String, String&gt; getSimpleStates(boolean withPort)
+    {
+<span class="nc" id="L167">        Map&lt;String, String&gt; nodesStatus = new HashMap&lt;String, String&gt;(Gossiper.instance.endpointStateMap.size());</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddressAndPort, EndpointState&gt; entry : Gossiper.instance.endpointStateMap.entrySet())</span>
+        {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            if (entry.getValue().isAlive())</span>
+<span class="nc" id="L171">                nodesStatus.put(entry.getKey().toString(withPort), &quot;UP&quot;);</span>
+            else
+<span class="nc" id="L173">                nodesStatus.put(entry.getKey().toString(withPort), &quot;DOWN&quot;);</span>
+<span class="nc" id="L174">        }</span>
+<span class="nc" id="L175">        return nodesStatus;</span>
+    }
+
+    public int getDownEndpointCount()
+    {
+<span class="nc" id="L180">        int count = 0;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddressAndPort, EndpointState&gt; entry : Gossiper.instance.endpointStateMap.entrySet())</span>
+        {
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (!entry.getValue().isAlive())</span>
+<span class="nc" id="L184">                count++;</span>
+<span class="nc" id="L185">        }</span>
+<span class="nc" id="L186">        return count;</span>
+    }
+
+    public int getUpEndpointCount()
+    {
+<span class="nc" id="L191">        int count = 0;</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        for (Map.Entry&lt;InetAddressAndPort, EndpointState&gt; entry : Gossiper.instance.endpointStateMap.entrySet())</span>
+        {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">            if (entry.getValue().isAlive())</span>
+<span class="nc" id="L195">                count++;</span>
+<span class="nc" id="L196">        }</span>
+<span class="nc" id="L197">        return count;</span>
+    }
+
+    @Override
+    public TabularData getPhiValues() throws OpenDataException
+    {
+<span class="nc" id="L203">        return getPhiValues(false);</span>
+    }
+
+    @Override
+    public TabularData getPhiValuesWithPort() throws OpenDataException
+    {
+<span class="nc" id="L209">        return getPhiValues(true);</span>
+    }
+
+    private TabularData getPhiValues(boolean withPort) throws OpenDataException
+    {
+<span class="nc" id="L214">        final CompositeType ct = new CompositeType(&quot;Node&quot;, &quot;Node&quot;,</span>
+                new String[]{&quot;Endpoint&quot;, &quot;PHI&quot;},
+                new String[]{&quot;IP of the endpoint&quot;, &quot;PHI value&quot;},
+                new OpenType[]{SimpleType.STRING, SimpleType.DOUBLE});
+<span class="nc" id="L218">        final TabularDataSupport results = new TabularDataSupport(new TabularType(&quot;PhiList&quot;, &quot;PhiList&quot;, ct, new String[]{&quot;Endpoint&quot;}));</span>
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        for (final Map.Entry&lt;InetAddressAndPort, ArrivalWindow&gt; entry : arrivalSamples.entrySet())</span>
+        {
+<span class="nc" id="L222">            final ArrivalWindow window = entry.getValue();</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (window.mean() &gt; 0)</span>
+            {
+<span class="nc" id="L225">                final double phi = window.getLastReportedPhi();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                if (phi != Double.MIN_VALUE)</span>
+                {
+                    // returned values are scaled by PHI_FACTOR so that the are on the same scale as PhiConvictThreshold
+<span class="nc" id="L229">                    final CompositeData data = new CompositeDataSupport(ct,</span>
+                            new String[]{&quot;Endpoint&quot;, &quot;PHI&quot;},
+<span class="nc" id="L231">                            new Object[]{entry.getKey().toString(withPort), phi * PHI_FACTOR});</span>
+<span class="nc" id="L232">                    results.put(data);</span>
+                }
+            }
+<span class="nc" id="L235">        }</span>
+<span class="nc" id="L236">        return results;</span>
+    }
+
+    public String getEndpointState(String address) throws UnknownHostException
+    {
+<span class="nc" id="L241">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L242">        EndpointState endpointState = Gossiper.instance.getEndpointStateForEndpoint(InetAddressAndPort.getByName(address));</span>
+<span class="nc" id="L243">        appendEndpointState(sb, endpointState);</span>
+<span class="nc" id="L244">        return sb.toString();</span>
+    }
+
+    private void appendEndpointState(StringBuilder sb, EndpointState endpointState)
+    {
+<span class="fc" id="L249">        sb.append(&quot;  generation:&quot;).append(endpointState.getHeartBeatState().getGeneration()).append(&quot;\n&quot;);</span>
+<span class="fc" id="L250">        sb.append(&quot;  heartbeat:&quot;).append(endpointState.getHeartBeatState().getHeartBeatVersion()).append(&quot;\n&quot;);</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">        for (Map.Entry&lt;ApplicationState, VersionedValue&gt; state : endpointState.states())</span>
+        {
+<span class="fc bfc" id="L253" title="All 2 branches covered.">            if (state.getKey() == ApplicationState.TOKENS)</span>
+<span class="fc" id="L254">                continue;</span>
+<span class="fc" id="L255">            sb.append(&quot;  &quot;).append(state.getKey()).append(&quot;:&quot;).append(state.getValue().version).append(&quot;:&quot;).append(state.getValue().value).append(&quot;\n&quot;);</span>
+<span class="fc" id="L256">        }</span>
+<span class="fc" id="L257">        VersionedValue tokens = endpointState.getApplicationState(ApplicationState.TOKENS);</span>
+<span class="pc bpc" id="L258" title="1 of 2 branches missed.">        if (tokens != null)</span>
+        {
+<span class="fc" id="L260">            sb.append(&quot;  TOKENS:&quot;).append(tokens.version).append(&quot;:&lt;hidden&gt;\n&quot;);</span>
+        }
+        else
+        {
+<span class="nc" id="L264">            sb.append(&quot;  TOKENS: not present\n&quot;);</span>
+        }
+<span class="fc" id="L266">    }</span>
+
+    /**
+     * Dump the inter arrival times for examination if necessary.
+     */
+    public void dumpInterArrivalTimes()
+    {
+<span class="nc" id="L273">        Path path = null;</span>
+        try {
+<span class="nc" id="L275">            path = Files.createTempFile(&quot;failuredetector-&quot;, &quot;.dat&quot;);</span>
+
+<span class="nc" id="L277">            try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(path, StandardOpenOption.APPEND)))</span>
+            {
+<span class="nc" id="L279">                os.write(toString().getBytes());</span>
+            }
+        }
+<span class="nc" id="L282">        catch (IOException e)</span>
+        {
+<span class="nc" id="L284">            throw new FSWriteError(e, path);</span>
+<span class="nc" id="L285">        }</span>
+<span class="nc" id="L286">    }</span>
+
+    public void setPhiConvictThreshold(double phi)
+    {
+<span class="nc" id="L290">        DatabaseDescriptor.setPhiConvictThreshold(phi);</span>
+<span class="nc" id="L291">    }</span>
+
+    public double getPhiConvictThreshold()
+    {
+<span class="fc" id="L295">        return DatabaseDescriptor.getPhiConvictThreshold();</span>
+    }
+
+    public boolean isAlive(InetAddressAndPort ep)
+    {
+<span class="fc bfc" id="L300" title="All 2 branches covered.">        if (ep.equals(FBUtilities.getBroadcastAddressAndPort()))</span>
+<span class="fc" id="L301">            return true;</span>
+
+<span class="fc" id="L303">        EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(ep);</span>
+        // we could assert not-null, but having isAlive fail screws a node over so badly that
+        // it's worth being defensive here so minor bugs don't cause disproportionate
+        // badness.  (See CASSANDRA-1463 for an example).
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">        if (epState == null)</span>
+<span class="nc" id="L308">            logger.error(&quot;Unknown endpoint: &quot; + ep, new IllegalArgumentException(&quot;&quot;));</span>
+<span class="pc bpc" id="L309" title="1 of 4 branches missed.">        return epState != null &amp;&amp; epState.isAlive();</span>
+    }
+
+    public void report(InetAddressAndPort ep)
+    {
+<span class="fc" id="L314">        long now = preciseTime.now();</span>
+<span class="fc" id="L315">        ArrivalWindow heartbeatWindow = arrivalSamples.get(ep);</span>
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">        if (heartbeatWindow == null)</span>
+        {
+            // avoid adding an empty ArrivalWindow to the Map
+<span class="fc" id="L319">            heartbeatWindow = new ArrivalWindow(SAMPLE_SIZE);</span>
+<span class="fc" id="L320">            heartbeatWindow.add(now, ep);</span>
+<span class="fc" id="L321">            heartbeatWindow = arrivalSamples.putIfAbsent(ep, heartbeatWindow);</span>
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">            if (heartbeatWindow != null)</span>
+<span class="nc" id="L323">                heartbeatWindow.add(now, ep);</span>
+        }
+        else
+        {
+<span class="nc" id="L327">            heartbeatWindow.add(now, ep);</span>
+        }
+
+<span class="pc bpc" id="L330" title="3 of 4 branches missed.">        if (logger.isTraceEnabled() &amp;&amp; heartbeatWindow != null)</span>
+<span class="nc" id="L331">            logger.trace(&quot;Average for {} is {}ns&quot;, ep, heartbeatWindow.mean());</span>
+<span class="fc" id="L332">    }</span>
+
+    public void interpret(InetAddressAndPort ep)
+    {
+<span class="fc" id="L336">        ArrivalWindow hbWnd = arrivalSamples.get(ep);</span>
+<span class="fc bfc" id="L337" title="All 2 branches covered.">        if (hbWnd == null)</span>
+        {
+<span class="fc" id="L339">            return;</span>
+        }
+<span class="fc" id="L341">        long now = preciseTime.now();</span>
+<span class="fc" id="L342">        long diff = now - lastInterpret;</span>
+<span class="fc" id="L343">        lastInterpret = now;</span>
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">        if (diff &gt; MAX_LOCAL_PAUSE_IN_NANOS)</span>
+        {
+<span class="nc" id="L346">            logger.warn(&quot;Not marking nodes down due to local pause of {}ns &gt; {}ns&quot;, diff, MAX_LOCAL_PAUSE_IN_NANOS);</span>
+<span class="nc" id="L347">            lastPause = now;</span>
+<span class="nc" id="L348">            return;</span>
+        }
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">        if (preciseTime.now() - lastPause &lt; MAX_LOCAL_PAUSE_IN_NANOS)</span>
+        {
+<span class="nc" id="L352">            logger.debug(&quot;Still not marking nodes down due to local pause&quot;);</span>
+<span class="nc" id="L353">            return;</span>
+        }
+<span class="fc" id="L355">        double phi = hbWnd.phi(now);</span>
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L357">            logger.trace(&quot;PHI for {} : {}&quot;, ep, phi);</span>
+
+<span class="pc bpc" id="L359" title="1 of 2 branches missed.">        if (PHI_FACTOR * phi &gt; getPhiConvictThreshold())</span>
+        {
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L362">                logger.trace(&quot;Node {} phi {} &gt; {}; intervals: {} mean: {}ns&quot;, new Object[]{ep, PHI_FACTOR * phi, getPhiConvictThreshold(), hbWnd, hbWnd.mean()});</span>
+<span class="fc bfc" id="L363" title="All 2 branches covered.">            for (IFailureDetectionEventListener listener : fdEvntListeners)</span>
+            {
+<span class="fc" id="L365">                listener.convict(ep, phi);</span>
+<span class="fc" id="L366">            }</span>
+        }
+<span class="nc bnc" id="L368" title="All 4 branches missed.">        else if (logger.isDebugEnabled() &amp;&amp; (PHI_FACTOR * phi * DEBUG_PERCENTAGE / 100.0 &gt; getPhiConvictThreshold()))</span>
+        {
+<span class="nc" id="L370">            logger.debug(&quot;PHI for {} : {}&quot;, ep, phi);</span>
+        }
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        else if (logger.isTraceEnabled())</span>
+        {
+<span class="nc" id="L374">            logger.trace(&quot;PHI for {} : {}&quot;, ep, phi);</span>
+<span class="nc" id="L375">            logger.trace(&quot;mean for {} : {}ns&quot;, ep, hbWnd.mean());</span>
+        }
+<span class="fc" id="L377">    }</span>
+
+    public void forceConviction(InetAddressAndPort ep)
+    {
+<span class="nc" id="L381">        logger.debug(&quot;Forcing conviction of {}&quot;, ep);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        for (IFailureDetectionEventListener listener : fdEvntListeners)</span>
+        {
+<span class="nc" id="L384">            listener.convict(ep, getPhiConvictThreshold());</span>
+<span class="nc" id="L385">        }</span>
+<span class="nc" id="L386">    }</span>
+
+    public void remove(InetAddressAndPort ep)
+    {
+<span class="fc" id="L390">        arrivalSamples.remove(ep);</span>
+<span class="fc" id="L391">    }</span>
+
+    public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+<span class="fc" id="L395">        fdEvntListeners.add(listener);</span>
+<span class="fc" id="L396">    }</span>
+
+    public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
+    {
+<span class="nc" id="L400">        fdEvntListeners.remove(listener);</span>
+<span class="nc" id="L401">    }</span>
+
+    public String toString()
+    {
+<span class="nc" id="L405">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L406">        Set&lt;InetAddressAndPort&gt; eps = arrivalSamples.keySet();</span>
+
+<span class="nc" id="L408">        sb.append(&quot;-----------------------------------------------------------------------&quot;);</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        for (InetAddressAndPort ep : eps)</span>
+        {
+<span class="nc" id="L411">            ArrivalWindow hWnd = arrivalSamples.get(ep);</span>
+<span class="nc" id="L412">            sb.append(ep).append(&quot; : &quot;);</span>
+<span class="nc" id="L413">            sb.append(hWnd);</span>
+<span class="nc" id="L414">            sb.append(LINE_SEPARATOR.getString());</span>
+<span class="nc" id="L415">        }</span>
+<span class="nc" id="L416">        sb.append(&quot;-----------------------------------------------------------------------&quot;);</span>
+<span class="nc" id="L417">        return sb.toString();</span>
+    }
+}
+
+/*
+ This class is not thread safe.
+ */
+class ArrayBackedBoundedStats
+{
+    private final long[] arrivalIntervals;
+<span class="fc" id="L427">    private long sum = 0;</span>
+<span class="fc" id="L428">    private int index = 0;</span>
+<span class="fc" id="L429">    private boolean isFilled = false;</span>
+<span class="fc" id="L430">    private volatile double mean = 0;</span>
+
+    public ArrayBackedBoundedStats(final int size)
+<span class="fc" id="L433">    {</span>
+<span class="fc" id="L434">        arrivalIntervals = new long[size];</span>
+<span class="fc" id="L435">    }</span>
+
+    public void add(long interval)
+    {
+<span class="fc bfc" id="L439" title="All 2 branches covered.">        if(index == arrivalIntervals.length)</span>
+        {
+<span class="fc" id="L441">            isFilled = true;</span>
+<span class="fc" id="L442">            index = 0;</span>
+        }
+
+<span class="fc bfc" id="L445" title="All 2 branches covered.">        if(isFilled)</span>
+<span class="fc" id="L446">            sum = sum - arrivalIntervals[index];</span>
+
+<span class="fc" id="L448">        arrivalIntervals[index++] = interval;</span>
+<span class="fc" id="L449">        sum += interval;</span>
+<span class="fc" id="L450">        mean = (double)sum / size();</span>
+<span class="fc" id="L451">    }</span>
+
+    private int size()
+    {
+<span class="fc bfc" id="L455" title="All 2 branches covered.">        return isFilled ? arrivalIntervals.length : index;</span>
+    }
+
+    public double mean()
+    {
+<span class="fc" id="L460">        return mean;</span>
+    }
+
+    public long[] getArrivalIntervals()
+    {
+<span class="fc" id="L465">        return arrivalIntervals;</span>
+    }
+
+}
+
+class ArrivalWindow
+{
+<span class="fc" id="L472">    private static final Logger logger = LoggerFactory.getLogger(ArrivalWindow.class);</span>
+<span class="fc" id="L473">    private long tLast = 0L;</span>
+    private final ArrayBackedBoundedStats arrivalIntervals;
+<span class="fc" id="L475">    private double lastReportedPhi = Double.MIN_VALUE;</span>
+
+    // in the event of a long partition, never record an interval longer than the rpc timeout,
+    // since if a host is regularly experiencing connectivity problems lasting this long we'd
+    // rather mark it down quickly instead of adapting
+    // this value defaults to the same initial value the FD is seeded with
+<span class="fc" id="L481">    private final long MAX_INTERVAL_IN_NANO = getMaxInterval();</span>
+
+    ArrivalWindow(int size)
+<span class="fc" id="L484">    {</span>
+<span class="fc" id="L485">        arrivalIntervals = new ArrayBackedBoundedStats(size);</span>
+<span class="fc" id="L486">    }</span>
+
+    private static long getMaxInterval()
+    {
+<span class="fc" id="L490">        long newValue = FD_MAX_INTERVAL_MS.getLong(FailureDetector.INITIAL_VALUE_NANOS);</span>
+<span class="pc bpc" id="L491" title="1 of 2 branches missed.">        if (newValue != FailureDetector.INITIAL_VALUE_NANOS)</span>
+<span class="nc" id="L492">            logger.info(&quot;Overriding {} from {}ms to {}ms&quot;, FD_MAX_INTERVAL_MS.getKey(), FailureDetector.INITIAL_VALUE_NANOS, newValue);</span>
+<span class="fc" id="L493">        return TimeUnit.NANOSECONDS.convert(newValue, TimeUnit.MILLISECONDS);</span>
+    }
+
+    synchronized void add(long value, InetAddressAndPort ep)
+    {
+<span class="pc bpc" id="L498" title="1 of 2 branches missed.">        assert tLast &gt;= 0;</span>
+<span class="fc bfc" id="L499" title="All 2 branches covered.">        if (tLast &gt; 0L)</span>
+        {
+<span class="fc" id="L501">            long interArrivalTime = (value - tLast);</span>
+<span class="pc bpc" id="L502" title="1 of 2 branches missed.">            if (interArrivalTime &lt;= MAX_INTERVAL_IN_NANO)</span>
+            {
+<span class="fc" id="L504">                arrivalIntervals.add(interArrivalTime);</span>
+<span class="fc" id="L505">                logger.trace(&quot;Reporting interval time of {}ns for {}&quot;, interArrivalTime, ep);</span>
+            }
+            else
+            {
+<span class="nc" id="L509">                logger.trace(&quot;Ignoring interval time of {}ns for {}&quot;, interArrivalTime, ep);</span>
+            }
+<span class="fc" id="L511">        }</span>
+        else
+        {
+            // We use a very large initial interval since the &quot;right&quot; average depends on the cluster size
+            // and it's better to err high (false negatives, which will be corrected by waiting a bit longer)
+            // than low (false positives, which cause &quot;flapping&quot;).
+<span class="fc" id="L517">            arrivalIntervals.add(FailureDetector.INITIAL_VALUE_NANOS);</span>
+        }
+<span class="fc" id="L519">        tLast = value;</span>
+<span class="fc" id="L520">    }</span>
+
+    double mean()
+    {
+<span class="fc" id="L524">        return arrivalIntervals.mean();</span>
+    }
+
+    // see CASSANDRA-2597 for an explanation of the math at work here.
+    double phi(long tnow)
+    {
+<span class="pc bpc" id="L530" title="2 of 4 branches missed.">        assert arrivalIntervals.mean() &gt; 0 &amp;&amp; tLast &gt; 0; // should not be called before any samples arrive</span>
+<span class="fc" id="L531">        long t = tnow - tLast;</span>
+<span class="fc" id="L532">        lastReportedPhi = t / mean();</span>
+<span class="fc" id="L533">        return lastReportedPhi;</span>
+    }
+
+    double getLastReportedPhi()
+    {
+<span class="nc" id="L538">        return lastReportedPhi;</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L543">        return Arrays.toString(arrivalIntervals.getArrivalIntervals());</span>
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

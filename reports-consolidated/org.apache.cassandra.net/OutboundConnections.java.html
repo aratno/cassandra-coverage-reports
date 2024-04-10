@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundConnections.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundConnections.java</span></div><h1>OutboundConnections.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.nio.channels.ClosedChannelException;
+import java.util.List;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+
+import org.apache.cassandra.utils.concurrent.FutureCombiner;
+import org.apache.cassandra.utils.concurrent.Condition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.carrotsearch.hppc.ObjectObjectHashMap;
+import io.netty.util.concurrent.Future; //checkstyle: permit this import
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.InternodeOutboundMetrics;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static java.lang.Math.max;
+import static org.apache.cassandra.config.CassandraRelevantProperties.OTCP_LARGE_MESSAGE_THRESHOLD;
+import static org.apache.cassandra.gms.Gossiper.instance;
+import static org.apache.cassandra.net.FrameEncoderCrc.HEADER_AND_TRAILER_LENGTH;
+import static org.apache.cassandra.net.MessagingService.current_version;
+import static org.apache.cassandra.net.ConnectionType.URGENT_MESSAGES;
+import static org.apache.cassandra.net.ConnectionType.LARGE_MESSAGES;
+import static org.apache.cassandra.net.ConnectionType.SMALL_MESSAGES;
+import static org.apache.cassandra.net.ResourceLimits.*;
+import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+
+/**
+ * Groups a set of outbound connections to a given peer, and routes outgoing messages to the appropriate connection
+ * (based upon message's type or size). Contains a {@link OutboundConnection} for each of the
+ * {@link ConnectionType} types.
+ */
+public class OutboundConnections
+{
+<span class="fc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(OutboundConnections.class);</span>
+
+    private static final int HEADER_LENGTH = 8  // magic number
+                                            + 1  // token
+                                            + 4  // compressed length
+                                            + 4  // uncompressed length
+                                            + 4; // checksum
+
+    @VisibleForTesting
+<span class="fc" id="L69">    public static final int LARGE_MESSAGE_THRESHOLD = OTCP_LARGE_MESSAGE_THRESHOLD.getInt()</span>
+<span class="fc" id="L70">    - max(max(HEADER_LENGTH, HEADER_AND_TRAILER_LENGTH), FrameEncoderLZ4.HEADER_AND_TRAILER_LENGTH);</span>
+
+<span class="fc" id="L72">    private final Condition metricsReady = newOneTimeCondition();</span>
+    private volatile InternodeOutboundMetrics metrics;
+    private final Limit reserveCapacity;
+
+    private OutboundConnectionSettings template;
+    public final OutboundConnection small;
+    public final OutboundConnection large;
+    public final OutboundConnection urgent;
+
+    private OutboundConnections(OutboundConnectionSettings template)
+<span class="fc" id="L82">    {</span>
+<span class="fc" id="L83">        this.template = template = template.withDefaultReserveLimits();</span>
+<span class="fc" id="L84">        reserveCapacity = new Concurrent(template.applicationSendQueueReserveEndpointCapacityInBytes);</span>
+<span class="fc" id="L85">        EndpointAndGlobal reserveCapacityInBytes = new EndpointAndGlobal(reserveCapacity, template.applicationSendQueueReserveGlobalCapacityInBytes);</span>
+<span class="fc" id="L86">        this.small = new OutboundConnection(SMALL_MESSAGES, template, reserveCapacityInBytes);</span>
+<span class="fc" id="L87">        this.large = new OutboundConnection(LARGE_MESSAGES, template, reserveCapacityInBytes);</span>
+<span class="fc" id="L88">        this.urgent = new OutboundConnection(URGENT_MESSAGES, template, reserveCapacityInBytes);</span>
+<span class="fc" id="L89">    }</span>
+
+    /**
+     * Select the appropriate connection for the provided message and use it to send the message.
+     */
+    public void enqueue(Message msg, ConnectionType type) throws ClosedChannelException
+    {
+<span class="fc" id="L96">        connectionFor(msg, type).enqueue(msg);</span>
+<span class="fc" id="L97">    }</span>
+
+    static &lt;K&gt; OutboundConnections tryRegister(ConcurrentMap&lt;K, OutboundConnections&gt; in, K key, OutboundConnectionSettings settings)
+    {
+<span class="fc" id="L101">        OutboundConnections connections = in.get(key);</span>
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        if (connections == null)</span>
+        {
+<span class="fc" id="L104">            connections = new OutboundConnections(settings);</span>
+<span class="fc" id="L105">            OutboundConnections existing = in.putIfAbsent(key, connections);</span>
+
+<span class="fc bfc" id="L107" title="All 2 branches covered.">            if (existing == null)</span>
+            {
+<span class="fc" id="L109">                connections.metrics = new InternodeOutboundMetrics(settings.to, connections);</span>
+<span class="fc" id="L110">                connections.metricsReady.signalAll();</span>
+            }
+            else
+            {
+<span class="fc" id="L114">                connections.metricsReady.signalAll();</span>
+<span class="fc" id="L115">                connections.close(false);</span>
+<span class="fc" id="L116">                connections = existing;</span>
+            }
+        }
+<span class="fc" id="L119">        return connections;</span>
+    }
+
+    /**
+     * Reconnect to the peer using the given {@code addr}. Outstanding messages in each channel will be sent on the
+     * current channel. Typically this function is used for something like EC2 public IP addresses which need to be used
+     * for communication between EC2 regions.
+     *
+     * @param addr IP Address to use (and prefer) going forward for connecting to the peer
+     */
+    synchronized Future&lt;Void&gt; reconnectWithNewIp(InetAddressAndPort addr)
+    {
+<span class="fc" id="L131">        template = template.withConnectTo(addr);</span>
+<span class="fc" id="L132">        return FutureCombiner.nettySuccessListener(</span>
+<span class="fc" id="L133">            apply(c -&gt; c.reconnectWith(template))</span>
+        );
+    }
+
+    /**
+     * Close the connections permanently
+     *
+     * @param flushQueues {@code true} if existing messages in the queue should be sent before closing.
+     */
+    synchronized Future&lt;Void&gt; scheduleClose(long time, TimeUnit unit, boolean flushQueues)
+    {
+        // immediately release our metrics, so that if we need to re-open immediately we can safely register a new one
+<span class="fc" id="L145">        releaseMetrics();</span>
+<span class="fc" id="L146">        return FutureCombiner.nettySuccessListener(</span>
+<span class="fc" id="L147">            apply(c -&gt; c.scheduleClose(time, unit, flushQueues))</span>
+        );
+    }
+
+    /**
+     * Close the connections permanently
+     *
+     * @param flushQueues {@code true} if existing messages in the queue should be sent before closing.
+     */
+    synchronized Future&lt;Void&gt; close(boolean flushQueues)
+    {
+        // immediately release our metrics, so that if we need to re-open immediately we can safely register a new one
+<span class="fc" id="L159">        releaseMetrics();</span>
+<span class="fc" id="L160">        return FutureCombiner.nettySuccessListener(</span>
+<span class="fc" id="L161">            apply(c -&gt; c.close(flushQueues))</span>
+        );
+    }
+
+    private void releaseMetrics()
+    {
+        try
+        {
+<span class="fc" id="L169">            metricsReady.await();</span>
+        }
+<span class="nc" id="L171">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L173">            throw new UncheckedInterruptedException(e);</span>
+<span class="fc" id="L174">        }</span>
+
+<span class="fc bfc" id="L176" title="All 2 branches covered.">        if (metrics != null)</span>
+<span class="fc" id="L177">            metrics.release();</span>
+<span class="fc" id="L178">    }</span>
+
+    /**
+     * Close each netty channel and its socket
+     */
+    void interrupt()
+    {
+        // must return a non-null value for ImmutableList.of()
+<span class="fc" id="L186">        apply(OutboundConnection::interrupt);</span>
+<span class="fc" id="L187">    }</span>
+
+    /**
+     * Apply the given function to each of the connections we are pooling, returning the results as a list
+     */
+    private &lt;V&gt; List&lt;V&gt; apply(Function&lt;OutboundConnection, V&gt; f)
+    {
+<span class="fc" id="L194">        return ImmutableList.of(</span>
+<span class="fc" id="L195">            f.apply(urgent), f.apply(small), f.apply(large)</span>
+        );
+    }
+
+    @VisibleForTesting
+    OutboundConnection connectionFor(Message&lt;?&gt; message)
+    {
+<span class="fc" id="L202">        return connectionFor(message, null);</span>
+    }
+
+    private OutboundConnection connectionFor(Message msg, ConnectionType forceConnection)
+    {
+<span class="fc" id="L207">        return connectionFor(connectionTypeFor(msg, forceConnection));</span>
+    }
+
+    private static ConnectionType connectionTypeFor(Message&lt;?&gt; msg, ConnectionType specifyConnection)
+    {
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        if (specifyConnection != null)</span>
+<span class="fc" id="L213">            return specifyConnection;</span>
+
+<span class="fc bfc" id="L215" title="All 2 branches covered.">        if (msg.serializedSize(current_version) &gt; LARGE_MESSAGE_THRESHOLD)</span>
+        {
+<span class="fc bfc" id="L217" title="All 2 branches covered.">            if (msg.verb().priority == Verb.Priority.P0)</span>
+            {
+<span class="fc" id="L219">                NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES,</span>
+                                 &quot;Enqueued URGENT message which exceeds large message threshold&quot;);
+
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L223">                    logger.trace(&quot;{} message with size {} exceeded large message threshold {}&quot;,</span>
+<span class="nc" id="L224">                                 msg.verb(),</span>
+<span class="nc" id="L225">                                 msg.serializedSize(current_version),</span>
+<span class="nc" id="L226">                                 LARGE_MESSAGE_THRESHOLD);</span>
+            }
+
+<span class="fc" id="L229">            return LARGE_MESSAGES;</span>
+        }
+
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        return msg.verb().priority == Verb.Priority.P0</span>
+<span class="fc" id="L233">               ? URGENT_MESSAGES</span>
+<span class="fc" id="L234">               : SMALL_MESSAGES;</span>
+    }
+
+    @VisibleForTesting
+    final OutboundConnection connectionFor(ConnectionType type)
+    {
+<span class="pc bpc" id="L240" title="1 of 4 branches missed.">        switch (type)</span>
+        {
+            case SMALL_MESSAGES:
+<span class="fc" id="L243">                return small;</span>
+            case LARGE_MESSAGES:
+<span class="fc" id="L245">                return large;</span>
+            case URGENT_MESSAGES:
+<span class="fc" id="L247">                return urgent;</span>
+            default:
+<span class="nc" id="L249">                throw new IllegalArgumentException(&quot;unsupported connection type: &quot; + type);</span>
+        }
+    }
+
+    public long usingReserveBytes()
+    {
+<span class="fc" id="L255">        return reserveCapacity.using();</span>
+    }
+
+    long expiredCallbacks()
+    {
+<span class="fc" id="L260">        return metrics.expiredCallbacks.getCount();</span>
+    }
+
+    void incrementExpiredCallbackCount()
+    {
+<span class="fc" id="L265">        metrics.expiredCallbacks.mark();</span>
+<span class="fc" id="L266">    }</span>
+
+    OutboundConnectionSettings template()
+    {
+<span class="nc" id="L270">        return template;</span>
+    }
+
+    private static class UnusedConnectionMonitor
+    {
+        UnusedConnectionMonitor(MessagingService messagingService)
+<span class="fc" id="L276">        {</span>
+<span class="fc" id="L277">            this.messagingService = messagingService;</span>
+<span class="fc" id="L278">        }</span>
+
+        static class Counts
+        {
+            final long small, large, urgent;
+            Counts(long small, long large, long urgent)
+            {
+                this.small = small;
+                this.large = large;
+                this.urgent = urgent;
+            }
+        }
+
+        final MessagingService messagingService;
+<span class="fc" id="L292">        ObjectObjectHashMap&lt;InetAddressAndPort, Counts&gt; prevEndpointToCounts = new ObjectObjectHashMap&lt;&gt;();</span>
+
+        private void closeUnusedSinceLastRun()
+        {
+<span class="fc" id="L296">            ObjectObjectHashMap&lt;InetAddressAndPort, Counts&gt; curEndpointToCounts = new ObjectObjectHashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">            for (OutboundConnections connections : messagingService.channelManagers.values())</span>
+            {
+<span class="nc" id="L299">                Counts cur = new Counts(</span>
+<span class="nc" id="L300">                    connections.small.submittedCount(),</span>
+<span class="nc" id="L301">                    connections.large.submittedCount(),</span>
+<span class="nc" id="L302">                    connections.urgent.submittedCount()</span>
+                );
+<span class="nc" id="L304">                curEndpointToCounts.put(connections.template.to, cur);</span>
+
+<span class="nc" id="L306">                Counts prev = prevEndpointToCounts.get(connections.template.to);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (prev == null)</span>
+<span class="nc" id="L308">                    continue;</span>
+
+<span class="nc bnc" id="L310" title="All 6 branches missed.">                if (cur.small != prev.small &amp;&amp; cur.large != prev.large &amp;&amp; cur.urgent != prev.urgent)</span>
+<span class="nc" id="L311">                    continue;</span>
+
+<span class="nc bnc" id="L313" title="All 6 branches missed.">                if (cur.small == prev.small &amp;&amp; cur.large == prev.large &amp;&amp; cur.urgent == prev.urgent</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    &amp;&amp; !instance.isKnownEndpoint(connections.template.to))</span>
+                {
+<span class="nc" id="L316">                    logger.info(&quot;Closing outbound connections to {}, as inactive and not known by Gossiper&quot;,</span>
+                                connections.template.to);
+                    // close entirely if no traffic and the endpoint is unknown
+<span class="nc" id="L319">                    messagingService.closeOutboundNow(connections);</span>
+<span class="nc" id="L320">                    continue;</span>
+                }
+
+<span class="nc bnc" id="L323" title="All 2 branches missed.">                if (cur.small == prev.small)</span>
+<span class="nc" id="L324">                    connections.small.interrupt();</span>
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">                if (cur.large == prev.large)</span>
+<span class="nc" id="L327">                    connections.large.interrupt();</span>
+
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                if (cur.urgent == prev.urgent)</span>
+<span class="nc" id="L330">                    connections.urgent.interrupt();</span>
+<span class="nc" id="L331">            }</span>
+
+<span class="fc" id="L333">            prevEndpointToCounts = curEndpointToCounts;</span>
+<span class="fc" id="L334">        }</span>
+    }
+
+    static void scheduleUnusedConnectionMonitoring(MessagingService messagingService, ScheduledExecutorService executor, long delay, TimeUnit units)
+    {
+<span class="fc" id="L339">        executor.scheduleWithFixedDelay(new UnusedConnectionMonitor(messagingService)::closeUnusedSinceLastRun, 0L, delay, units);</span>
+<span class="fc" id="L340">    }</span>
+
+    @VisibleForTesting
+    static OutboundConnections unsafeCreate(OutboundConnectionSettings template)
+    {
+<span class="fc" id="L345">        OutboundConnections connections = new OutboundConnections(template);</span>
+<span class="fc" id="L346">        connections.metricsReady.signalAll();</span>
+<span class="fc" id="L347">        return connections;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

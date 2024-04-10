@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DiagnosticSnapshotService.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">DiagnosticSnapshotService.java</span></div><h1>DiagnosticSnapshotService.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.net.ParamType.SNAPSHOT_RANGES;
+
+/**
+ * Provides a means to take snapshots when triggered by anomalous events or when the breaking of invariants is
+ * detected. When debugging certain classes of problems, having access to the relevant set of sstables when the problem
+ * is detected (or as close to then as possible) can be invaluable.
+ *
+ * This class performs two functions; on a replica where an anomaly is detected, it provides methods to issue snapshot
+ * requests to a provided set of replicas. For instance, if rows with duplicate clusterings are detected
+ * (CASSANDRA-15789) during a read, a snapshot request will be issued to all participating replicas. If detected during
+ * compaction, only the replica itself will receive the request. Requests are issued at a maximum rate of 1 per minute
+ * for any given table. Any additional triggers for the same table during the 60 second window are dropped, regardless
+ * of the replica set. This window is configurable via a system property (cassandra.diagnostic_snapshot_interval_nanos),
+ * but this is intended for use in testing only and operators are not expected to override the default.
+ *
+ * The second function performed is to handle snapshot requests on replicas. Snapshot names are prefixed with strings
+ * specific to the reason which triggered them. To manage consumption of disk space, replicas are restricted to taking
+ * a single snapshot for each prefix in a single calendar day. So if duplicate rows are detected by multiple
+ * coordinators during reads with the same replica set (or overlapping sets) on the same table, the coordinators may
+ * each issue snapshot  requests, but the replicas will only accept the first one they receive. Further requests will
+ * be dropped on the replica side.
+ */
+public class DiagnosticSnapshotService
+{
+<span class="fc" id="L71">    private static final Logger logger = LoggerFactory.getLogger(DiagnosticSnapshotService.class);</span>
+
+<span class="fc" id="L73">    public static final DiagnosticSnapshotService instance =</span>
+<span class="fc" id="L74">        new DiagnosticSnapshotService(executorFactory().sequential(&quot;DiagnosticSnapshot&quot;));</span>
+
+    public static final String REPAIRED_DATA_MISMATCH_SNAPSHOT_PREFIX = &quot;RepairedDataMismatch-&quot;;
+    public static final String DUPLICATE_ROWS_DETECTED_SNAPSHOT_PREFIX = &quot;DuplicateRows-&quot;;
+    private static final int MAX_SNAPSHOT_RANGE_COUNT = 100; // otherwise, snapshot everything
+
+    private final Executor executor;
+
+    private DiagnosticSnapshotService(Executor executor)
+<span class="fc" id="L83">    {</span>
+<span class="fc" id="L84">        this.executor = executor;</span>
+<span class="fc" id="L85">    }</span>
+
+<span class="fc" id="L87">    private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.BASIC_ISO_DATE;</span>
+<span class="fc" id="L88">    private final ConcurrentHashMap&lt;TableId, AtomicLong&gt; lastSnapshotTimes = new ConcurrentHashMap&lt;&gt;();</span>
+
+    public static void repairedDataMismatch(TableMetadata metadata, Iterable&lt;InetAddressAndPort&gt; replicas)
+    {
+<span class="nc" id="L92">        repairedDataMismatch(metadata, replicas, Collections.emptyList());</span>
+<span class="nc" id="L93">    }</span>
+
+    public static void repairedDataMismatch(TableMetadata metadata, Iterable&lt;InetAddressAndPort&gt; replicas, List&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L97">        instance.maybeTriggerSnapshot(metadata, REPAIRED_DATA_MISMATCH_SNAPSHOT_PREFIX, replicas, ranges);</span>
+<span class="nc" id="L98">    }</span>
+
+    public static void duplicateRows(TableMetadata metadata, Iterable&lt;InetAddressAndPort&gt; replicas)
+    {
+<span class="fc" id="L102">        instance.maybeTriggerSnapshot(metadata, DUPLICATE_ROWS_DETECTED_SNAPSHOT_PREFIX, replicas);</span>
+<span class="fc" id="L103">    }</span>
+
+    public static boolean isDiagnosticSnapshotRequest(SnapshotCommand command)
+    {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        return command.snapshot_name.startsWith(REPAIRED_DATA_MISMATCH_SNAPSHOT_PREFIX)</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            || command.snapshot_name.startsWith(DUPLICATE_ROWS_DETECTED_SNAPSHOT_PREFIX);</span>
+    }
+
+    public static void snapshot(SnapshotCommand command, List&lt;Range&lt;Token&gt;&gt; ranges, InetAddressAndPort initiator)
+    {
+<span class="nc" id="L113">        Preconditions.checkArgument(isDiagnosticSnapshotRequest(command));</span>
+<span class="nc" id="L114">        instance.maybeSnapshot(command, ranges, initiator);</span>
+<span class="nc" id="L115">    }</span>
+
+    public static String getSnapshotName(String prefix)
+    {
+<span class="fc" id="L119">        return String.format(&quot;%s%s&quot;, prefix, DATE_FORMAT.format(LocalDate.now()));</span>
+    }
+
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L125">        ExecutorUtils.shutdownNowAndWait(timeout, unit, executor);</span>
+<span class="nc" id="L126">    }</span>
+
+    private void maybeTriggerSnapshot(TableMetadata metadata, String prefix, Iterable&lt;InetAddressAndPort&gt; endpoints)
+    {
+<span class="fc" id="L130">        maybeTriggerSnapshot(metadata, prefix, endpoints, Collections.emptyList());</span>
+<span class="fc" id="L131">    }</span>
+
+    private void maybeTriggerSnapshot(TableMetadata metadata, String prefix, Iterable&lt;InetAddressAndPort&gt; endpoints, List&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="fc" id="L135">        long now = nanoTime();</span>
+<span class="fc" id="L136">        AtomicLong cached = lastSnapshotTimes.computeIfAbsent(metadata.id, u -&gt; new AtomicLong(0));</span>
+<span class="fc" id="L137">        long last = cached.get();</span>
+<span class="fc" id="L138">        long interval = DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS.getLong();</span>
+<span class="pc bpc" id="L139" title="2 of 4 branches missed.">        if (now - last &gt; interval &amp;&amp; cached.compareAndSet(last, now))</span>
+        {
+<span class="fc" id="L141">            Message&lt;SnapshotCommand&gt; msg = Message.out(Verb.SNAPSHOT_REQ,</span>
+                                                       new SnapshotCommand(metadata.keyspace,
+                                                                           metadata.name,
+<span class="fc" id="L144">                                                                           getSnapshotName(prefix),</span>
+                                                                           false));
+
+<span class="pc bpc" id="L147" title="3 of 4 branches missed.">            if (!ranges.isEmpty() &amp;&amp; ranges.size() &lt; MAX_SNAPSHOT_RANGE_COUNT)</span>
+<span class="nc" id="L148">                msg = msg.withParam(SNAPSHOT_RANGES, ranges);</span>
+<span class="fc bfc" id="L149" title="All 2 branches covered.">            for (InetAddressAndPort replica : endpoints)</span>
+<span class="fc" id="L150">                MessagingService.instance().send(msg, replica);</span>
+<span class="fc" id="L151">        }</span>
+        else
+        {
+<span class="nc" id="L154">            logger.debug(&quot;Diagnostic snapshot request dropped due to throttling&quot;);</span>
+        }
+<span class="fc" id="L156">    }</span>
+
+    private void maybeSnapshot(SnapshotCommand command, List&lt;Range&lt;Token&gt;&gt; ranges, InetAddressAndPort initiator)
+    {
+<span class="nc" id="L160">        executor.execute(new DiagnosticSnapshotTask(command, ranges, initiator));</span>
+<span class="nc" id="L161">    }</span>
+
+    private static class DiagnosticSnapshotTask implements Runnable
+    {
+        final SnapshotCommand command;
+        final InetAddressAndPort from;
+        final List&lt;Range&lt;Token&gt;&gt; ranges;
+
+        DiagnosticSnapshotTask(SnapshotCommand command, List&lt;Range&lt;Token&gt;&gt; ranges, InetAddressAndPort from)
+        {
+            this.command = command;
+            this.ranges = ranges;
+            this.from = from;
+        }
+
+        public void run()
+        {
+            try
+            {
+                Keyspace ks = Keyspace.open(command.keyspace);
+                if (ks == null)
+                {
+                    logger.info(&quot;Snapshot request received from {} for {}.{} but keyspace not found&quot;,
+                                from,
+                                command.keyspace,
+                                command.column_family);
+                    return;
+                }
+
+                ColumnFamilyStore cfs = ks.getColumnFamilyStore(command.column_family);
+                if (cfs.snapshotExists(command.snapshot_name))
+                {
+                    logger.info(&quot;Received diagnostic snapshot request from {} for {}.{}, &quot; +
+                                &quot;but snapshot with tag {} already exists&quot;,
+                                from,
+                                command.keyspace,
+                                command.column_family,
+                                command.snapshot_name);
+                    return;
+                }
+                logger.info(&quot;Creating snapshot requested by {} of {}.{} tag: {}&quot;,
+                            from,
+                            command.keyspace,
+                            command.column_family,
+                            command.snapshot_name);
+
+                if (ranges.isEmpty())
+                    cfs.snapshot(command.snapshot_name);
+                else
+                {
+                    cfs.snapshot(command.snapshot_name,
+                                 (sstable) -&gt; checkIntersection(ranges,
+                                                                sstable.getFirst().getToken(),
+                                                                sstable.getLast().getToken()),
+                                 false, false);
+                }
+            }
+            catch (IllegalArgumentException e)
+            {
+                logger.warn(&quot;Snapshot request received from {} for {}.{} but CFS not found&quot;,
+                            from,
+                            command.keyspace,
+                            command.column_family);
+            }
+        }
+    }
+
+    private static boolean checkIntersection(List&lt;Range&lt;Token&gt;&gt; normalizedRanges, Token first, Token last)
+    {
+<span class="nc" id="L230">        Bounds&lt;Token&gt; bounds = new Bounds&lt;&gt;(first, last);</span>
+<span class="nc" id="L231">        return normalizedRanges.stream().anyMatch(range -&gt; range.intersects(bounds));</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Hint.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">Hint.java</span></div><h1>Hint.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
+import com.google.common.primitives.Ints;
+
+import javax.annotation.Nullable;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.vint.VIntCoding;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_MAX_HINT_TTL;
+import static org.apache.cassandra.db.TypeSizes.sizeof;
+import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+/**
+ * Encapsulates the hinted mutation, its creation time, and the gc grace seconds param for each table involved.
+ *
+ * - Why do we need to track hint creation time?
+ * - We must exclude updates for tables that have been truncated after hint's creation, otherwise the result is data corruption.
+ *
+ * - Why do we need to track gc grace seconds?
+ * - Hints can stay in storage for a while before being applied, and without recording gc grace seconds (+ creation time),
+ *   if we apply the mutation blindly, we risk resurrecting a deleted value, a tombstone for which had been already
+ *   compacted away while the hint was in storage.
+ *
+ *   We also look at the smallest current value of the gcgs param for each affected table when applying the hint, and use
+ *   creation time + min(recorded gc gs, current gcgs + current gc grace) as the overall hint expiration time.
+ *   This allows now to safely reduce gc gs on tables without worrying that an applied old hint might resurrect any data.
+ */
+public final class Hint
+{
+<span class="fc" id="L62">    public static final Serializer serializer = new Serializer();</span>
+<span class="fc" id="L63">    static final int maxHintTTL = CASSANDRA_MAX_HINT_TTL.getInt();</span>
+
+    final Mutation mutation;
+    final long creationTime;  // time of hint creation (in milliseconds)
+    final int gcgs; // the smallest gc gs of all involved tables (in seconds)
+
+    private Hint(Mutation mutation, long creationTime, int gcgs)
+<span class="fc" id="L70">    {</span>
+<span class="fc" id="L71">        this.mutation = mutation;</span>
+<span class="fc" id="L72">        this.creationTime = creationTime;</span>
+<span class="fc" id="L73">        this.gcgs = gcgs;</span>
+<span class="fc" id="L74">    }</span>
+
+    /**
+     * @param mutation the hinted mutation
+     * @param creationTime time of this hint's creation (in milliseconds since epoch)
+     */
+    public static Hint create(Mutation mutation, long creationTime)
+    {
+<span class="fc" id="L82">        return new Hint(mutation, creationTime, mutation.smallestGCGS());</span>
+    }
+
+    /*
+     * @param mutation the hinted mutation
+     * @param creationTime time of this hint's creation (in milliseconds since epoch)
+     * @param gcgs the smallest gcgs of all tables involved at the time of hint creation (in seconds)
+     */
+    public static Hint create(Mutation mutation, long creationTime, int gcgs)
+    {
+<span class="nc" id="L92">        return new Hint(mutation, creationTime, gcgs);</span>
+    }
+
+    /**
+     * Applies the contained mutation unless it's expired, filtering out any updates for truncated tables
+     */
+    Future&lt;?&gt; applyFuture()
+    {
+<span class="pc bpc" id="L100" title="1 of 2 branches missed.">        if (isLive())</span>
+        {
+            // filter out partition update for tables that have been truncated since hint's creation
+<span class="fc" id="L103">            Mutation filtered = mutation;</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">            for (TableId id : mutation.getTableIds())</span>
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">                if (creationTime &lt;= SystemKeyspace.getTruncatedAt(id))</span>
+<span class="nc" id="L106">                    filtered = filtered.without(id);</span>
+
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">            if (!filtered.isEmpty())</span>
+<span class="fc" id="L109">                return filtered.applyFuture();</span>
+        }
+
+<span class="nc" id="L112">        return ImmediateFuture.success(null);</span>
+    }
+
+    void apply()
+    {
+        try
+        {
+<span class="nc" id="L119">            applyFuture().get();</span>
+        }
+<span class="nc" id="L121">        catch (Exception e)</span>
+        {
+<span class="nc" id="L123">            Throwables.throwIfUnchecked(e.getCause());</span>
+<span class="nc" id="L124">            throw new RuntimeException(e.getCause());</span>
+<span class="nc" id="L125">        }</span>
+<span class="nc" id="L126">    }</span>
+
+    /**
+     * @return the overall ttl of the hint - the minimum of all mutation's tables' gc gs now and at the time of creation
+     */
+    int ttl()
+    {
+<span class="fc" id="L133">        return Math.min(gcgs, mutation.smallestGCGS());</span>
+    }
+
+    /**
+     * @return calculates whether or not it is safe to apply the hint without risking to resurrect any deleted data
+     */
+    public boolean isLive()
+    {
+<span class="fc" id="L141">        return isLive(creationTime, currentTimeMillis(), ttl());</span>
+    }
+
+    static boolean isLive(long creationTime, long now, int hintTTL)
+    {
+<span class="pc bpc" id="L146" title="1 of 2 branches missed.">        return expirationInMillis(creationTime, hintTTL) &gt; now;</span>
+    }
+
+    @VisibleForTesting
+    long expirationInMillis()
+    {
+<span class="nc" id="L152">        int smallestGCGS = Math.min(gcgs, mutation.smallestGCGS());</span>
+<span class="nc" id="L153">        return expirationInMillis(creationTime, smallestGCGS);</span>
+    }
+
+    private static long expirationInMillis(long creationTime, int hintTTL)
+    {
+<span class="fc" id="L158">        return creationTime + TimeUnit.SECONDS.toMillis(Math.min(hintTTL, maxHintTTL));</span>
+    }
+
+<span class="fc" id="L161">    static final class Serializer implements IVersionedSerializer&lt;Hint&gt;</span>
+    {
+        public long serializedSize(Hint hint, int version)
+        {
+<span class="fc" id="L165">            long size = sizeof(hint.creationTime);</span>
+<span class="fc" id="L166">            size += sizeofUnsignedVInt(hint.gcgs);</span>
+<span class="fc" id="L167">            size += hint.mutation.serializedSize(version);</span>
+<span class="fc" id="L168">            return size;</span>
+        }
+
+        public void serialize(Hint hint, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L173">            out.writeLong(hint.creationTime);</span>
+<span class="fc" id="L174">            out.writeUnsignedVInt32(hint.gcgs);</span>
+<span class="fc" id="L175">            Mutation.serializer.serialize(hint.mutation, out, version);</span>
+<span class="fc" id="L176">        }</span>
+
+        public Hint deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L180">            long creationTime = in.readLong();</span>
+<span class="fc" id="L181">            int gcgs = in.readUnsignedVInt32();</span>
+<span class="fc" id="L182">            return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);</span>
+        }
+
+        public long getHintCreationTime(ByteBuffer hintBuffer, int version)
+        {
+<span class="fc" id="L187">            return hintBuffer.getLong(0);</span>
+        }
+
+        /**
+         * Will short-circuit Mutation deserialization if the hint is definitely dead. If a Hint instance is
+         * returned, there is a chance it's live, if gcgs on one of the table involved got reduced between
+         * hint creation and deserialization, but this does not impact correctness - an extra liveness check will
+         * also be performed on the receiving end.
+         *
+         * @return null if the hint is definitely dead, a Hint instance if it's likely live
+         */
+        @Nullable
+        Hint deserializeIfLive(DataInputPlus in, long now, long size, int version) throws IOException
+        {
+<span class="nc" id="L201">            long creationTime = in.readLong();</span>
+<span class="nc" id="L202">            int gcgs = in.readUnsignedVInt32();</span>
+<span class="nc" id="L203">            int bytesRead = sizeof(creationTime) + sizeofUnsignedVInt(gcgs);</span>
+
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (isLive(creationTime, now, gcgs))</span>
+<span class="nc" id="L206">                return new Hint(Mutation.serializer.deserialize(in, version), creationTime, gcgs);</span>
+
+<span class="nc" id="L208">            in.skipBytesFully(Ints.checkedCast(size) - bytesRead);</span>
+<span class="nc" id="L209">            return null;</span>
+        }
+
+        /**
+         * Will short-circuit ByteBuffer allocation if the hint is definitely dead. If a ByteBuffer instance is
+         * returned, there is a chance it's live, if gcgs on one of the table involved got reduced between
+         * hint creation and deserialization, but this does not impact correctness - an extra liveness check will
+         * also be performed on the receiving end.
+         *
+         * @return null if the hint is definitely dead, a ByteBuffer instance if it's likely live
+         */
+        @Nullable
+        ByteBuffer readBufferIfLive(DataInputPlus in, long now, int size, int version) throws IOException
+        {
+<span class="fc" id="L223">            int maxHeaderSize = Math.min(sizeof(Long.MAX_VALUE) + VIntCoding.MAX_SIZE, size);</span>
+<span class="fc" id="L224">            byte[] header = new byte[maxHeaderSize];</span>
+<span class="fc" id="L225">            in.readFully(header);</span>
+
+<span class="fc" id="L227">            try (DataInputBuffer input = new DataInputBuffer(header))</span>
+            {
+<span class="fc" id="L229">                long creationTime = input.readLong();</span>
+<span class="fc" id="L230">                int gcgs = input.readUnsignedVInt32();</span>
+
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">                if (!isLive(creationTime, now, gcgs))</span>
+                {
+<span class="nc" id="L234">                    in.skipBytesFully(size - maxHeaderSize);</span>
+<span class="nc" id="L235">                    return null;</span>
+                }
+<span class="nc" id="L237">            }</span>
+
+<span class="fc" id="L239">            byte[] bytes = new byte[size];</span>
+<span class="fc" id="L240">            System.arraycopy(header, 0, bytes, 0, header.length);</span>
+<span class="fc" id="L241">            in.readFully(bytes, header.length, size - header.length);</span>
+<span class="fc" id="L242">            return ByteBuffer.wrap(bytes);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

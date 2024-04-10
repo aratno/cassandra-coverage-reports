@@ -1,0 +1,442 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DynamicEndpointSnitch.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.locator</a> &gt; <span class="el_source">DynamicEndpointSnitch.java</span></div><h1>DynamicEndpointSnitch.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.locator;
+
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import com.codahale.metrics.ExponentiallyDecayingReservoir;
+
+import com.codahale.metrics.Snapshot;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.net.LatencySubscribers;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MBeanWrapper;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.IGNORE_DYNAMIC_SNITCH_SEVERITY;
+
+/**
+ * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
+ */
+public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements LatencySubscribers.Subscriber, DynamicEndpointSnitchMBean
+{
+<span class="pc bpc" id="L53" title="1 of 2 branches missed.">    private static final boolean USE_SEVERITY = !IGNORE_DYNAMIC_SNITCH_SEVERITY.getBoolean();</span>
+
+    private static final double ALPHA = 0.75; // set to 0.75 to make EDS more biased to towards the newer values
+    private static final int WINDOW_SIZE = 100;
+
+<span class="fc" id="L58">    private volatile int dynamicUpdateInterval = DatabaseDescriptor.getDynamicUpdateInterval();</span>
+<span class="fc" id="L59">    private volatile int dynamicResetInterval = DatabaseDescriptor.getDynamicResetInterval();</span>
+<span class="fc" id="L60">    private volatile double dynamicBadnessThreshold = DatabaseDescriptor.getDynamicBadnessThreshold();</span>
+
+    // the score for a merged set of endpoints must be this much worse than the score for separate endpoints to
+    // warrant not merging two ranges into a single range
+    private static final double RANGE_MERGING_PREFERENCE = 1.5;
+
+    private String mbeanName;
+<span class="fc" id="L67">    private boolean registered = false;</span>
+
+<span class="fc" id="L69">    private volatile HashMap&lt;InetAddressAndPort, Double&gt; scores = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L70">    private final ConcurrentHashMap&lt;InetAddressAndPort, ExponentiallyDecayingReservoir&gt; samples = new ConcurrentHashMap&lt;&gt;();</span>
+
+    public final IEndpointSnitch subsnitch;
+
+    private volatile ScheduledFuture&lt;?&gt; updateSchedular;
+    private volatile ScheduledFuture&lt;?&gt; resetSchedular;
+
+    private final Runnable update;
+    private final Runnable reset;
+
+    public DynamicEndpointSnitch(IEndpointSnitch snitch)
+    {
+<span class="fc" id="L82">        this(snitch, null);</span>
+<span class="fc" id="L83">    }</span>
+
+    public DynamicEndpointSnitch(IEndpointSnitch snitch, String instance)
+<span class="fc" id="L86">    {</span>
+<span class="fc" id="L87">        mbeanName = &quot;org.apache.cassandra.db:type=DynamicEndpointSnitch&quot;;</span>
+<span class="fc bfc" id="L88" title="All 2 branches covered.">        if (instance != null)</span>
+<span class="fc" id="L89">            mbeanName += &quot;,instance=&quot; + instance;</span>
+<span class="fc" id="L90">        subsnitch = snitch;</span>
+<span class="fc" id="L91">        update = new Runnable()</span>
+<span class="fc" id="L92">        {</span>
+            public void run()
+            {
+<span class="fc" id="L95">                updateScores();</span>
+<span class="fc" id="L96">            }</span>
+        };
+<span class="fc" id="L98">        reset = new Runnable()</span>
+<span class="fc" id="L99">        {</span>
+            public void run()
+            {
+                // we do this so that a host considered bad has a chance to recover, otherwise would we never try
+                // to read from it, which would cause its score to never change
+<span class="nc" id="L104">                reset();</span>
+<span class="nc" id="L105">            }</span>
+        };
+
+<span class="fc bfc" id="L108" title="All 2 branches covered.">        if (DatabaseDescriptor.isDaemonInitialized())</span>
+        {
+<span class="fc" id="L110">            updateSchedular = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(update, dynamicUpdateInterval, dynamicUpdateInterval, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L111">            resetSchedular = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(reset, dynamicResetInterval, dynamicResetInterval, TimeUnit.MILLISECONDS);</span>
+<span class="fc" id="L112">            registerMBean();</span>
+        }
+<span class="fc" id="L114">    }</span>
+
+    /**
+     * Update configuration from {@link DatabaseDescriptor} and estart the update-scheduler and reset-scheduler tasks
+     * if the configured rates for these tasks have changed.
+     */
+    public void applyConfigChanges()
+    {
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        if (dynamicUpdateInterval != DatabaseDescriptor.getDynamicUpdateInterval())</span>
+        {
+<span class="nc" id="L124">            dynamicUpdateInterval = DatabaseDescriptor.getDynamicUpdateInterval();</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            if (DatabaseDescriptor.isDaemonInitialized())</span>
+            {
+<span class="nc" id="L127">                updateSchedular.cancel(false);</span>
+<span class="nc" id="L128">                updateSchedular = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(update, dynamicUpdateInterval, dynamicUpdateInterval, TimeUnit.MILLISECONDS);</span>
+            }
+        }
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (dynamicResetInterval != DatabaseDescriptor.getDynamicResetInterval())</span>
+        {
+<span class="nc" id="L134">            dynamicResetInterval = DatabaseDescriptor.getDynamicResetInterval();</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (DatabaseDescriptor.isDaemonInitialized())</span>
+            {
+<span class="nc" id="L137">                resetSchedular.cancel(false);</span>
+<span class="nc" id="L138">                resetSchedular = ScheduledExecutors.scheduledTasks.scheduleWithFixedDelay(reset, dynamicResetInterval, dynamicResetInterval, TimeUnit.MILLISECONDS);</span>
+            }
+        }
+
+<span class="nc" id="L142">        dynamicBadnessThreshold = DatabaseDescriptor.getDynamicBadnessThreshold();</span>
+<span class="nc" id="L143">    }</span>
+
+    private void registerMBean()
+    {
+<span class="fc" id="L147">        MBeanWrapper.instance.registerMBean(this, mbeanName);</span>
+<span class="fc" id="L148">    }</span>
+
+    public void close()
+    {
+<span class="nc" id="L152">        updateSchedular.cancel(false);</span>
+<span class="nc" id="L153">        resetSchedular.cancel(false);</span>
+
+<span class="nc" id="L155">        MBeanWrapper.instance.unregisterMBean(mbeanName);</span>
+<span class="nc" id="L156">    }</span>
+
+    @Override
+    public void gossiperStarting()
+    {
+<span class="fc" id="L161">        subsnitch.gossiperStarting();</span>
+<span class="fc" id="L162">    }</span>
+
+    public String getRack(InetAddressAndPort endpoint)
+    {
+<span class="fc" id="L166">        return subsnitch.getRack(endpoint);</span>
+    }
+
+    public String getDatacenter(InetAddressAndPort endpoint)
+    {
+<span class="fc" id="L171">        return subsnitch.getDatacenter(endpoint);</span>
+    }
+
+    @Override
+    public &lt;C extends ReplicaCollection&lt;? extends C&gt;&gt; C sortedByProximity(final InetAddressAndPort address, C unsortedAddresses)
+    {
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        assert address.equals(FBUtilities.getBroadcastAddressAndPort()); // we only know about ourself</span>
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">        return dynamicBadnessThreshold == 0</span>
+<span class="nc" id="L179">                ? sortedByProximityWithScore(address, unsortedAddresses)</span>
+<span class="fc" id="L180">                : sortedByProximityWithBadness(address, unsortedAddresses);</span>
+    }
+
+    private &lt;C extends ReplicaCollection&lt;? extends C&gt;&gt; C sortedByProximityWithScore(final InetAddressAndPort address, C unsortedAddresses)
+    {
+        // Scores can change concurrently from a call to this method. But Collections.sort() expects
+        // its comparator to be &quot;stable&quot;, that is 2 endpoint should compare the same way for the duration
+        // of the sort() call. As we copy the scores map on write, it is thus enough to alias the current
+        // version of it during this call.
+<span class="fc" id="L189">        final HashMap&lt;InetAddressAndPort, Double&gt; scores = this.scores;</span>
+<span class="fc" id="L190">        return unsortedAddresses.sorted((r1, r2) -&gt; compareEndpoints(address, r1, r2, scores));</span>
+    }
+
+    private &lt;C extends ReplicaCollection&lt;? extends C&gt;&gt; C sortedByProximityWithBadness(final InetAddressAndPort address, C replicas)
+    {
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        if (replicas.size() &lt; 2)</span>
+<span class="fc" id="L196">            return replicas;</span>
+
+        // TODO: avoid copy
+<span class="fc" id="L199">        replicas = subsnitch.sortedByProximity(address, replicas);</span>
+<span class="fc" id="L200">        HashMap&lt;InetAddressAndPort, Double&gt; scores = this.scores; // Make sure the score don't change in the middle of the loop below</span>
+                                                           // (which wouldn't really matter here but its cleaner that way).
+<span class="fc" id="L202">        ArrayList&lt;Double&gt; subsnitchOrderedScores = new ArrayList&lt;&gt;(replicas.size());</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">        for (Replica replica : replicas)</span>
+        {
+<span class="fc" id="L205">            Double score = scores.get(replica.endpoint());</span>
+<span class="fc bfc" id="L206" title="All 2 branches covered.">            if (score == null)</span>
+<span class="fc" id="L207">                score = defaultStore(replica.endpoint());</span>
+<span class="fc" id="L208">            subsnitchOrderedScores.add(score);</span>
+<span class="fc" id="L209">        }</span>
+
+        // Sort the scores and then compare them (positionally) to the scores in the subsnitch order.
+        // If any of the subsnitch-ordered scores exceed the optimal/sorted score by dynamicBadnessThreshold, use
+        // the score-sorted ordering instead of the subsnitch ordering.
+<span class="fc" id="L214">        ArrayList&lt;Double&gt; sortedScores = new ArrayList&lt;&gt;(subsnitchOrderedScores);</span>
+<span class="fc" id="L215">        Collections.sort(sortedScores);</span>
+
+        // only calculate this once b/c its volatile and shouldn't be modified during the loop either
+<span class="fc" id="L218">        double badnessThreshold = 1.0 + dynamicBadnessThreshold;</span>
+<span class="fc" id="L219">        Iterator&lt;Double&gt; sortedScoreIterator = sortedScores.iterator();</span>
+<span class="fc bfc" id="L220" title="All 2 branches covered.">        for (Double subsnitchScore : subsnitchOrderedScores)</span>
+        {
+<span class="fc bfc" id="L222" title="All 2 branches covered.">            if (subsnitchScore &gt; (sortedScoreIterator.next() * badnessThreshold))</span>
+            {
+<span class="fc" id="L224">                return sortedByProximityWithScore(address, replicas);</span>
+            }
+<span class="fc" id="L226">        }</span>
+
+<span class="fc" id="L228">        return replicas;</span>
+    }
+
+    private static double defaultStore(InetAddressAndPort target)
+    {
+<span class="pc bpc" id="L233" title="1 of 2 branches missed.">        return USE_SEVERITY ? getSeverity(target) : 0.0;</span>
+    }
+
+    // Compare endpoints given an immutable snapshot of the scores
+    private int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2, Map&lt;InetAddressAndPort, Double&gt; scores)
+    {
+<span class="fc" id="L239">        Double scored1 = scores.get(a1.endpoint());</span>
+<span class="fc" id="L240">        Double scored2 = scores.get(a2.endpoint());</span>
+        
+<span class="fc bfc" id="L242" title="All 2 branches covered.">        if (scored1 == null)</span>
+        {
+<span class="fc" id="L244">            scored1 = defaultStore(a1.endpoint());</span>
+        }
+
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (scored2 == null)</span>
+        {
+<span class="nc" id="L249">            scored2 = defaultStore(a2.endpoint());</span>
+        }
+
+<span class="fc bfc" id="L252" title="All 2 branches covered.">        if (scored1.equals(scored2))</span>
+<span class="fc" id="L253">            return subsnitch.compareEndpoints(target, a1, a2);</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">        if (scored1 &lt; scored2)</span>
+<span class="fc" id="L255">            return -1;</span>
+        else
+<span class="fc" id="L257">            return 1;</span>
+    }
+
+    public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
+    {
+        // That function is fundamentally unsafe because the scores can change at any time and so the result of that
+        // method is not stable for identical arguments. This is why we don't rely on super.sortByProximity() in
+        // sortByProximityWithScore().
+<span class="nc" id="L265">        throw new UnsupportedOperationException(&quot;You shouldn't wrap the DynamicEndpointSnitch (within itself or otherwise)&quot;);</span>
+    }
+
+    public void receiveTiming(InetAddressAndPort host, long latency, TimeUnit unit) // this is cheap
+    {
+<span class="fc" id="L270">        ExponentiallyDecayingReservoir sample = samples.get(host);</span>
+<span class="fc bfc" id="L271" title="All 2 branches covered.">        if (sample == null)</span>
+        {
+<span class="fc" id="L273">            ExponentiallyDecayingReservoir maybeNewSample = new ExponentiallyDecayingReservoir(WINDOW_SIZE, ALPHA);</span>
+<span class="fc" id="L274">            sample = samples.putIfAbsent(host, maybeNewSample);</span>
+<span class="fc bfc" id="L275" title="All 2 branches covered.">            if (sample == null)</span>
+<span class="fc" id="L276">                sample = maybeNewSample;</span>
+        }
+<span class="fc" id="L278">        sample.update(unit.toMillis(latency));</span>
+<span class="fc" id="L279">    }</span>
+
+    @VisibleForTesting
+    public void updateScores() // this is expensive
+    {
+<span class="fc bfc" id="L284" title="All 2 branches covered.">        if (!StorageService.instance.isInitialized())</span>
+<span class="fc" id="L285">            return;</span>
+<span class="fc bfc" id="L286" title="All 2 branches covered.">        if (!registered)</span>
+        {
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">            if (MessagingService.instance() != null)</span>
+            {
+<span class="fc" id="L290">                MessagingService.instance().latencySubscribers.subscribe(this);</span>
+<span class="fc" id="L291">                registered = true;</span>
+            }
+
+        }
+<span class="fc" id="L295">        double maxLatency = 1;</span>
+
+<span class="fc" id="L297">        Map&lt;InetAddressAndPort, Snapshot&gt; snapshots = new HashMap&lt;&gt;(samples.size());</span>
+<span class="fc bfc" id="L298" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, ExponentiallyDecayingReservoir&gt; entry : samples.entrySet())</span>
+        {
+<span class="fc" id="L300">            snapshots.put(entry.getKey(), entry.getValue().getSnapshot());</span>
+<span class="fc" id="L301">        }</span>
+
+        // We're going to weight the latency for each host against the worst one we see, to
+        // arrive at sort of a 'badness percentage' for them. First, find the worst for each:
+<span class="fc" id="L305">        HashMap&lt;InetAddressAndPort, Double&gt; newScores = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, Snapshot&gt; entry : snapshots.entrySet())</span>
+        {
+<span class="fc" id="L308">            double mean = entry.getValue().getMedian();</span>
+<span class="fc bfc" id="L309" title="All 2 branches covered.">            if (mean &gt; maxLatency)</span>
+<span class="fc" id="L310">                maxLatency = mean;</span>
+<span class="fc" id="L311">        }</span>
+        // now make another pass to do the weighting based on the maximums we found before
+<span class="fc bfc" id="L313" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, Snapshot&gt; entry : snapshots.entrySet())</span>
+        {
+<span class="fc" id="L315">            double score = entry.getValue().getMedian() / maxLatency;</span>
+            // finally, add the severity without any weighting, since hosts scale this relative to their own load and the size of the task causing the severity.
+            // &quot;Severity&quot; is basically a measure of compaction activity (CASSANDRA-3722).
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">            if (USE_SEVERITY)</span>
+<span class="fc" id="L319">                score += getSeverity(entry.getKey());</span>
+            // lowest score (least amount of badness) wins.
+<span class="fc" id="L321">            newScores.put(entry.getKey(), score);</span>
+<span class="fc" id="L322">        }</span>
+<span class="fc" id="L323">        scores = newScores;</span>
+<span class="fc" id="L324">    }</span>
+
+    private void reset()
+    {
+<span class="nc" id="L328">       samples.clear();</span>
+<span class="nc" id="L329">    }</span>
+
+    public Map&lt;InetAddress, Double&gt; getScores()
+    {
+<span class="nc" id="L333">        return scores.entrySet().stream().collect(Collectors.toMap(address -&gt; address.getKey().getAddress(), Map.Entry::getValue));</span>
+    }
+
+    public Map&lt;String, Double&gt; getScoresWithPort()
+    {
+<span class="nc" id="L338">        return scores.entrySet().stream().collect(Collectors.toMap(address -&gt; address.getKey().toString(true), Map.Entry::getValue));</span>
+    }
+
+    public int getUpdateInterval()
+    {
+<span class="nc" id="L343">        return dynamicUpdateInterval;</span>
+    }
+    public int getResetInterval()
+    {
+<span class="nc" id="L347">        return dynamicResetInterval;</span>
+    }
+    public double getBadnessThreshold()
+    {
+<span class="nc" id="L351">        return dynamicBadnessThreshold;</span>
+    }
+
+    public String getSubsnitchClassName()
+    {
+<span class="nc" id="L356">        return subsnitch.getClass().getName();</span>
+    }
+
+    public List&lt;Double&gt; dumpTimings(String hostname) throws UnknownHostException
+    {
+<span class="nc" id="L361">        InetAddressAndPort host = InetAddressAndPort.getByName(hostname);</span>
+<span class="nc" id="L362">        ArrayList&lt;Double&gt; timings = new ArrayList&lt;Double&gt;();</span>
+<span class="nc" id="L363">        ExponentiallyDecayingReservoir sample = samples.get(host);</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (sample != null)</span>
+        {
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            for (double time: sample.getSnapshot().getValues())</span>
+<span class="nc" id="L367">                timings.add(time);</span>
+        }
+<span class="nc" id="L369">        return timings;</span>
+    }
+
+    @Override
+    public void setSeverity(double severity)
+    {
+<span class="nc" id="L375">        addSeverity(severity);</span>
+<span class="nc" id="L376">    }</span>
+
+    public static void addSeverity(double severity)
+    {
+<span class="nc" id="L380">        Gossiper.instance.addLocalApplicationState(ApplicationState.SEVERITY, StorageService.instance.valueFactory.severity(severity));</span>
+<span class="nc" id="L381">    }</span>
+
+    @VisibleForTesting
+    public static double getSeverity(InetAddressAndPort endpoint)
+    {
+<span class="fc" id="L386">        EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(endpoint);</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">        if (state == null)</span>
+<span class="fc" id="L388">            return 0.0;</span>
+
+<span class="fc" id="L390">        VersionedValue event = state.getApplicationState(ApplicationState.SEVERITY);</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">        if (event == null)</span>
+<span class="fc" id="L392">            return 0.0;</span>
+
+<span class="nc" id="L394">        return Double.parseDouble(event.value);</span>
+    }
+
+    public double getSeverity()
+    {
+<span class="nc" id="L399">        return getSeverity(FBUtilities.getBroadcastAddressAndPort());</span>
+    }
+
+    public boolean isWorthMergingForRangeQuery(ReplicaCollection&lt;?&gt; merged, ReplicaCollection&lt;?&gt; l1, ReplicaCollection&lt;?&gt; l2)
+    {
+<span class="pc bpc" id="L404" title="1 of 2 branches missed.">        if (!subsnitch.isWorthMergingForRangeQuery(merged, l1, l2))</span>
+<span class="nc" id="L405">            return false;</span>
+
+        // skip checking scores in the single-node case
+<span class="pc bpc" id="L408" title="3 of 6 branches missed.">        if (l1.size() == 1 &amp;&amp; l2.size() == 1 &amp;&amp; l1.get(0).equals(l2.get(0)))</span>
+<span class="fc" id="L409">            return true;</span>
+
+        // Make sure we return the subsnitch decision (i.e true if we're here) if we lack too much scores
+<span class="nc" id="L412">        double maxMerged = maxScore(merged);</span>
+<span class="nc" id="L413">        double maxL1 = maxScore(l1);</span>
+<span class="nc" id="L414">        double maxL2 = maxScore(l2);</span>
+<span class="nc bnc" id="L415" title="All 6 branches missed.">        if (maxMerged &lt; 0 || maxL1 &lt; 0 || maxL2 &lt; 0)</span>
+<span class="nc" id="L416">            return true;</span>
+
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        return maxMerged &lt;= (maxL1 + maxL2) * RANGE_MERGING_PREFERENCE;</span>
+    }
+
+    // Return the max score for the endpoint in the provided list, or -1.0 if no node have a score.
+    private double maxScore(ReplicaCollection&lt;?&gt; endpoints)
+    {
+<span class="nc" id="L424">        double maxScore = -1.0;</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        for (Replica replica : endpoints)</span>
+        {
+<span class="nc" id="L427">            Double score = scores.get(replica.endpoint());</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            if (score == null)</span>
+<span class="nc" id="L429">                continue;</span>
+
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            if (score &gt; maxScore)</span>
+<span class="nc" id="L432">                maxScore = score;</span>
+<span class="nc" id="L433">        }</span>
+<span class="nc" id="L434">        return maxScore;</span>
+    }
+
+    public boolean validate(Set&lt;String&gt; datacenters, Set&lt;String&gt; racks)
+    {
+<span class="fc" id="L439">        return subsnitch.validate(datacenters, racks);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

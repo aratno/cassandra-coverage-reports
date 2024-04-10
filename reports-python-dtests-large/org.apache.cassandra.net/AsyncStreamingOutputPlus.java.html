@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AsyncStreamingOutputPlus.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">AsyncStreamingOutputPlus.java</span></div><h1>AsyncStreamingOutputPlus.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.DefaultFileRegion;
+import io.netty.channel.FileRegion;
+import io.netty.channel.WriteBufferWaterMark;
+import io.netty.handler.ssl.SslHandler;
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.net.SharedDefaultFileRegion.SharedFileChannel;
+import org.apache.cassandra.streaming.StreamingDataOutputPlus;
+import org.apache.cassandra.utils.memory.BufferPool;
+import org.apache.cassandra.utils.memory.BufferPools;
+
+import static java.lang.Math.min;
+
+/**
+ * A {@link DataOutputStreamPlus} that writes ASYNCHRONOUSLY to a Netty Channel.
+ *
+ * The close() and flush() methods synchronously wait for pending writes, and will propagate any exceptions
+ * encountered in writing them to the wire.
+ *
+ * The correctness of this class depends on the ChannelPromise we create against a Channel always being completed,
+ * which appears to be a guarantee provided by Netty so long as the event loop is running.
+ */
+public class AsyncStreamingOutputPlus extends AsyncChannelOutputPlus implements StreamingDataOutputPlus
+{
+<span class="fc" id="L56">    private static final Logger logger = LoggerFactory.getLogger(AsyncStreamingOutputPlus.class);</span>
+
+<span class="fc" id="L58">    private final BufferPool bufferPool = BufferPools.forNetworking();</span>
+
+    final int defaultLowWaterMark;
+    final int defaultHighWaterMark;
+
+    public AsyncStreamingOutputPlus(Channel channel)
+    {
+<span class="fc" id="L65">        super(channel);</span>
+<span class="fc" id="L66">        WriteBufferWaterMark waterMark = channel.config().getWriteBufferWaterMark();</span>
+<span class="fc" id="L67">        this.defaultLowWaterMark = waterMark.low();</span>
+<span class="fc" id="L68">        this.defaultHighWaterMark = waterMark.high();</span>
+<span class="fc" id="L69">        allocateBuffer();</span>
+<span class="fc" id="L70">    }</span>
+
+    private void allocateBuffer()
+    {
+        // this buffer is only used for small quantities of data
+<span class="fc" id="L75">        buffer = bufferPool.getAtLeast(8 &lt;&lt; 10, BufferType.OFF_HEAP);</span>
+<span class="fc" id="L76">    }</span>
+
+    @Override
+    protected void doFlush(int count) throws IOException
+    {
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">        if (!channel.isOpen())</span>
+<span class="nc" id="L82">            throw new ClosedChannelException();</span>
+
+        // flush the current backing write buffer only if there's any pending data
+<span class="fc" id="L85">        ByteBuffer flush = buffer;</span>
+<span class="fc bfc" id="L86" title="All 2 branches covered.">        if (flush.position() == 0)</span>
+<span class="fc" id="L87">            return;</span>
+
+<span class="fc" id="L89">        flush.flip();</span>
+<span class="fc" id="L90">        int byteCount = flush.limit();</span>
+<span class="fc" id="L91">        ChannelPromise promise = beginFlush(byteCount, 0, Integer.MAX_VALUE);</span>
+<span class="fc" id="L92">        channel.writeAndFlush(GlobalBufferPoolAllocator.wrap(flush), promise);</span>
+<span class="fc" id="L93">        allocateBuffer();</span>
+<span class="fc" id="L94">    }</span>
+
+    public long position()
+    {
+<span class="nc" id="L98">        return flushed() + buffer.position();</span>
+    }
+
+    /**
+     * Provide a lambda that can request a buffer of suitable size, then fill the buffer and have
+     * that buffer written and flushed to the underlying channel, without having to handle buffer
+     * allocation, lifetime or cleanup, including in case of exceptions.
+     * &lt;p&gt;
+     * Any exception thrown by the Write will be propagated to the caller, after any buffer is cleaned up.
+     */
+    public int writeToChannel(Write write, RateLimiter limiter) throws IOException
+    {
+<span class="fc" id="L110">        doFlush(0);</span>
+<span class="fc" id="L111">        class Holder</span>
+        {
+            ChannelPromise promise;
+            ByteBuffer buffer;
+        }
+<span class="fc" id="L116">        Holder holder = new Holder();</span>
+
+        try
+        {
+<span class="fc" id="L120">            write.write(size -&gt; {</span>
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">                if (holder.buffer != null)</span>
+<span class="nc" id="L122">                    throw new IllegalStateException(&quot;Can only allocate one ByteBuffer&quot;);</span>
+<span class="fc" id="L123">                limiter.acquire(size);</span>
+<span class="fc" id="L124">                holder.promise = beginFlush(size, defaultLowWaterMark, defaultHighWaterMark);</span>
+<span class="fc" id="L125">                holder.buffer = bufferPool.get(size, BufferType.OFF_HEAP);</span>
+<span class="fc" id="L126">                return holder.buffer;</span>
+            });
+        }
+<span class="nc" id="L129">        catch (Throwable t)</span>
+        {
+            // we don't currently support cancelling the flush, but at this point we are recoverable if we want
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            if (holder.buffer != null)</span>
+<span class="nc" id="L133">                bufferPool.put(holder.buffer);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (holder.promise != null)</span>
+<span class="nc" id="L135">                holder.promise.tryFailure(t);</span>
+<span class="nc" id="L136">            throw t;</span>
+<span class="fc" id="L137">        }</span>
+
+<span class="fc" id="L139">        ByteBuffer buffer = holder.buffer;</span>
+<span class="fc" id="L140">        bufferPool.putUnusedPortion(buffer);</span>
+
+<span class="fc" id="L142">        int length = buffer.limit();</span>
+<span class="fc" id="L143">        channel.writeAndFlush(GlobalBufferPoolAllocator.wrap(buffer), holder.promise);</span>
+<span class="fc" id="L144">        return length;</span>
+    }
+
+    /**
+     * Writes all data in file channel to stream: &lt;br&gt;
+     * * For zero-copy-streaming, 1MiB at a time, with at most 2MiB in flight at once. &lt;br&gt;
+     * * For streaming with SSL, 64KiB at a time, with at most 32+64KiB (default low water mark + batch size) in flight. &lt;br&gt;
+     * &lt;p&gt;
+     * This method takes ownership of the provided {@link FileChannel}.
+     * &lt;p&gt;
+     * WARNING: this method blocks only for permission to write to the netty channel; it exits before
+     * the {@link FileRegion}(zero-copy) or {@link ByteBuffer}(ssl) is flushed to the network.
+     */
+    public long writeFileToChannel(FileChannel file, RateLimiter limiter) throws IOException
+    {
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">        if (channel.pipeline().get(SslHandler.class) != null)</span>
+            // each batch is loaded into ByteBuffer, 64KiB is more BufferPool friendly.
+<span class="nc" id="L161">            return writeFileToChannel(file, limiter, 1 &lt;&lt; 16);</span>
+        else
+            // write files in 1MiB chunks, since there may be blocking work performed to fetch it from disk,
+            // the data is never brought in process and is gated by the wire anyway
+<span class="fc" id="L165">            return writeFileToChannelZeroCopy(file, limiter, 1 &lt;&lt; 20, 1 &lt;&lt; 20, 2 &lt;&lt; 20);</span>
+    }
+
+    @VisibleForTesting
+    long writeFileToChannel(FileChannel fc, RateLimiter limiter, int batchSize) throws IOException
+    {
+<span class="nc" id="L171">        final long length = fc.size();</span>
+<span class="nc" id="L172">        long bytesTransferred = 0;</span>
+
+        try
+        {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            while (bytesTransferred &lt; length)</span>
+            {
+<span class="nc" id="L178">                int toWrite = (int) min(batchSize, length - bytesTransferred);</span>
+<span class="nc" id="L179">                final long position = bytesTransferred;</span>
+
+<span class="nc" id="L181">                writeToChannel(bufferSupplier -&gt; {</span>
+<span class="nc" id="L182">                    ByteBuffer outBuffer = bufferSupplier.get(toWrite);</span>
+<span class="nc" id="L183">                    long read = fc.read(outBuffer, position);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                    if (read != toWrite)</span>
+<span class="nc" id="L185">                        throw new IOException(String.format(&quot;could not read required number of bytes from &quot; +</span>
+                                                            &quot;file to be streamed: read %d bytes, wanted %d bytes&quot;,
+<span class="nc" id="L187">                                                            read, toWrite));</span>
+<span class="nc" id="L188">                    outBuffer.flip();</span>
+<span class="nc" id="L189">                }, limiter);</span>
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L192">                    logger.trace(&quot;Writing {} bytes at position {} of {}&quot;, toWrite, bytesTransferred, length);</span>
+<span class="nc" id="L193">                bytesTransferred += toWrite;</span>
+<span class="nc" id="L194">            }</span>
+        }
+        finally
+        {
+            // we don't need to wait until byte buffer is flushed by netty
+<span class="nc" id="L199">            fc.close();</span>
+        }
+
+<span class="nc" id="L202">        return bytesTransferred;</span>
+    }
+
+    @VisibleForTesting
+    long writeFileToChannelZeroCopy(FileChannel file, RateLimiter limiter, int batchSize, int lowWaterMark, int highWaterMark) throws IOException
+    {
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        if (!limiter.isRateLimited())</span>
+<span class="nc" id="L209">            return writeFileToChannelZeroCopyUnthrottled(file);</span>
+        else
+<span class="fc" id="L211">            return writeFileToChannelZeroCopyThrottled(file, limiter, batchSize, lowWaterMark, highWaterMark);</span>
+    }
+
+    private long writeFileToChannelZeroCopyUnthrottled(FileChannel file) throws IOException
+    {
+<span class="nc" id="L216">        final long length = file.size();</span>
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L219">            logger.trace(&quot;Writing {} bytes&quot;, length);</span>
+
+<span class="nc" id="L221">        ChannelPromise promise = beginFlush(length, 0, length);</span>
+<span class="nc" id="L222">        final DefaultFileRegion defaultFileRegion = new DefaultFileRegion(file, 0, length);</span>
+<span class="nc" id="L223">        channel.writeAndFlush(defaultFileRegion, promise);</span>
+
+<span class="nc" id="L225">        return length;</span>
+    }
+
+    private long writeFileToChannelZeroCopyThrottled(FileChannel file, RateLimiter limiter, int batchSize, int lowWaterMark, int highWaterMark) throws IOException
+    {
+<span class="fc" id="L230">        final long length = file.size();</span>
+<span class="fc" id="L231">        long bytesTransferred = 0;</span>
+
+<span class="fc" id="L233">        final SharedFileChannel sharedFile = SharedDefaultFileRegion.share(file);</span>
+        try
+        {
+            int toWrite;
+<span class="fc bfc" id="L237" title="All 2 branches covered.">            while (bytesTransferred &lt; length)</span>
+            {
+<span class="fc" id="L239">                toWrite = (int) min(batchSize, length - bytesTransferred);</span>
+
+<span class="fc" id="L241">                limiter.acquire(toWrite);</span>
+<span class="fc" id="L242">                ChannelPromise promise = beginFlush(toWrite, lowWaterMark, highWaterMark);</span>
+
+<span class="fc" id="L244">                SharedDefaultFileRegion fileRegion = new SharedDefaultFileRegion(sharedFile, bytesTransferred, toWrite);</span>
+<span class="fc" id="L245">                channel.writeAndFlush(fileRegion, promise);</span>
+
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L248">                    logger.trace(&quot;Writing {} bytes at position {} of {}&quot;, toWrite, bytesTransferred, length);</span>
+<span class="fc" id="L249">                bytesTransferred += toWrite;</span>
+<span class="fc" id="L250">            }</span>
+
+<span class="fc" id="L252">            return bytesTransferred;</span>
+        }
+        finally
+        {
+<span class="fc" id="L256">            sharedFile.release();</span>
+        }
+    }
+
+    /**
+     * Discard any buffered data, and the buffers that contain it.
+     * May be invoked instead of {@link #close()} if we terminate exceptionally.
+     */
+    public void discard()
+    {
+<span class="pc bpc" id="L266" title="1 of 2 branches missed.">        if (buffer != null)</span>
+        {
+<span class="fc" id="L268">            bufferPool.put(buffer);</span>
+<span class="fc" id="L269">            buffer = null;</span>
+        }
+<span class="fc" id="L271">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

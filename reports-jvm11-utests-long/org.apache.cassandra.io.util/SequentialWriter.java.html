@@ -1,0 +1,472 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SequentialWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">SequentialWriter.java</span></div><h1>SequentialWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.util;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
+import java.util.function.LongConsumer;
+
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.utils.SyncUtil;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+import static org.apache.cassandra.utils.Throwables.merge;
+
+/**
+ * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
+ * fsync incrementally if Config.trickle_fsync is enabled.
+ */
+<span class="fc" id="L37">public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional</span>
+{
+    // absolute path to the given file
+    private final String filePath;
+    private final File file;
+
+    // Offset for start of buffer relative to underlying file
+    protected long bufferOffset;
+
+    protected final FileChannel fchannel;
+
+    //Allow derived classes to specify writing to the channel
+    //directly shouldn't happen because they intercept via doFlush for things
+    //like compression or checksumming
+    //Another hack for this value is that it also indicates that flushing early
+    //should not occur, flushes aligned with buffer size are desired
+    //Unless... it's the last flush. Compression and checksum formats
+    //expect block (same as buffer size) alignment for everything except the last block
+    private final boolean strictFlushing;
+
+    // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
+    // latency spikes
+    private final SequentialWriterOption option;
+<span class="fc" id="L60">    private int bytesSinceTrickleFsync = 0;</span>
+
+    protected long lastFlushOffset;
+
+    protected LongConsumer runPostFlush;
+
+<span class="fc" id="L66">    private final TransactionalProxy txnProxy = txnProxy();</span>
+
+    // due to lack of multiple-inheritance, we proxy our transactional implementation
+<span class="fc" id="L69">    protected class TransactionalProxy extends AbstractTransactional</span>
+    {
+        @Override
+        protected Throwable doPreCleanup(Throwable accumulate)
+        {
+            // close is idempotent
+<span class="fc" id="L75">            try { channel.close(); }</span>
+<span class="pc" id="L76">            catch (Throwable t) { accumulate = merge(accumulate, t); }</span>
+
+<span class="pc bpc" id="L78" title="1 of 2 branches missed.">            if (buffer != null)</span>
+            {
+<span class="fc" id="L80">                try { FileUtils.clean(buffer); }</span>
+<span class="pc" id="L81">                catch (Throwable t) { accumulate = merge(accumulate, t); }</span>
+<span class="fc" id="L82">                buffer = null;</span>
+            }
+
+<span class="fc" id="L85">            return accumulate;</span>
+        }
+
+        @Override
+        protected void doPrepare()
+        {
+<span class="fc" id="L91">            syncInternal();</span>
+<span class="fc" id="L92">        }</span>
+
+        @Override
+        protected Throwable doCommit(Throwable accumulate)
+        {
+<span class="fc" id="L97">            return accumulate;</span>
+        }
+
+        @Override
+        protected Throwable doAbort(Throwable accumulate)
+        {
+<span class="nc" id="L103">            return accumulate;</span>
+        }
+    }
+
+    // TODO: we should specify as a parameter if we permit an existing file or not
+    private static FileChannel openChannel(File file)
+    {
+        try
+        {
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">            if (file.exists())</span>
+            {
+<span class="nc" id="L114">                return FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE);</span>
+            }
+            else
+            {
+<span class="fc" id="L118">                FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW);</span>
+                try
+                {
+<span class="fc" id="L121">                    SyncUtil.trySyncDir(file.parent());</span>
+                }
+<span class="nc" id="L123">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L125">                    try { channel.close(); }</span>
+<span class="nc" id="L126">                    catch (Throwable t2) { t.addSuppressed(t2); }</span>
+<span class="fc" id="L127">                }</span>
+<span class="fc" id="L128">                return channel;</span>
+            }
+        }
+<span class="nc" id="L131">        catch (IOException e)</span>
+        {
+<span class="nc" id="L133">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /**
+     * Create heap-based, non-compressed SequenialWriter with default buffer size(64k).
+     *
+     * @param file File to write
+     */
+    public SequentialWriter(File file)
+    {
+<span class="nc" id="L144">       this(file, SequentialWriterOption.DEFAULT);</span>
+<span class="nc" id="L145">    }</span>
+
+    /**
+     * Create SequentialWriter for given file with specific writer option.
+     *
+     * @param file File to write
+     * @param option Writer option
+     */
+    public SequentialWriter(File file, SequentialWriterOption option)
+    {
+<span class="fc" id="L155">        this(file, option, true);</span>
+<span class="fc" id="L156">    }</span>
+
+    /**
+     * Create SequentialWriter for given file with specific writer option.
+     * @param file
+     * @param option
+     * @param strictFlushing
+     */
+    public SequentialWriter(File file, SequentialWriterOption option, boolean strictFlushing)
+    {
+<span class="fc" id="L166">        super(openChannel(file), option.allocateBuffer());</span>
+<span class="fc" id="L167">        this.strictFlushing = strictFlushing;</span>
+<span class="fc" id="L168">        this.fchannel = (FileChannel)channel;</span>
+
+<span class="fc" id="L170">        this.file = file;</span>
+<span class="fc" id="L171">        this.filePath = file.absolutePath();</span>
+
+<span class="fc" id="L173">        this.option = option;</span>
+<span class="fc" id="L174">    }</span>
+
+    public void skipBytes(long numBytes) throws IOException
+    {
+<span class="nc" id="L178">        flush();</span>
+<span class="nc" id="L179">        fchannel.position(fchannel.position() + numBytes);</span>
+<span class="nc" id="L180">        bufferOffset = fchannel.position();</span>
+<span class="nc" id="L181">    }</span>
+
+    /**
+     * Synchronize file contents with disk.
+     */
+    public void sync()
+    {
+<span class="fc" id="L188">        syncInternal();</span>
+<span class="fc" id="L189">    }</span>
+
+    protected void syncDataOnlyInternal()
+    {
+        try
+        {
+<span class="fc" id="L195">            SyncUtil.force(fchannel, false);</span>
+        }
+<span class="nc" id="L197">        catch (IOException e)</span>
+        {
+<span class="nc" id="L199">            throw new FSWriteError(e, getPath());</span>
+<span class="fc" id="L200">        }</span>
+<span class="fc" id="L201">    }</span>
+
+    /*
+     * This is only safe to call before truncation or close for CompressedSequentialWriter
+     * Otherwise it will leave a non-uniform size compressed block in the middle of the file
+     * and the compressed format can't handle that.
+     */
+    protected void syncInternal()
+    {
+<span class="fc" id="L210">        doFlush(0);</span>
+<span class="fc" id="L211">        syncDataOnlyInternal();</span>
+<span class="fc" id="L212">    }</span>
+
+    @Override
+    protected void doFlush(int count)
+    {
+<span class="fc" id="L217">        flushData();</span>
+
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">        if (option.trickleFsync())</span>
+        {
+<span class="nc" id="L221">            bytesSinceTrickleFsync += buffer.position();</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (bytesSinceTrickleFsync &gt;= option.trickleFsyncByteInterval())</span>
+            {
+<span class="nc" id="L224">                syncDataOnlyInternal();</span>
+<span class="nc" id="L225">                bytesSinceTrickleFsync = 0;</span>
+            }
+        }
+
+        // Remember that we wrote, so we don't write it again on next flush().
+<span class="fc" id="L230">        resetBuffer();</span>
+<span class="fc" id="L231">    }</span>
+
+    public void setPostFlushListener(LongConsumer runPostFlush)
+    {
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">        assert this.runPostFlush == null;</span>
+<span class="fc" id="L236">        this.runPostFlush = runPostFlush;</span>
+<span class="fc" id="L237">    }</span>
+
+    /**
+     * Override this method instead of overriding flush()
+     * @throws FSWriteError on any I/O error.
+     */
+    protected void flushData()
+    {
+        try
+        {
+<span class="fc" id="L247">            buffer.flip();</span>
+<span class="fc" id="L248">            channel.write(buffer);</span>
+<span class="fc" id="L249">            lastFlushOffset += buffer.position();</span>
+        }
+<span class="nc" id="L251">        catch (IOException e)</span>
+        {
+<span class="nc" id="L253">            throw new FSWriteError(e, getPath());</span>
+<span class="fc" id="L254">        }</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">        if (runPostFlush != null)</span>
+<span class="fc" id="L256">            runPostFlush.accept(getLastFlushOffset());</span>
+<span class="fc" id="L257">    }</span>
+
+    @Override
+    public boolean hasPosition()
+    {
+<span class="nc" id="L262">        return true;</span>
+    }
+
+    @Override
+    public long position()
+    {
+<span class="fc" id="L268">        return current();</span>
+    }
+
+    @Override
+    public int maxBytesInPage()
+    {
+<span class="nc" id="L274">        return PageAware.PAGE_SIZE;</span>
+    }
+
+    @Override
+    public void padToPageBoundary() throws IOException
+    {
+<span class="nc" id="L280">        PageAware.pad(this);</span>
+<span class="nc" id="L281">    }</span>
+
+    @Override
+    public int bytesLeftInPage()
+    {
+<span class="nc" id="L286">        return PageAware.bytesLeftInPage(position());</span>
+    }
+
+    @Override
+    public long paddedPosition()
+    {
+<span class="nc" id="L292">        return PageAware.padded(position());</span>
+    }
+
+    /**
+     * Returns the current file pointer of the underlying on-disk file.
+     * Note that since write works by buffering data, the value of this will increase by buffer
+     * size and not every write to the writer will modify this value.
+     * Furthermore, for compressed files, this value refers to compressed data, while the
+     * writer getFilePointer() refers to uncompressedFile
+     *
+     * @return the current file pointer
+     */
+    public long getOnDiskFilePointer()
+    {
+<span class="fc" id="L306">        return position();</span>
+    }
+
+    public long getEstimatedOnDiskBytesWritten()
+    {
+<span class="fc" id="L311">        return getOnDiskFilePointer();</span>
+    }
+
+    public long length()
+    {
+        try
+        {
+<span class="nc" id="L318">            return Math.max(current(), fchannel.size());</span>
+        }
+<span class="nc" id="L320">        catch (IOException e)</span>
+        {
+<span class="nc" id="L322">            throw new FSReadError(e, getPath());</span>
+        }
+    }
+
+    public String getPath()
+    {
+<span class="fc" id="L328">        return filePath;</span>
+    }
+
+    public File getFile()
+    {
+<span class="nc" id="L333">        return file;</span>
+    }
+
+    protected void resetBuffer()
+    {
+<span class="fc" id="L338">        bufferOffset = current();</span>
+<span class="fc" id="L339">        buffer.clear();</span>
+<span class="fc" id="L340">    }</span>
+
+    protected long current()
+    {
+<span class="fc bfc" id="L344" title="All 2 branches covered.">        return bufferOffset + (buffer == null ? 0 : buffer.position());</span>
+    }
+
+    public DataPosition mark()
+    {
+<span class="nc" id="L349">        return new BufferedFileWriterMark(current());</span>
+    }
+
+    /**
+     * Drops all buffered data that's past the limits of our new file mark + buffer capacity, or syncs and truncates
+     * the underlying file to the marked position
+     */
+    public void resetAndTruncate(DataPosition mark)
+    {
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        assert mark instanceof BufferedFileWriterMark;</span>
+
+<span class="nc" id="L360">        long previous = current();</span>
+<span class="nc" id="L361">        long truncateTarget = ((BufferedFileWriterMark) mark).pointer;</span>
+
+        // If we're resetting to a point within our buffered data, just adjust our buffered position to drop bytes to
+        // the right of the desired mark.
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (previous - truncateTarget &lt;= buffer.position())</span>
+        {
+<span class="nc" id="L367">            buffer.position(buffer.position() - ((int) (previous - truncateTarget)));</span>
+<span class="nc" id="L368">            return;</span>
+        }
+
+        // synchronize current buffer with disk - we don't want any data loss
+<span class="nc" id="L372">        syncInternal();</span>
+
+        // truncate file to given position
+<span class="nc" id="L375">        truncate(truncateTarget);</span>
+
+        try
+        {
+<span class="nc" id="L379">            fchannel.position(truncateTarget);</span>
+        }
+<span class="nc" id="L381">        catch (IOException e)</span>
+        {
+<span class="nc" id="L383">            throw new FSReadError(e, getPath());</span>
+<span class="nc" id="L384">        }</span>
+
+<span class="nc" id="L386">        bufferOffset = truncateTarget;</span>
+<span class="nc" id="L387">        resetBuffer();</span>
+<span class="nc" id="L388">    }</span>
+
+    public long getLastFlushOffset()
+    {
+<span class="fc" id="L392">        return lastFlushOffset;</span>
+    }
+
+    public void truncate(long toSize)
+    {
+        try
+        {
+<span class="nc" id="L399">            fchannel.truncate(toSize);</span>
+<span class="nc" id="L400">            lastFlushOffset = toSize;</span>
+        }
+<span class="nc" id="L402">        catch (IOException e)</span>
+        {
+<span class="nc" id="L404">            throw new FSWriteError(e, getPath());</span>
+<span class="nc" id="L405">        }</span>
+<span class="nc" id="L406">    }</span>
+
+    public boolean isOpen()
+    {
+<span class="nc" id="L410">        return channel.isOpen();</span>
+    }
+
+    @Override
+    public final void prepareToCommit()
+    {
+<span class="fc" id="L416">        txnProxy.prepareToCommit();</span>
+<span class="fc" id="L417">    }</span>
+
+    @Override
+    public final Throwable commit(Throwable accumulate)
+    {
+<span class="fc" id="L422">        return txnProxy.commit(accumulate);</span>
+    }
+
+    @Override
+    public final Throwable abort(Throwable accumulate)
+    {
+<span class="nc" id="L428">        return txnProxy.abort(accumulate);</span>
+    }
+
+    @Override
+    public final void close()
+    {
+<span class="fc bfc" id="L434" title="All 2 branches covered.">        if (option.finishOnClose())</span>
+<span class="fc" id="L435">            txnProxy.finish();</span>
+        else
+<span class="fc" id="L437">            txnProxy.close();</span>
+<span class="fc" id="L438">    }</span>
+
+    public int writeDirectlyToChannel(ByteBuffer buf) throws IOException
+    {
+<span class="pc bpc" id="L442" title="1 of 2 branches missed.">        if (strictFlushing)</span>
+<span class="nc" id="L443">            throw new UnsupportedOperationException();</span>
+        // Don't allow writes to the underlying channel while data is buffered
+<span class="fc" id="L445">        flush();</span>
+<span class="fc" id="L446">        return channel.write(buf);</span>
+    }
+
+    public final void finish()
+    {
+<span class="fc" id="L451">        txnProxy.finish();</span>
+<span class="fc" id="L452">    }</span>
+
+    protected TransactionalProxy txnProxy()
+    {
+<span class="fc" id="L456">        return new TransactionalProxy();</span>
+    }
+
+    /**
+     * Class to hold a mark to the position of the file
+     */
+    protected static class BufferedFileWriterMark implements DataPosition
+    {
+        final long pointer;
+
+        public BufferedFileWriterMark(long pointer)
+        {
+            this.pointer = pointer;
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

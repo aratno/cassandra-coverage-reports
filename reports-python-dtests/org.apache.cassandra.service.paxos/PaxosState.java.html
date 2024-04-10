@@ -1,0 +1,824 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosState.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosState.java</span></div><h1>PaxosState.java</h1><pre class="source lang-java linenums">/*
+ * 
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * 
+ */
+package org.apache.cassandra.service.paxos;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.primitives.Ints;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import org.apache.cassandra.concurrent.ImmediateExecutor;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.metrics.PaxosMetrics;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.exceptions.RequestTimeoutException;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.service.paxos.uncommitted.PaxosBallotTracker;
+import org.apache.cassandra.service.paxos.uncommitted.PaxosStateTracker;
+import org.apache.cassandra.service.paxos.uncommitted.PaxosUncommittedTracker;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.Nemesis;
+
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.PAXOS_DISABLE_COORDINATOR_LOCKING;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.config.Config.PaxosStatePurging.gc_grace;
+import static org.apache.cassandra.config.Config.PaxosStatePurging.legacy;
+import static org.apache.cassandra.config.DatabaseDescriptor.paxosStatePurging;
+import static org.apache.cassandra.service.paxos.Commit.*;
+import static org.apache.cassandra.service.paxos.PaxosState.MaybePromise.Outcome.*;
+import static org.apache.cassandra.service.paxos.Commit.Accepted.latestAccepted;
+import static org.apache.cassandra.service.paxos.Commit.Committed.latestCommitted;
+import static org.apache.cassandra.service.paxos.Commit.isAfter;
+
+/**
+ * We save to memory the result of each operation before persisting to disk, however each operation that performs
+ * the update does not return a result to the coordinator until the result is fully persisted.
+ */
+public class PaxosState implements PaxosOperationLock
+{
+<span class="fc" id="L70">    private static volatile boolean DISABLE_COORDINATOR_LOCKING = PAXOS_DISABLE_COORDINATOR_LOCKING.getBoolean();</span>
+<span class="fc" id="L71">    public static final ConcurrentHashMap&lt;Key, PaxosState&gt; ACTIVE = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="fc" id="L72">    public static final Map&lt;Key, Snapshot&gt; RECENT = Caffeine.newBuilder()</span>
+<span class="fc" id="L73">                                                            .maximumWeight(DatabaseDescriptor.getPaxosCacheSizeInMiB() &lt;&lt; 20)</span>
+<span class="fc bfc" id="L74" title="All 2 branches covered.">                                                            .&lt;Key, Snapshot&gt;weigher((k, v) -&gt; Ints.saturatedCast((v.accepted != null ? v.accepted.update.unsharedHeapSize() : 0L) + v.committed.update.unsharedHeapSize()))</span>
+<span class="fc" id="L75">                                                            .executor(ImmediateExecutor.INSTANCE)</span>
+<span class="fc" id="L76">                                                            .build().asMap();</span>
+
+    private static class TrackerHandle
+    {
+        static final PaxosStateTracker tracker;
+
+        static
+        {
+            try
+            {
+<span class="fc" id="L86">                tracker = PaxosStateTracker.create(Directories.dataDirectories);</span>
+            }
+<span class="nc" id="L88">            catch (IOException e)</span>
+            {
+<span class="nc" id="L90">                throw new RuntimeException(e);</span>
+<span class="fc" id="L91">            }</span>
+<span class="fc" id="L92">        }</span>
+    }
+
+    public static void setDisableCoordinatorLocking(boolean disable)
+    {
+<span class="nc" id="L97">        DISABLE_COORDINATOR_LOCKING = disable;</span>
+<span class="nc" id="L98">    }</span>
+
+    public static boolean getDisableCoordinatorLocking()
+    {
+<span class="nc" id="L102">        return DISABLE_COORDINATOR_LOCKING;</span>
+    }
+
+    public static PaxosUncommittedTracker uncommittedTracker()
+    {
+<span class="fc" id="L107">        return TrackerHandle.tracker.uncommitted();</span>
+    }
+
+    public static PaxosBallotTracker ballotTracker()
+    {
+<span class="fc" id="L112">        return TrackerHandle.tracker.ballots();</span>
+    }
+
+    public static void initializeTrackers()
+    {
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">        Preconditions.checkState(TrackerHandle.tracker != null);</span>
+<span class="fc" id="L118">        PaxosMetrics.initialize();</span>
+<span class="fc" id="L119">    }</span>
+
+    public static void maybeRebuildUncommittedState() throws IOException
+    {
+<span class="fc" id="L123">        TrackerHandle.tracker.maybeRebuild();</span>
+<span class="fc" id="L124">    }</span>
+
+    public static void startAutoRepairs()
+    {
+<span class="fc" id="L128">        TrackerHandle.tracker.uncommitted().startAutoRepairs();</span>
+<span class="fc" id="L129">    }</span>
+
+    public static class Key
+    {
+        final DecoratedKey partitionKey;
+        final TableMetadata metadata;
+
+        public Key(DecoratedKey partitionKey, TableMetadata metadata)
+<span class="fc" id="L137">        {</span>
+<span class="fc" id="L138">            this.partitionKey = partitionKey;</span>
+<span class="fc" id="L139">            this.metadata = metadata;</span>
+<span class="fc" id="L140">        }</span>
+
+        public int hashCode()
+        {
+<span class="fc" id="L144">            return partitionKey.hashCode() * 31 + metadata.id.hashCode();</span>
+        }
+
+        public boolean equals(Object that)
+        {
+<span class="pc bpc" id="L149" title="1 of 4 branches missed.">            return that instanceof Key &amp;&amp; equals((Key) that);</span>
+        }
+
+        public boolean equals(Key that)
+        {
+<span class="fc bfc" id="L154" title="All 2 branches covered.">            return this.partitionKey.equals(that.partitionKey)</span>
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">                    &amp;&amp; this.metadata.id.equals(that.metadata.id);</span>
+        }
+    }
+
+<span class="fc" id="L159">    public static class Snapshot</span>
+    {
+        public final @Nonnull
+        Ballot promised;
+        public final @Nonnull
+        Ballot promisedWrite; // &lt;= promised
+        public final @Nullable Accepted  accepted; // if already committed, this will be null
+        public final @Nonnull  Committed committed;
+
+        public Snapshot(@Nonnull Ballot promised, @Nonnull Ballot promisedWrite, @Nullable Accepted accepted, @Nonnull Committed committed)
+<span class="fc" id="L169">        {</span>
+<span class="pc bpc" id="L170" title="2 of 4 branches missed.">            assert isAfter(promised, promisedWrite) || promised == promisedWrite;</span>
+<span class="pc bpc" id="L171" title="1 of 4 branches missed.">            assert accepted == null || accepted.update.partitionKey().equals(committed.update.partitionKey());</span>
+<span class="pc bpc" id="L172" title="1 of 4 branches missed.">            assert accepted == null || accepted.update.metadata().id.equals(committed.update.metadata().id);</span>
+<span class="pc bpc" id="L173" title="1 of 4 branches missed.">            assert accepted == null || committed.isBefore(accepted.ballot);</span>
+
+<span class="fc" id="L175">            this.promised = promised;</span>
+<span class="fc" id="L176">            this.promisedWrite = promisedWrite;</span>
+<span class="fc" id="L177">            this.accepted = accepted;</span>
+<span class="fc" id="L178">            this.committed = committed;</span>
+<span class="fc" id="L179">        }</span>
+
+        public @Nonnull
+        Ballot latestWitnessedOrLowBound(Ballot latestWriteOrLowBound)
+        {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            return promised == promisedWrite ? latestWriteOrLowBound : latest(promised, latestWriteOrLowBound);</span>
+        }
+
+        public @Nonnull
+        Ballot latestWitnessedOrLowBound()
+        {
+            // warn: if proposal has same timestamp as promised, we should prefer accepted
+            // since (if different) it reached a quorum of promises; this means providing it as first argument
+            Ballot latest;
+<span class="fc" id="L193">            latest = latest(accepted, committed).ballot;</span>
+<span class="fc" id="L194">            latest = latest(latest, promised);</span>
+<span class="fc" id="L195">            latest = latest(latest, ballotTracker().getLowBound());</span>
+<span class="fc" id="L196">            return latest;</span>
+        }
+
+        public @Nonnull
+        Ballot latestWriteOrLowBound()
+        {
+            // warn: if proposal has same timestamp as promised, we should prefer accepted
+            // since (if different) it reached a quorum of promises; this means providing it as first argument
+<span class="nc bnc" id="L204" title="All 4 branches missed.">            Ballot latest = accepted != null &amp;&amp; !accepted.update.isEmpty() ? accepted.ballot : null;</span>
+<span class="nc" id="L205">            latest = latest(latest, committed.ballot);</span>
+<span class="nc" id="L206">            latest = latest(latest, promisedWrite);</span>
+<span class="nc" id="L207">            latest = latest(latest, ballotTracker().getLowBound());</span>
+<span class="nc" id="L208">            return latest;</span>
+        }
+
+        public static Snapshot merge(Snapshot a, Snapshot b)
+        {
+<span class="pc bpc" id="L213" title="1 of 4 branches missed.">            if (a == null || b == null)</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">                return a == null ? b : a;</span>
+
+<span class="fc" id="L216">            Committed committed = latestCommitted(a.committed, b.committed);</span>
+<span class="pc bpc" id="L217" title="3 of 4 branches missed.">            if (a instanceof UnsafeSnapshot &amp;&amp; b instanceof UnsafeSnapshot)</span>
+<span class="nc" id="L218">                return new UnsafeSnapshot(committed);</span>
+
+            Accepted accepted;
+            Ballot promised, promisedWrite;
+<span class="pc bpc" id="L222" title="2 of 4 branches missed.">            if (a instanceof UnsafeSnapshot || b instanceof UnsafeSnapshot)</span>
+            {
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">                if (a instanceof UnsafeSnapshot)</span>
+<span class="nc" id="L225">                    a = b; // we already have the winning Committed saved above, so just want the full snapshot (if either)</span>
+
+<span class="fc bfc" id="L227" title="All 2 branches covered.">                if (committed == a.committed)</span>
+<span class="fc" id="L228">                    return a;</span>
+
+<span class="fc" id="L230">                promised = a.promised;</span>
+<span class="fc" id="L231">                promisedWrite = a.promisedWrite;</span>
+<span class="fc bfc" id="L232" title="All 2 branches covered.">                accepted = isAfter(a.accepted, committed) ? a.accepted : null;</span>
+            }
+            else
+            {
+<span class="nc" id="L236">                accepted = latestAccepted(a.accepted, b.accepted);</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">                accepted = isAfter(accepted, committed) ? accepted : null;</span>
+<span class="nc" id="L238">                promised = latest(a.promised, b.promised);</span>
+<span class="nc" id="L239">                promisedWrite = latest(a.promisedWrite, b.promisedWrite);</span>
+            }
+
+<span class="fc" id="L242">            return new Snapshot(promised, promisedWrite, accepted, committed);</span>
+        }
+
+        Snapshot removeExpired(long nowInSec)
+        {
+<span class="pc bpc" id="L247" title="1 of 4 branches missed.">            boolean isAcceptedExpired = accepted != null &amp;&amp; accepted.isExpired(nowInSec);</span>
+<span class="fc" id="L248">            boolean isCommittedExpired = committed.isExpired(nowInSec);</span>
+
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">            if (paxosStatePurging() == gc_grace)</span>
+            {
+<span class="nc" id="L252">                long expireOlderThan = SECONDS.toMicros(nowInSec - committed.update.metadata().params.gcGraceSeconds);</span>
+<span class="nc bnc" id="L253" title="All 4 branches missed.">                isAcceptedExpired |= accepted != null &amp;&amp; accepted.ballot.unixMicros() &lt; expireOlderThan;</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                isCommittedExpired |= committed.ballot.unixMicros() &lt; expireOlderThan;</span>
+            }
+
+<span class="pc bpc" id="L257" title="2 of 4 branches missed.">            if (!isAcceptedExpired &amp;&amp; !isCommittedExpired)</span>
+<span class="fc" id="L258">                return this;</span>
+
+<span class="nc" id="L260">            return new Snapshot(promised, promisedWrite,</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                                isAcceptedExpired ? null : accepted,</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                                isCommittedExpired</span>
+<span class="nc" id="L263">                                    ? Committed.none(committed.update.partitionKey(), committed.update.metadata())</span>
+<span class="nc" id="L264">                                    : committed);</span>
+        }
+    }
+
+    // used to permit recording Committed outcomes without waiting for initial read
+    public static class UnsafeSnapshot extends Snapshot
+    {
+        public UnsafeSnapshot(@Nonnull Committed committed)
+        {
+<span class="fc" id="L273">            super(Ballot.none(), Ballot.none(), null, committed);</span>
+<span class="fc" id="L274">        }</span>
+
+        public UnsafeSnapshot(@Nonnull Commit committed)
+        {
+<span class="fc" id="L278">            this(new Committed(committed.ballot, committed.update));</span>
+<span class="fc" id="L279">        }</span>
+    }
+
+    @VisibleForTesting
+    public static class MaybePromise
+    {
+<span class="nc" id="L285">        public enum Outcome { REJECT, PERMIT_READ, PROMISE }</span>
+
+        final Snapshot before;
+        final Snapshot after;
+        final Ballot supersededBy;
+        final Outcome outcome;
+
+        MaybePromise(Snapshot before, Snapshot after, Ballot supersededBy, Outcome outcome)
+<span class="nc" id="L293">        {</span>
+<span class="nc" id="L294">            this.before = before;</span>
+<span class="nc" id="L295">            this.after = after;</span>
+<span class="nc" id="L296">            this.supersededBy = supersededBy;</span>
+<span class="nc" id="L297">            this.outcome = outcome;</span>
+<span class="nc" id="L298">        }</span>
+
+        static MaybePromise promise(Snapshot before, Snapshot after)
+        {
+<span class="nc" id="L302">            return new MaybePromise(before, after, null, PROMISE);</span>
+        }
+
+        static MaybePromise permitRead(Snapshot before, Ballot supersededBy)
+        {
+<span class="nc" id="L307">            return new MaybePromise(before, before, supersededBy, PERMIT_READ);</span>
+        }
+
+        static MaybePromise reject(Snapshot snapshot, Ballot supersededBy)
+        {
+<span class="nc" id="L312">            return new MaybePromise(snapshot, snapshot, supersededBy, REJECT);</span>
+        }
+
+        public Outcome outcome()
+        {
+<span class="nc" id="L317">            return outcome;</span>
+        }
+
+        public Ballot supersededBy()
+        {
+<span class="nc" id="L322">            return supersededBy;</span>
+        }
+    }
+
+<span class="fc" id="L326">    @Nemesis private static final AtomicReferenceFieldUpdater&lt;PaxosState, Snapshot&gt; currentUpdater = AtomicReferenceFieldUpdater.newUpdater(PaxosState.class, Snapshot.class, &quot;current&quot;);</span>
+
+    final Key key;
+    private int active; // current number of active referents (once drops to zero, we remove the global entry)
+    @Nemesis private volatile Snapshot current;
+    @Nemesis private volatile Thread lockedBy;
+    @Nemesis private volatile int waiting;
+
+<span class="fc" id="L334">    private static final AtomicReferenceFieldUpdater&lt;PaxosState, Thread&gt; lockedByUpdater = AtomicReferenceFieldUpdater.newUpdater(PaxosState.class, Thread.class, &quot;lockedBy&quot;);</span>
+
+    private PaxosState(Key key, Snapshot current)
+<span class="fc" id="L337">    {</span>
+<span class="fc" id="L338">        this.key = key;</span>
+<span class="fc" id="L339">        this.current = current;</span>
+<span class="fc" id="L340">    }</span>
+
+    @VisibleForTesting
+    public static PaxosState get(Commit commit)
+    {
+<span class="nc" id="L345">        return get(commit.update.partitionKey(), commit.update.metadata());</span>
+    }
+
+    public static PaxosState get(DecoratedKey partitionKey, TableMetadata table)
+    {
+        // TODO would be nice to refactor verb handlers to support re-submitting to executor if waiting for another thread to read state
+<span class="nc" id="L351">        return getUnsafe(partitionKey, table).maybeLoad();</span>
+    }
+
+    // does not increment total number of accessors, since we would accept null (so only access if others are, not for own benefit)
+    private static PaxosState tryGetUnsafe(DecoratedKey partitionKey, TableMetadata metadata)
+    {
+<span class="fc" id="L357">        return ACTIVE.compute(new Key(partitionKey, metadata), (key, cur) -&gt; {</span>
+<span class="fc bfc" id="L358" title="All 2 branches covered.">            if (cur == null)</span>
+            {
+<span class="fc" id="L360">                Snapshot saved = RECENT.remove(key);</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">                if (saved != null)</span>
+                    //noinspection resource
+<span class="fc" id="L363">                    cur = new PaxosState(key, saved);</span>
+            }
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">            if (cur != null)</span>
+<span class="fc" id="L366">                ++cur.active;</span>
+<span class="fc" id="L367">            return cur;</span>
+        });
+    }
+
+    private static PaxosState getUnsafe(DecoratedKey partitionKey, TableMetadata metadata)
+    {
+<span class="fc" id="L373">        return ACTIVE.compute(new Key(partitionKey, metadata), (key, cur) -&gt; {</span>
+<span class="fc bfc" id="L374" title="All 2 branches covered.">            if (cur == null)</span>
+            {
+                //noinspection resource
+<span class="fc" id="L377">                cur = new PaxosState(key, RECENT.remove(key));</span>
+            }
+<span class="fc" id="L379">            ++cur.active;</span>
+<span class="fc" id="L380">            return cur;</span>
+        });
+    }
+
+    private static PaxosState getUnsafe(Commit commit)
+    {
+<span class="fc" id="L386">        return getUnsafe(commit.update.partitionKey(), commit.update.metadata());</span>
+    }
+
+    // don't increment the total count, as we are only using this for locking purposes when coordinating
+    @VisibleForTesting
+    public static PaxosOperationLock lock(DecoratedKey partitionKey, TableMetadata metadata, long deadline, ConsistencyLevel consistencyForConsensus, boolean isWrite) throws RequestTimeoutException
+    {
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (DISABLE_COORDINATOR_LOCKING)</span>
+<span class="nc" id="L394">            return PaxosOperationLock.noOp();</span>
+
+<span class="nc" id="L396">        PaxosState lock = ACTIVE.compute(new Key(partitionKey, metadata), (key, cur) -&gt; {</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (cur == null)</span>
+<span class="nc" id="L398">                cur = new PaxosState(key, RECENT.remove(key));</span>
+<span class="nc" id="L399">            ++cur.active;</span>
+<span class="nc" id="L400">            return cur;</span>
+        });
+
+        try
+        {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            if (!lock.lock(deadline))</span>
+<span class="nc" id="L406">                throw throwTimeout(metadata, consistencyForConsensus, isWrite);</span>
+<span class="nc" id="L407">            return lock;</span>
+        }
+<span class="nc" id="L409">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L411">            lock.close();</span>
+<span class="nc" id="L412">            throw t;</span>
+        }
+    }
+    
+    private static RequestTimeoutException throwTimeout(TableMetadata metadata, ConsistencyLevel consistencyForConsensus, boolean isWrite)
+    {
+<span class="nc" id="L418">        int blockFor = consistencyForConsensus.blockFor(Keyspace.open(metadata.keyspace).getReplicationStrategy());</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        throw isWrite</span>
+<span class="nc" id="L420">                ? new WriteTimeoutException(WriteType.CAS, consistencyForConsensus, 0, blockFor)</span>
+<span class="nc" id="L421">                : new ReadTimeoutException(consistencyForConsensus, 0, blockFor, false);</span>
+    }
+
+    private PaxosState maybeLoad()
+    {
+        try
+        {
+<span class="fc" id="L428">            Snapshot current = this.current;</span>
+<span class="pc bpc" id="L429" title="1 of 4 branches missed.">            if (current == null || current instanceof UnsafeSnapshot)</span>
+            {
+<span class="fc" id="L431">                synchronized (this)</span>
+                {
+<span class="fc" id="L433">                    current = this.current;</span>
+<span class="pc bpc" id="L434" title="3 of 4 branches missed.">                    if (current == null || current instanceof UnsafeSnapshot)</span>
+                    {
+<span class="fc" id="L436">                        Snapshot snapshot = SystemKeyspace.loadPaxosState(key.partitionKey, key.metadata, 0);</span>
+<span class="fc" id="L437">                        currentUpdater.accumulateAndGet(this, snapshot, Snapshot::merge);</span>
+                    }
+<span class="fc" id="L439">                }</span>
+            }
+        }
+<span class="nc" id="L442">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L444">            try { close(); } catch (Throwable t2) { t.addSuppressed(t2); }</span>
+<span class="nc" id="L445">            throw t;</span>
+<span class="fc" id="L446">        }</span>
+
+<span class="fc" id="L448">        return this;</span>
+    }
+
+    private boolean lock(long deadline)
+    {
+        try
+        {
+<span class="nc" id="L455">            Thread thread = Thread.currentThread();</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">            if (lockedByUpdater.compareAndSet(this, null, thread))</span>
+<span class="nc" id="L457">                return true;</span>
+
+<span class="nc" id="L459">            synchronized (this)</span>
+            {
+<span class="nc" id="L461">                waiting++;</span>
+
+                try
+                {
+                    while (true)
+                    {
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                        if (lockedByUpdater.compareAndSet(this, null, thread))</span>
+<span class="nc" id="L468">                            return true;</span>
+
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                        while (lockedBy != null)</span>
+                        {
+<span class="nc" id="L472">                            long now = nanoTime();</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                            if (now &gt;= deadline)</span>
+<span class="nc" id="L474">                                return false;</span>
+
+<span class="nc" id="L476">                            wait(1 + ((deadline - now) - 1) / 1000000);</span>
+<span class="nc" id="L477">                        }</span>
+                    }
+                }
+                finally
+                {
+<span class="nc" id="L482">                    waiting--;</span>
+                }
+            }
+        }
+<span class="nc" id="L486">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L488">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L489">            return false;</span>
+        }
+    }
+
+    private void maybeUnlock()
+    {
+        // no visibility requirements, as if we hold the lock it was last updated by us
+<span class="pc bpc" id="L496" title="1 of 2 branches missed.">        if (lockedBy == null)</span>
+<span class="fc" id="L497">            return;</span>
+
+<span class="nc" id="L499">        Thread thread = Thread.currentThread();</span>
+
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (lockedBy == thread)</span>
+        {
+<span class="nc" id="L503">            lockedBy = null;</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">            if (waiting &gt; 0)</span>
+            {
+<span class="nc" id="L506">                synchronized (this)</span>
+                {
+<span class="nc" id="L508">                    notify();</span>
+<span class="nc" id="L509">                }</span>
+            }
+        }
+<span class="nc" id="L512">    }</span>
+
+    public void close()
+    {
+<span class="fc" id="L516">        maybeUnlock();</span>
+<span class="fc" id="L517">        ACTIVE.compute(key, (key, cur) -&gt;</span>
+        {
+<span class="pc bpc" id="L519" title="1 of 2 branches missed.">            assert cur != null;</span>
+<span class="fc bfc" id="L520" title="All 2 branches covered.">            if (--cur.active &gt; 0)</span>
+<span class="fc" id="L521">                return cur;</span>
+
+<span class="fc" id="L523">            Snapshot stash = cur.current;</span>
+<span class="pc bpc" id="L524" title="2 of 4 branches missed.">            if (stash != null &amp;&amp; stash.getClass() == Snapshot.class)</span>
+<span class="fc" id="L525">                RECENT.put(key, stash);</span>
+<span class="fc" id="L526">            return null;</span>
+        });
+<span class="fc" id="L528">    }</span>
+
+    Snapshot current(Ballot ballot)
+    {
+<span class="nc" id="L532">        return current((int)ballot.unix(SECONDS));</span>
+    }
+
+    Snapshot current(long nowInSec)
+    {
+        // CASSANDRA-12043 is not an issue for v2, as we perform Commit+Prepare and PrepareRefresh
+        // which are able to make progress whether or not the old commit is shadowed by the TTL (since they
+        // depend only on the write being successful, not the data being read again later).
+        // However, we still use nowInSec to guard reads to ensure we do not log any linearizability violations
+        // due to discrepancies in gc grace handling
+
+<span class="nc" id="L543">        Snapshot current = this.current;</span>
+<span class="nc bnc" id="L544" title="All 4 branches missed.">        if (current == null || current.getClass() != Snapshot.class)</span>
+<span class="nc" id="L545">            throw new IllegalStateException();</span>
+<span class="nc" id="L546">        return current.removeExpired(nowInSec);</span>
+    }
+
+    @VisibleForTesting
+    public Snapshot currentSnapshot()
+    {
+<span class="nc" id="L552">        return current;</span>
+    }
+
+    @VisibleForTesting
+    public void updateStateUnsafe(Function&lt;Snapshot, Snapshot&gt; f)
+    {
+<span class="nc" id="L558">        current = f.apply(current);</span>
+<span class="nc" id="L559">    }</span>
+
+    /**
+     * Record the requested ballot as promised if it is newer than our current promise; otherwise do nothing.
+     * @return a PromiseResult containing the before and after state for this operation
+     */
+    public MaybePromise promiseIfNewer(Ballot ballot, boolean isWrite)
+    {
+        Snapshot before, after;
+        while (true)
+        {
+<span class="nc" id="L570">            Snapshot realBefore = current;</span>
+<span class="nc" id="L571">            before = realBefore.removeExpired((int)ballot.unix(SECONDS));</span>
+<span class="nc" id="L572">            Ballot latestWriteOrLowBound = before.latestWriteOrLowBound();</span>
+<span class="nc" id="L573">            Ballot latest = before.latestWitnessedOrLowBound(latestWriteOrLowBound);</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            if (isAfter(ballot, latest))</span>
+            {
+<span class="nc bnc" id="L576" title="All 2 branches missed.">                after = new Snapshot(ballot, isWrite ? ballot : before.promisedWrite, before.accepted, before.committed);</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                if (currentUpdater.compareAndSet(this, before, after))</span>
+                {
+                    // It doesn't matter if a later operation witnesses this before it's persisted,
+                    // as it can only lead to rejecting a promise which leaves no persistent state
+                    // (and it's anyway safe to arbitrarily reject promises)
+<span class="nc bnc" id="L582" title="All 2 branches missed.">                    if (isWrite)</span>
+                    {
+<span class="nc" id="L584">                        Tracing.trace(&quot;Promising read/write ballot {}&quot;, ballot);</span>
+<span class="nc" id="L585">                        SystemKeyspace.savePaxosWritePromise(key.partitionKey, key.metadata, ballot);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L589">                        Tracing.trace(&quot;Promising read ballot {}&quot;, ballot);</span>
+<span class="nc" id="L590">                        SystemKeyspace.savePaxosReadPromise(key.partitionKey, key.metadata, ballot);</span>
+                    }
+<span class="nc" id="L592">                    return MaybePromise.promise(before, after);</span>
+                }
+            }
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            else if (isAfter(ballot, latestWriteOrLowBound))</span>
+            {
+<span class="nc" id="L597">                Tracing.trace(&quot;Permitting only read by ballot {}&quot;, ballot);</span>
+<span class="nc" id="L598">                return MaybePromise.permitRead(before, latest);</span>
+            }
+            else
+            {
+<span class="nc" id="L602">                Tracing.trace(&quot;Promise rejected; {} older than {}&quot;, ballot, latest);</span>
+<span class="nc" id="L603">                return MaybePromise.reject(before, latest);</span>
+            }
+
+<span class="nc bnc" id="L606" title="All 2 branches missed.">            Snapshot realAfter = new Snapshot(ballot, isWrite ? ballot : realBefore.promisedWrite, realBefore.accepted, realBefore.committed);</span>
+<span class="nc" id="L607">            after = new Snapshot(ballot, realAfter.promisedWrite, before.accepted, before.committed);</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">            if (currentUpdater.compareAndSet(this, realBefore, realAfter))</span>
+<span class="nc" id="L609">                break;</span>
+<span class="nc" id="L610">        }</span>
+
+        // It doesn't matter if a later operation witnesses this before it's persisted,
+        // as it can only lead to rejecting a promise which leaves no persistent state
+        // (and it's anyway safe to arbitrarily reject promises)
+<span class="nc" id="L615">        Tracing.trace(&quot;Promising ballot {}&quot;, ballot);</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (isWrite) SystemKeyspace.savePaxosWritePromise(key.partitionKey, key.metadata, ballot);</span>
+<span class="nc" id="L617">        else SystemKeyspace.savePaxosReadPromise(key.partitionKey, key.metadata, ballot);</span>
+<span class="nc" id="L618">        return MaybePromise.promise(before, after);</span>
+    }
+
+    /**
+     * Record an acceptance of the proposal if there is no newer promise; otherwise inform the caller of the newer ballot
+     */
+    public Ballot acceptIfLatest(Proposal proposal)
+    {
+<span class="nc bnc" id="L626" title="All 4 branches missed.">        if (paxosStatePurging() == legacy &amp;&amp; !(proposal instanceof AcceptedWithTTL))</span>
+<span class="nc" id="L627">            proposal = AcceptedWithTTL.withDefaultTTL(proposal);</span>
+
+        // state.promised can be null, because it is invalidated by committed;
+        // we may also have accepted a newer proposal than we promised, so we confirm that we are the absolute newest
+        // (or that we have the exact same ballot as our promise, which is the typical case)
+        Snapshot before, after;
+        while (true)
+        {
+<span class="nc" id="L635">            Snapshot realBefore = current;</span>
+<span class="nc" id="L636">            before = realBefore.removeExpired((int)proposal.ballot.unix(SECONDS));</span>
+<span class="nc" id="L637">            Ballot latest = before.latestWitnessedOrLowBound();</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if (!proposal.isSameOrAfter(latest))</span>
+            {
+<span class="nc" id="L640">                Tracing.trace(&quot;Rejecting proposal {}; latest is now {}&quot;, proposal.ballot, latest);</span>
+<span class="nc" id="L641">                return latest;</span>
+            }
+
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            if (proposal.hasSameBallot(before.committed)) // TODO: consider not answering</span>
+<span class="nc" id="L645">                return null; // no need to save anything, or indeed answer at all</span>
+
+<span class="nc" id="L647">            after = new Snapshot(realBefore.promised, realBefore.promisedWrite, proposal.accepted(), realBefore.committed);</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            if (currentUpdater.compareAndSet(this, realBefore, after))</span>
+<span class="nc" id="L649">                break;</span>
+<span class="nc" id="L650">        }</span>
+
+        // It is more worrisome to permit witnessing an accepted proposal before we have persisted it
+        // because this has more tangible effects on the recipient, but again it is safe: either it is
+        //  - witnessed to reject (which is always safe, as it prevents rather than creates an outcome); or
+        //  - witnessed as an in progress proposal
+        // in the latter case, for there to be any effect on the state the proposal must be re-proposed, or not,
+        // on its own terms, and must
+        // be persisted by the re-proposer, and so it remains a non-issue
+        // though this
+<span class="nc" id="L660">        Tracing.trace(&quot;Accepting proposal {}&quot;, proposal);</span>
+<span class="nc" id="L661">        SystemKeyspace.savePaxosProposal(proposal);</span>
+<span class="nc" id="L662">        return null;</span>
+    }
+
+    public void commit(Agreed commit)
+    {
+<span class="nc" id="L667">        applyCommit(commit, this, (apply, to) -&gt;</span>
+<span class="nc" id="L668">            currentUpdater.accumulateAndGet(to, new UnsafeSnapshot(apply), Snapshot::merge)</span>
+        );
+<span class="nc" id="L670">    }</span>
+
+    public static void commitDirect(Commit commit)
+    {
+<span class="fc" id="L674">        applyCommit(commit, null, (apply, ignore) -&gt; {</span>
+<span class="fc" id="L675">            try (PaxosState state = tryGetUnsafe(apply.update.partitionKey(), apply.update.metadata()))</span>
+            {
+<span class="pc bpc" id="L677" title="1 of 2 branches missed.">                if (state != null)</span>
+<span class="fc" id="L678">                    currentUpdater.accumulateAndGet(state, new UnsafeSnapshot(apply), Snapshot::merge);</span>
+            }
+<span class="fc" id="L680">        });</span>
+<span class="fc" id="L681">    }</span>
+
+    private static void applyCommit(Commit commit, PaxosState state, BiConsumer&lt;Commit, PaxosState&gt; postCommit)
+    {
+<span class="pc bpc" id="L685" title="2 of 4 branches missed.">        if (paxosStatePurging() == legacy &amp;&amp; !(commit instanceof CommittedWithTTL))</span>
+<span class="fc" id="L686">            commit = CommittedWithTTL.withDefaultTTL(commit);</span>
+
+<span class="fc" id="L688">        long start = nanoTime();</span>
+        try
+        {
+            // TODO: run Paxos Repair before truncate so we can excise this
+            // The table may have been truncated since the proposal was initiated. In that case, we
+            // don't want to perform the mutation and potentially resurrect truncated data
+<span class="pc bpc" id="L694" title="1 of 2 branches missed.">            if (commit.ballot.unixMicros() &gt;= SystemKeyspace.getTruncatedAt(commit.update.metadata().id))</span>
+            {
+<span class="fc" id="L696">                Tracing.trace(&quot;Committing proposal {}&quot;, commit);</span>
+<span class="fc" id="L697">                Mutation mutation = commit.makeMutation();</span>
+<span class="fc" id="L698">                Keyspace.open(mutation.getKeyspaceName()).apply(mutation, true);</span>
+<span class="fc" id="L699">            }</span>
+            else
+            {
+<span class="nc" id="L702">                Tracing.trace(&quot;Not committing proposal {} as ballot timestamp predates last truncation time&quot;, commit);</span>
+            }
+
+            // for commits we save to disk first, because we can; even here though it is safe to permit later events to
+            // witness the state before it is persisted. The only tricky situation is that we use the witnessing of
+            // a quorum of nodes having witnessed the latest commit to decide if we need to disseminate a commit
+            // again before proceeding with any new operation, but in this case we have already persisted the relevant
+            // information, namely the base table mutation.  So this fact is persistent, even if knowldge of this fact
+            // is not (and if this is lost, it may only lead to a future operation unnecessarily committing again)
+<span class="fc" id="L711">            SystemKeyspace.savePaxosCommit(commit);</span>
+<span class="fc" id="L712">            postCommit.accept(commit, state);</span>
+        }
+        finally
+        {
+<span class="fc" id="L716">            Keyspace.openAndGetStore(commit.update.metadata()).metric.casCommit.addNano(nanoTime() - start);</span>
+        }
+<span class="fc" id="L718">    }</span>
+
+    public static PrepareResponse legacyPrepare(Commit toPrepare)
+    {
+<span class="fc" id="L722">        long start = nanoTime();</span>
+<span class="fc" id="L723">        try (PaxosState unsafeState = getUnsafe(toPrepare))</span>
+        {
+<span class="fc" id="L725">            synchronized (unsafeState.key)</span>
+            {
+<span class="fc" id="L727">                unsafeState.maybeLoad();</span>
+<span class="pc bpc" id="L728" title="1 of 2 branches missed.">                assert unsafeState.current != null;</span>
+
+                while (true)
+                {
+                    // ignore nowInSec when merging as this can only be an issue during the transition period, so the unbounded
+                    // problem of CASSANDRA-12043 is not an issue
+<span class="fc" id="L734">                    Snapshot realBefore = unsafeState.current;</span>
+<span class="fc" id="L735">                    Snapshot before = realBefore.removeExpired(toPrepare.ballot.unix(SECONDS));</span>
+<span class="fc" id="L736">                    Ballot latest = before.latestWitnessedOrLowBound();</span>
+<span class="fc bfc" id="L737" title="All 2 branches covered.">                    if (toPrepare.isAfter(latest))</span>
+                    {
+<span class="fc" id="L739">                        Snapshot after = new Snapshot(toPrepare.ballot, toPrepare.ballot, realBefore.accepted, realBefore.committed);</span>
+<span class="fc bfc" id="L740" title="All 2 branches covered.">                        if (currentUpdater.compareAndSet(unsafeState, realBefore, after))</span>
+                        {
+<span class="fc" id="L742">                            Tracing.trace(&quot;Promising ballot {}&quot;, toPrepare.ballot);</span>
+<span class="fc" id="L743">                            DecoratedKey partitionKey = toPrepare.update.partitionKey();</span>
+<span class="fc" id="L744">                            TableMetadata metadata = toPrepare.update.metadata();</span>
+<span class="fc" id="L745">                            SystemKeyspace.savePaxosWritePromise(partitionKey, metadata, toPrepare.ballot);</span>
+<span class="fc bfc" id="L746" title="All 2 branches covered.">                            return new PrepareResponse(true, before.accepted == null ? Accepted.none(partitionKey, metadata) : before.accepted, before.committed);</span>
+                        }
+<span class="fc" id="L748">                    }</span>
+                    else
+                    {
+<span class="fc" id="L751">                        Tracing.trace(&quot;Promise rejected; {} is not sufficiently newer than {}&quot;, toPrepare, before.promised);</span>
+                        // return the currently promised ballot (not the last accepted one) so the coordinator can make sure it uses newer ballot next time (#5667)
+<span class="fc" id="L753">                        return new PrepareResponse(false, new Commit(before.promised, toPrepare.update), before.committed);</span>
+                    }
+<span class="fc" id="L755">                }</span>
+            }
+<span class="pc bpc" id="L757" title="1 of 2 branches missed.">        }</span>
+        finally
+        {
+<span class="fc" id="L760">            Keyspace.openAndGetStore(toPrepare.update.metadata()).metric.casPrepare.addNano(nanoTime() - start);</span>
+        }
+    }
+
+    public static Boolean legacyPropose(Commit proposal)
+    {
+<span class="pc bpc" id="L766" title="2 of 4 branches missed.">        if (paxosStatePurging() == legacy &amp;&amp; !(proposal instanceof AcceptedWithTTL))</span>
+<span class="fc" id="L767">            proposal = AcceptedWithTTL.withDefaultTTL(proposal);</span>
+
+<span class="fc" id="L769">        long start = nanoTime();</span>
+<span class="fc" id="L770">        try (PaxosState unsafeState = getUnsafe(proposal))</span>
+        {
+<span class="fc" id="L772">            synchronized (unsafeState.key)</span>
+            {
+<span class="fc" id="L774">                unsafeState.maybeLoad();</span>
+<span class="pc bpc" id="L775" title="1 of 2 branches missed.">                assert unsafeState.current != null;</span>
+
+                while (true)
+                {
+<span class="fc" id="L779">                    Snapshot realBefore = unsafeState.current;</span>
+<span class="fc" id="L780">                    Snapshot before = realBefore.removeExpired((int)proposal.ballot.unix(SECONDS));</span>
+<span class="fc" id="L781">                    boolean accept = proposal.isSameOrAfter(before.latestWitnessedOrLowBound());</span>
+<span class="fc bfc" id="L782" title="All 2 branches covered.">                    if (accept)</span>
+                    {
+<span class="pc bpc" id="L784" title="1 of 2 branches missed.">                        if (proposal.hasSameBallot(before.committed) ||</span>
+<span class="pc bpc" id="L785" title="1 of 2 branches missed.">                            currentUpdater.compareAndSet(unsafeState, realBefore,</span>
+                                                         new Snapshot(realBefore.promised, realBefore.promisedWrite,
+                                                                      new Accepted(proposal), realBefore.committed)))
+                        {
+<span class="fc" id="L789">                            Tracing.trace(&quot;Accepting proposal {}&quot;, proposal);</span>
+<span class="fc" id="L790">                            SystemKeyspace.savePaxosProposal(proposal);</span>
+<span class="fc" id="L791">                            return true;</span>
+                        }
+                    }
+                    else
+                    {
+<span class="fc" id="L796">                        Tracing.trace(&quot;Rejecting proposal for {} because inProgress is now {}&quot;, proposal, before.promised);</span>
+<span class="fc" id="L797">                        return false;</span>
+                    }
+<span class="nc" id="L799">                }</span>
+            }
+<span class="pc bpc" id="L801" title="1 of 2 branches missed.">        }</span>
+        finally
+        {
+<span class="fc" id="L804">            Keyspace.openAndGetStore(proposal.update.metadata()).metric.casPropose.addNano(nanoTime() - start);</span>
+        }
+    }
+
+    public static void unsafeReset()
+    {
+<span class="nc" id="L810">        ACTIVE.clear();</span>
+<span class="nc" id="L811">        RECENT.clear();</span>
+<span class="nc" id="L812">        ballotTracker().truncate();</span>
+<span class="nc" id="L813">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)
+    public static Snapshot unsafeGetIfPresent(DecoratedKey partitionKey, TableMetadata metadata)
+    {
+<span class="nc" id="L818">        Key key = new Key(partitionKey, metadata);</span>
+<span class="nc" id="L819">        PaxosState cur = ACTIVE.get(key);</span>
+<span class="nc bnc" id="L820" title="All 2 branches missed.">        if (cur != null) return cur.current;</span>
+<span class="nc" id="L821">        return RECENT.get(key);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

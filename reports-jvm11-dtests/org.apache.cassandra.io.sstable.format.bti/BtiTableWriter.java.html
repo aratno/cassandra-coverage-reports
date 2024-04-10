@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>BtiTableWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format.bti</a> &gt; <span class="el_source">BtiTableWriter.java</span></div><h1>BtiTableWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable.format.bti;
+
+import java.io.IOException;
+import java.util.Collection;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.DataComponent;
+import org.apache.cassandra.io.sstable.format.IndexComponent;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableReader.OpenReason;
+import org.apache.cassandra.io.sstable.format.SortedTableWriter;
+import org.apache.cassandra.io.sstable.format.bti.BtiFormat.Components;
+import org.apache.cassandra.io.util.DataPosition;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.MmappedRegionsCache;
+import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.IFilter;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Throwables;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
+import static org.apache.cassandra.io.util.FileHandle.Builder.NO_LENGTH_OVERRIDE;
+
+/**
+ * Writes SSTables in BTI format (see {@link BtiFormat}), which can be read by {@link BtiTableReader}.
+ */
+@VisibleForTesting
+public class BtiTableWriter extends SortedTableWriter&lt;BtiFormatPartitionWriter, BtiTableWriter.IndexWriter&gt;
+{
+    private static final Logger logger = LoggerFactory.getLogger(BtiTableWriter.class);
+
+    public BtiTableWriter(Builder builder, LifecycleNewTracker lifecycleNewTracker, SSTable.Owner owner)
+    {
+        super(builder, lifecycleNewTracker, owner);
+    }
+
+    @Override
+    protected TrieIndexEntry createRowIndexEntry(DecoratedKey key, DeletionTime partitionLevelDeletion, long finishResult) throws IOException
+    {
+        TrieIndexEntry entry = TrieIndexEntry.create(partitionWriter.getInitialPosition(),
+                                                     finishResult,
+                                                     partitionLevelDeletion,
+                                                     partitionWriter.getRowIndexBlockCount());
+        indexWriter.append(key, entry);
+        return entry;
+    }
+
+    @SuppressWarnings({ &quot;resource&quot;, &quot;RedundantSuppression&quot; })
+    private BtiTableReader openInternal(OpenReason openReason, boolean isFinal, Supplier&lt;PartitionIndex&gt; partitionIndexSupplier)
+    {
+        IFilter filter = null;
+        FileHandle dataFile = null;
+        PartitionIndex partitionIndex = null;
+        FileHandle rowIndexFile = null;
+
+        BtiTableReader.Builder builder = unbuildTo(new BtiTableReader.Builder(descriptor), true).setMaxDataAge(maxDataAge)
+                                                                                                .setSerializationHeader(header)
+                                                                                                .setOpenReason(openReason);
+
+        try
+        {
+            builder.setStatsMetadata(statsMetadata());
+
+            partitionIndex = partitionIndexSupplier.get();
+            rowIndexFile = indexWriter.rowIndexFHBuilder.complete();
+            dataFile = openDataFile(isFinal ? NO_LENGTH_OVERRIDE : dataWriter.getLastFlushOffset(), builder.getStatsMetadata());
+            filter = indexWriter.getFilterCopy();
+
+            return builder.setPartitionIndex(partitionIndex)
+                          .setFirst(partitionIndex.firstKey())
+                          .setLast(partitionIndex.lastKey())
+                          .setRowIndexFile(rowIndexFile)
+                          .setDataFile(dataFile)
+                          .setFilter(filter)
+                          .build(owner().orElse(null), true, true);
+        }
+        catch (RuntimeException | Error ex)
+        {
+            JVMStabilityInspector.inspectThrowable(ex);
+            Throwables.closeNonNullAndAddSuppressed(ex, filter, dataFile, rowIndexFile, partitionIndex);
+            throw ex;
+        }
+    }
+
+    @Override
+    public void openEarly(Consumer&lt;SSTableReader&gt; callWhenReady)
+    {
+        long dataLength = dataWriter.position();
+        indexWriter.buildPartial(dataLength, partitionIndex -&gt;
+        {
+            indexWriter.rowIndexFHBuilder.withLengthOverride(indexWriter.rowIndexWriter.getLastFlushOffset());
+            BtiTableReader reader = openInternal(OpenReason.EARLY, false, () -&gt; partitionIndex);
+            callWhenReady.accept(reader);
+        });
+    }
+
+    @Override
+    public SSTableReader openFinalEarly()
+    {
+        // we must ensure the data is completely flushed to disk
+        indexWriter.complete(); // This will be called by completedPartitionIndex() below too, but we want it done now to
+        // ensure outstanding openEarly actions are not triggered.
+        dataWriter.sync();
+        indexWriter.rowIndexWriter.sync();
+        // Note: Nothing must be written to any of the files after this point, as the chunk cache could pick up and
+        // retain a partially-written page.
+
+        return openFinal(OpenReason.EARLY);
+    }
+
+    @Override
+    @SuppressWarnings({ &quot;resource&quot;, &quot;RedundantSuppression&quot; })
+    protected SSTableReader openFinal(OpenReason openReason)
+    {
+
+        if (maxDataAge &lt; 0)
+            maxDataAge = Clock.Global.currentTimeMillis();
+
+        return openInternal(openReason, true, indexWriter::completedPartitionIndex);
+    }
+
+    /**
+     * Encapsulates writing the index and filter for an SSTable. The state of this object is not valid until it has been closed.
+     */
+    protected static class IndexWriter extends SortedTableWriter.AbstractIndexWriter
+    {
+        final SequentialWriter rowIndexWriter;
+        private final FileHandle.Builder rowIndexFHBuilder;
+        private final SequentialWriter partitionIndexWriter;
+        private final FileHandle.Builder partitionIndexFHBuilder;
+        private final PartitionIndexBuilder partitionIndex;
+        boolean partitionIndexCompleted = false;
+        private DataPosition riMark;
+        private DataPosition piMark;
+
+        IndexWriter(Builder b, SequentialWriter dataWriter)
+        {
+            super(b);
+            rowIndexWriter = new SequentialWriter(descriptor.fileFor(Components.ROW_INDEX), b.getIOOptions().writerOptions);
+            rowIndexFHBuilder = IndexComponent.fileBuilder(Components.ROW_INDEX, b).withMmappedRegionsCache(b.getMmappedRegionsCache());
+            partitionIndexWriter = new SequentialWriter(descriptor.fileFor(Components.PARTITION_INDEX), b.getIOOptions().writerOptions);
+            partitionIndexFHBuilder = IndexComponent.fileBuilder(Components.PARTITION_INDEX, b).withMmappedRegionsCache(b.getMmappedRegionsCache());
+            partitionIndex = new PartitionIndexBuilder(partitionIndexWriter, partitionIndexFHBuilder);
+            // register listeners to be alerted when the data files are flushed
+            partitionIndexWriter.setPostFlushListener(partitionIndex::markPartitionIndexSynced);
+            rowIndexWriter.setPostFlushListener(partitionIndex::markRowIndexSynced);
+            dataWriter.setPostFlushListener(partitionIndex::markDataSynced);
+        }
+
+        public long append(DecoratedKey key, AbstractRowIndexEntry indexEntry) throws IOException
+        {
+            bf.add(key);
+            long position;
+            if (indexEntry.isIndexed())
+            {
+                long indexStart = rowIndexWriter.position();
+                try
+                {
+                    ByteBufferUtil.writeWithShortLength(key.getKey(), rowIndexWriter);
+                    ((TrieIndexEntry) indexEntry).serialize(rowIndexWriter, rowIndexWriter.position(), descriptor.version);
+                }
+                catch (IOException e)
+                {
+                    throw new FSWriteError(e, rowIndexWriter.getFile());
+                }
+
+                if (logger.isTraceEnabled())
+                    logger.trace(&quot;wrote index entry: {} at {}&quot;, indexEntry, indexStart);
+                position = indexStart;
+            }
+            else
+            {
+                // Write data position directly in trie.
+                position = ~indexEntry.position;
+            }
+            partitionIndex.addEntry(key, position);
+            return position;
+        }
+
+        public boolean buildPartial(long dataPosition, Consumer&lt;PartitionIndex&gt; callWhenReady)
+        {
+            return partitionIndex.buildPartial(callWhenReady, rowIndexWriter.position(), dataPosition);
+        }
+
+        public void mark()
+        {
+            riMark = rowIndexWriter.mark();
+            piMark = partitionIndexWriter.mark();
+        }
+
+        public void resetAndTruncate()
+        {
+            // we can't un-set the bloom filter addition, but extra keys in there are harmless.
+            // we can't reset dbuilder either, but that is the last thing called in after append, so
+            // we assume that if that worked then we won't be trying to reset.
+            rowIndexWriter.resetAndTruncate(riMark);
+            partitionIndexWriter.resetAndTruncate(piMark);
+        }
+
+        protected void doPrepare()
+        {
+            flushBf();
+
+            // truncate index file
+            rowIndexWriter.prepareToCommit();
+            rowIndexFHBuilder.withLengthOverride(rowIndexWriter.getLastFlushOffset());
+
+            complete();
+        }
+
+        void complete() throws FSWriteError
+        {
+            if (partitionIndexCompleted)
+                return;
+
+            try
+            {
+                partitionIndex.complete();
+                partitionIndexCompleted = true;
+            }
+            catch (IOException e)
+            {
+                throw new FSWriteError(e, partitionIndexWriter.getFile());
+            }
+        }
+
+        PartitionIndex completedPartitionIndex()
+        {
+            complete();
+            rowIndexFHBuilder.withLengthOverride(0);
+            partitionIndexFHBuilder.withLengthOverride(0);
+            try
+            {
+                return PartitionIndex.load(partitionIndexFHBuilder, metadata.getLocal().partitioner, false);
+            }
+            catch (IOException e)
+            {
+                throw new FSReadError(e, partitionIndexWriter.getFile());
+            }
+        }
+
+        protected Throwable doCommit(Throwable accumulate)
+        {
+            return rowIndexWriter.commit(accumulate);
+        }
+
+        protected Throwable doAbort(Throwable accumulate)
+        {
+            return rowIndexWriter.abort(accumulate);
+        }
+
+        @Override
+        protected Throwable doPostCleanup(Throwable accumulate)
+        {
+            return Throwables.close(accumulate, bf, partitionIndex, rowIndexWriter, partitionIndexWriter);
+        }
+    }
+
+    public static class Builder extends SortedTableWriter.Builder&lt;BtiFormatPartitionWriter, IndexWriter, BtiTableWriter, Builder&gt;
+    {
+        private MmappedRegionsCache mmappedRegionsCache;
+        private OperationType operationType;
+
+        private boolean dataWriterOpened;
+        private boolean partitionWriterOpened;
+        private boolean indexWriterOpened;
+
+        public Builder(Descriptor descriptor)
+        {
+<span class="nc" id="L306">            super(descriptor);</span>
+<span class="nc" id="L307">        }</span>
+
+        @Override
+        public Builder addDefaultComponents(Collection&lt;Index.Group&gt; indexGroups)
+        {
+<span class="nc" id="L312">            super.addDefaultComponents(indexGroups);</span>
+
+<span class="nc" id="L314">            addComponents(ImmutableSet.of(Components.PARTITION_INDEX, Components.ROW_INDEX));</span>
+
+<span class="nc" id="L316">            return this;</span>
+        }
+
+        // The following getters for the resources opened by buildInternal method can be only used during the lifetime of
+        // that method - that is, during the construction of the sstable.
+
+        @Override
+        public MmappedRegionsCache getMmappedRegionsCache()
+        {
+<span class="nc" id="L325">            return ensuringInBuildInternalContext(mmappedRegionsCache);</span>
+        }
+
+        @Override
+        protected SequentialWriter openDataWriter()
+        {
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            checkState(!dataWriterOpened, &quot;Data writer has been already opened.&quot;);</span>
+
+<span class="nc" id="L333">            return DataComponent.buildWriter(descriptor,</span>
+<span class="nc" id="L334">                                             getTableMetadataRef().getLocal(),</span>
+<span class="nc" id="L335">                                             getIOOptions().writerOptions,</span>
+<span class="nc" id="L336">                                             getMetadataCollector(),</span>
+<span class="nc" id="L337">                                             ensuringInBuildInternalContext(operationType),</span>
+<span class="nc" id="L338">                                             getIOOptions().flushCompression);</span>
+        }
+
+        @Override
+        protected IndexWriter openIndexWriter(SequentialWriter dataWriter)
+        {
+<span class="nc" id="L344">            checkNotNull(dataWriter);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">            checkState(!indexWriterOpened, &quot;Index writer has been already opened.&quot;);</span>
+
+<span class="nc" id="L347">            IndexWriter indexWriter = new IndexWriter(this, dataWriter);</span>
+<span class="nc" id="L348">            indexWriterOpened = true;</span>
+<span class="nc" id="L349">            return indexWriter;</span>
+        }
+
+        @Override
+        protected BtiFormatPartitionWriter openPartitionWriter(SequentialWriter dataWriter, IndexWriter indexWriter)
+        {
+<span class="nc" id="L355">            checkNotNull(dataWriter);</span>
+<span class="nc" id="L356">            checkNotNull(indexWriter);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            checkState(!partitionWriterOpened, &quot;Partition writer has been already opened.&quot;);</span>
+
+<span class="nc" id="L359">            BtiFormatPartitionWriter partitionWriter = new BtiFormatPartitionWriter(getSerializationHeader(),</span>
+<span class="nc" id="L360">                                                                                    getTableMetadataRef().getLocal().comparator,</span>
+                                                                                    dataWriter,
+                                                                                    indexWriter.rowIndexWriter,
+                                                                                    descriptor.version);
+<span class="nc" id="L364">            partitionWriterOpened = true;</span>
+<span class="nc" id="L365">            return partitionWriter;</span>
+        }
+
+        private &lt;T&gt; T ensuringInBuildInternalContext(T value)
+        {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">            checkState(value != null, &quot;The requested resource has not been initialized yet.&quot;);</span>
+<span class="nc" id="L371">            return value;</span>
+        }
+
+        @Override
+        protected BtiTableWriter buildInternal(LifecycleNewTracker lifecycleNewTracker, Owner owner)
+        {
+            try
+            {
+<span class="nc" id="L379">                this.mmappedRegionsCache = new MmappedRegionsCache();</span>
+<span class="nc" id="L380">                this.operationType = lifecycleNewTracker.opType();</span>
+
+<span class="nc" id="L382">                return new BtiTableWriter(this, lifecycleNewTracker, owner);</span>
+            }
+<span class="nc" id="L384">            catch (RuntimeException | Error ex)</span>
+            {
+<span class="nc" id="L386">                Throwables.closeAndAddSuppressed(ex, mmappedRegionsCache);</span>
+<span class="nc" id="L387">                throw ex;</span>
+            }
+            finally
+            {
+<span class="nc" id="L391">                mmappedRegionsCache = null;</span>
+<span class="nc" id="L392">                partitionWriterOpened = false;</span>
+<span class="nc" id="L393">                indexWriterOpened = false;</span>
+<span class="nc" id="L394">                dataWriterOpened = false;</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

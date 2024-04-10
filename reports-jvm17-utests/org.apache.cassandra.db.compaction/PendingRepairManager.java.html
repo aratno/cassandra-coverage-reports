@@ -1,0 +1,561 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PendingRepairManager.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">PendingRepairManager.java</span></div><h1>PendingRepairManager.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Maps;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.repair.consistent.admin.CleanupSummary;
+import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.TimeUUID;
+
+/**
+ * Companion to CompactionStrategyManager which manages the sstables marked pending repair.
+ *
+ * SSTables are classified as pending repair by the anti-compaction performed at the beginning
+ * of an incremental repair, or when they're streamed in with a pending repair id. This prevents
+ * unrepaired / pending repaired sstables from being compacted together. Once the repair session
+ * has completed, or failed, sstables will be re-classified as part of the compaction process.
+ */
+class PendingRepairManager
+{
+<span class="fc" id="L64">    private static final Logger logger = LoggerFactory.getLogger(PendingRepairManager.class);</span>
+
+    private final ColumnFamilyStore cfs;
+    private final CompactionParams params;
+    private final boolean isTransient;
+<span class="fc" id="L69">    private volatile ImmutableMap&lt;TimeUUID, AbstractCompactionStrategy&gt; strategies = ImmutableMap.of();</span>
+
+    /**
+     * Indicates we're being asked to do something with an sstable that isn't marked pending repair
+     */
+    public static class IllegalSSTableArgumentException extends IllegalArgumentException
+    {
+        public IllegalSSTableArgumentException(String s)
+        {
+<span class="fc" id="L78">            super(s);</span>
+<span class="fc" id="L79">        }</span>
+    }
+
+    PendingRepairManager(ColumnFamilyStore cfs, CompactionParams params, boolean isTransient)
+<span class="fc" id="L83">    {</span>
+<span class="fc" id="L84">        this.cfs = cfs;</span>
+<span class="fc" id="L85">        this.params = params;</span>
+<span class="fc" id="L86">        this.isTransient = isTransient;</span>
+<span class="fc" id="L87">    }</span>
+
+    private ImmutableMap.Builder&lt;TimeUUID, AbstractCompactionStrategy&gt; mapBuilder()
+    {
+<span class="fc" id="L91">        return ImmutableMap.builder();</span>
+    }
+
+    AbstractCompactionStrategy get(TimeUUID id)
+    {
+<span class="fc" id="L96">        return strategies.get(id);</span>
+    }
+
+    AbstractCompactionStrategy get(SSTableReader sstable)
+    {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        assert sstable.isPendingRepair();</span>
+<span class="nc" id="L102">        return get(sstable.getSSTableMetadata().pendingRepair);</span>
+    }
+
+    AbstractCompactionStrategy getOrCreate(TimeUUID id)
+    {
+<span class="fc" id="L107">        checkPendingID(id);</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        assert id != null;</span>
+<span class="fc" id="L109">        AbstractCompactionStrategy strategy = get(id);</span>
+<span class="fc bfc" id="L110" title="All 2 branches covered.">        if (strategy == null)</span>
+        {
+<span class="fc" id="L112">            synchronized (this)</span>
+            {
+<span class="fc" id="L114">                strategy = get(id);</span>
+
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">                if (strategy == null)</span>
+                {
+<span class="fc" id="L118">                    logger.debug(&quot;Creating {}.{} compaction strategy for pending repair: {}&quot;, cfs.metadata.keyspace, cfs.metadata.name, id);</span>
+<span class="fc" id="L119">                    strategy = cfs.createCompactionStrategyInstance(params);</span>
+<span class="fc" id="L120">                    strategies = mapBuilder().putAll(strategies).put(id, strategy).build();</span>
+                }
+<span class="fc" id="L122">            }</span>
+        }
+<span class="fc" id="L124">        return strategy;</span>
+    }
+
+    private static void checkPendingID(TimeUUID pendingID)
+    {
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (pendingID == null)</span>
+        {
+<span class="fc" id="L131">            throw new IllegalSSTableArgumentException(&quot;sstable is not pending repair&quot;);</span>
+        }
+<span class="fc" id="L133">    }</span>
+
+    AbstractCompactionStrategy getOrCreate(SSTableReader sstable)
+    {
+<span class="fc" id="L137">        return getOrCreate(sstable.getSSTableMetadata().pendingRepair);</span>
+    }
+
+    private synchronized void removeSessionIfEmpty(TimeUUID sessionID)
+    {
+<span class="fc bfc" id="L142" title="All 4 branches covered.">        if (!strategies.containsKey(sessionID) || !strategies.get(sessionID).getSSTables().isEmpty())</span>
+<span class="fc" id="L143">            return;</span>
+
+<span class="fc" id="L145">        logger.debug(&quot;Removing compaction strategy for pending repair {} on  {}.{}&quot;, sessionID, cfs.metadata.keyspace, cfs.metadata.name);</span>
+<span class="fc bfc" id="L146" title="All 2 branches covered.">        strategies = ImmutableMap.copyOf(Maps.filterKeys(strategies, k -&gt; !k.equals(sessionID)));</span>
+<span class="fc" id="L147">    }</span>
+
+    synchronized void removeSSTable(SSTableReader sstable)
+    {
+<span class="fc bfc" id="L151" title="All 2 branches covered.">        for (Map.Entry&lt;TimeUUID, AbstractCompactionStrategy&gt; entry : strategies.entrySet())</span>
+        {
+<span class="fc" id="L153">            entry.getValue().removeSSTable(sstable);</span>
+<span class="fc" id="L154">            removeSessionIfEmpty(entry.getKey());</span>
+<span class="fc" id="L155">        }</span>
+<span class="fc" id="L156">    }</span>
+
+
+    void removeSSTables(Iterable&lt;SSTableReader&gt; removed)
+    {
+<span class="fc bfc" id="L161" title="All 2 branches covered.">        for (SSTableReader sstable : removed)</span>
+<span class="fc" id="L162">            removeSSTable(sstable);</span>
+<span class="fc" id="L163">    }</span>
+
+    synchronized void addSSTable(SSTableReader sstable)
+    {
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        Preconditions.checkArgument(sstable.isTransient() == isTransient);</span>
+<span class="fc" id="L168">        getOrCreate(sstable).addSSTable(sstable);</span>
+<span class="fc" id="L169">    }</span>
+
+    void addSSTables(Iterable&lt;SSTableReader&gt; added)
+    {
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        for (SSTableReader sstable : added)</span>
+<span class="fc" id="L174">            addSSTable(sstable);</span>
+<span class="fc" id="L175">    }</span>
+
+    synchronized void replaceSSTables(Set&lt;SSTableReader&gt; removed, Set&lt;SSTableReader&gt; added)
+    {
+<span class="pc bpc" id="L179" title="3 of 4 branches missed.">        if (removed.isEmpty() &amp;&amp; added.isEmpty())</span>
+<span class="nc" id="L180">            return;</span>
+
+        // left=removed, right=added
+<span class="fc" id="L183">        Map&lt;TimeUUID, Pair&lt;Set&lt;SSTableReader&gt;, Set&lt;SSTableReader&gt;&gt;&gt; groups = new HashMap&lt;&gt;();</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">        for (SSTableReader sstable : removed)</span>
+        {
+<span class="fc" id="L186">            TimeUUID sessionID = sstable.getSSTableMetadata().pendingRepair;</span>
+<span class="fc bfc" id="L187" title="All 2 branches covered.">            if (!groups.containsKey(sessionID))</span>
+            {
+<span class="fc" id="L189">                groups.put(sessionID, Pair.create(new HashSet&lt;&gt;(), new HashSet&lt;&gt;()));</span>
+            }
+<span class="fc" id="L191">            groups.get(sessionID).left.add(sstable);</span>
+<span class="fc" id="L192">        }</span>
+
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        for (SSTableReader sstable : added)</span>
+        {
+<span class="fc" id="L196">            TimeUUID sessionID = sstable.getSSTableMetadata().pendingRepair;</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">            if (!groups.containsKey(sessionID))</span>
+            {
+<span class="nc" id="L199">                groups.put(sessionID, Pair.create(new HashSet&lt;&gt;(), new HashSet&lt;&gt;()));</span>
+            }
+<span class="fc" id="L201">            groups.get(sessionID).right.add(sstable);</span>
+<span class="fc" id="L202">        }</span>
+
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        for (Map.Entry&lt;TimeUUID, Pair&lt;Set&lt;SSTableReader&gt;, Set&lt;SSTableReader&gt;&gt;&gt; entry : groups.entrySet())</span>
+        {
+<span class="fc" id="L206">            AbstractCompactionStrategy strategy = getOrCreate(entry.getKey());</span>
+<span class="fc" id="L207">            Set&lt;SSTableReader&gt; groupRemoved = entry.getValue().left;</span>
+<span class="fc" id="L208">            Set&lt;SSTableReader&gt; groupAdded = entry.getValue().right;</span>
+
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">            if (!groupRemoved.isEmpty())</span>
+<span class="fc" id="L211">                strategy.replaceSSTables(groupRemoved, groupAdded);</span>
+            else
+<span class="nc" id="L213">                strategy.addSSTables(groupAdded);</span>
+
+<span class="fc" id="L215">            removeSessionIfEmpty(entry.getKey());</span>
+<span class="fc" id="L216">        }</span>
+<span class="fc" id="L217">    }</span>
+
+    synchronized void startup()
+    {
+<span class="fc" id="L221">        strategies.values().forEach(AbstractCompactionStrategy::startup);</span>
+<span class="fc" id="L222">    }</span>
+
+    synchronized void shutdown()
+    {
+<span class="fc" id="L226">        strategies.values().forEach(AbstractCompactionStrategy::shutdown);</span>
+<span class="fc" id="L227">    }</span>
+
+    private int getEstimatedRemainingTasks(TimeUUID sessionID, AbstractCompactionStrategy strategy)
+    {
+<span class="fc" id="L231">        return getEstimatedRemainingTasks(sessionID, strategy, 0, 0);</span>
+    }
+
+    private int getEstimatedRemainingTasks(TimeUUID sessionID, AbstractCompactionStrategy strategy, int additionalSSTables, long additionalBytes)
+    {
+<span class="fc bfc" id="L236" title="All 2 branches covered.">        return canCleanup(sessionID) ? 0 : strategy.getEstimatedRemainingTasks();</span>
+    }
+
+    int getEstimatedRemainingTasks()
+    {
+<span class="fc" id="L241">        return getEstimatedRemainingTasks(0, 0);</span>
+    }
+
+    int getEstimatedRemainingTasks(int additionalSSTables, long additionalBytes)
+    {
+<span class="fc" id="L246">        int tasks = 0;</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">        for (Map.Entry&lt;TimeUUID, AbstractCompactionStrategy&gt; entry : strategies.entrySet())</span>
+        {
+<span class="fc" id="L249">            tasks += getEstimatedRemainingTasks(entry.getKey(), entry.getValue(), additionalSSTables, additionalBytes);</span>
+<span class="fc" id="L250">        }</span>
+<span class="fc" id="L251">        return tasks;</span>
+    }
+
+    /**
+     * @return the highest max remaining tasks of all contained compaction strategies
+     */
+    int getMaxEstimatedRemainingTasks()
+    {
+<span class="fc" id="L259">        int tasks = 0;</span>
+<span class="pc bpc" id="L260" title="1 of 2 branches missed.">        for (Map.Entry&lt;TimeUUID, AbstractCompactionStrategy&gt; entry : strategies.entrySet())</span>
+        {
+<span class="nc" id="L262">            tasks = Math.max(tasks, getEstimatedRemainingTasks(entry.getKey(), entry.getValue()));</span>
+<span class="nc" id="L263">        }</span>
+<span class="fc" id="L264">        return tasks;</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    private RepairFinishedCompactionTask getRepairFinishedCompactionTask(TimeUUID sessionID)
+    {
+<span class="fc" id="L270">        Preconditions.checkState(canCleanup(sessionID));</span>
+<span class="fc" id="L271">        AbstractCompactionStrategy compactionStrategy = get(sessionID);</span>
+<span class="pc bpc" id="L272" title="1 of 2 branches missed.">        if (compactionStrategy == null)</span>
+<span class="nc" id="L273">            return null;</span>
+<span class="fc" id="L274">        Set&lt;SSTableReader&gt; sstables = compactionStrategy.getSSTables();</span>
+<span class="fc" id="L275">        long repairedAt = ActiveRepairService.instance().consistent.local.getFinalSessionRepairedAt(sessionID);</span>
+<span class="fc" id="L276">        LifecycleTransaction txn = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);</span>
+<span class="pc bpc" id="L277" title="1 of 2 branches missed.">        return txn == null ? null : new RepairFinishedCompactionTask(cfs, txn, sessionID, repairedAt);</span>
+    }
+
+    public static class CleanupTask
+    {
+        private final ColumnFamilyStore cfs;
+        private final List&lt;Pair&lt;TimeUUID, RepairFinishedCompactionTask&gt;&gt; tasks;
+
+        public CleanupTask(ColumnFamilyStore cfs, List&lt;Pair&lt;TimeUUID, RepairFinishedCompactionTask&gt;&gt; tasks)
+        {
+            this.cfs = cfs;
+            this.tasks = tasks;
+        }
+
+        public CleanupSummary cleanup()
+        {
+            Set&lt;TimeUUID&gt; successful = new HashSet&lt;&gt;();
+            Set&lt;TimeUUID&gt; unsuccessful = new HashSet&lt;&gt;();
+            for (Pair&lt;TimeUUID, RepairFinishedCompactionTask&gt; pair : tasks)
+            {
+                TimeUUID session = pair.left;
+                RepairFinishedCompactionTask task = pair.right;
+
+                if (task != null)
+                {
+                    try
+                    {
+                        task.run();
+                        successful.add(session);
+                    }
+                    catch (Throwable t)
+                    {
+                        t = task.transaction.abort(t);
+                        logger.error(&quot;Failed cleaning up &quot; + session, t);
+                        unsuccessful.add(session);
+                    }
+                }
+                else
+                {
+                    unsuccessful.add(session);
+                }
+            }
+            return new CleanupSummary(cfs, successful, unsuccessful);
+        }
+
+        public Throwable abort(Throwable accumulate)
+        {
+            for (Pair&lt;TimeUUID, RepairFinishedCompactionTask&gt; pair : tasks)
+                accumulate = pair.right.transaction.abort(accumulate);
+            return accumulate;
+        }
+    }
+
+    public CleanupTask releaseSessionData(Collection&lt;TimeUUID&gt; sessionIDs)
+    {
+<span class="nc" id="L332">        List&lt;Pair&lt;TimeUUID, RepairFinishedCompactionTask&gt;&gt; tasks = new ArrayList&lt;&gt;(sessionIDs.size());</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        for (TimeUUID session : sessionIDs)</span>
+        {
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (hasDataForSession(session))</span>
+            {
+<span class="nc" id="L337">                tasks.add(Pair.create(session, getRepairFinishedCompactionTask(session)));</span>
+            }
+<span class="nc" id="L339">        }</span>
+<span class="nc" id="L340">        return new CleanupTask(cfs, tasks);</span>
+    }
+
+    synchronized int getNumPendingRepairFinishedTasks()
+    {
+<span class="fc" id="L345">        int count = 0;</span>
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        for (TimeUUID sessionID : strategies.keySet())</span>
+        {
+<span class="fc bfc" id="L348" title="All 2 branches covered.">            if (canCleanup(sessionID))</span>
+            {
+<span class="fc" id="L350">                count++;</span>
+            }
+<span class="fc" id="L352">        }</span>
+<span class="fc" id="L353">        return count;</span>
+    }
+
+    synchronized AbstractCompactionTask getNextRepairFinishedTask()
+    {
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        for (TimeUUID sessionID : strategies.keySet())</span>
+        {
+<span class="fc bfc" id="L360" title="All 2 branches covered.">            if (canCleanup(sessionID))</span>
+            {
+<span class="fc" id="L362">                return getRepairFinishedCompactionTask(sessionID);</span>
+            }
+<span class="fc" id="L364">        }</span>
+<span class="nc" id="L365">        return null;</span>
+    }
+
+    synchronized AbstractCompactionTask getNextBackgroundTask(long gcBefore)
+    {
+<span class="fc bfc" id="L370" title="All 2 branches covered.">        if (strategies.isEmpty())</span>
+<span class="fc" id="L371">            return null;</span>
+
+<span class="fc" id="L373">        Map&lt;TimeUUID, Integer&gt; numTasks = new HashMap&lt;&gt;(strategies.size());</span>
+<span class="fc" id="L374">        ArrayList&lt;TimeUUID&gt; sessions = new ArrayList&lt;&gt;(strategies.size());</span>
+<span class="fc bfc" id="L375" title="All 2 branches covered.">        for (Map.Entry&lt;TimeUUID, AbstractCompactionStrategy&gt; entry : strategies.entrySet())</span>
+        {
+<span class="fc bfc" id="L377" title="All 2 branches covered.">            if (canCleanup(entry.getKey()))</span>
+            {
+<span class="fc" id="L379">                continue;</span>
+            }
+<span class="fc" id="L381">            numTasks.put(entry.getKey(), getEstimatedRemainingTasks(entry.getKey(), entry.getValue()));</span>
+<span class="fc" id="L382">            sessions.add(entry.getKey());</span>
+<span class="fc" id="L383">        }</span>
+
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        if (sessions.isEmpty())</span>
+<span class="fc" id="L386">            return null;</span>
+
+        // we want the session with the most compactions at the head of the list
+<span class="pc" id="L389">        sessions.sort((o1, o2) -&gt; numTasks.get(o2) - numTasks.get(o1));</span>
+
+<span class="fc" id="L391">        TimeUUID sessionID = sessions.get(0);</span>
+<span class="fc" id="L392">        return get(sessionID).getNextBackgroundTask(gcBefore);</span>
+    }
+
+    synchronized Collection&lt;AbstractCompactionTask&gt; getMaximalTasks(long gcBefore, boolean splitOutput)
+    {
+<span class="fc bfc" id="L397" title="All 2 branches covered.">        if (strategies.isEmpty())</span>
+<span class="fc" id="L398">            return null;</span>
+
+<span class="fc" id="L400">        List&lt;AbstractCompactionTask&gt; maximalTasks = new ArrayList&lt;&gt;(strategies.size());</span>
+<span class="fc bfc" id="L401" title="All 2 branches covered.">        for (Map.Entry&lt;TimeUUID, AbstractCompactionStrategy&gt; entry : strategies.entrySet())</span>
+        {
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">            if (canCleanup(entry.getKey()))</span>
+            {
+<span class="fc" id="L405">                maximalTasks.add(getRepairFinishedCompactionTask(entry.getKey()));</span>
+            }
+            else
+            {
+<span class="nc" id="L409">                Collection&lt;AbstractCompactionTask&gt; tasks = entry.getValue().getMaximalTask(gcBefore, splitOutput);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                if (tasks != null)</span>
+<span class="nc" id="L411">                    maximalTasks.addAll(tasks);</span>
+            }
+<span class="fc" id="L413">        }</span>
+<span class="pc bpc" id="L414" title="1 of 2 branches missed.">        return !maximalTasks.isEmpty() ? maximalTasks : null;</span>
+    }
+
+    Collection&lt;AbstractCompactionStrategy&gt; getStrategies()
+    {
+<span class="fc" id="L419">        return strategies.values();</span>
+    }
+
+    Set&lt;TimeUUID&gt; getSessions()
+    {
+<span class="fc" id="L424">        return strategies.keySet();</span>
+    }
+
+    boolean canCleanup(TimeUUID sessionID)
+    {
+<span class="fc bfc" id="L429" title="All 2 branches covered.">        return !ActiveRepairService.instance().consistent.local.isSessionInProgress(sessionID);</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;)
+    synchronized Set&lt;ISSTableScanner&gt; getScanners(Collection&lt;SSTableReader&gt; sstables, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">        if (sstables.isEmpty())</span>
+        {
+<span class="nc" id="L437">            return Collections.emptySet();</span>
+        }
+
+<span class="fc" id="L440">        Map&lt;TimeUUID, Set&lt;SSTableReader&gt;&gt; sessionSSTables = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">        for (SSTableReader sstable : sstables)</span>
+        {
+<span class="fc" id="L443">            TimeUUID sessionID = sstable.getSSTableMetadata().pendingRepair;</span>
+<span class="nc" id="L444">            checkPendingID(sessionID);</span>
+<span class="nc" id="L445">            sessionSSTables.computeIfAbsent(sessionID, k -&gt; new HashSet&lt;&gt;()).add(sstable);</span>
+<span class="nc" id="L446">        }</span>
+
+<span class="nc" id="L448">        Set&lt;ISSTableScanner&gt; scanners = new HashSet&lt;&gt;(sessionSSTables.size());</span>
+        try
+        {
+<span class="nc bnc" id="L451" title="All 2 branches missed.">            for (Map.Entry&lt;TimeUUID, Set&lt;SSTableReader&gt;&gt; entry : sessionSSTables.entrySet())</span>
+            {
+<span class="nc" id="L453">                scanners.addAll(getOrCreate(entry.getKey()).getScanners(entry.getValue(), ranges).scanners);</span>
+<span class="nc" id="L454">            }</span>
+        }
+<span class="nc" id="L456">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L458">            ISSTableScanner.closeAllAndPropagate(scanners, t);</span>
+<span class="nc" id="L459">        }</span>
+<span class="nc" id="L460">        return scanners;</span>
+    }
+
+    public boolean hasStrategy(AbstractCompactionStrategy strategy)
+    {
+<span class="fc" id="L465">        return strategies.values().contains(strategy);</span>
+    }
+
+    public synchronized boolean hasDataForSession(TimeUUID sessionID)
+    {
+<span class="fc" id="L470">        return strategies.keySet().contains(sessionID);</span>
+    }
+
+    boolean containsSSTable(SSTableReader sstable)
+    {
+<span class="fc bfc" id="L475" title="All 2 branches covered.">        if (!sstable.isPendingRepair())</span>
+<span class="fc" id="L476">            return false;</span>
+
+<span class="fc" id="L478">        AbstractCompactionStrategy strategy = strategies.get(sstable.getPendingRepair());</span>
+<span class="fc bfc" id="L479" title="All 4 branches covered.">        return strategy != null &amp;&amp; strategy.getSSTables().contains(sstable);</span>
+    }
+
+    public Collection&lt;AbstractCompactionTask&gt; createUserDefinedTasks(Collection&lt;SSTableReader&gt; sstables, long gcBefore)
+    {
+<span class="fc" id="L484">        Map&lt;TimeUUID, List&lt;SSTableReader&gt;&gt; group = sstables.stream().collect(Collectors.groupingBy(s -&gt; s.getSSTableMetadata().pendingRepair));</span>
+<span class="fc" id="L485">        return group.entrySet().stream().map(g -&gt; strategies.get(g.getKey()).getUserDefinedTask(g.getValue(), gcBefore)).collect(Collectors.toList());</span>
+    }
+
+    /**
+     * promotes/demotes sstables involved in a consistent repair that has been finalized, or failed
+     */
+    class RepairFinishedCompactionTask extends AbstractCompactionTask
+    {
+        private final TimeUUID sessionID;
+        private final long repairedAt;
+
+        RepairFinishedCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction transaction, TimeUUID sessionID, long repairedAt)
+<span class="fc" id="L497">        {</span>
+<span class="fc" id="L498">            super(cfs, transaction);</span>
+<span class="fc" id="L499">            this.sessionID = sessionID;</span>
+<span class="fc" id="L500">            this.repairedAt = repairedAt;</span>
+<span class="fc" id="L501">        }</span>
+
+        @VisibleForTesting
+        TimeUUID getSessionID()
+        {
+<span class="fc" id="L506">            return sessionID;</span>
+        }
+
+        protected void runMayThrow() throws Exception
+        {
+<span class="fc" id="L511">            boolean completed = false;</span>
+<span class="fc bfc" id="L512" title="All 4 branches covered.">            boolean obsoleteSSTables = isTransient &amp;&amp; repairedAt &gt; 0;</span>
+            try
+            {
+<span class="fc bfc" id="L515" title="All 2 branches covered.">                if (obsoleteSSTables)</span>
+                {
+<span class="fc" id="L517">                    logger.info(&quot;Obsoleting transient repaired sstables for {}&quot;, sessionID);</span>
+<span class="fc" id="L518">                    Preconditions.checkState(Iterables.all(transaction.originals(), SSTableReader::isTransient));</span>
+<span class="fc" id="L519">                    transaction.obsoleteOriginals();</span>
+                }
+                else
+                {
+<span class="fc" id="L523">                    logger.info(&quot;Moving {} from pending to repaired with repaired at = {} and session id = {}&quot;, transaction.originals(), repairedAt, sessionID);</span>
+<span class="fc" id="L524">                    cfs.getCompactionStrategyManager().mutateRepaired(transaction.originals(), repairedAt, ActiveRepairService.NO_PENDING_REPAIR, false);</span>
+                }
+<span class="fc" id="L526">                completed = true;</span>
+            }
+            finally
+            {
+<span class="fc bfc" id="L530" title="All 2 branches covered.">                if (obsoleteSSTables)</span>
+                {
+<span class="fc" id="L532">                    transaction.finish();</span>
+                }
+                else
+                {
+                    // we abort here because mutating metadata isn't guarded by LifecycleTransaction, so this won't roll
+                    // anything back. Also, we don't want to obsolete the originals. We're only using it to prevent other
+                    // compactions from marking these sstables compacting, and unmarking them when we're done
+<span class="fc" id="L539">                    transaction.abort();</span>
+                }
+<span class="pc bpc" id="L541" title="1 of 2 branches missed.">                if (completed)</span>
+                {
+<span class="fc" id="L543">                    removeSessionIfEmpty(sessionID);</span>
+                }
+            }
+<span class="fc" id="L546">        }</span>
+
+        public CompactionAwareWriter getCompactionAwareWriter(ColumnFamilyStore cfs, Directories directories, LifecycleTransaction txn, Set&lt;SSTableReader&gt; nonExpiredSSTables)
+        {
+<span class="nc" id="L550">            throw new UnsupportedOperationException();</span>
+        }
+
+        protected int executeInternal(ActiveCompactionsTracker activeCompactions)
+        {
+<span class="fc" id="L555">            run();</span>
+<span class="fc" id="L556">            return transaction.originals().size();</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

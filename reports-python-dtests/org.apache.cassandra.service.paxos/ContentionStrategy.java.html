@@ -1,0 +1,652 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ContentionStrategy.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">ContentionStrategy.java</span></div><h1>ContentionStrategy.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
+
+import com.codahale.metrics.Snapshot;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.DoubleSupplier;
+import java.util.function.LongBinaryOperator;
+import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static java.lang.Double.parseDouble;
+import static java.lang.Integer.parseInt;
+import static java.lang.Math.*;
+import static java.util.Arrays.stream;
+import static java.util.concurrent.TimeUnit.*;
+import static org.apache.cassandra.config.DatabaseDescriptor.*;
+import static org.apache.cassandra.metrics.ClientRequestsMetricsHolder.casReadMetrics;
+import static org.apache.cassandra.metrics.ClientRequestsMetricsHolder.casWriteMetrics;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.Clock.waitUntil;
+
+/**
+ * &lt;p&gt;A strategy for making back-off decisions for Paxos operations that fail to make progress because of other paxos operations.
+ * The strategy is defined by four factors: &lt;ul&gt;
+ * &lt;li&gt; {@link #min}
+ * &lt;li&gt; {@link #max}
+ * &lt;li&gt; {@link #minDelta}
+ * &lt;li&gt; {@link #waitRandomizer}
+ * &lt;/ul&gt;
+ *
+ * &lt;p&gt;The first three represent time periods, and may be defined dynamically based on a simple calculation over: &lt;ul&gt;
+ * &lt;li&gt; {@code pX()} recent experienced latency distribution for successful operations,
+ *                 e.g. {@code p50(rw)} the maximum of read and write median latencies,
+ *                      {@code p999(r)} the 99.9th percentile of read latencies
+ * &lt;li&gt; {@code attempts} the number of failed attempts made by the operation so far
+ * &lt;li&gt; {@code constant} a user provided floating point constant
+ * &lt;/ul&gt;
+ *
+ * &lt;p&gt;Their calculation may take any of these forms
+ * &lt;li&gt; constant            {@code $constant$[mu]s}
+ * &lt;li&gt; dynamic constant    {@code pX() * constant}
+ * &lt;li&gt; dynamic linear      {@code pX() * constant * attempts}
+ * &lt;li&gt; dynamic exponential {@code pX() * constant ^ attempts}
+ *
+ * &lt;p&gt;Furthermore, the dynamic calculations can be bounded with a min/max, like so:
+ *  {@code min[mu]s &lt;= dynamic expr &lt;= max[mu]s}
+ *
+ * e.g.
+ * &lt;li&gt; {@code 10ms &lt;= p50(rw)*0.66}
+ * &lt;li&gt; {@code 10ms &lt;= p95(rw)*1.8^attempts &lt;= 100ms}
+ * &lt;li&gt; {@code 5ms &lt;= p50(rw)*0.5}
+ *
+ * &lt;p&gt;These calculations are put together to construct a range from which we draw a random number.
+ * The period we wait for {@code X} will be drawn so that {@code min &lt;= X &lt; max}.
+ *
+ * &lt;p&gt;With the constraint that {@code max} must be {@code minDelta} greater than {@code min},
+ * but no greater than its expression-defined maximum. {@code max} will be increased up until
+ * this point, after which {@code min} will be decreased until this gap is imposed.
+ *
+ * &lt;p&gt;The {@link #waitRandomizer} property specifies the manner in which a random value is drawn from the range.
+ * It is defined using one of the following specifiers:
+ * &lt;li&gt; uniform
+ * &lt;li&gt; exp($power$) or exponential($power$)
+ * &lt;li&gt; qexp($power$) or qexponential($power$) or quantizedexponential($power$)
+ *
+ * The uniform specifier is self-explanatory, selecting all values in the range with equal probability.
+ * The exponential specifier draws values towards the end of the range with higher probability, raising
+ * a floating point number in the range [0..1.0) to the power provided, and translating the resulting value
+ * to a uniform value in the range.
+ * The quantized exponential specifier partitions the range into {@code attempts} buckets, then applies the pure
+ * exponential approach to draw values from [0..attempts), before drawing a uniform value from the corresponding bucket
+ *
+ * &lt;p&gt;Finally, there is also a {@link #traceAfterAttempts} property that permits initiating tracing of operations
+ * that experience a certain minimum number of failed paxos rounds due to contention. A setting of 0 or 1 will initiate
+ * a trace session after the first failed ballot.
+ */
+public class ContentionStrategy
+{
+<span class="nc" id="L113">    private static final Logger logger = LoggerFactory.getLogger(ContentionStrategy.class);</span>
+
+<span class="nc" id="L115">    private static final Pattern BOUND = Pattern.compile(</span>
+                &quot;(?&lt;const&gt;0|[0-9]+[mu]s)&quot; +
+                &quot;|((?&lt;min&gt;0|[0-9]+[mu]s) *&lt;= *)?&quot; +
+                    &quot;(p(?&lt;perc&gt;[0-9]+)\\((?&lt;rw&gt;r|w|rw|wr)\\)|(?&lt;constbase&gt;0|[0-9]+[mu]s))&quot; +
+                    &quot;\\s*([*]\\s*(?&lt;mod&gt;[0-9.]+)?\\s*(?&lt;modkind&gt;[*^]\\s*attempts)?)?&quot; +
+                &quot;( *&lt;= *(?&lt;max&gt;0|[0-9]+[mu]s))?&quot;);
+<span class="nc" id="L121">    private static final Pattern TIME = Pattern.compile(</span>
+                &quot;0|([0-9]+)ms|([0-9]+)us&quot;);
+<span class="nc" id="L123">    private static final Pattern RANDOMIZER = Pattern.compile(</span>
+                &quot;uniform|exp(onential)?[(](?&lt;exp&gt;[0-9.]+)[)]|q(uantized)?exp(onential)?[(](?&lt;qexp&gt;[0-9.]+)[)]&quot;);
+    private static final String DEFAULT_WAIT_RANDOMIZER = &quot;qexp(1.5)&quot;; // at least 0ms, and at least 66% of median latency
+    private static final String DEFAULT_MIN = &quot;0 &lt;= p50(rw)*0.66&quot;; // at least 0ms, and at least 66% of median latency
+    private static final String DEFAULT_MAX = &quot;10ms &lt;= p95(rw)*1.8^attempts &lt;= 100ms&quot;; // p95 latency with exponential back-off at rate of 1.8^attempts
+    private static final String DEFAULT_MIN_DELTA = &quot;5ms &lt;= p50(rw)*0.5&quot;; // at least 5ms, and at least 50% of median latency
+
+    private static volatile ContentionStrategy current;
+
+    // Factories can be useful for testing purposes, to supply custom implementations of selectors and modifiers.
+<span class="nc" id="L133">    final static LatencySelectorFactory selectors = new LatencySelectorFactory(){};</span>
+<span class="nc" id="L134">    final static LatencyModifierFactory modifiers = new LatencyModifierFactory(){};</span>
+<span class="nc" id="L135">    final static WaitRandomizerFactory randomizers = new WaitRandomizerFactory(){};</span>
+
+    static
+    {
+<span class="nc" id="L139">        current = new ContentionStrategy(defaultWaitRandomizer(), defaultMinWait(), defaultMaxWait(), defaultMinDelta(), Integer.MAX_VALUE);</span>
+<span class="nc" id="L140">    }</span>
+
+    static interface LatencyModifierFactory
+    {
+<span class="nc" id="L144">        default LatencyModifier identity() { return (l, a) -&gt; l; }</span>
+<span class="nc" id="L145">        default LatencyModifier multiply(double constant) { return (l, a) -&gt; saturatedCast(l * constant); }</span>
+<span class="nc" id="L146">        default LatencyModifier multiplyByAttempts(double multiply) { return (l, a) -&gt; saturatedCast(l * multiply * a); }</span>
+<span class="nc" id="L147">        default LatencyModifier multiplyByAttemptsExp(double base) { return (l, a) -&gt; saturatedCast(l * pow(base, a)); }</span>
+    }
+
+    static interface LatencySupplier
+    {
+        abstract long get(double percentile);
+    }
+
+    static interface LatencySelector
+    {
+        abstract long select(LatencySupplier readLatencyHistogram, LatencySupplier writeLatencyHistogram);
+    }
+
+    static interface LatencySelectorFactory
+    {
+<span class="nc" id="L162">        default LatencySelector constant(long latency) { return (read, write) -&gt; latency; }</span>
+<span class="nc" id="L163">        default LatencySelector read(double percentile) { return (read, write) -&gt; read.get(percentile); }</span>
+<span class="nc" id="L164">        default LatencySelector write(double percentile) { return (read, write) -&gt; write.get(percentile); }</span>
+<span class="nc" id="L165">        default LatencySelector maxReadWrite(double percentile) { return (read, write) -&gt; max(read.get(percentile), write.get(percentile)); }</span>
+    }
+
+    static interface LatencyModifier
+    {
+        long modify(long latency, int attempts);
+    }
+
+    static interface WaitRandomizer
+    {
+        abstract long wait(long min, long max, int attempts);
+    }
+
+    static interface WaitRandomizerFactory
+    {
+<span class="nc" id="L180">        default LongBinaryOperator uniformLongSupplier() { return (min, max) -&gt; ThreadLocalRandom.current().nextLong(min, max); } // DO NOT USE METHOD HANDLES (want to fetch afresh each time)</span>
+<span class="nc" id="L181">        default DoubleSupplier uniformDoubleSupplier() { return () -&gt; ThreadLocalRandom.current().nextDouble(); }</span>
+        
+<span class="nc" id="L183">        default WaitRandomizer uniform() { return new Uniform(uniformLongSupplier()); }</span>
+<span class="nc" id="L184">        default WaitRandomizer exponential(double power) { return new Exponential(uniformLongSupplier(), uniformDoubleSupplier(), power); }</span>
+<span class="nc" id="L185">        default WaitRandomizer quantizedExponential(double power) { return new QuantizedExponential(uniformLongSupplier(), uniformDoubleSupplier(), power); }</span>
+
+        static class Uniform implements WaitRandomizer
+        {
+            final LongBinaryOperator uniformLong;
+
+            public Uniform(LongBinaryOperator uniformLong)
+<span class="nc" id="L192">            {</span>
+<span class="nc" id="L193">                this.uniformLong = uniformLong;</span>
+<span class="nc" id="L194">            }</span>
+
+            @Override
+            public long wait(long min, long max, int attempts)
+            {
+<span class="nc" id="L199">                return uniformLong.applyAsLong(min, max);</span>
+            }
+        }
+
+        static abstract class AbstractExponential implements WaitRandomizer
+        {
+            final LongBinaryOperator uniformLong;
+            final DoubleSupplier uniformDouble;
+            final double power;
+
+            public AbstractExponential(LongBinaryOperator uniformLong, DoubleSupplier uniformDouble, double power)
+<span class="nc" id="L210">            {</span>
+<span class="nc" id="L211">                this.uniformLong = uniformLong;</span>
+<span class="nc" id="L212">                this.uniformDouble = uniformDouble;</span>
+<span class="nc" id="L213">                this.power = power;</span>
+<span class="nc" id="L214">            }</span>
+        }
+
+        static class Exponential extends AbstractExponential
+        {
+            public Exponential(LongBinaryOperator uniformLong, DoubleSupplier uniformDouble, double power)
+            {
+<span class="nc" id="L221">                super(uniformLong, uniformDouble, power);</span>
+<span class="nc" id="L222">            }</span>
+
+            @Override
+            public long wait(long min, long max, int attempts)
+            {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                if (attempts == 1)</span>
+<span class="nc" id="L228">                    return uniformLong.applyAsLong(min, max);</span>
+
+<span class="nc" id="L230">                double p = uniformDouble.getAsDouble();</span>
+<span class="nc" id="L231">                long delta = max - min;</span>
+<span class="nc" id="L232">                delta *= Math.pow(p, power);</span>
+<span class="nc" id="L233">                return max - delta;</span>
+            }
+        }
+
+        static class QuantizedExponential extends AbstractExponential
+        {
+            public QuantizedExponential(LongBinaryOperator uniformLong, DoubleSupplier uniformDouble, double power)
+            {
+<span class="nc" id="L241">                super(uniformLong, uniformDouble, power);</span>
+<span class="nc" id="L242">            }</span>
+
+            @Override
+            public long wait(long min, long max, int attempts)
+            {
+<span class="nc" id="L247">                long quanta = (max - min) / attempts;</span>
+<span class="nc bnc" id="L248" title="All 4 branches missed.">                if (attempts == 1 || quanta == 0)</span>
+<span class="nc" id="L249">                    return uniformLong.applyAsLong(min, max);</span>
+
+<span class="nc" id="L251">                double p = uniformDouble.getAsDouble();</span>
+<span class="nc" id="L252">                int base = (int) (attempts * Math.pow(p, power));</span>
+<span class="nc" id="L253">                return max - ThreadLocalRandom.current().nextLong(quanta * base, quanta * (base + 1));</span>
+            }
+        }
+    }
+
+    static class SnapshotAndTime
+    {
+        final long validUntil;
+        final Snapshot snapshot;
+
+        SnapshotAndTime(long validUntil, Snapshot snapshot)
+<span class="nc" id="L264">        {</span>
+<span class="nc" id="L265">            this.validUntil = validUntil;</span>
+<span class="nc" id="L266">            this.snapshot = snapshot;</span>
+<span class="nc" id="L267">        }</span>
+    }
+
+    static class TimeLimitedLatencySupplier extends AtomicReference&lt;SnapshotAndTime&gt; implements LatencySupplier
+    {
+        final Supplier&lt;Snapshot&gt; snapshotSupplier;
+        final long validForNanos;
+
+        TimeLimitedLatencySupplier(Supplier&lt;Snapshot&gt; snapshotSupplier, long time, TimeUnit units)
+<span class="nc" id="L276">        {</span>
+<span class="nc" id="L277">            this.snapshotSupplier = snapshotSupplier;</span>
+<span class="nc" id="L278">            this.validForNanos = units.toNanos(time);</span>
+<span class="nc" id="L279">        }</span>
+
+        private Snapshot getSnapshot()
+        {
+<span class="nc" id="L283">            long now = nanoTime();</span>
+
+<span class="nc" id="L285">            SnapshotAndTime cur = get();</span>
+<span class="nc bnc" id="L286" title="All 4 branches missed.">            if (cur != null &amp;&amp; cur.validUntil &gt; now)</span>
+<span class="nc" id="L287">                return cur.snapshot;</span>
+
+<span class="nc" id="L289">            Snapshot newSnapshot = snapshotSupplier.get();</span>
+<span class="nc" id="L290">            SnapshotAndTime next = new SnapshotAndTime(now + validForNanos, newSnapshot);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (compareAndSet(cur, next))</span>
+<span class="nc" id="L292">                return next.snapshot;</span>
+
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            return accumulateAndGet(next, (a, b) -&gt; a.validUntil &gt; b.validUntil ? a : b).snapshot;</span>
+        }
+
+        @Override
+        public long get(double percentile)
+        {
+<span class="nc" id="L300">            return (long)getSnapshot().getValue(percentile);</span>
+        }
+    }
+
+    static class Bound
+    {
+        final long min, max, onFailure;
+        final LatencyModifier modifier;
+        final LatencySelector selector;
+        final LatencySupplier reads, writes;
+
+        Bound(long min, long max, long onFailure, LatencyModifier modifier, LatencySelector selector)
+<span class="nc" id="L312">        {</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            Preconditions.checkArgument(min&lt;=max, &quot;min (%s) must be less than or equal to max (%s)&quot;, min, max);</span>
+<span class="nc" id="L314">            this.min = min;</span>
+<span class="nc" id="L315">            this.max = max;</span>
+<span class="nc" id="L316">            this.onFailure = onFailure;</span>
+<span class="nc" id="L317">            this.modifier = modifier;</span>
+<span class="nc" id="L318">            this.selector = selector;</span>
+<span class="nc" id="L319">            this.reads = new TimeLimitedLatencySupplier(casReadMetrics.latency::getSnapshot, 10L, SECONDS);</span>
+<span class="nc" id="L320">            this.writes = new TimeLimitedLatencySupplier(casWriteMetrics.latency::getSnapshot, 10L, SECONDS);</span>
+<span class="nc" id="L321">        }</span>
+
+        long get(int attempts)
+        {
+            try
+            {
+<span class="nc" id="L327">                long base = selector.select(reads, writes);</span>
+<span class="nc" id="L328">                return max(min, min(max, modifier.modify(base, attempts)));</span>
+            }
+<span class="nc" id="L330">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L332">                NoSpamLogger.getLogger(logger, 1L, MINUTES).info(&quot;&quot;, t);</span>
+<span class="nc" id="L333">                return onFailure;</span>
+            }
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L339">            return &quot;Bound{&quot; +</span>
+                   &quot;min=&quot; + min +
+                   &quot;, max=&quot; + max +
+                   &quot;, onFailure=&quot; + onFailure +
+                   &quot;, modifier=&quot; + modifier +
+                   &quot;, selector=&quot; + selector +
+                   '}';
+        }
+    }
+
+    final WaitRandomizer waitRandomizer;
+    final Bound min, max, minDelta;
+    final int traceAfterAttempts;
+
+    public ContentionStrategy(String waitRandomizer, String min, String max, String minDelta, int traceAfterAttempts)
+<span class="nc" id="L354">    {</span>
+<span class="nc" id="L355">        this.waitRandomizer = parseWaitRandomizer(waitRandomizer);</span>
+<span class="nc" id="L356">        this.min = parseBound(min, true);</span>
+<span class="nc" id="L357">        this.max = parseBound(max, false);</span>
+<span class="nc" id="L358">        this.minDelta = parseBound(minDelta, true);</span>
+<span class="nc" id="L359">        this.traceAfterAttempts = traceAfterAttempts;</span>
+<span class="nc" id="L360">    }</span>
+
+<span class="nc" id="L362">    public enum Type</span>
+    {
+<span class="nc" id="L364">        READ(&quot;Contended Paxos Read&quot;), WRITE(&quot;Contended Paxos Write&quot;), REPAIR(&quot;Contended Paxos Repair&quot;);</span>
+
+        final String traceTitle;
+        final String lowercase;
+
+        Type(String traceTitle)
+<span class="nc" id="L370">        {</span>
+<span class="nc" id="L371">            this.traceTitle = traceTitle;</span>
+<span class="nc" id="L372">            this.lowercase = name().toLowerCase();</span>
+<span class="nc" id="L373">        }</span>
+    }
+
+    long computeWaitUntilForContention(int attempts, TableMetadata table, DecoratedKey partitionKey, ConsistencyLevel consistency, Type type)
+    {
+<span class="nc bnc" id="L378" title="All 4 branches missed.">        if (attempts &gt;= traceAfterAttempts &amp;&amp; !Tracing.isTracing())</span>
+        {
+<span class="nc" id="L380">            Tracing.instance.newSession(Tracing.TraceType.QUERY);</span>
+<span class="nc" id="L381">            Tracing.instance.begin(type.traceTitle,</span>
+<span class="nc" id="L382">                                   ImmutableMap.of(</span>
+                                       &quot;keyspace&quot;, table.keyspace,
+                                       &quot;table&quot;, table.name,
+<span class="nc" id="L385">                                       &quot;partitionKey&quot;, table.partitionKeyType.getString(partitionKey.getKey()),</span>
+<span class="nc" id="L386">                                       &quot;consistency&quot;, consistency.name(),</span>
+                                       &quot;kind&quot;, type.lowercase
+                                   ));
+
+<span class="nc" id="L390">            logger.info(&quot;Tracing contended paxos {} for key {} on {}.{} with trace id {}&quot;,</span>
+                        type.lowercase,
+<span class="nc" id="L392">                        ByteBufferUtil.bytesToHex(partitionKey.getKey()),</span>
+                        table.keyspace, table.name,
+<span class="nc" id="L394">                        Tracing.instance.getSessionId());</span>
+        }
+
+<span class="nc" id="L397">        long minWaitMicros = min.get(attempts);</span>
+<span class="nc" id="L398">        long maxWaitMicros = max.get(attempts);</span>
+<span class="nc" id="L399">        long minDeltaMicros = minDelta.get(attempts);</span>
+
+<span class="nc bnc" id="L401" title="All 2 branches missed.">        if (minWaitMicros + minDeltaMicros &gt; maxWaitMicros)</span>
+        {
+<span class="nc" id="L403">            maxWaitMicros = minWaitMicros + minDeltaMicros;</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">            if (maxWaitMicros &gt; this.max.max)</span>
+            {
+<span class="nc" id="L406">                maxWaitMicros = this.max.max;</span>
+<span class="nc" id="L407">                minWaitMicros = max(this.min.min, min(this.min.max, maxWaitMicros - minDeltaMicros));</span>
+            }
+        }
+
+<span class="nc" id="L411">        long wait = waitRandomizer.wait(minWaitMicros, maxWaitMicros, attempts);</span>
+<span class="nc" id="L412">        return nanoTime() + MICROSECONDS.toNanos(wait);</span>
+    }
+
+    boolean doWaitForContention(long deadline, int attempts, TableMetadata table, DecoratedKey partitionKey, ConsistencyLevel consistency, Type type)
+    {
+<span class="nc" id="L417">        long until = computeWaitUntilForContention(attempts, table, partitionKey, consistency, type);</span>
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (until &gt;= deadline)</span>
+<span class="nc" id="L419">            return false;</span>
+
+        try
+        {
+<span class="nc" id="L423">            waitUntil(until);</span>
+        }
+<span class="nc" id="L425">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L427">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L428">            return false;</span>
+<span class="nc" id="L429">        }</span>
+<span class="nc" id="L430">        return true;</span>
+    }
+
+    static boolean waitForContention(long deadline, int attempts, TableMetadata table, DecoratedKey partitionKey, ConsistencyLevel consistency, Type type)
+    {
+<span class="nc" id="L435">        return current.doWaitForContention(deadline, attempts, table, partitionKey, consistency, type);</span>
+    }
+
+    static long waitUntilForContention(int attempts, TableMetadata table, DecoratedKey partitionKey, ConsistencyLevel consistency, Type type)
+    {
+<span class="nc" id="L440">        return current.computeWaitUntilForContention(attempts, table, partitionKey, consistency, type);</span>
+    }
+
+    static class ParsedStrategy
+    {
+        final String waitRandomizer, min, max, minDelta;
+        final ContentionStrategy strategy;
+
+        ParsedStrategy(String waitRandomizer, String min, String max, String minDelta, ContentionStrategy strategy)
+<span class="nc" id="L449">        {</span>
+<span class="nc" id="L450">            this.waitRandomizer = waitRandomizer;</span>
+<span class="nc" id="L451">            this.min = min;</span>
+<span class="nc" id="L452">            this.max = max;</span>
+<span class="nc" id="L453">            this.minDelta = minDelta;</span>
+<span class="nc" id="L454">            this.strategy = strategy;</span>
+<span class="nc" id="L455">        }</span>
+    }
+
+    @VisibleForTesting
+    static ParsedStrategy parseStrategy(String spec)
+    {
+<span class="nc" id="L461">        String[] args = spec.split(&quot;,&quot;);</span>
+<span class="nc" id="L462">        String waitRandomizer = find(args, &quot;random&quot;);</span>
+<span class="nc" id="L463">        String min = find(args, &quot;min&quot;);</span>
+<span class="nc" id="L464">        String max = find(args, &quot;max&quot;);</span>
+<span class="nc" id="L465">        String minDelta = find(args, &quot;delta&quot;);</span>
+<span class="nc" id="L466">        String trace = find(args, &quot;trace&quot;);</span>
+
+<span class="nc bnc" id="L468" title="All 2 branches missed.">        if (waitRandomizer == null) waitRandomizer = defaultWaitRandomizer();</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        if (min == null) min = defaultMinWait();</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">        if (max == null) max = defaultMaxWait();</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">        if (minDelta == null) minDelta = defaultMinDelta();</span>
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        int traceAfterAttempts = trace == null ? current.traceAfterAttempts: Integer.parseInt(trace);</span>
+
+<span class="nc" id="L474">        ContentionStrategy strategy = new ContentionStrategy(waitRandomizer, min, max, minDelta, traceAfterAttempts);</span>
+<span class="nc" id="L475">        return new ParsedStrategy(waitRandomizer, min, max, minDelta, strategy);</span>
+    }
+
+
+    public static void setStrategy(String spec)
+    {
+<span class="nc" id="L481">        ParsedStrategy parsed = parseStrategy(spec);</span>
+<span class="nc" id="L482">        current = parsed.strategy;</span>
+<span class="nc" id="L483">        setPaxosContentionWaitRandomizer(parsed.waitRandomizer);</span>
+<span class="nc" id="L484">        setPaxosContentionMinWait(parsed.min);</span>
+<span class="nc" id="L485">        setPaxosContentionMaxWait(parsed.max);</span>
+<span class="nc" id="L486">        setPaxosContentionMinDelta(parsed.minDelta);</span>
+<span class="nc" id="L487">    }</span>
+
+    public static String getStrategySpec()
+    {
+<span class="nc" id="L491">        return &quot;min=&quot; + defaultMinWait()</span>
+<span class="nc" id="L492">                + &quot;,max=&quot; + defaultMaxWait()</span>
+<span class="nc" id="L493">                + &quot;,delta=&quot; + defaultMinDelta()</span>
+<span class="nc" id="L494">                + &quot;,random=&quot; + defaultWaitRandomizer()</span>
+                + &quot;,trace=&quot; + current.traceAfterAttempts;
+    }
+
+    private static String find(String[] args, String param)
+    {
+<span class="nc" id="L500">        return stream(args).filter(s -&gt; s.startsWith(param + '='))</span>
+<span class="nc" id="L501">                .map(s -&gt; s.substring(param.length() + 1))</span>
+<span class="nc" id="L502">                .findFirst().orElse(null);</span>
+    }
+
+    private static LatencySelector parseLatencySelector(Matcher m, LatencySelectorFactory selectors)
+    {
+<span class="nc" id="L507">        String perc = m.group(&quot;perc&quot;);</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        if (perc == null)</span>
+<span class="nc" id="L509">            return selectors.constant(parseInMicros(m.group(&quot;constbase&quot;)));</span>
+
+<span class="nc" id="L511">        double percentile = parseDouble(&quot;0.&quot; + perc);</span>
+<span class="nc" id="L512">        String rw = m.group(&quot;rw&quot;);</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (rw.length() == 2)</span>
+<span class="nc" id="L514">            return selectors.maxReadWrite(percentile);</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">        else if (&quot;r&quot;.equals(rw))</span>
+<span class="nc" id="L516">            return selectors.read(percentile);</span>
+        else
+<span class="nc" id="L518">            return selectors.write(percentile);</span>
+    }
+
+    private static LatencyModifier parseLatencyModifier(Matcher m, LatencyModifierFactory modifiers)
+    {
+<span class="nc" id="L523">        String mod = m.group(&quot;mod&quot;);</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">        if (mod == null)</span>
+<span class="nc" id="L525">            return modifiers.identity();</span>
+
+<span class="nc" id="L527">        double modifier = parseDouble(mod);</span>
+
+<span class="nc" id="L529">        String modkind = m.group(&quot;modkind&quot;);</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if (modkind == null)</span>
+<span class="nc" id="L531">            return modifiers.multiply(modifier);</span>
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        if (modkind.startsWith(&quot;*&quot;))</span>
+<span class="nc" id="L534">            return modifiers.multiplyByAttempts(modifier);</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">        else if (modkind.startsWith(&quot;^&quot;))</span>
+<span class="nc" id="L536">            return modifiers.multiplyByAttemptsExp(modifier);</span>
+        else
+<span class="nc" id="L538">            throw new IllegalArgumentException(&quot;Unrecognised attempt modifier: &quot; + modkind);</span>
+    }
+
+    static long saturatedCast(double v)
+    {
+<span class="nc bnc" id="L543" title="All 2 branches missed.">        if (v &gt; Long.MAX_VALUE)</span>
+<span class="nc" id="L544">            return Long.MAX_VALUE;</span>
+<span class="nc" id="L545">        return (long) v;</span>
+    }
+
+    static WaitRandomizer parseWaitRandomizer(String input)
+    {
+<span class="nc" id="L550">        return parseWaitRandomizer(input, randomizers);</span>
+    }
+
+    static WaitRandomizer parseWaitRandomizer(String input, WaitRandomizerFactory randomizers)
+    {
+<span class="nc" id="L555">        Matcher m = RANDOMIZER.matcher(input);</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">        if (!m.matches())</span>
+<span class="nc" id="L557">            throw new IllegalArgumentException(input + &quot; does not match&quot; + RANDOMIZER);</span>
+
+        String exp;
+<span class="nc" id="L560">        exp = m.group(&quot;exp&quot;);</span>
+<span class="nc bnc" id="L561" title="All 2 branches missed.">        if (exp != null)</span>
+<span class="nc" id="L562">            return randomizers.exponential(Double.parseDouble(exp));</span>
+<span class="nc" id="L563">        exp = m.group(&quot;qexp&quot;);</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">        if (exp != null)</span>
+<span class="nc" id="L565">            return randomizers.quantizedExponential(Double.parseDouble(exp));</span>
+<span class="nc" id="L566">        return randomizers.uniform();</span>
+    }
+
+    static Bound parseBound(String input, boolean isMin)
+    {
+<span class="nc" id="L571">        return parseBound(input, isMin, selectors, modifiers);</span>
+    }
+
+    @VisibleForTesting
+    static Bound parseBound(String input, boolean isMin, LatencySelectorFactory selectors, LatencyModifierFactory modifiers)
+    {
+<span class="nc" id="L577">        Matcher m = BOUND.matcher(input);</span>
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        if (!m.matches())</span>
+<span class="nc" id="L579">            throw new IllegalArgumentException(input + &quot; does not match &quot; + BOUND);</span>
+
+<span class="nc" id="L581">        String maybeConst = m.group(&quot;const&quot;);</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">        if (maybeConst != null)</span>
+        {
+<span class="nc" id="L584">            long v = parseInMicros(maybeConst);</span>
+<span class="nc" id="L585">            return new Bound(v, v, v, modifiers.identity(), selectors.constant(v));</span>
+        }
+
+<span class="nc" id="L588">        long min = parseInMicros(m.group(&quot;min&quot;), 0);</span>
+<span class="nc" id="L589">        long max = parseInMicros(m.group(&quot;max&quot;), maxQueryTimeoutMicros() / 2);</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        return new Bound(min, max, isMin ? min : max, parseLatencyModifier(m, modifiers), parseLatencySelector(m, selectors));</span>
+    }
+
+    private static long parseInMicros(String input, long orElse)
+    {
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        if (input == null)</span>
+<span class="nc" id="L596">            return orElse;</span>
+
+<span class="nc" id="L598">        return parseInMicros(input);</span>
+    }
+
+    private static long parseInMicros(String input)
+    {
+<span class="nc" id="L603">        Matcher m = TIME.matcher(input);</span>
+<span class="nc bnc" id="L604" title="All 2 branches missed.">        if (!m.matches())</span>
+<span class="nc" id="L605">            throw new IllegalArgumentException(input + &quot; does not match &quot; + TIME);</span>
+
+        String text;
+<span class="nc bnc" id="L608" title="All 2 branches missed.">        if (null != (text = m.group(1)))</span>
+<span class="nc" id="L609">            return parseInt(text) * 1000;</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        else if (null != (text = m.group(2)))</span>
+<span class="nc" id="L611">            return parseInt(text);</span>
+        else
+<span class="nc" id="L613">            return 0;</span>
+    }
+
+    @VisibleForTesting
+    static String defaultWaitRandomizer()
+    {
+<span class="nc" id="L619">        return orElse(DatabaseDescriptor::getPaxosContentionWaitRandomizer, DEFAULT_WAIT_RANDOMIZER);</span>
+    }
+
+    @VisibleForTesting
+    static String defaultMinWait()
+    {
+<span class="nc" id="L625">        return orElse(DatabaseDescriptor::getPaxosContentionMinWait, DEFAULT_MIN);</span>
+    }
+
+    @VisibleForTesting
+    static String defaultMaxWait()
+    {
+<span class="nc" id="L631">        return orElse(DatabaseDescriptor::getPaxosContentionMaxWait, DEFAULT_MAX);</span>
+    }
+
+    @VisibleForTesting
+    static String defaultMinDelta()
+    {
+<span class="nc" id="L637">        return orElse(DatabaseDescriptor::getPaxosContentionMinDelta, DEFAULT_MIN_DELTA);</span>
+    }
+
+    @VisibleForTesting
+    static long maxQueryTimeoutMicros()
+    {
+<span class="nc" id="L643">        return max(max(getCasContentionTimeout(MICROSECONDS), getWriteRpcTimeout(MICROSECONDS)), getReadRpcTimeout(MICROSECONDS));</span>
+    }
+
+    private static String orElse(Supplier&lt;String&gt; get, String orElse)
+    {
+<span class="nc" id="L648">        String result = get.get();</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">        return result != null ? result : orElse;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

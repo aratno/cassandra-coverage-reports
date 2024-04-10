@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosStartPrepareCleanup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.cleanup</a> &gt; <span class="el_source">PaxosStartPrepareCleanup.java</span></div><h1>PaxosStartPrepareCleanup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.cleanup;
+
+import java.io.IOException;
+import java.util.*;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.PendingRangeCalculatorService;
+import org.apache.cassandra.service.paxos.Ballot;
+import org.apache.cassandra.service.paxos.Commit;
+import org.apache.cassandra.service.paxos.PaxosRepairHistory;
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
+
+import static org.apache.cassandra.net.Verb.PAXOS2_CLEANUP_START_PREPARE_REQ;
+import static org.apache.cassandra.service.paxos.Paxos.newBallot;
+import static org.apache.cassandra.service.paxos.PaxosState.ballotTracker;
+
+/**
+ * Determines the highest ballot we should attempt to repair
+ */
+public class PaxosStartPrepareCleanup extends AsyncFuture&lt;PaxosCleanupHistory&gt; implements RequestCallbackWithFailure&lt;PaxosCleanupHistory&gt;
+{
+<span class="nc" id="L57">    private static final Logger logger = LoggerFactory.getLogger(PaxosStartPrepareCleanup.class);</span>
+
+<span class="nc" id="L59">    public static final RequestSerializer serializer = new RequestSerializer();</span>
+
+    private final TableId table;
+
+    private final Set&lt;InetAddressAndPort&gt; waitingResponse;
+<span class="nc" id="L64">    private Ballot maxBallot = null;</span>
+<span class="nc" id="L65">    private PaxosRepairHistory history = null;</span>
+
+    PaxosStartPrepareCleanup(TableId table, Collection&lt;InetAddressAndPort&gt; endpoints)
+<span class="nc" id="L68">    {</span>
+<span class="nc" id="L69">        this.table = table;</span>
+<span class="nc" id="L70">        this.waitingResponse = new HashSet&lt;&gt;(endpoints);</span>
+<span class="nc" id="L71">    }</span>
+
+    /**
+     * We run paxos repair as part of topology changes, so we include the local endpoint state in the paxos repair
+     * prepare message to prevent racing with gossip dissemination and guarantee that every repair participant is aware
+     * of the pending ring change during repair.
+     */
+    public static PaxosStartPrepareCleanup prepare(TableId tableId, Collection&lt;InetAddressAndPort&gt; endpoints, EndpointState localEpState, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L80">        PaxosStartPrepareCleanup callback = new PaxosStartPrepareCleanup(tableId, endpoints);</span>
+<span class="nc" id="L81">        synchronized (callback)</span>
+        {
+<span class="nc" id="L83">            Message&lt;Request&gt; message = Message.out(PAXOS2_CLEANUP_START_PREPARE_REQ, new Request(tableId, localEpState, ranges));</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">            for (InetAddressAndPort endpoint : endpoints)</span>
+<span class="nc" id="L85">                MessagingService.instance().sendWithCallback(message, endpoint, callback);</span>
+<span class="nc" id="L86">        }</span>
+<span class="nc" id="L87">        return callback;</span>
+    }
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="nc" id="L93">        tryFailure(new PaxosCleanupException(&quot;Received &quot; + reason + &quot; failure response from &quot; + from));</span>
+<span class="nc" id="L94">    }</span>
+
+    public synchronized void onResponse(Message&lt;PaxosCleanupHistory&gt; msg)
+    {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        if (isDone())</span>
+<span class="nc" id="L99">            return;</span>
+
+<span class="nc bnc" id="L101" title="All 2 branches missed.">        if (!waitingResponse.remove(msg.from()))</span>
+<span class="nc" id="L102">            throw new IllegalArgumentException(&quot;Received unexpected response from &quot; + msg.from());</span>
+
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (Commit.isAfter(msg.payload.highBound, maxBallot))</span>
+<span class="nc" id="L105">            maxBallot = msg.payload.highBound;</span>
+
+<span class="nc" id="L107">        history = PaxosRepairHistory.merge(history, msg.payload.history);</span>
+
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (waitingResponse.isEmpty())</span>
+<span class="nc" id="L110">            trySuccess(new PaxosCleanupHistory(table, maxBallot, history));</span>
+<span class="nc" id="L111">    }</span>
+
+    private static void maybeUpdateTopology(InetAddressAndPort endpoint, EndpointState remote)
+    {
+<span class="nc" id="L115">        EndpointState local = Gossiper.instance.getEndpointStateForEndpoint(endpoint);</span>
+<span class="nc bnc" id="L116" title="All 4 branches missed.">        if (local == null || local.isSupersededBy(remote))</span>
+        {
+<span class="nc" id="L118">            logger.trace(&quot;updating endpoint info for {} with {}&quot;, endpoint, remote);</span>
+<span class="nc" id="L119">            Map&lt;InetAddressAndPort, EndpointState&gt; states = Collections.singletonMap(endpoint, remote);</span>
+
+<span class="nc" id="L121">            Gossiper.runInGossipStageBlocking(() -&gt; {</span>
+<span class="nc" id="L122">                Gossiper.instance.notifyFailureDetector(states);</span>
+<span class="nc" id="L123">                Gossiper.instance.applyStateLocally(states);</span>
+<span class="nc" id="L124">            });</span>
+            // TODO: We should also wait for schema pulls/pushes, however this would be quite an involved change to MigrationManager
+            //       (which currently drops some migration tasks on the floor).
+            //       Note it would be fine for us to fail to complete the migration task and simply treat this response as a failure/timeout.
+        }
+        // even if we have th latest gossip info, wait until pending range calculations are complete
+<span class="nc" id="L130">        PendingRangeCalculatorService.instance.blockUntilFinished();</span>
+<span class="nc" id="L131">    }</span>
+
+    public static class Request
+    {
+        final TableId tableId;
+        final EndpointState epState;
+        final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+
+        public Request(TableId tableId, EndpointState epState, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+<span class="nc" id="L140">        {</span>
+<span class="nc" id="L141">            this.tableId = tableId;</span>
+<span class="nc" id="L142">            this.epState = epState;</span>
+<span class="nc" id="L143">            this.ranges = ranges;</span>
+<span class="nc" id="L144">        }</span>
+    }
+
+<span class="nc" id="L147">    public static class RequestSerializer implements IVersionedSerializer&lt;Request&gt;</span>
+    {
+        public void serialize(Request request, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L151">            request.tableId.serialize(out);</span>
+<span class="nc" id="L152">            EndpointState.serializer.serialize(request.epState, out, version);</span>
+<span class="nc" id="L153">            out.writeInt(request.ranges.size());</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            for (Range&lt;Token&gt; rt : request.ranges)</span>
+<span class="nc" id="L155">                AbstractBounds.tokenSerializer.serialize(rt, out, version);</span>
+<span class="nc" id="L156">        }</span>
+
+        public Request deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L160">            TableId tableId = TableId.deserialize(in);</span>
+<span class="nc" id="L161">            EndpointState epState = EndpointState.serializer.deserialize(in, version);</span>
+
+<span class="nc" id="L163">            int numRanges = in.readInt();</span>
+<span class="nc" id="L164">            List&lt;Range&lt;Token&gt;&gt; ranges = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            for (int i = 0; i &lt; numRanges; i++)</span>
+            {
+<span class="nc" id="L167">                Range&lt;Token&gt; range = (Range&lt;Token&gt;) AbstractBounds.tokenSerializer.deserialize(in, DatabaseDescriptor.getPartitioner(), version);</span>
+<span class="nc" id="L168">                ranges.add(range);</span>
+            }
+<span class="nc" id="L170">            return new Request(tableId, epState, ranges);</span>
+        }
+
+        public long serializedSize(Request request, int version)
+        {
+<span class="nc" id="L175">            long size = request.tableId.serializedSize();</span>
+<span class="nc" id="L176">            size += EndpointState.serializer.serializedSize(request.epState, version);</span>
+<span class="nc" id="L177">            size += TypeSizes.sizeof(request.ranges.size());</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            for (Range&lt;Token&gt; range : request.ranges)</span>
+<span class="nc" id="L179">                size += AbstractBounds.tokenSerializer.serializedSize(range, version);</span>
+<span class="nc" id="L180">            return size;</span>
+        }
+    }
+
+<span class="nc" id="L184">    public static final IVerbHandler&lt;Request&gt; verbHandler = in -&gt; {</span>
+<span class="nc" id="L185">        ColumnFamilyStore table = Schema.instance.getColumnFamilyStoreInstance(in.payload.tableId);</span>
+<span class="nc" id="L186">        maybeUpdateTopology(in.from(), in.payload.epState);</span>
+<span class="nc" id="L187">        Ballot highBound = newBallot(ballotTracker().getHighBound(), ConsistencyLevel.SERIAL);</span>
+<span class="nc" id="L188">        PaxosRepairHistory history = table.getPaxosRepairHistoryForRanges(in.payload.ranges);</span>
+<span class="nc" id="L189">        Message&lt;PaxosCleanupHistory&gt; out = in.responseWith(new PaxosCleanupHistory(table.metadata.id, highBound, history));</span>
+<span class="nc" id="L190">        MessagingService.instance().send(out, in.respondTo());</span>
+<span class="nc" id="L191">    };</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CQL3CasRequest.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements</a> &gt; <span class="el_source">CQL3CasRequest.java</span></div><h1>CQL3CasRequest.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.*;
+
+import org.apache.cassandra.db.marshal.TimeUUIDType;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.conditions.ColumnCondition;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.partitions.FilteredPartition;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.CASRequest;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.paxos.Ballot;
+import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.TimeUUID;
+
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+
+/**
+ * Processed CAS conditions and update on potentially multiple rows of the same partition.
+ */
+<span class="fc" id="L49">public class CQL3CasRequest implements CASRequest</span>
+{
+    public final TableMetadata metadata;
+    public final DecoratedKey key;
+    private final RegularAndStaticColumns conditionColumns;
+    private final boolean updatesRegularRows;
+    private final boolean updatesStaticRow;
+    private boolean hasExists; // whether we have an exist or if not exist condition
+
+    // Conditions on the static row. We keep it separate from 'conditions' as most things related to the static row are
+    // special cases anyway.
+    private RowCondition staticConditions;
+    // We index RowCondition by the clustering of the row they applied to for 2 reasons:
+    //   1) this allows to keep things sorted to build the read command below
+    //   2) this allows to detect when contradictory conditions are set (not exists with some other conditions on the same row)
+    private final TreeMap&lt;Clustering&lt;?&gt;, RowCondition&gt; conditions;
+
+<span class="fc" id="L66">    private final List&lt;RowUpdate&gt; updates = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L67">    private final List&lt;RangeDeletion&gt; rangeDeletions = new ArrayList&lt;&gt;();</span>
+
+    public CQL3CasRequest(TableMetadata metadata,
+                          DecoratedKey key,
+                          RegularAndStaticColumns conditionColumns,
+                          boolean updatesRegularRows,
+                          boolean updatesStaticRow)
+<span class="fc" id="L74">    {</span>
+<span class="fc" id="L75">        this.metadata = metadata;</span>
+<span class="fc" id="L76">        this.key = key;</span>
+<span class="fc" id="L77">        this.conditions = new TreeMap&lt;&gt;(metadata.comparator);</span>
+<span class="fc" id="L78">        this.conditionColumns = conditionColumns;</span>
+<span class="fc" id="L79">        this.updatesRegularRows = updatesRegularRows;</span>
+<span class="fc" id="L80">        this.updatesStaticRow = updatesStaticRow;</span>
+<span class="fc" id="L81">    }</span>
+
+    void addRowUpdate(Clustering&lt;?&gt; clustering, ModificationStatement stmt, QueryOptions options, long timestamp, long nowInSeconds)
+    {
+<span class="fc" id="L85">        updates.add(new RowUpdate(clustering, stmt, options, timestamp, nowInSeconds));</span>
+<span class="fc" id="L86">    }</span>
+
+    void addRangeDeletion(Slice slice, ModificationStatement stmt, QueryOptions options, long timestamp, long nowInSeconds)
+    {
+<span class="nc" id="L90">        rangeDeletions.add(new RangeDeletion(slice, stmt, options, timestamp, nowInSeconds));</span>
+<span class="nc" id="L91">    }</span>
+
+    public void addNotExist(Clustering&lt;?&gt; clustering) throws InvalidRequestException
+    {
+<span class="fc" id="L95">        addExistsCondition(clustering, new NotExistCondition(clustering), true);</span>
+<span class="fc" id="L96">    }</span>
+
+    public void addExist(Clustering&lt;?&gt; clustering) throws InvalidRequestException
+    {
+<span class="fc" id="L100">        addExistsCondition(clustering, new ExistCondition(clustering), false);</span>
+<span class="fc" id="L101">    }</span>
+
+    private void addExistsCondition(Clustering&lt;?&gt; clustering, RowCondition condition, boolean isNotExist)
+    {
+<span class="pc bpc" id="L105" title="1 of 4 branches missed.">        assert condition instanceof ExistCondition || condition instanceof NotExistCondition;</span>
+<span class="fc" id="L106">        RowCondition previous = getConditionsForRow(clustering);</span>
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if (previous != null)</span>
+        {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            if (previous.getClass().equals(condition.getClass()))</span>
+            {
+                // We can get here if a BATCH has 2 different statements on the same row with the same &quot;exist&quot; condition.
+                // For instance (assuming 'k' is the full PK):
+                //   BEGIN BATCH
+                //      INSERT INTO t(k, v1) VALUES (0, 'foo') IF NOT EXISTS;
+                //      INSERT INTO t(k, v2) VALUES (0, 'bar') IF NOT EXISTS;
+                //   APPLY BATCH;
+                // Of course, those can be trivially rewritten by the user as a single INSERT statement, but we still don't
+                // want this to be a problem (see #12867 in particular), so we simply return (the condition itself has
+                // already be set).
+<span class="nc bnc" id="L120" title="All 2 branches missed.">                assert hasExists; // We shouldn't have a previous condition unless hasExists has been set already.</span>
+<span class="nc" id="L121">                return;</span>
+            }
+            else
+            {
+                // these should be prevented by the parser, but it doesn't hurt to check
+<span class="nc bnc" id="L126" title="All 4 branches missed.">                throw (previous instanceof NotExistCondition || previous instanceof ExistCondition)</span>
+<span class="nc" id="L127">                    ? new InvalidRequestException(&quot;Cannot mix IF EXISTS and IF NOT EXISTS conditions for the same row&quot;)</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                    : new InvalidRequestException(&quot;Cannot mix IF conditions and IF &quot; + (isNotExist ? &quot;NOT &quot; : &quot;&quot;) + &quot;EXISTS for the same row&quot;);</span>
+            }
+        }
+
+<span class="fc" id="L132">        setConditionsForRow(clustering, condition);</span>
+<span class="fc" id="L133">        hasExists = true;</span>
+<span class="fc" id="L134">    }</span>
+
+    public void addConditions(Clustering&lt;?&gt; clustering, Collection&lt;ColumnCondition&gt; conds, QueryOptions options) throws InvalidRequestException
+    {
+<span class="fc" id="L138">        RowCondition condition = getConditionsForRow(clustering);</span>
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">        if (condition == null)</span>
+        {
+<span class="fc" id="L141">            condition = new ColumnsConditions(clustering);</span>
+<span class="fc" id="L142">            setConditionsForRow(clustering, condition);</span>
+        }
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        else if (!(condition instanceof ColumnsConditions))</span>
+        {
+<span class="nc" id="L146">            throw new InvalidRequestException(&quot;Cannot mix IF conditions and IF NOT EXISTS for the same row&quot;);</span>
+        }
+<span class="fc" id="L148">        ((ColumnsConditions)condition).addConditions(conds, options);</span>
+<span class="fc" id="L149">    }</span>
+
+    private RowCondition getConditionsForRow(Clustering&lt;?&gt; clustering)
+    {
+<span class="fc bfc" id="L153" title="All 2 branches covered.">        return clustering == Clustering.STATIC_CLUSTERING ? staticConditions : conditions.get(clustering);</span>
+    }
+
+    private void setConditionsForRow(Clustering&lt;?&gt; clustering, RowCondition condition)
+    {
+<span class="fc bfc" id="L158" title="All 2 branches covered.">        if (clustering == Clustering.STATIC_CLUSTERING)</span>
+        {
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">            assert staticConditions == null;</span>
+<span class="fc" id="L161">            staticConditions = condition;</span>
+        }
+        else
+        {
+<span class="fc" id="L165">            RowCondition previous = conditions.put(clustering, condition);</span>
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">            assert previous == null;</span>
+        }
+<span class="fc" id="L168">    }</span>
+
+    private RegularAndStaticColumns columnsToRead()
+    {
+<span class="fc" id="L172">        RegularAndStaticColumns allColumns = metadata.regularAndStaticColumns();</span>
+
+        // If we update static row, we won't have any conditions on regular rows.
+        // If we update regular row, we have to fetch all regular rows (which would satisfy column condition) and
+        // static rows that take part in column condition.
+        // In both cases, we're fetching enough rows to distinguish between &quot;all conditions are nulls&quot; and &quot;row does not exist&quot;.
+        // We have to do this as we can't rely on row marker for that (see #6623)
+<span class="fc bfc" id="L179" title="All 2 branches covered.">        Columns statics = updatesStaticRow ? allColumns.statics : conditionColumns.statics;</span>
+<span class="fc bfc" id="L180" title="All 2 branches covered.">        Columns regulars = updatesRegularRows ? allColumns.regulars : conditionColumns.regulars;</span>
+<span class="fc" id="L181">        return new RegularAndStaticColumns(statics, regulars);</span>
+    }
+
+    public SinglePartitionReadCommand readCommand(long nowInSec)
+    {
+<span class="pc bpc" id="L186" title="1 of 4 branches missed.">        assert staticConditions != null || !conditions.isEmpty();</span>
+
+        // Fetch all columns, but query only the selected ones
+<span class="fc" id="L189">        ColumnFilter columnFilter = ColumnFilter.selection(columnsToRead());</span>
+
+        // With only a static condition, we still want to make the distinction between a non-existing partition and one
+        // that exists (has some live data) but has not static content. So we query the first live row of the partition.
+<span class="fc bfc" id="L193" title="All 2 branches covered.">        if (conditions.isEmpty())</span>
+<span class="fc" id="L194">            return SinglePartitionReadCommand.create(metadata,</span>
+                                                   nowInSec,
+                                                   columnFilter,
+<span class="fc" id="L197">                                                   RowFilter.none(),</span>
+<span class="fc" id="L198">                                                   DataLimits.cqlLimits(1),</span>
+                                                   key,
+                                                   new ClusteringIndexSliceFilter(Slices.ALL, false));
+
+<span class="fc" id="L202">        ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(conditions.navigableKeySet(), false);</span>
+<span class="fc" id="L203">        return SinglePartitionReadCommand.create(metadata, nowInSec, key, columnFilter, filter);</span>
+    }
+
+    /**
+     * Checks whether the conditions represented by this object applies provided the current state of the partition on
+     * which those conditions are.
+     *
+     * @param current the partition with current data corresponding to these conditions. More precisely, this must be
+     * the result of executing the command returned by {@link #readCommand}. This can be empty but it should not be
+     * {@code null}.
+     * @return whether the conditions represented by this object applies or not.
+     */
+    public boolean appliesTo(FilteredPartition current) throws InvalidRequestException
+    {
+<span class="fc bfc" id="L217" title="All 4 branches covered.">        if (staticConditions != null &amp;&amp; !staticConditions.appliesTo(current))</span>
+<span class="fc" id="L218">            return false;</span>
+
+<span class="fc bfc" id="L220" title="All 2 branches covered.">        for (RowCondition condition : conditions.values())</span>
+        {
+<span class="fc bfc" id="L222" title="All 2 branches covered.">            if (!condition.appliesTo(current))</span>
+<span class="fc" id="L223">                return false;</span>
+<span class="fc" id="L224">        }</span>
+<span class="fc" id="L225">        return true;</span>
+    }
+
+    private RegularAndStaticColumns updatedColumns()
+    {
+<span class="fc" id="L230">        RegularAndStaticColumns.Builder builder = RegularAndStaticColumns.builder();</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">        for (RowUpdate upd : updates)</span>
+<span class="fc" id="L232">            builder.addAll(upd.stmt.updatedColumns());</span>
+<span class="fc" id="L233">        return builder.build();</span>
+    }
+
+    public PartitionUpdate makeUpdates(FilteredPartition current, ClientState clientState, Ballot ballot) throws InvalidRequestException
+    {
+<span class="fc" id="L238">        PartitionUpdate.Builder updateBuilder = new PartitionUpdate.Builder(metadata, key, updatedColumns(), conditions.size());</span>
+<span class="fc" id="L239">        long timeUuidNanos = 0;</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">        for (RowUpdate upd : updates)</span>
+<span class="fc" id="L241">            timeUuidNanos = upd.applyUpdates(current, updateBuilder, clientState, ballot.msb(), timeUuidNanos);</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        for (RangeDeletion upd : rangeDeletions)</span>
+<span class="nc" id="L243">            upd.applyUpdates(current, updateBuilder, clientState);</span>
+
+<span class="fc" id="L245">        PartitionUpdate partitionUpdate = updateBuilder.build();</span>
+<span class="fc" id="L246">        IndexRegistry.obtain(metadata).validate(partitionUpdate);</span>
+
+<span class="fc" id="L248">        return partitionUpdate;</span>
+    }
+
+    private static class CASUpdateParameters extends UpdateParameters
+    {
+        final long timeUuidMsb;
+        long timeUuidNanos;
+
+        public CASUpdateParameters(TableMetadata metadata, RegularAndStaticColumns updatedColumns, ClientState state, QueryOptions options, long timestamp, long nowInSec, int ttl, Map&lt;DecoratedKey, Partition&gt; prefetchedRows, long timeUuidMsb, long timeUuidNanos) throws InvalidRequestException
+        {
+<span class="fc" id="L258">            super(metadata, updatedColumns, state, options, timestamp, nowInSec, ttl, prefetchedRows);</span>
+<span class="fc" id="L259">            this.timeUuidMsb = timeUuidMsb;</span>
+<span class="fc" id="L260">            this.timeUuidNanos = timeUuidNanos;</span>
+<span class="fc" id="L261">        }</span>
+
+        public byte[] nextTimeUUIDAsBytes()
+        {
+<span class="nc" id="L265">            return TimeUUID.toBytes(timeUuidMsb, TimeUUIDType.signedBytesToNativeLong(timeUuidNanos++));</span>
+        }
+    }
+
+    /**
+     * Due to some operation on lists, we can't generate the update that a given Modification statement does before
+     * we get the values read by the initial read of Paxos. A RowUpdate thus just store the relevant information
+     * (include the statement iself) to generate those updates. We'll have multiple RowUpdate for a Batch, otherwise
+     * we'll have only one.
+     */
+    private class RowUpdate
+    {
+        private final Clustering&lt;?&gt; clustering;
+        private final ModificationStatement stmt;
+        private final QueryOptions options;
+        private final long timestamp;
+        private final long nowInSeconds;
+
+        private RowUpdate(Clustering&lt;?&gt; clustering, ModificationStatement stmt, QueryOptions options, long timestamp, long nowInSeconds)
+<span class="fc" id="L284">        {</span>
+<span class="fc" id="L285">            this.clustering = clustering;</span>
+<span class="fc" id="L286">            this.stmt = stmt;</span>
+<span class="fc" id="L287">            this.options = options;</span>
+<span class="fc" id="L288">            this.timestamp = timestamp;</span>
+<span class="fc" id="L289">            this.nowInSeconds = nowInSeconds;</span>
+<span class="fc" id="L290">        }</span>
+
+        long applyUpdates(FilteredPartition current, PartitionUpdate.Builder updateBuilder, ClientState state, long timeUuidMsb, long timeUuidNanos)
+        {
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">            Map&lt;DecoratedKey, Partition&gt; map = stmt.requiresRead() ? Collections.singletonMap(key, current) : null;</span>
+<span class="fc" id="L295">            CASUpdateParameters params =</span>
+<span class="fc" id="L296">                new CASUpdateParameters(metadata, updateBuilder.columns(), state, options, timestamp, nowInSeconds,</span>
+<span class="fc" id="L297">                                     stmt.getTimeToLive(options), map, timeUuidMsb, timeUuidNanos);</span>
+<span class="fc" id="L298">            stmt.addUpdateForKey(updateBuilder, clustering, params);</span>
+<span class="fc" id="L299">            return params.timeUuidNanos;</span>
+        }
+    }
+
+    private class RangeDeletion
+    {
+        private final Slice slice;
+        private final ModificationStatement stmt;
+        private final QueryOptions options;
+        private final long timestamp;
+        private final long nowInSeconds;
+
+        private RangeDeletion(Slice slice, ModificationStatement stmt, QueryOptions options, long timestamp, long nowInSeconds)
+<span class="nc" id="L312">        {</span>
+<span class="nc" id="L313">            this.slice = slice;</span>
+<span class="nc" id="L314">            this.stmt = stmt;</span>
+<span class="nc" id="L315">            this.options = options;</span>
+<span class="nc" id="L316">            this.timestamp = timestamp;</span>
+<span class="nc" id="L317">            this.nowInSeconds = nowInSeconds;</span>
+<span class="nc" id="L318">        }</span>
+
+        void applyUpdates(FilteredPartition current, PartitionUpdate.Builder updateBuilder, ClientState state)
+        {
+            // No slice statements currently require a read, but this maintains consistency with RowUpdate, and future proofs us
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            Map&lt;DecoratedKey, Partition&gt; map = stmt.requiresRead() ? Collections.singletonMap(key, current) : null;</span>
+<span class="nc" id="L324">            UpdateParameters params =</span>
+                new UpdateParameters(metadata,
+<span class="nc" id="L326">                                     updateBuilder.columns(),</span>
+                                     state,
+                                     options,
+                                     timestamp,
+                                     nowInSeconds,
+<span class="nc" id="L331">                                     stmt.getTimeToLive(options),</span>
+                                     map);
+<span class="nc" id="L333">            stmt.addUpdateForKey(updateBuilder, slice, params);</span>
+<span class="nc" id="L334">        }</span>
+    }
+
+    private static abstract class RowCondition
+    {
+        public final Clustering&lt;?&gt; clustering;
+
+        protected RowCondition(Clustering&lt;?&gt; clustering)
+<span class="fc" id="L342">        {</span>
+<span class="fc" id="L343">            this.clustering = clustering;</span>
+<span class="fc" id="L344">        }</span>
+
+        public abstract boolean appliesTo(FilteredPartition current) throws InvalidRequestException;
+    }
+
+    private static class NotExistCondition extends RowCondition
+    {
+        private NotExistCondition(Clustering&lt;?&gt; clustering)
+        {
+<span class="fc" id="L353">            super(clustering);</span>
+<span class="fc" id="L354">        }</span>
+
+        public boolean appliesTo(FilteredPartition current)
+        {
+<span class="fc bfc" id="L358" title="All 2 branches covered.">            return current.getRow(clustering) == null;</span>
+        }
+    }
+
+    private static class ExistCondition extends RowCondition
+    {
+        private ExistCondition(Clustering&lt;?&gt; clustering)
+        {
+<span class="fc" id="L366">            super(clustering);</span>
+<span class="fc" id="L367">        }</span>
+
+        public boolean appliesTo(FilteredPartition current)
+        {
+<span class="fc bfc" id="L371" title="All 2 branches covered.">            return current.getRow(clustering) != null;</span>
+        }
+    }
+
+    private static class ColumnsConditions extends RowCondition
+    {
+<span class="fc" id="L377">        private final Multimap&lt;Pair&lt;ColumnIdentifier, ByteBuffer&gt;, ColumnCondition.Bound&gt; conditions = HashMultimap.create();</span>
+
+        private ColumnsConditions(Clustering&lt;?&gt; clustering)
+        {
+<span class="fc" id="L381">            super(clustering);</span>
+<span class="fc" id="L382">        }</span>
+
+        public void addConditions(Collection&lt;ColumnCondition&gt; conds, QueryOptions options) throws InvalidRequestException
+        {
+<span class="fc bfc" id="L386" title="All 2 branches covered.">            for (ColumnCondition condition : conds)</span>
+            {
+<span class="fc" id="L388">                ColumnCondition.Bound current = condition.bind(options);</span>
+<span class="fc" id="L389">                conditions.put(Pair.create(condition.column.name, current.getCollectionElementValue()), current);</span>
+<span class="fc" id="L390">            }</span>
+<span class="fc" id="L391">        }</span>
+
+        public boolean appliesTo(FilteredPartition current) throws InvalidRequestException
+        {
+<span class="fc" id="L395">            Row row = current.getRow(clustering);</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">            for (ColumnCondition.Bound condition : conditions.values())</span>
+            {
+<span class="fc bfc" id="L398" title="All 2 branches covered.">                if (!condition.appliesTo(row))</span>
+<span class="fc" id="L399">                    return false;</span>
+<span class="fc" id="L400">            }</span>
+<span class="fc" id="L401">            return true;</span>
+        }
+    }
+    
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L408">        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

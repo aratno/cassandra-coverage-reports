@@ -1,0 +1,833 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractMessageHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">AbstractMessageHandler.java</span></div><h1>AbstractMessageHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.EventLoop;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.net.FrameDecoder.CorruptFrame;
+import org.apache.cassandra.net.FrameDecoder.Frame;
+import org.apache.cassandra.net.FrameDecoder.FrameProcessor;
+import org.apache.cassandra.net.FrameDecoder.IntactFrame;
+import org.apache.cassandra.net.Message.Header;
+import org.apache.cassandra.net.ResourceLimits.Limit;
+
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+import static org.apache.cassandra.net.Crc.InvalidCrc;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+
+/**
+ * Core logic for handling inbound message deserialization and execution (in tandem with {@link FrameDecoder}).
+ *
+ * Handles small and large messages, corruption, flow control, dispatch of message processing to a suitable
+ * consumer.
+ *
+ * # Interaction with {@link FrameDecoder}
+ *
+ * An {@link AbstractMessageHandler} implementation sits on top of a {@link FrameDecoder} in the Netty pipeline,
+ * and is tightly coupled with it.
+ *
+ * {@link FrameDecoder} decodes inbound frames and relies on a supplied {@link FrameProcessor} to act on them.
+ * {@link AbstractMessageHandler} provides two implementations of that interface:
+ *  - {@link #process(Frame)} is the default, primary processor, and is expected to be implemented by subclasses
+ *  - {@link UpToOneMessageFrameProcessor}, supplied to the decoder when the handler is reactivated after being
+ *    put in waiting mode due to lack of acquirable reserve memory capacity permits
+ *
+ * Return value of {@link FrameProcessor#process(Frame)} determines whether the decoder should keep processing
+ * frames (if {@code true} is returned) or stop until explicitly reactivated (if {@code false} is). To reactivate
+ * the decoder (once notified of available resource permits), {@link FrameDecoder#reactivate()} is invoked.
+ *
+ * # Frames
+ *
+ * {@link AbstractMessageHandler} operates on frames of messages, and there are several kinds of them:
+ *  1. {@link IntactFrame} that are contained. As names suggest, these contain one or multiple fully contained
+ *     messages believed to be uncorrupted. Guaranteed to not contain an part of an incomplete message.
+ *     See {@link #processFrameOfContainedMessages(ShareableBytes, Limit, Limit)}.
+ *  2. {@link IntactFrame} that are NOT contained. These are uncorrupted parts of a large message split over multiple
+ *     parts due to their size. Can represent first or subsequent frame of a large message.
+ *     See {@link #processFirstFrameOfLargeMessage(IntactFrame, Limit, Limit)} and
+ *     {@link #processSubsequentFrameOfLargeMessage(Frame)}.
+ *  3. {@link CorruptFrame} with corrupt header. These are unrecoverable, and force a connection to be dropped.
+ *  4. {@link CorruptFrame} with a valid header, but corrupt payload. These can be either contained or uncontained.
+ *     - contained frames with corrupt payload can be gracefully dropped without dropping the connection
+ *     - uncontained frames with corrupt payload can be gracefully dropped unless they represent the first
+ *       frame of a new large message, as in that case we don't know how many bytes to skip
+ *     See {@link #processCorruptFrame(CorruptFrame)}.
+ *
+ *  Fundamental frame invariants:
+ *  1. A contained frame can only have fully-encapsulated messages - 1 to n, that don't cross frame boundaries
+ *  2. An uncontained frame can hold a part of one message only. It can NOT, say, contain end of one large message
+ *     and a beginning of another one. All the bytes in an uncontained frame always belong to a single message.
+ *
+ * # Small vs large messages
+ *
+ * A single handler is equipped to process both small and large messages, potentially interleaved, but the logic
+ * differs depending on size. Small messages are deserialized in place, and then handed off to an appropriate
+ * thread pool for processing. Large messages accumulate frames until completion of a message, then hand off
+ * the untouched frames to the correct thread pool for the verb to be deserialized there and immediately processed.
+ *
+ * See {@link LargeMessage} and subclasses for concrete {@link AbstractMessageHandler} implementations for details
+ * of the large-message accumulating state-machine, and {@link InboundMessageHandler.ProcessMessage} and its inheritors 
+ * for the differences in execution.
+ *
+ * # Flow control (backpressure)
+ *
+ * To prevent message producers from overwhelming and bringing nodes down with more inbound messages that
+ * can be processed in a timely manner, {@link AbstractMessageHandler} provides support for implementations to
+ * provide their own flow control policy.
+ *
+ * Before we attempt to process a message fully, we first infer its size from the stream. This inference is
+ * delegated to implementations as the encoding of the message size is protocol specific. Having assertained
+ * the size of the incoming message, we then attempt to acquire the corresponding number of memory permits.
+ * If we succeed, then we move on actually process the message. If we fail, the frame decoder deactivates
+ * until sufficient permits are released for the message to be processed and the handler is activated again.
+ * Permits are released back once the message has been fully processed - the definition of which is again
+ * delegated to the concrete implementations.
+ *
+ * Every connection has an exclusive number of permits allocated to it. In addition to it, there is a per-endpoint
+ * reserve capacity and a global reserve capacity {@link Limit}, shared between all connections from the same host
+ * and all connections, respectively. So long as long as the handler stays within its exclusive limit, it doesn't
+ * need to tap into reserve capacity.
+ *
+ * If tapping into reserve capacity is necessary, but the handler fails to acquire capacity from either
+ * endpoint of global reserve (and it needs to acquire from both), the handler and its frame decoder become
+ * inactive and register with a {@link WaitQueue} of the appropriate type, depending on which of the reserves
+ * couldn't be tapped into. Once enough messages have finished processing and had their permits released back
+ * to the reserves, {@link WaitQueue} will reactivate the sleeping handlers and they'll resume processing frames.
+ *
+ * The reason we 'split' reserve capacity into two limits - endpoing and global - is to guarantee liveness, and
+ * prevent single endpoint's connections from taking over the whole reserve, starving other connections.
+ *
+ * One permit per byte of serialized message gets acquired. When inflated on-heap, each message will occupy more
+ * than that, necessarily, but despite wide variance, it's a good enough proxy that correlates with on-heap footprint.
+ */
+public abstract class AbstractMessageHandler extends ChannelInboundHandlerAdapter implements FrameProcessor
+{
+<span class="fc" id="L136">    private static final Logger logger = LoggerFactory.getLogger(AbstractMessageHandler.class);</span>
+    
+    protected final FrameDecoder decoder;
+
+    protected final Channel channel;
+
+    protected final int largeThreshold;
+    protected LargeMessage&lt;?&gt; largeMessage;
+
+    protected final long queueCapacity;
+<span class="fc" id="L146">    volatile long queueSize = 0L;</span>
+<span class="fc" id="L147">    private static final AtomicLongFieldUpdater&lt;AbstractMessageHandler&gt; queueSizeUpdater =</span>
+<span class="fc" id="L148">        AtomicLongFieldUpdater.newUpdater(AbstractMessageHandler.class, &quot;queueSize&quot;);</span>
+
+    protected final Limit endpointReserveCapacity;
+    protected final WaitQueue endpointWaitQueue;
+
+    protected final Limit globalReserveCapacity;
+    protected final WaitQueue globalWaitQueue;
+
+    protected final OnHandlerClosed onClosed;
+
+    // wait queue handle, non-null if we overrun endpoint or global capacity and request to be resumed once it's released
+<span class="fc" id="L159">    private WaitQueue.Ticket ticket = null;</span>
+
+    protected long corruptFramesRecovered, corruptFramesUnrecovered;
+    protected long receivedCount, receivedBytes;
+    protected long throttledCount, throttledNanos;
+
+    private boolean isClosed;
+
+    public AbstractMessageHandler(FrameDecoder decoder,
+
+                                  Channel channel,
+                                  int largeThreshold,
+
+                                  long queueCapacity,
+                                  Limit endpointReserveCapacity,
+                                  Limit globalReserveCapacity,
+                                  WaitQueue endpointWaitQueue,
+                                  WaitQueue globalWaitQueue,
+
+                                  OnHandlerClosed onClosed)
+<span class="fc" id="L179">    {</span>
+<span class="fc" id="L180">        this.decoder = decoder;</span>
+
+<span class="fc" id="L182">        this.channel = channel;</span>
+<span class="fc" id="L183">        this.largeThreshold = largeThreshold;</span>
+
+<span class="fc" id="L185">        this.queueCapacity = queueCapacity;</span>
+<span class="fc" id="L186">        this.endpointReserveCapacity = endpointReserveCapacity;</span>
+<span class="fc" id="L187">        this.endpointWaitQueue = endpointWaitQueue;</span>
+<span class="fc" id="L188">        this.globalReserveCapacity = globalReserveCapacity;</span>
+<span class="fc" id="L189">        this.globalWaitQueue = globalWaitQueue;</span>
+
+<span class="fc" id="L191">        this.onClosed = onClosed;</span>
+<span class="fc" id="L192">    }</span>
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg)
+    {
+        /*
+         * InboundMessageHandler works in tandem with FrameDecoder to implement flow control
+         * and work stashing optimally. We rely on FrameDecoder to invoke the provided
+         * FrameProcessor rather than on the pipeline and invocations of channelRead().
+         * process(Frame) is the primary entry point for this class.
+         */
+<span class="nc" id="L203">        throw new IllegalStateException(&quot;InboundMessageHandler doesn't expect channelRead() to be invoked&quot;);</span>
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx)
+    {
+<span class="fc" id="L209">        decoder.activate(this); // the frame decoder starts inactive until explicitly activated by the added inbound message handler</span>
+<span class="fc" id="L210">    }</span>
+
+    @Override
+    public boolean process(Frame frame) throws IOException
+    {
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">        if (frame instanceof IntactFrame)</span>
+<span class="fc" id="L216">            return processIntactFrame((IntactFrame) frame, endpointReserveCapacity, globalReserveCapacity);</span>
+
+<span class="nc" id="L218">        processCorruptFrame((CorruptFrame) frame);</span>
+<span class="nc" id="L219">        return true;</span>
+    }
+
+    private boolean processIntactFrame(IntactFrame frame, Limit endpointReserve, Limit globalReserve) throws IOException
+    {
+<span class="fc bfc" id="L224" title="All 2 branches covered.">        if (frame.isSelfContained)</span>
+<span class="fc" id="L225">            return processFrameOfContainedMessages(frame.contents, endpointReserve, globalReserve);</span>
+<span class="fc bfc" id="L226" title="All 2 branches covered.">        else if (null == largeMessage)</span>
+<span class="fc" id="L227">            return processFirstFrameOfLargeMessage(frame, endpointReserve, globalReserve);</span>
+        else
+<span class="fc" id="L229">            return processSubsequentFrameOfLargeMessage(frame);</span>
+    }
+
+    /*
+     * Handle contained messages (not crossing boundaries of the frame) - both small and large, for the inbound
+     * definition of large (breaching the size threshold for what we are willing to process on event-loop vs.
+     * off event-loop).
+     */
+    private boolean processFrameOfContainedMessages(ShareableBytes bytes, Limit endpointReserve, Limit globalReserve) throws IOException
+    {
+<span class="fc bfc" id="L239" title="All 2 branches covered.">        while (bytes.hasRemaining())</span>
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">            if (!processOneContainedMessage(bytes, endpointReserve, globalReserve))</span>
+<span class="nc" id="L241">                return false;</span>
+<span class="fc" id="L242">        return true;</span>
+    }
+
+    protected abstract boolean processOneContainedMessage(ShareableBytes bytes, Limit endpointReserve, Limit globalReserve) throws IOException;
+
+
+    /*
+     * Handling of multi-frame large messages
+     */
+
+    protected abstract boolean processFirstFrameOfLargeMessage(IntactFrame frame, Limit endpointReserve, Limit globalReserve) throws IOException;
+
+    protected boolean processSubsequentFrameOfLargeMessage(Frame frame)
+    {
+<span class="fc" id="L256">        receivedBytes += frame.frameSize;</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        if (largeMessage.supply(frame))</span>
+        {
+<span class="fc" id="L259">            receivedCount++;</span>
+<span class="fc" id="L260">            largeMessage = null;</span>
+        }
+<span class="fc" id="L262">        return true;</span>
+    }
+
+    /*
+     * We can handle some corrupt frames gracefully without dropping the connection and losing all the
+     * queued up messages, but not others.
+     *
+     * Corrupt frames that *ARE NOT* safe to skip gracefully and require the connection to be dropped:
+     *  - any frame with corrupt header (!frame.isRecoverable())
+     *  - first corrupt-payload frame of a large message (impossible to infer message size, and without it
+     *    impossible to skip the message safely
+     *
+     * Corrupt frames that *ARE* safe to skip gracefully, without reconnecting:
+     *  - any self-contained frame with a corrupt payload (but not header): we lose all the messages in the
+     *    frame, but that has no effect on subsequent ones
+     *  - any non-first payload-corrupt frame of a large message: we know the size of the large message in
+     *    flight, so we just skip frames until we've seen all its bytes; we only lose the large message
+     */
+    protected abstract void processCorruptFrame(CorruptFrame frame) throws InvalidCrc;
+
+    private void onEndpointReserveCapacityRegained(Limit endpointReserve, long elapsedNanos)
+    {
+<span class="nc" id="L284">        onReserveCapacityRegained(endpointReserve, globalReserveCapacity, elapsedNanos);</span>
+<span class="nc" id="L285">    }</span>
+
+    private void onGlobalReserveCapacityRegained(Limit globalReserve, long elapsedNanos)
+    {
+<span class="nc" id="L289">        onReserveCapacityRegained(endpointReserveCapacity, globalReserve, elapsedNanos);</span>
+<span class="nc" id="L290">    }</span>
+
+    private void onReserveCapacityRegained(Limit endpointReserve, Limit globalReserve, long elapsedNanos)
+    {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (isClosed)</span>
+<span class="nc" id="L295">            return;</span>
+
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        assert channel.eventLoop().inEventLoop();</span>
+
+<span class="nc" id="L299">        ticket = null;</span>
+<span class="nc" id="L300">        throttledNanos += elapsedNanos;</span>
+
+        try
+        {
+            /*
+             * Process up to one message using supplied overridden reserves - one of them pre-allocated,
+             * and guaranteed to be enough for one message - then, if no obstacles encountered, reactivate
+             * the frame decoder using normal reserve capacities.
+             */
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (processUpToOneMessage(endpointReserve, globalReserve))</span>
+            {
+<span class="nc" id="L311">                decoder.reactivate();</span>
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                if (decoder.isActive())</span>
+<span class="nc" id="L314">                    ClientMetrics.instance.unpauseConnection();</span>
+            }
+        }
+<span class="nc" id="L317">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L319">            fatalExceptionCaught(t);</span>
+<span class="nc" id="L320">        }</span>
+<span class="nc" id="L321">    }</span>
+
+    protected abstract void fatalExceptionCaught(Throwable t);
+
+    // return true if the handler should be reactivated - if no new hurdles were encountered,
+    // like running out of the other kind of reserve capacity
+    protected boolean processUpToOneMessage(Limit endpointReserve, Limit globalReserve) throws IOException
+    {
+<span class="nc" id="L329">        UpToOneMessageFrameProcessor processor = new UpToOneMessageFrameProcessor(endpointReserve, globalReserve);</span>
+<span class="nc" id="L330">        decoder.processBacklog(processor);</span>
+<span class="nc" id="L331">        return processor.isActive;</span>
+    }
+
+    /*
+     * Process at most one message. Won't always be an entire one (if the message in the head of line
+     * is a large one, and there aren't sufficient frames to decode it entirely), but will never be more than one.
+     */
+    private class UpToOneMessageFrameProcessor implements FrameProcessor
+    {
+        private final Limit endpointReserve;
+        private final Limit globalReserve;
+
+<span class="nc" id="L343">        boolean isActive = true;</span>
+<span class="nc" id="L344">        boolean firstFrame = true;</span>
+
+        private UpToOneMessageFrameProcessor(Limit endpointReserve, Limit globalReserve)
+<span class="nc" id="L347">        {</span>
+<span class="nc" id="L348">            this.endpointReserve = endpointReserve;</span>
+<span class="nc" id="L349">            this.globalReserve = globalReserve;</span>
+<span class="nc" id="L350">        }</span>
+
+        @Override
+        public boolean process(Frame frame) throws IOException
+        {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">            if (firstFrame)</span>
+            {
+<span class="nc bnc" id="L357" title="All 2 branches missed.">                if (!(frame instanceof IntactFrame))</span>
+<span class="nc" id="L358">                    throw new IllegalStateException(&quot;First backlog frame must be intact&quot;);</span>
+<span class="nc" id="L359">                firstFrame = false;</span>
+<span class="nc" id="L360">                return processFirstFrame((IntactFrame) frame);</span>
+            }
+
+<span class="nc" id="L363">            return processSubsequentFrame(frame);</span>
+        }
+
+        private boolean processFirstFrame(IntactFrame frame) throws IOException
+        {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if (frame.isSelfContained)</span>
+            {
+<span class="nc" id="L370">                isActive = processOneContainedMessage(frame.contents, endpointReserve, globalReserve);</span>
+<span class="nc" id="L371">                return false; // stop after one message</span>
+            }
+            else
+            {
+<span class="nc" id="L375">                isActive = processFirstFrameOfLargeMessage(frame, endpointReserve, globalReserve);</span>
+<span class="nc" id="L376">                return isActive; // continue unless fallen behind coprocessor or ran out of reserve capacity again</span>
+            }
+        }
+
+        private boolean processSubsequentFrame(Frame frame) throws IOException
+        {
+<span class="nc bnc" id="L382" title="All 2 branches missed.">            if (frame instanceof IntactFrame)</span>
+<span class="nc" id="L383">                processSubsequentFrameOfLargeMessage(frame);</span>
+            else
+<span class="nc" id="L385">                processCorruptFrame((CorruptFrame) frame);</span>
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            return largeMessage != null; // continue until done with the large message</span>
+        }
+    }
+
+    /**
+     * Try to acquire permits for the inbound message. In case of failure, register with the right wait queue to be
+     * reactivated once permit capacity is regained.
+     */
+    @SuppressWarnings(&quot;BooleanMethodIsAlwaysInverted&quot;)
+    protected boolean acquireCapacity(Limit endpointReserve, Limit globalReserve, int bytes, long currentTimeNanos, long expiresAtNanos)
+    {
+<span class="fc" id="L398">        ResourceLimits.Outcome outcome = acquireCapacity(endpointReserve, globalReserve, bytes);</span>
+
+<span class="pc bpc" id="L400" title="1 of 2 branches missed.">        if (outcome == ResourceLimits.Outcome.INSUFFICIENT_ENDPOINT)</span>
+<span class="nc" id="L401">            ticket = endpointWaitQueue.register(this, bytes, currentTimeNanos, expiresAtNanos);</span>
+<span class="pc bpc" id="L402" title="1 of 2 branches missed.">        else if (outcome == ResourceLimits.Outcome.INSUFFICIENT_GLOBAL)</span>
+<span class="nc" id="L403">            ticket = globalWaitQueue.register(this, bytes, currentTimeNanos, expiresAtNanos);</span>
+
+<span class="pc bpc" id="L405" title="1 of 2 branches missed.">        if (outcome != ResourceLimits.Outcome.SUCCESS)</span>
+<span class="nc" id="L406">            throttledCount++;</span>
+
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">        return outcome == ResourceLimits.Outcome.SUCCESS;</span>
+    }
+
+    protected ResourceLimits.Outcome acquireCapacity(Limit endpointReserve, Limit globalReserve, int bytes)
+    {
+<span class="fc" id="L413">        long currentQueueSize = queueSize;</span>
+
+        /*
+         * acquireCapacity() is only ever called on the event loop, and as such queueSize is only ever increased
+         * on the event loop. If there is enough capacity, we can safely addAndGet() and immediately return.
+         */
+<span class="pc bpc" id="L419" title="1 of 2 branches missed.">        if (currentQueueSize + bytes &lt;= queueCapacity)</span>
+        {
+<span class="fc" id="L421">            queueSizeUpdater.addAndGet(this, bytes);</span>
+<span class="fc" id="L422">            return ResourceLimits.Outcome.SUCCESS;</span>
+        }
+
+        // we know we don't have enough local queue capacity for the entire message, so we need to borrow some from reserve capacity
+<span class="nc" id="L426">        long allocatedExcess = min(currentQueueSize + bytes - queueCapacity, bytes);</span>
+
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (!globalReserve.tryAllocate(allocatedExcess))</span>
+<span class="nc" id="L429">            return ResourceLimits.Outcome.INSUFFICIENT_GLOBAL;</span>
+
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (!endpointReserve.tryAllocate(allocatedExcess))</span>
+        {
+<span class="nc" id="L433">            globalReserve.release(allocatedExcess);</span>
+<span class="nc" id="L434">            globalWaitQueue.signal();</span>
+<span class="nc" id="L435">            return ResourceLimits.Outcome.INSUFFICIENT_ENDPOINT;</span>
+        }
+
+<span class="nc" id="L438">        long newQueueSize = queueSizeUpdater.addAndGet(this, bytes);</span>
+<span class="nc" id="L439">        long actualExcess = max(0, min(newQueueSize - queueCapacity, bytes));</span>
+
+        /*
+         * It's possible that some permits were released at some point after we loaded current queueSize,
+         * and we can satisfy more of the permits using our exclusive per-connection capacity, needing
+         * less than previously estimated from the reserves. If that's the case, release the now unneeded
+         * permit excess back to endpoint/global reserves.
+         */
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (actualExcess != allocatedExcess) // actualExcess &lt; allocatedExcess</span>
+        {
+<span class="nc" id="L449">            long excess = allocatedExcess - actualExcess;</span>
+
+<span class="nc" id="L451">            endpointReserve.release(excess);</span>
+<span class="nc" id="L452">            globalReserve.release(excess);</span>
+
+<span class="nc" id="L454">            endpointWaitQueue.signal();</span>
+<span class="nc" id="L455">            globalWaitQueue.signal();</span>
+        }
+
+<span class="nc" id="L458">        return ResourceLimits.Outcome.SUCCESS;</span>
+    }
+
+    public void releaseCapacity(int bytes)
+    {
+<span class="fc" id="L463">        long oldQueueSize = queueSizeUpdater.getAndAdd(this, -bytes);</span>
+<span class="pc bpc" id="L464" title="1 of 2 branches missed.">        if (oldQueueSize &gt; queueCapacity)</span>
+        {
+<span class="nc" id="L466">            long excess = min(oldQueueSize - queueCapacity, bytes);</span>
+
+<span class="nc" id="L468">            endpointReserveCapacity.release(excess);</span>
+<span class="nc" id="L469">            globalReserveCapacity.release(excess);</span>
+
+<span class="nc" id="L471">            endpointWaitQueue.signal();</span>
+<span class="nc" id="L472">            globalWaitQueue.signal();</span>
+        }
+<span class="fc" id="L474">    }</span>
+
+    /**
+     * Invoked to release capacity for a message that has been fully, successfully processed.
+     *
+     * Normally no different from invoking {@link #releaseCapacity(int)}, but is necessary for the verifier
+     * to be able to delay capacity release for backpressure testing.
+     */
+    @VisibleForTesting
+    protected void releaseProcessedCapacity(int size, Header header)
+    {
+<span class="fc" id="L485">        releaseCapacity(size);</span>
+<span class="fc" id="L486">    }</span>
+
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx)
+    {
+<span class="fc" id="L492">        isClosed = true;</span>
+
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">        if (null != largeMessage)</span>
+<span class="nc" id="L495">            largeMessage.abort();</span>
+
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">        if (null != ticket)</span>
+<span class="nc" id="L498">            ticket.invalidate();</span>
+
+<span class="fc" id="L500">        onClosed.call(this);</span>
+<span class="fc" id="L501">    }</span>
+
+    private EventLoop eventLoop()
+    {
+<span class="nc" id="L505">        return channel.eventLoop();</span>
+    }
+
+    protected abstract String id();
+
+    /*
+     * A large-message frame-accumulating state machine.
+     *
+     * Collects intact frames until it's has all the bytes necessary to deserialize the large message,
+     * at which point it schedules a task on the appropriate {@link Stage},
+     * a task that deserializes the message and immediately invokes the verb handler.
+     *
+     * Also handles corrupt frames and potential expiry of the large message during accumulation:
+     * if it's taking the frames too long to arrive, there is no point in holding on to the
+     * accumulated frames, or in gathering more - so we release the ones we already have, and
+     * skip any remaining ones, alongside with returning memory permits early.
+     */
+    protected abstract class LargeMessage&lt;H&gt;
+    {
+        protected final int size;
+        protected final H header;
+
+<span class="fc" id="L527">        protected final List&lt;ShareableBytes&gt; buffers = new ArrayList&lt;&gt;();</span>
+        protected int received;
+
+        protected final long expiresAtNanos;
+
+        protected boolean isExpired;
+        protected boolean isCorrupt;
+
+        protected LargeMessage(int size, H header, long expiresAtNanos, boolean isExpired)
+<span class="fc" id="L536">        {</span>
+<span class="fc" id="L537">            this.size = size;</span>
+<span class="fc" id="L538">            this.header = header;</span>
+<span class="fc" id="L539">            this.expiresAtNanos = expiresAtNanos;</span>
+<span class="fc" id="L540">            this.isExpired = isExpired;</span>
+<span class="fc" id="L541">        }</span>
+
+        protected LargeMessage(int size, H header, long expiresAtNanos, ShareableBytes bytes)
+        {
+<span class="nc" id="L545">            this(size, header, expiresAtNanos, false);</span>
+<span class="nc" id="L546">            buffers.add(bytes);</span>
+<span class="nc" id="L547">        }</span>
+
+        /**
+         * Return true if this was the last frame of the large message.
+         */
+        public boolean supply(Frame frame)
+        {
+<span class="pc bpc" id="L554" title="1 of 2 branches missed.">            if (frame instanceof IntactFrame)</span>
+<span class="fc" id="L555">                onIntactFrame((IntactFrame) frame);</span>
+            else
+<span class="nc" id="L557">                onCorruptFrame();</span>
+
+<span class="fc" id="L559">            received += frame.frameSize;</span>
+<span class="fc bfc" id="L560" title="All 2 branches covered.">            if (size == received)</span>
+<span class="fc" id="L561">                onComplete();</span>
+<span class="fc bfc" id="L562" title="All 2 branches covered.">            return size == received;</span>
+        }
+
+        private void onIntactFrame(IntactFrame frame)
+        {
+<span class="fc" id="L567">            boolean expires = approxTime.isAfter(expiresAtNanos);</span>
+<span class="pc bpc" id="L568" title="2 of 4 branches missed.">            if (!isExpired &amp;&amp; !isCorrupt)</span>
+            {
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">                if (!expires)</span>
+                {
+<span class="fc" id="L572">                    buffers.add(frame.contents.sliceAndConsume(frame.frameSize).share());</span>
+<span class="fc" id="L573">                    return;</span>
+                }
+<span class="nc" id="L575">                releaseBuffersAndCapacity(); // release resources once we transition from normal state to expired</span>
+            }
+<span class="nc" id="L577">            frame.consume();</span>
+<span class="nc" id="L578">            isExpired |= expires;</span>
+<span class="nc" id="L579">        }</span>
+
+        private void onCorruptFrame()
+        {
+<span class="nc bnc" id="L583" title="All 4 branches missed.">            if (!isExpired &amp;&amp; !isCorrupt)</span>
+<span class="nc" id="L584">                releaseBuffersAndCapacity(); // release resources once we transition from normal state to corrupt</span>
+<span class="nc" id="L585">            isCorrupt = true;</span>
+<span class="nc" id="L586">            isExpired |= approxTime.isAfter(expiresAtNanos);</span>
+<span class="nc" id="L587">        }</span>
+
+        protected abstract void onComplete();
+
+        protected abstract void abort();
+
+        protected void releaseBuffers()
+        {
+<span class="fc" id="L595">            buffers.forEach(ShareableBytes::release); buffers.clear();</span>
+<span class="fc" id="L596">        }</span>
+
+        protected void releaseBuffersAndCapacity()
+        {
+<span class="nc" id="L600">            releaseBuffers(); releaseCapacity(size);</span>
+<span class="nc" id="L601">        }</span>
+    }
+
+    /**
+     * A special-purpose wait queue to park inbound message handlers that failed to allocate
+     * reserve capacity for a message in. Upon such failure a handler registers itself with
+     * a {@link WaitQueue} of the appropriate kind (either ENDPOINT or GLOBAL - if failed
+     * to allocate endpoint or global reserve capacity, respectively), stops processing any
+     * accumulated frames or receiving new ones, and waits - until reactivated.
+     *
+     * Every time permits are returned to an endpoint or global {@link Limit}, the respective
+     * queue gets signalled, and if there are any handlers registered in it, we will attempt
+     * to reactivate as many waiting handlers as current available reserve capacity allows
+     * us to - immediately, on the {@link #signal()}-calling thread. At most one such attempt
+     * will be in progress at any given time.
+     *
+     * Handlers that can be reactivated will be grouped by their {@link EventLoop} and a single
+     * {@link ReactivateHandlers} task will be scheduled per event loop, on the corresponding
+     * event loops.
+     *
+     * When run, the {@link ReactivateHandlers} task will ask each handler in its group to first
+     * process one message - using preallocated reserve capacity - and if no obstacles were met -
+     * reactivate the handlers, this time using their regular reserves.
+     *
+     * See {@link WaitQueue#schedule()}, {@link ReactivateHandlers#run()}, {@link Ticket#reactivateHandler(Limit)}.
+     */
+    public static final class WaitQueue
+    {
+<span class="fc" id="L629">        enum Kind { ENDPOINT, GLOBAL }</span>
+
+        private static final int NOT_RUNNING = 0;
+        @SuppressWarnings(&quot;unused&quot;)
+        private static final int RUNNING     = 1;
+        private static final int RUN_AGAIN   = 2;
+
+        private volatile int scheduled;
+<span class="fc" id="L637">        private static final AtomicIntegerFieldUpdater&lt;WaitQueue&gt; scheduledUpdater =</span>
+<span class="fc" id="L638">            AtomicIntegerFieldUpdater.newUpdater(WaitQueue.class, &quot;scheduled&quot;);</span>
+
+        private final Kind kind;
+        private final Limit reserveCapacity;
+
+<span class="fc" id="L643">        private final ManyToOneConcurrentLinkedQueue&lt;Ticket&gt; queue = new ManyToOneConcurrentLinkedQueue&lt;&gt;();</span>
+
+        private WaitQueue(Kind kind, Limit reserveCapacity)
+<span class="fc" id="L646">        {</span>
+<span class="fc" id="L647">            this.kind = kind;</span>
+<span class="fc" id="L648">            this.reserveCapacity = reserveCapacity;</span>
+<span class="fc" id="L649">        }</span>
+
+        public static WaitQueue endpoint(Limit endpointReserveCapacity)
+        {
+<span class="fc" id="L653">            return new WaitQueue(Kind.ENDPOINT, endpointReserveCapacity);</span>
+        }
+
+        public static WaitQueue global(Limit globalReserveCapacity)
+        {
+<span class="fc" id="L658">            return new WaitQueue(Kind.GLOBAL, globalReserveCapacity);</span>
+        }
+
+        private Ticket register(AbstractMessageHandler handler, int bytesRequested, long registeredAtNanos, long expiresAtNanos)
+        {
+<span class="nc" id="L663">            Ticket ticket = new Ticket(this, handler, bytesRequested, registeredAtNanos, expiresAtNanos);</span>
+<span class="nc" id="L664">            Ticket previous = queue.relaxedPeekLastAndOffer(ticket);</span>
+<span class="nc bnc" id="L665" title="All 4 branches missed.">            if (null == previous || !previous.isWaiting())</span>
+<span class="nc" id="L666">                signal(); // only signal the queue if this handler is first to register</span>
+<span class="nc" id="L667">            return ticket;</span>
+        }
+
+        @VisibleForTesting
+        public void signal()
+        {
+<span class="nc bnc" id="L673" title="All 2 branches missed.">            if (queue.relaxedIsEmpty())</span>
+<span class="nc" id="L674">                return; // we can return early if no handlers have registered with the wait queue</span>
+
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (NOT_RUNNING == scheduledUpdater.getAndUpdate(this, i -&gt; min(RUN_AGAIN, i + 1)))</span>
+            {
+                do
+                {
+<span class="nc" id="L680">                    schedule();</span>
+                }
+<span class="nc bnc" id="L682" title="All 2 branches missed.">                while (RUN_AGAIN == scheduledUpdater.getAndDecrement(this));</span>
+            }
+<span class="nc" id="L684">        }</span>
+
+        private void schedule()
+        {
+<span class="nc" id="L688">            Map&lt;EventLoop, ReactivateHandlers&gt; tasks = null;</span>
+
+<span class="nc" id="L690">            long currentTimeNanos = approxTime.now();</span>
+
+            Ticket t;
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            while ((t = queue.peek()) != null)</span>
+            {
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                if (!t.call()) // invalidated</span>
+                {
+<span class="nc" id="L697">                    queue.remove();</span>
+<span class="nc" id="L698">                    continue;</span>
+                }
+
+<span class="nc" id="L701">                boolean isLive = t.isLive(currentTimeNanos);</span>
+<span class="nc bnc" id="L702" title="All 4 branches missed.">                if (isLive &amp;&amp; !reserveCapacity.tryAllocate(t.bytesRequested))</span>
+                {
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                    if (!t.reset()) // the ticket was invalidated after being called but before now</span>
+                    {
+<span class="nc" id="L706">                        queue.remove();</span>
+<span class="nc" id="L707">                        continue;</span>
+                    }
+                    break; // TODO: traverse the entire queue to unblock handlers that have expired or invalidated tickets
+                }
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">                if (null == tasks)</span>
+<span class="nc" id="L713">                    tasks = new IdentityHashMap&lt;&gt;();</span>
+
+<span class="nc" id="L715">                queue.remove();</span>
+<span class="nc" id="L716">                tasks.computeIfAbsent(t.handler.eventLoop(), e -&gt; new ReactivateHandlers()).add(t, isLive);</span>
+<span class="nc" id="L717">            }</span>
+
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (null != tasks)</span>
+<span class="nc" id="L720">                tasks.forEach(EventLoop::execute);</span>
+<span class="nc" id="L721">        }</span>
+
+<span class="nc" id="L723">        private class ReactivateHandlers implements Runnable</span>
+        {
+<span class="nc" id="L725">            List&lt;Ticket&gt; tickets = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L726">            long capacity = 0L;</span>
+
+            private void add(Ticket ticket, boolean isLive)
+            {
+<span class="nc" id="L730">                tickets.add(ticket);</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">                if (isLive) capacity += ticket.bytesRequested;</span>
+<span class="nc" id="L732">            }</span>
+
+            public void run()
+            {
+<span class="nc" id="L736">                Limit limit = new ResourceLimits.Basic(capacity);</span>
+                try
+                {
+<span class="nc bnc" id="L739" title="All 2 branches missed.">                    for (Ticket ticket : tickets)</span>
+<span class="nc" id="L740">                        ticket.reactivateHandler(limit);</span>
+                }
+                finally
+                {
+                    /*
+                     * Free up any unused capacity, if any. Will be non-zero if one or more handlers were closed
+                     * when we attempted to run their callback, or used more of their other reserve; or if the first
+                     * message in the unprocessed stream has expired in the narrow time window.
+                     */
+<span class="nc" id="L749">                    long remaining = limit.remaining();</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                    if (remaining &gt; 0)</span>
+                    {
+<span class="nc" id="L752">                        reserveCapacity.release(remaining);</span>
+<span class="nc" id="L753">                        signal();</span>
+                    }
+                }
+<span class="nc" id="L756">            }</span>
+        }
+
+        private static final class Ticket
+        {
+            private static final int WAITING     = 0;
+            private static final int CALLED      = 1;
+            private static final int INVALIDATED = 2; // invalidated by a handler that got closed
+
+            private volatile int state;
+<span class="nc" id="L766">            private static final AtomicIntegerFieldUpdater&lt;Ticket&gt; stateUpdater =</span>
+<span class="nc" id="L767">                AtomicIntegerFieldUpdater.newUpdater(Ticket.class, &quot;state&quot;);</span>
+
+            private final WaitQueue waitQueue;
+            private final AbstractMessageHandler handler;
+            private final int bytesRequested;
+            private final long reigsteredAtNanos;
+            private final long expiresAtNanos;
+
+            private Ticket(WaitQueue waitQueue, AbstractMessageHandler handler, int bytesRequested, long registeredAtNanos, long expiresAtNanos)
+<span class="nc" id="L776">            {</span>
+<span class="nc" id="L777">                this.waitQueue = waitQueue;</span>
+<span class="nc" id="L778">                this.handler = handler;</span>
+<span class="nc" id="L779">                this.bytesRequested = bytesRequested;</span>
+<span class="nc" id="L780">                this.reigsteredAtNanos = registeredAtNanos;</span>
+<span class="nc" id="L781">                this.expiresAtNanos = expiresAtNanos;</span>
+<span class="nc" id="L782">            }</span>
+
+            private void reactivateHandler(Limit capacity)
+            {
+<span class="nc" id="L786">                long elapsedNanos = approxTime.now() - reigsteredAtNanos;</span>
+                try
+                {
+<span class="nc bnc" id="L789" title="All 2 branches missed.">                    if (waitQueue.kind == Kind.ENDPOINT)</span>
+<span class="nc" id="L790">                        handler.onEndpointReserveCapacityRegained(capacity, elapsedNanos);</span>
+                    else
+<span class="nc" id="L792">                        handler.onGlobalReserveCapacityRegained(capacity, elapsedNanos);</span>
+                }
+<span class="nc" id="L794">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L796">                    logger.error(&quot;{} exception caught while reactivating a handler&quot;, handler.id(), t);</span>
+<span class="nc" id="L797">                }</span>
+<span class="nc" id="L798">            }</span>
+
+            private boolean isWaiting()
+            {
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                return state == WAITING;</span>
+            }
+
+            private boolean isLive(long currentTimeNanos)
+            {
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                return !approxTime.isAfter(currentTimeNanos, expiresAtNanos);</span>
+            }
+
+            private void invalidate()
+            {
+<span class="nc" id="L812">                state = INVALIDATED;</span>
+<span class="nc" id="L813">                waitQueue.signal();</span>
+<span class="nc" id="L814">            }</span>
+
+            private boolean call()
+            {
+<span class="nc" id="L818">                return stateUpdater.compareAndSet(this, WAITING, CALLED);</span>
+            }
+
+            private boolean reset()
+            {
+<span class="nc" id="L823">                return stateUpdater.compareAndSet(this, CALLED, WAITING);</span>
+            }
+        }
+    }
+
+    public interface OnHandlerClosed
+    {
+        void call(AbstractMessageHandler handler);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

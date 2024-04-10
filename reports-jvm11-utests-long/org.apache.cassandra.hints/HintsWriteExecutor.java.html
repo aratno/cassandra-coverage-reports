@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsWriteExecutor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsWriteExecutor.java</span></div><h1>HintsWriteExecutor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Iterator;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+
+/**
+ * A single threaded executor that exclusively writes all the hints and otherwise manipulate the writers.
+ *
+ * Flushing demultiplexes the provided {@link HintsBuffer} and sequentially writes to each {@link HintsWriter},
+ * using the same shared write buffer. In the near future, when CASSANDRA-9428 (compression) is implemented,
+ * will also share a compression buffer.
+ */
+final class HintsWriteExecutor
+{
+<span class="fc" id="L48">    private static final Logger logger = LoggerFactory.getLogger(HintsWriteExecutor.class);</span>
+
+    static final int WRITE_BUFFER_SIZE = 256 &lt;&lt; 10;
+
+    private final HintsCatalog catalog;
+    private final ByteBuffer writeBuffer;
+    private final ExecutorPlus executor;
+
+    HintsWriteExecutor(HintsCatalog catalog)
+<span class="fc" id="L57">    {</span>
+<span class="fc" id="L58">        this.catalog = catalog;</span>
+
+<span class="fc" id="L60">        writeBuffer = ByteBuffer.allocateDirect(WRITE_BUFFER_SIZE);</span>
+<span class="fc" id="L61">        executor = executorFactory().sequential(&quot;HintsWriteExecutor&quot;);</span>
+<span class="fc" id="L62">    }</span>
+
+    /*
+     * Should be very fast (worst case scenario - write a few 10s of mebibytes to disk).
+     */
+    void shutdownBlocking()
+    {
+<span class="nc" id="L69">        executor.shutdown();</span>
+        try
+        {
+<span class="nc" id="L72">            executor.awaitTermination(1, TimeUnit.MINUTES);</span>
+        }
+<span class="nc" id="L74">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L76">            throw new AssertionError(e);</span>
+<span class="nc" id="L77">        }</span>
+<span class="nc" id="L78">    }</span>
+
+    /**
+     * Flush the provided buffer, recycle it and offer it back to the pool.
+     */
+    Future&lt;?&gt; flushBuffer(HintsBuffer buffer, HintsBufferPool bufferPool)
+    {
+<span class="nc" id="L85">        return executor.submit(new FlushBufferTask(buffer, bufferPool));</span>
+    }
+
+    /**
+     * Flush the current buffer, but without clearing/recycling it.
+     */
+    Future&lt;?&gt; flushBufferPool(HintsBufferPool bufferPool)
+    {
+<span class="fc" id="L93">        return executor.submit(new FlushBufferPoolTask(bufferPool));</span>
+    }
+
+    /**
+     * Flush the current buffer just for the specified hints stores. Without clearing/recycling it.
+     */
+    Future&lt;?&gt; flushBufferPool(HintsBufferPool bufferPool, Iterable&lt;HintsStore&gt; stores)
+    {
+<span class="fc" id="L101">        return executor.submit(new PartiallyFlushBufferPoolTask(bufferPool, stores));</span>
+    }
+
+    void fsyncWritersBlockingly(Iterable&lt;HintsStore&gt; stores)
+    {
+        try
+        {
+<span class="fc" id="L108">            executor.submit(new FsyncWritersTask(stores)).get();</span>
+        }
+<span class="nc" id="L110">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L112">            throw new UncheckedInterruptedException(e);</span>
+        }
+<span class="nc" id="L114">        catch (ExecutionException e)</span>
+        {
+<span class="nc" id="L116">            throw new RuntimeException(e);</span>
+<span class="fc" id="L117">        }</span>
+<span class="fc" id="L118">    }</span>
+
+    Future&lt;?&gt; closeWriter(HintsStore store)
+    {
+<span class="nc" id="L122">        return executor.submit(store::closeWriter);</span>
+    }
+
+    Future&lt;?&gt; closeAllWriters()
+    {
+<span class="nc" id="L127">        return executor.submit(() -&gt; catalog.stores().forEach(HintsStore::closeWriter));</span>
+    }
+
+    private final class FlushBufferTask implements Runnable
+    {
+        private final HintsBuffer buffer;
+        private final HintsBufferPool bufferPool;
+
+        FlushBufferTask(HintsBuffer buffer, HintsBufferPool bufferPool)
+        {
+            this.buffer = buffer;
+            this.bufferPool = bufferPool;
+        }
+
+        public void run()
+        {
+            buffer.waitForModifications();
+
+            try
+            {
+                flush(buffer);
+            }
+            finally
+            {
+                HintsBuffer recycledBuffer = buffer.recycle();
+                bufferPool.offer(recycledBuffer);
+            }
+        }
+    }
+
+    private final class FlushBufferPoolTask implements Runnable
+    {
+        private final HintsBufferPool bufferPool;
+
+        FlushBufferPoolTask(HintsBufferPool bufferPool)
+<span class="fc" id="L162">        {</span>
+<span class="fc" id="L163">            this.bufferPool = bufferPool;</span>
+<span class="fc" id="L164">        }</span>
+
+        public void run()
+        {
+<span class="fc" id="L168">            HintsBuffer buffer = bufferPool.currentBuffer();</span>
+<span class="fc" id="L169">            buffer.waitForModifications();</span>
+            try
+            {
+<span class="fc" id="L172">                flush(buffer);</span>
+            }
+<span class="nc" id="L174">            catch(FSError e)</span>
+            {
+<span class="nc" id="L176">                logger.error(&quot;Unable to flush hint buffer: {}&quot;, e.getLocalizedMessage(), e);</span>
+<span class="nc" id="L177">                FileUtils.handleFSErrorAndPropagate(e);</span>
+<span class="fc" id="L178">            }</span>
+<span class="fc" id="L179">        }</span>
+    }
+
+    private final class PartiallyFlushBufferPoolTask implements Runnable
+    {
+        private final HintsBufferPool bufferPool;
+        private final Iterable&lt;HintsStore&gt; stores;
+
+        PartiallyFlushBufferPoolTask(HintsBufferPool bufferPool, Iterable&lt;HintsStore&gt; stores)
+<span class="fc" id="L188">        {</span>
+<span class="fc" id="L189">            this.bufferPool = bufferPool;</span>
+<span class="fc" id="L190">            this.stores = stores;</span>
+<span class="fc" id="L191">        }</span>
+
+        public void run()
+        {
+<span class="fc" id="L195">            HintsBuffer buffer = bufferPool.currentBuffer();</span>
+<span class="fc" id="L196">            buffer.waitForModifications();</span>
+<span class="pc" id="L197">            stores.forEach(store -&gt; flush(buffer.consumingHintsIterator(store.hostId), store, buffer));</span>
+<span class="fc" id="L198">        }</span>
+    }
+
+    private final class FsyncWritersTask implements Runnable
+    {
+        private final Iterable&lt;HintsStore&gt; stores;
+
+        FsyncWritersTask(Iterable&lt;HintsStore&gt; stores)
+<span class="fc" id="L206">        {</span>
+<span class="fc" id="L207">            this.stores = stores;</span>
+<span class="fc" id="L208">        }</span>
+
+        public void run()
+        {
+<span class="fc" id="L212">            stores.forEach(HintsStore::fsyncWriter);</span>
+<span class="fc" id="L213">            catalog.fsyncDirectory();</span>
+<span class="fc" id="L214">        }</span>
+    }
+
+    private void flush(HintsBuffer buffer)
+    {
+<span class="pc" id="L219">        buffer.hostIds().forEach(hostId -&gt; flush(buffer.consumingHintsIterator(hostId), catalog.get(hostId), buffer));</span>
+<span class="fc" id="L220">    }</span>
+
+    private void flush(Iterator&lt;ByteBuffer&gt; iterator, HintsStore store, HintsBuffer buffer)
+    {
+        while (true)
+        {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (iterator.hasNext())</span>
+<span class="nc" id="L227">                flushInternal(iterator, store);</span>
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">            if (!iterator.hasNext())</span>
+<span class="nc" id="L230">                break;</span>
+
+            // exceeded the size limit for an individual file, but still have more to write
+            // close the current writer and continue flushing to a new one in the next iteration
+            try
+            {
+<span class="nc" id="L236">                store.closeWriter();</span>
+            }
+            finally
+            {
+                /*
+                We remove the earliest hint for a respective hostId of the store from the buffer,
+                we are removing it specifically after we closed the store above in try block
+                so hints are persisted on disk before.
+
+                There is a periodic flushing of a buffer driven by hints_flush_period and clearing
+                this entry upon every flush would remove the information what is the earliest hint in the buffer
+                for a respective node prematurely.
+
+                Since this flushing method is called for every host id a buffer holds, we will eventually
+                remove all hostIds of the earliest hints of the buffer, and it will be added again as soon as there
+                is a new hint for that node to be delivered.
+                */
+<span class="nc" id="L253">                buffer.clearEarliestHintForHostId(store.hostId);</span>
+<span class="nc" id="L254">            }</span>
+        }
+<span class="nc" id="L256">    }</span>
+
+    @SuppressWarnings(&quot;resource&quot;)   // writer not closed here
+    private void flushInternal(Iterator&lt;ByteBuffer&gt; iterator, HintsStore store)
+    {
+<span class="nc" id="L261">        long maxHintsFileSize = DatabaseDescriptor.getMaxHintsFileSize();</span>
+
+<span class="nc" id="L263">        HintsWriter writer = store.getOrOpenWriter();</span>
+
+<span class="nc" id="L265">        try (HintsWriter.Session session = writer.newSession(writeBuffer))</span>
+        {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            while (iterator.hasNext())</span>
+            {
+<span class="nc" id="L269">                session.append(iterator.next());</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                if (session.position() &gt;= maxHintsFileSize)</span>
+<span class="nc" id="L271">                    break;</span>
+            }
+        }
+<span class="nc" id="L274">        catch (IOException e)</span>
+        {
+<span class="nc" id="L276">            throw new FSWriteError(e, writer.descriptor().fileName());</span>
+<span class="nc" id="L277">        }</span>
+<span class="nc" id="L278">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

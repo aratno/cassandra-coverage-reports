@@ -1,0 +1,505 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CIDRGroupsMappingIntervalTree.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth</a> &gt; <span class="el_source">CIDRGroupsMappingIntervalTree.java</span></div><h1>CIDRGroupsMappingIntervalTree.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.auth;
+
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.cql3.CIDR;
+
+/**
+ * This class implements CIDR Interval tree and the ability to find longest matching CIDR for the given IP.
+ * CIDRs interval tree is a variant of interval tree. Each node contains a CIDR and a value.
+ * A node has left children array and the right children array.
+ * - The left children's CIDRs are either less than the starting IP of parent or overlaps with the parent node.
+ * - The right children's CIDRs are either greater than the ending IP of the parent or overlaps with the parent node.
+ * Note that nodes that overlap with the parent node are included in both left and right children arrays.
+ *
+ * The tree organizes nodes by placing non-overlapping CIDRs at the same level. In general, CIDRs with the same net mask
+ * do not overlap, hence are placed in the same level. CIDRs with different net mask may overlap, hence placed at
+ * different levels in the tree. In addition to this, there is an optimisation to promote a CIDR to an upper level, if
+ * it is not overlapping with any CIDR in the parent level, that means, in such cases a CIDR with different net mask can
+ * co-locate in the same level with other CIDRs.
+ *
+ * Levels closer to the root contains CIDRs with higher net mask value. Net mask value decreases as levels further down
+ * from the root. i.e, Nearer the level to the root, the narrower the CIDR, meaning matching the longer IP prefix.
+ *
+ * Search for Longest matching CIDR for an IP starts at level 0, if not found a match, search continues to the next
+ * level, until it finds a match or reaches leaf nodes without a match. That means search terminates on the first match
+ * closest to the root, i.e, locates narrowest matching CIDR.
+ *
+ * Example:
+ * Assume below CIDRs
+ * &quot;128.10.120.2/10&quot;, ==&gt; IP range 128.0.0.0 - 128.63.255.255, netmask 10
+ * &quot;128.20.120.2/20&quot;, ==&gt; IP range 128.20.112.0 - 128.20.127.255, netmask 20
+ * &quot;0.0.0.0/0&quot;,       ==&gt; IP range 0.0.0.0 - 255.255.255.255, netmask 0
+ * &quot;10.1.1.2/10&quot;      ==&gt; IP range 10.0.0.0 - 10.63.255.255, netmask 10
+ *
+ * Resulting interval tree looks like:
+ *
+ * (10.0.0.0 - 10.63.255.255, 10)  (128.20.112.0 - 128.20.127.255, 20)
+ *               /             \               / \
+ *              /              (128.0.0.0 - 128.63.255.255, 10)
+ *             /                      /  \
+ *            (0.0.0.0 - 255.255.255.255, 0)
+ *
+ * Note that in this example (10.0.0.0 - 10.63.255.255, 10) doesn't have any overlapping CIDR, hence moved up a level as
+ * an optimization
+ */
+public class CIDRGroupsMappingIntervalTree&lt;V&gt; implements CIDRGroupsMappingTable&lt;V&gt;
+{
+    private final IPIntervalTree&lt;V&gt; tree;
+
+    /**
+     * Build an interval tree for given CIDRs
+     * @param isIPv6 true if this CIDR groups mapping is for IPv6 IPs, false otherwise
+     * @param cidrMappings CIDR to Value mappings
+     */
+    public CIDRGroupsMappingIntervalTree(boolean isIPv6, Map&lt;CIDR, Set&lt;V&gt;&gt; cidrMappings)
+<span class="fc" id="L86">    {</span>
+<span class="fc bfc" id="L87" title="All 2 branches covered.">        for (CIDR cidr : cidrMappings.keySet())</span>
+        {
+<span class="fc bfc" id="L89" title="All 2 branches covered.">            if (isIPv6 != cidr.isIPv6())</span>
+<span class="fc" id="L90">                throw new IllegalArgumentException(&quot;Invalid CIDR format, expecting &quot; + getIPTypeString(isIPv6) +</span>
+<span class="fc" id="L91">                                                   &quot;, received &quot; + getIPTypeString(cidr.isIPv6()));</span>
+<span class="fc" id="L92">        }</span>
+
+<span class="fc" id="L94">        this.tree = IPIntervalTree.build(new ArrayList&lt;&gt;(cidrMappings</span>
+<span class="fc" id="L95">                                                         .entrySet()</span>
+<span class="fc" id="L96">                                                         .stream()</span>
+<span class="fc" id="L97">                                                         .collect(Collectors.groupingBy(p -&gt; p.getKey().getNetMask(),</span>
+                                                                                        TreeMap::new,
+<span class="fc" id="L99">                                                                                        Collectors.toList()))</span>
+<span class="fc" id="L100">                                                         .descendingMap()</span>
+<span class="fc" id="L101">                                                         .values()));</span>
+<span class="fc" id="L102">    }</span>
+
+    /**
+     * Get the longest matching CIDR (i.e, the narrowest match) for given IP
+     * @param ip IP to lookup CIDR group
+     * @return CIDR group name(s)
+     */
+    public Set&lt;V&gt; lookupLongestMatchForIP(InetAddress ip)
+    {
+        // Valid when empty CIDR groups mappings received, i.e, cidr_groups table is empty
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        if (tree == null)</span>
+<span class="fc" id="L113">            return Collections.emptySet();</span>
+
+<span class="fc" id="L115">        return tree.query(ip);</span>
+    }
+
+    /**
+     * This class represents a node of an IP interval tree.
+     * A node contains a CIDR, value associated with it, left and right children
+     */
+    static class IPIntervalNode&lt;V&gt;
+    {
+        private final CIDR cidr;
+<span class="fc" id="L125">        private final Set&lt;V&gt; values = new HashSet&lt;&gt;();</span>
+        private IPIntervalNode&lt;V&gt;[] left;
+        private IPIntervalNode&lt;V&gt;[] right;
+
+        public IPIntervalNode(CIDR cidr, Set&lt;V&gt; values, IPIntervalNode&lt;V&gt;[] children)
+<span class="fc" id="L130">        {</span>
+<span class="fc" id="L131">            this.cidr = cidr;</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">            if (values != null)</span>
+<span class="fc" id="L133">                this.values.addAll(values);</span>
+<span class="fc" id="L134">            updateChildren(children, true, true);</span>
+<span class="fc" id="L135">        }</span>
+
+        @VisibleForTesting
+        CIDR cidr()
+        {
+<span class="fc" id="L140">            return cidr;</span>
+        }
+
+        @VisibleForTesting
+        IPIntervalNode&lt;V&gt;[] left()
+        {
+<span class="fc" id="L146">            return left;</span>
+        }
+
+        @VisibleForTesting
+        IPIntervalNode&lt;V&gt;[] right()
+        {
+<span class="fc" id="L152">            return right;</span>
+        }
+
+        private void updateLeft(IPIntervalNode&lt;V&gt;[] newValue, boolean shouldUpdate)
+        {
+<span class="fc bfc" id="L157" title="All 2 branches covered.">            if (shouldUpdate)</span>
+<span class="fc" id="L158">                this.left = newValue;</span>
+<span class="fc" id="L159">        }</span>
+
+        private void updateRight(IPIntervalNode&lt;V&gt;[] newValue, boolean shouldUpdate)
+        {
+<span class="fc bfc" id="L163" title="All 2 branches covered.">            if (shouldUpdate)</span>
+<span class="fc" id="L164">                this.right = newValue;</span>
+<span class="fc" id="L165">        }</span>
+
+        /**
+         * Split the children array according to the IP range of this node, and link the nodes to either
+         * the left or right children.
+         * @param children array of nodes which are children for this node
+         * @param updateLeft true to update left children, false otherwise
+         * @param updateRight true to update right children, false otherwise
+         */
+        private void updateChildren(IPIntervalNode&lt;V&gt;[] children, boolean updateLeft, boolean updateRight)
+        {
+            // this is leaf node
+<span class="fc bfc" id="L177" title="All 2 branches covered.">            if (children == null)</span>
+            {
+<span class="fc" id="L179">                updateLeft(null, updateLeft);</span>
+<span class="fc" id="L180">                updateRight(null, updateRight);</span>
+<span class="fc" id="L181">                return;</span>
+            }
+
+            // Find the node in the children that is the closest to this node.
+<span class="fc" id="L185">            int index = binarySearchNodesIndex(children, this.cidr.getStartIpAddress());</span>
+<span class="fc" id="L186">            IPIntervalNode&lt;V&gt; closest = children[index];</span>
+
+            // Scenario - all children nodes are greater than this node
+<span class="fc bfc" id="L189" title="All 4 branches covered.">            if (index == 0 &amp;&amp; CIDR.compareIPs(this.cidr.getEndIpAddress(), closest.cidr.getStartIpAddress()) &lt; 0)</span>
+            {
+<span class="fc" id="L191">                updateLeft(null, updateLeft);</span>
+<span class="fc" id="L192">                updateRight(children, updateRight);</span>
+            }
+            // Scenario - all children nodes are lower than this node
+<span class="fc bfc" id="L195" title="All 2 branches covered.">            else if (index == children.length - 1 &amp;&amp;</span>
+<span class="fc bfc" id="L196" title="All 2 branches covered.">                     CIDR.compareIPs(this.cidr.getStartIpAddress(), closest.cidr.getEndIpAddress()) &gt; 0)</span>
+            {
+<span class="fc" id="L198">                updateLeft(children, updateLeft);</span>
+<span class="fc" id="L199">                updateRight(null, updateRight);</span>
+            }
+            else // Scenario - part of the children nodes are lower, and the other are greater
+            {
+                // When this node does not overlap with the closest, split the array and
+                // link left and right children correspondingly.
+<span class="fc bfc" id="L205" title="All 2 branches covered.">                if (CIDR.compareIPs(this.cidr.getStartIpAddress(), closest.cidr.getEndIpAddress()) &gt; 0)</span>
+                {
+                    // including the closest (node at index) in left
+<span class="fc" id="L208">                    updateLeft(Arrays.copyOfRange(children, 0, index + 1), updateLeft);</span>
+                    // put the rest in right
+<span class="fc" id="L210">                    updateRight(Arrays.copyOfRange(children, index + 1, children.length), updateRight);</span>
+                }
+                else // When the node overlaps, include the closest node in both its left and right children nodes.
+                {
+                    // The parent node overlaps with at most 1 interval in the children, because of nature of the CIDR.
+                    // Increasing the bit mask by 1, divides the range into halfs.
+                    // Note that the node@index is included in both left and right
+                    // it is because the current interval partially overlaps with the closest interval
+                    // The overlapping interval should always be searched if we cannot find an exact match with current interval.
+<span class="fc" id="L219">                    updateLeft(Arrays.copyOfRange(children, 0, index + 1), updateLeft);</span>
+<span class="fc" id="L220">                    updateRight(Arrays.copyOfRange(children, index, children.length), updateRight);</span>
+                }
+            }
+<span class="fc" id="L223">        }</span>
+
+        private void updateLeftIfNull(IPIntervalNode&lt;V&gt;[] children)
+        {
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            if (left != null)</span>
+<span class="fc" id="L228">                return;</span>
+
+<span class="fc" id="L230">            updateChildren(children, true, false);</span>
+<span class="fc" id="L231">        }</span>
+
+        private void updateRightIfNull(IPIntervalNode&lt;V&gt;[] children)
+        {
+<span class="fc bfc" id="L235" title="All 2 branches covered.">            if (right != null)</span>
+<span class="fc" id="L236">                return;</span>
+
+<span class="fc" id="L238">            updateChildren(children, false, true);</span>
+<span class="fc" id="L239">        }</span>
+
+        /**
+         * Binary search given array of nodes and return index of the closest matching node.
+         * It looks up for the interval that matches exactly or is left (lower) to the ip.
+         * @param nodes array of nodes
+         * @param ip    IP address to search
+         * @param &lt;V&gt;   data type of the value
+         * @return index of the closest node
+         */
+        static &lt;V&gt; int binarySearchNodesIndex(IPIntervalNode&lt;V&gt;[] nodes, InetAddress ip)
+        {
+<span class="fc" id="L251">            int start = 0; // inclusive</span>
+<span class="fc" id="L252">            int end = nodes.length; // exclusive</span>
+
+            while (true)
+            {
+<span class="fc bfc" id="L256" title="All 2 branches covered.">                if (start &gt;= end)</span>
+                {
+                    // return the closest
+<span class="fc" id="L259">                    return Math.max((end - 1), 0);</span>
+                }
+
+<span class="fc" id="L262">                int mid = start + (end - start) / 2;</span>
+<span class="fc" id="L263">                IPIntervalNode&lt;V&gt; midNode = nodes[mid];</span>
+<span class="fc" id="L264">                int cmp = CIDR.compareIPs(ip, midNode.cidr.getStartIpAddress());</span>
+
+<span class="fc bfc" id="L266" title="All 2 branches covered.">                if (cmp == 0) // found the node</span>
+                {
+<span class="fc" id="L268">                    return mid;</span>
+                }
+<span class="fc bfc" id="L270" title="All 2 branches covered.">                else if (cmp &lt; 0) // Given IP is less than middle node's starting IP, search left side sub array</span>
+                {
+<span class="fc" id="L272">                    end = mid;</span>
+                }
+                else  // Given IP is &gt;= middle node's starting IP, so compare ending IP
+                {
+<span class="fc" id="L276">                    int compEnd = CIDR.compareIPs(ip, midNode.cidr.getEndIpAddress());</span>
+                    // Given IP is &gt;= middle node's starting IP and &lt;= than the ending IP, found the match
+<span class="fc bfc" id="L278" title="All 2 branches covered.">                    if (compEnd &lt;= 0)</span>
+                    {
+<span class="fc" id="L280">                        return mid;</span>
+                    }
+                    else // IP &gt; middle node's end IP &gt;= given IP, search right side sub array
+                    {
+<span class="fc" id="L284">                        start = mid + 1;</span>
+                    }
+                }
+<span class="fc" id="L287">            }</span>
+        }
+
+        /**
+         * Binary search given array of nodes to find the closest IP interval to the input IP
+         * @param nodes array of nodes
+         * @param ip    IP address to search
+         * @param &lt;V&gt;   data type of the value
+         * @return the closest node to the input IP
+         */
+        static &lt;V&gt; IPIntervalNode&lt;V&gt; binarySearchNodes(IPIntervalNode&lt;V&gt;[] nodes, InetAddress ip)
+        {
+<span class="fc" id="L299">            int index = binarySearchNodesIndex(nodes, ip);</span>
+<span class="fc" id="L300">            return nodes[index];</span>
+        }
+
+        /**
+         * Search the tree for a CIDR matching given IP. Uses DFS and stops on first match i.e, finds the closest match
+         * to the root, which is the narrowest matching CIDR
+         * @param root subtree with this node as root
+         * @param ip   IP address to search
+         * @param &lt;V&gt;  data type of the value
+         * @return value(s) associated with the CIDR matching the given IP, Returns null if no match found
+         */
+        static &lt;V&gt; Set&lt;V&gt; query(IPIntervalNode&lt;V&gt; root, InetAddress ip)
+        {
+<span class="fc" id="L313">            IPIntervalNode&lt;V&gt; current = root;</span>
+            while (true) // while loop transformed from tail recursion
+            {
+<span class="fc bfc" id="L316" title="All 2 branches covered.">                boolean largerThanStart = CIDR.compareIPs(ip, current.cidr.getStartIpAddress()) &gt;= 0;</span>
+<span class="fc bfc" id="L317" title="All 2 branches covered.">                boolean lessThanEnd = CIDR.compareIPs(ip, current.cidr.getEndIpAddress()) &lt;= 0;</span>
+<span class="fc bfc" id="L318" title="All 4 branches covered.">                if (largerThanStart &amp;&amp; lessThanEnd)</span>
+                {
+<span class="fc" id="L320">                    return current.values;</span>
+                }
+                else
+                {
+<span class="fc bfc" id="L324" title="All 2 branches covered.">                    IPIntervalNode&lt;V&gt;[] candidates = largerThanStart ? current.right : current.left;</span>
+                    // the tree is exhausted, and we are unable to find a match
+<span class="fc bfc" id="L326" title="All 2 branches covered.">                    if (candidates == null)</span>
+                    {
+<span class="fc" id="L328">                        return null;</span>
+                    }
+<span class="fc" id="L330">                    current = binarySearchNodes(candidates, ip);</span>
+                }
+<span class="fc" id="L332">            }</span>
+        }
+    }
+
+
+    /**
+     * This class represents an interval tree for CIDRs
+     * @param &lt;V&gt; data type of the value
+     */
+    static class IPIntervalTree&lt;V&gt;
+    {
+        // References to first level nodes of the tree
+        private final IPIntervalNode&lt;V&gt;[] level0;
+        // depth of the tree
+        private final int depth;
+
+        private IPIntervalTree(IPIntervalNode&lt;V&gt;[] nodes, int depth)
+<span class="fc" id="L349">        {</span>
+<span class="fc" id="L350">            this.level0 = nodes;</span>
+<span class="fc" id="L351">            this.depth = depth;</span>
+<span class="fc" id="L352">        }</span>
+
+        @VisibleForTesting
+        int getDepth()
+        {
+<span class="nc" id="L357">            return depth;</span>
+        }
+
+        /**
+         * Optimize levels by moving non-overlapping CIDRs from lower level to the upper level. Levels are updated in-place
+         * This optimization moves CIDRs closer to the root, hence improves the search to find IP nearer to the root,
+         * i.e, avoiding going depth during the search
+         * @param upperLevel level for CIDRs with higher netmask value
+         * @param lowerLevel level for CIDRs with lower netmask value
+         * @param &lt;V&gt;        data type of value
+         */
+        private static &lt;V&gt; void optimizeLevels(List&lt;Map.Entry&lt;CIDR, V&gt;&gt; upperLevel, List&lt;Map.Entry&lt;CIDR, V&gt;&gt; lowerLevel)
+        {
+<span class="fc" id="L370">            List&lt;Map.Entry&lt;CIDR, V&gt;&gt; newUpper = new ArrayList&lt;&gt;(upperLevel.size() + lowerLevel.size());</span>
+<span class="fc" id="L371">            newUpper.addAll(upperLevel);</span>
+
+<span class="fc" id="L373">            List&lt;Map.Entry&lt;CIDR, V&gt;&gt; newLower = new ArrayList&lt;&gt;(lowerLevel.size());</span>
+
+<span class="fc bfc" id="L375" title="All 2 branches covered.">            for (int i = 0; i &lt; lowerLevel.size(); i++)</span>
+            {
+<span class="fc" id="L377">                boolean noOverlap = true;</span>
+<span class="fc bfc" id="L378" title="All 2 branches covered.">                for (int j = 0; j &lt; upperLevel.size(); j++)</span>
+                {
+<span class="fc bfc" id="L380" title="All 2 branches covered.">                    if (CIDR.overlaps(lowerLevel.get(i).getKey(), upperLevel.get(j).getKey()))</span>
+                    {
+                        // overlapping node remains in lower level
+<span class="fc" id="L383">                        newLower.add(lowerLevel.get(i));</span>
+<span class="fc" id="L384">                        noOverlap = false;</span>
+<span class="fc" id="L385">                        break;</span>
+                    }
+                }
+
+                // the node from lower level does not overlap with any node in upper level, so move it up
+<span class="fc bfc" id="L390" title="All 2 branches covered.">                if (noOverlap)</span>
+                {
+<span class="fc" id="L392">                    newUpper.add(lowerLevel.get(i));</span>
+                }
+            }
+
+<span class="fc" id="L396">            upperLevel.clear();</span>
+<span class="fc" id="L397">            lowerLevel.clear();</span>
+<span class="fc" id="L398">            upperLevel.addAll(newUpper);</span>
+<span class="fc" id="L399">            lowerLevel.addAll(newLower);</span>
+<span class="fc" id="L400">        }</span>
+
+        /**
+         * Optimize by lifting lower level non-overlapping CIDRs to the upper levels.
+         * The method modifies cidrsGroupedByNetMasks in-place.
+         * @param cidrsGroupedByNetMasks CIDRs grouped by netmask, levels in the order of higher netmask to lower netmask value
+         * @param &lt;V&gt;                    data type of the value
+         */
+        private static &lt;V&gt; void optimizeAllLevels(List&lt;List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt;&gt; cidrsGroupedByNetMasks)
+        {
+<span class="fc bfc" id="L410" title="All 2 branches covered.">            for (int i = 0; i &lt; cidrsGroupedByNetMasks.size(); i++)</span>
+            {
+<span class="fc" id="L412">                List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt; current = cidrsGroupedByNetMasks.get(0);</span>
+<span class="fc bfc" id="L413" title="All 2 branches covered.">                for (int j = i + 1; j &lt; cidrsGroupedByNetMasks.size(); j++)</span>
+                {
+<span class="fc" id="L415">                    List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt; lower = cidrsGroupedByNetMasks.get(j);</span>
+<span class="fc" id="L416">                    optimizeLevels(current, lower);</span>
+                }
+            }
+<span class="fc" id="L419">        }</span>
+
+        /**
+         * Link the nodes between levels. If a node in the lower level has no left or right children,
+         * the nodes from higher levels are lifted and linked as the left or right children.
+         * @param cidrMappings list of CIDR to value mappings
+         * @param result       2 dimension array that stores all (linked) nodes in the tree. result[0] is the first level in the tree.
+         * @param startIndex   starting level in the result array, to link it to its children nodes
+         * @param &lt;V&gt;          data type of the value
+         */
+        @SuppressWarnings(&quot;unchecked&quot;)
+        private static &lt;V&gt; void linkNodes(List&lt;List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt;&gt; cidrMappings,
+                                          IPIntervalNode&lt;V&gt;[][] result,
+                                          int startIndex)
+        {
+<span class="fc" id="L434">            List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt; cidrsAtLevel = cidrMappings.get(startIndex);</span>
+<span class="fc" id="L435">            int next = startIndex + 1;</span>
+<span class="fc bfc" id="L436" title="All 2 branches covered.">            IPIntervalNode&lt;V&gt;[] lowerLevel = next == result.length ? null : result[next];</span>
+<span class="fc" id="L437">            result[startIndex] = cidrsAtLevel</span>
+<span class="fc" id="L438">            .stream()</span>
+<span class="fc" id="L439">            .map(pair -&gt; {</span>
+<span class="fc" id="L440">                CIDR cidr = pair.getKey();</span>
+<span class="fc" id="L441">                Set&lt;V&gt; value = pair.getValue();</span>
+<span class="fc" id="L442">                IPIntervalNode&lt;V&gt; node = new IPIntervalNode&lt;&gt;(cidr, value, lowerLevel);</span>
+                // Cannot link its left or right children to the next level nodes.
+                // Try the nodes in the even lower levels.
+<span class="fc bfc" id="L445" title="All 6 branches covered.">                if (next + 1 &lt; result.length &amp;&amp; (node.left == null || node.right == null))</span>
+                {
+<span class="fc bfc" id="L447" title="All 2 branches covered.">                    for (int i = next + 1; i &lt; result.length; i++)</span>
+                    {
+<span class="fc" id="L449">                        node.updateLeftIfNull(result[i]);</span>
+<span class="fc" id="L450">                        node.updateRightIfNull(result[i]);</span>
+
+                        // the node has both left and right children, it is good and no further lifting is needed.
+<span class="pc bpc" id="L453" title="1 of 4 branches missed.">                        if (node.left != null &amp;&amp; node.right != null)</span>
+                        {
+<span class="fc" id="L455">                            break;</span>
+                        }
+                    }
+                }
+<span class="fc" id="L459">                return node;</span>
+            })
+            // sort by ipStart. Remember the interval do not overlap
+<span class="fc" id="L462">            .sorted(Comparator.comparing(n -&gt; n.cidr.getStartIpAddress(), CIDR::compareIPs))</span>
+<span class="fc" id="L463">            .toArray(IPIntervalNode[]::new);</span>
+<span class="fc" id="L464">        }</span>
+
+        /**
+         * Build an interval tree for given CIDRs
+         * @param cidrsGroupedByNetMasks CIDRs grouped by netmask, levels in the order of higher netmask to lower netmask value
+         * @param &lt;V&gt;                    data type of the value
+         * @return returns reference to the interval tree, returns null if input is empty
+         */
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public static &lt;V&gt; IPIntervalTree&lt;V&gt; build(List&lt;List&lt;Map.Entry&lt;CIDR, Set&lt;V&gt;&gt;&gt;&gt; cidrsGroupedByNetMasks)
+        {
+<span class="fc bfc" id="L475" title="All 2 branches covered.">            if (cidrsGroupedByNetMasks.isEmpty())</span>
+<span class="fc" id="L476">                return null;</span>
+
+<span class="fc" id="L478">            optimizeAllLevels(cidrsGroupedByNetMasks);</span>
+
+            // After optimization, trim empty levels if exists
+<span class="fc" id="L481">            cidrsGroupedByNetMasks.removeIf(List::isEmpty);</span>
+
+            // Create an array for each level
+<span class="fc" id="L484">            IPIntervalNode&lt;V&gt;[][] result = new IPIntervalNode[cidrsGroupedByNetMasks.size()][];</span>
+            // build the tree bottom up, i.e, add CIDRs in the order of smaller netmask value to higher netmask value
+<span class="fc bfc" id="L486" title="All 2 branches covered.">            for (int i = cidrsGroupedByNetMasks.size() - 1; i &gt;= 0; i--)</span>
+            {
+<span class="fc" id="L488">                linkNodes(cidrsGroupedByNetMasks, result, i);</span>
+            }
+<span class="fc" id="L490">            return new IPIntervalTree&lt;&gt;(result[0], cidrsGroupedByNetMasks.size());</span>
+        }
+
+        /**
+         * Search interval tree for the longest matching CIDR for the given IP
+         * @param ip IP address to search
+         * @return Value(s) associated with matching CIDR
+         */
+        public Set&lt;V&gt; query(InetAddress ip)
+        {
+<span class="fc" id="L500">            IPIntervalNode&lt;V&gt; closest = IPIntervalNode.binarySearchNodes(level0, ip);</span>
+<span class="fc" id="L501">            return IPIntervalNode.query(closest, ip);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,1782 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OutboundConnection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">OutboundConnection.java</span></div><h1>OutboundConnection.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.nio.channels.ClosedChannelException;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.EventLoop;
+import io.netty.channel.unix.Errors;
+import io.netty.util.concurrent.Future; //checkstyle: permit this import
+import io.netty.util.concurrent.Promise; //checkstyle: permit this import
+import io.netty.util.concurrent.PromiseNotifier;
+import io.netty.util.concurrent.SucceededFuture;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.util.DataOutputBufferFixed;
+import org.apache.cassandra.net.OutboundConnectionInitiator.Result.MessagingSuccess;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.cassandra.net.InternodeConnectionUtils.isSSLError;
+import static org.apache.cassandra.net.MessagingService.current_version;
+import static org.apache.cassandra.net.OutboundConnectionInitiator.*;
+import static org.apache.cassandra.net.OutboundConnections.LARGE_MESSAGE_THRESHOLD;
+import static org.apache.cassandra.net.ResourceLimits.*;
+import static org.apache.cassandra.net.ResourceLimits.Outcome.*;
+import static org.apache.cassandra.net.SocketFactory.*;
+import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+import static org.apache.cassandra.utils.Throwables.isCausedBy;
+import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
+
+/**
+ * Represents a connection type to a peer, and handles the state transistions on the connection and the netty {@link Channel}.
+ * The underlying socket is not opened until explicitly requested (by sending a message).
+ *
+ * TODO: complete this description
+ *
+ * Aside from a few administrative methods, the main entry point to sending a message is {@link #enqueue(Message)}.
+ * Any thread may send a message (enqueueing it to {@link #queue}), but only one thread may consume messages from this
+ * queue.  There is a single delivery thread - either the event loop, or a companion thread - that has logical ownership
+ * of the queue, but other threads may temporarily take ownership in order to perform book keeping, pruning, etc.,
+ * to ensure system stability.
+ *
+ * {@link Delivery#run()} is the main entry point for consuming messages from the queue, and executes either on the event
+ * loop or on a non-dedicated companion thread.  This processing is activated via {@link Delivery#execute()}.
+ *
+ * Almost all internal state maintenance on this class occurs on the eventLoop, a single threaded executor which is
+ * assigned in the constructor.  Further details are outlined below in the class.  Some behaviours require coordination
+ * between the eventLoop and the companion thread (if any).  Some minimal set of behaviours are permitted to occur on
+ * producers to ensure the connection remains healthy and does not overcommit resources.
+ *
+ * All methods are safe to invoke from any thread unless otherwise stated.
+ */
+@SuppressWarnings({ &quot;WeakerAccess&quot;, &quot;FieldMayBeFinal&quot;, &quot;NonAtomicOperationOnVolatileField&quot;, &quot;SameParameterValue&quot; })
+public class OutboundConnection
+{
+<span class="fc" id="L101">    static final Logger logger = LoggerFactory.getLogger(OutboundConnection.class);</span>
+<span class="fc" id="L102">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 30L, TimeUnit.SECONDS);</span>
+
+<span class="fc" id="L104">    private static final AtomicLongFieldUpdater&lt;OutboundConnection&gt; submittedUpdater = AtomicLongFieldUpdater.newUpdater(OutboundConnection.class, &quot;submittedCount&quot;);</span>
+<span class="fc" id="L105">    private static final AtomicLongFieldUpdater&lt;OutboundConnection&gt; pendingCountAndBytesUpdater = AtomicLongFieldUpdater.newUpdater(OutboundConnection.class, &quot;pendingCountAndBytes&quot;);</span>
+<span class="fc" id="L106">    private static final AtomicLongFieldUpdater&lt;OutboundConnection&gt; overloadedCountUpdater = AtomicLongFieldUpdater.newUpdater(OutboundConnection.class, &quot;overloadedCount&quot;);</span>
+<span class="fc" id="L107">    private static final AtomicLongFieldUpdater&lt;OutboundConnection&gt; overloadedBytesUpdater = AtomicLongFieldUpdater.newUpdater(OutboundConnection.class, &quot;overloadedBytes&quot;);</span>
+<span class="fc" id="L108">    private static final AtomicReferenceFieldUpdater&lt;OutboundConnection, Future&gt; closingUpdater = AtomicReferenceFieldUpdater.newUpdater(OutboundConnection.class, Future.class, &quot;closing&quot;);</span>
+<span class="fc" id="L109">    private static final AtomicReferenceFieldUpdater&lt;OutboundConnection, Future&gt; scheduledCloseUpdater = AtomicReferenceFieldUpdater.newUpdater(OutboundConnection.class, Future.class, &quot;scheduledClose&quot;);</span>
+
+    private final EventLoop eventLoop;
+    private final Delivery delivery;
+
+    private final OutboundMessageCallbacks callbacks;
+    private final OutboundDebugCallbacks debug;
+    @VisibleForTesting
+    final OutboundMessageQueue queue;
+    /** the number of bytes we permit to queue to the network without acquiring any shared resource permits */
+    private final long pendingCapacityInBytes;
+    /** the number of messages and bytes queued for flush to the network,
+     * including those that are being flushed but have not been completed,
+     * packed into a long (top 20 bits for count, bottom 42 for bytes)*/
+<span class="fc" id="L123">    private volatile long pendingCountAndBytes = 0;</span>
+    /** global shared limits that we use only if our local limits are exhausted;
+     *  we allocate from here whenever queueSize &gt; queueCapacity */
+    private final EndpointAndGlobal reserveCapacityInBytes;
+
+    /** Used in logging statements to lazily build a human-readable number of pending bytes. */
+<span class="fc" id="L129">    private final Object readablePendingBytes =</span>
+<span class="pc" id="L130">        new Object() { @Override public String toString() { return prettyPrintMemory(pendingBytes()); } };</span>
+
+    /** Used in logging statements to lazily build a human-readable number of reserve endpoint bytes in use. */
+<span class="fc" id="L133">    private final Object readableReserveEndpointUsing =</span>
+<span class="pc" id="L134">        new Object() { @Override public String toString() { return prettyPrintMemory(reserveCapacityInBytes.endpoint.using()); } };</span>
+
+    /** Used in logging statements to lazily build a human-readable number of reserve global bytes in use. */
+<span class="fc" id="L137">    private final Object readableReserveGlobalUsing =</span>
+<span class="pc" id="L138">        new Object() { @Override public String toString() { return prettyPrintMemory(reserveCapacityInBytes.global.using()); } };</span>
+
+<span class="fc" id="L140">    private volatile long submittedCount = 0;   // updated with cas</span>
+<span class="fc" id="L141">    private volatile long overloadedCount = 0;  // updated with cas</span>
+<span class="fc" id="L142">    private volatile long overloadedBytes = 0;  // updated with cas</span>
+<span class="fc" id="L143">    private long expiredCount = 0;              // updated with queue lock held</span>
+<span class="fc" id="L144">    private long expiredBytes = 0;              // updated with queue lock held</span>
+<span class="fc" id="L145">    private long errorCount = 0;                // updated only by delivery thread</span>
+<span class="fc" id="L146">    private long errorBytes = 0;                // updated by delivery thread only</span>
+    private long sentCount;                     // updated by delivery thread only
+    private long sentBytes;                     // updated by delivery thread only
+    private long successfulConnections;         // updated by event loop only
+    private long connectionAttempts;            // updated by event loop only
+
+    private static final int pendingByteBits = 42;
+    private static boolean isMaxPendingCount(long pendingCountAndBytes)
+    {
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">        return (pendingCountAndBytes &amp; (-1L &lt;&lt; pendingByteBits)) == (-1L &lt;&lt; pendingByteBits);</span>
+    }
+
+    private static int pendingCount(long pendingCountAndBytes)
+    {
+<span class="nc" id="L160">        return (int) (pendingCountAndBytes &gt;&gt;&gt; pendingByteBits);</span>
+    }
+
+    private static long pendingBytes(long pendingCountAndBytes)
+    {
+<span class="fc" id="L165">        return pendingCountAndBytes &amp; (-1L &gt;&gt;&gt; (64 - pendingByteBits));</span>
+    }
+
+    private static long pendingCountAndBytes(long pendingCount, long pendingBytes)
+    {
+<span class="fc" id="L170">        return (pendingCount &lt;&lt; pendingByteBits) | pendingBytes;</span>
+    }
+
+    private final ConnectionType type;
+
+    /**
+     * Contains the base settings for this connection, _including_ any defaults filled in.
+     *
+     */
+    private OutboundConnectionSettings template;
+
+    private static class State
+    {
+<span class="fc" id="L183">        static final State CLOSED  = new State(Kind.CLOSED);</span>
+
+<span class="fc" id="L185">        enum Kind { ESTABLISHED, CONNECTING, DORMANT, CLOSED }</span>
+
+        final Kind kind;
+
+        State(Kind kind)
+<span class="fc" id="L190">        {</span>
+<span class="fc" id="L191">            this.kind = kind;</span>
+<span class="fc" id="L192">        }</span>
+
+<span class="fc bfc" id="L194" title="All 2 branches covered.">        boolean isEstablished()  { return kind == Kind.ESTABLISHED; }</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">        boolean isConnecting()   { return kind == Kind.CONNECTING; }</span>
+<span class="pc bpc" id="L196" title="1 of 4 branches missed.">        boolean isDisconnected() { return kind == Kind.CONNECTING || kind == Kind.DORMANT; }</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">        boolean isClosed()       { return kind == Kind.CLOSED; }</span>
+
+<span class="fc" id="L199">        Established  established()  { return (Established)  this; }</span>
+<span class="fc" id="L200">        Connecting   connecting()   { return (Connecting)   this; }</span>
+<span class="fc" id="L201">        Disconnected disconnected() { return (Disconnected) this; }</span>
+    }
+
+    /**
+     * We have successfully negotiated a channel, and believe it to still be valid.
+     *
+     * Before using this, we should check isConnected() to check the Channel hasn't
+     * become invalid.
+     */
+    private static class Established extends State
+    {
+        final int messagingVersion;
+        final Channel channel;
+        final FrameEncoder.PayloadAllocator payloadAllocator;
+        final OutboundConnectionSettings settings;
+
+        Established(int messagingVersion, Channel channel, FrameEncoder.PayloadAllocator payloadAllocator, OutboundConnectionSettings settings)
+        {
+<span class="fc" id="L219">            super(Kind.ESTABLISHED);</span>
+<span class="fc" id="L220">            this.messagingVersion = messagingVersion;</span>
+<span class="fc" id="L221">            this.channel = channel;</span>
+<span class="fc" id="L222">            this.payloadAllocator = payloadAllocator;</span>
+<span class="fc" id="L223">            this.settings = settings;</span>
+<span class="fc" id="L224">        }</span>
+
+<span class="fc" id="L226">        boolean isConnected() { return channel.isOpen(); }</span>
+    }
+
+    private static class Disconnected extends State
+    {
+        /** Periodic message expiry scheduled while we are disconnected; this will be cancelled and cleared each time we connect */
+        final Future&lt;?&gt; maintenance;
+        Disconnected(Kind kind, Future&lt;?&gt; maintenance)
+        {
+<span class="fc" id="L235">            super(kind);</span>
+<span class="fc" id="L236">            this.maintenance = maintenance;</span>
+<span class="fc" id="L237">        }</span>
+
+        public static Disconnected dormant(Future&lt;?&gt; maintenance)
+        {
+<span class="fc" id="L241">            return new Disconnected(Kind.DORMANT, maintenance);</span>
+        }
+    }
+
+<span class="fc" id="L245">    private static class Connecting extends Disconnected</span>
+    {
+        /**
+         * Currently (or scheduled to) (re)connect; this may be cancelled (if closing) or waited on (for delivery)
+         *
+         *  - The work managed by this future is partially performed asynchronously, not necessarily on the eventLoop.
+         *  - It is only completed on the eventLoop
+         *  - It may not be executing, but might be scheduled to be submitted if {@link #scheduled} is not null
+         */
+        final Future&lt;Result&lt;MessagingSuccess&gt;&gt; attempt;
+
+        /**
+         * If we are retrying to connect with some delay, this represents the scheduled inititation of another attempt
+         */
+        @Nullable
+        final Future&lt;?&gt; scheduled;
+
+        /**
+         * true iff we are retrying to connect after some failure (immediately or following a delay)
+         */
+        final boolean isFailingToConnect;
+
+        Connecting(Disconnected previous, Future&lt;Result&lt;MessagingSuccess&gt;&gt; attempt)
+        {
+<span class="fc" id="L269">            this(previous, attempt, null);</span>
+<span class="fc" id="L270">        }</span>
+
+        Connecting(Disconnected previous, Future&lt;Result&lt;MessagingSuccess&gt;&gt; attempt, Future&lt;?&gt; scheduled)
+        {
+<span class="fc" id="L274">            super(Kind.CONNECTING, previous.maintenance);</span>
+<span class="fc" id="L275">            this.attempt = attempt;</span>
+<span class="fc" id="L276">            this.scheduled = scheduled;</span>
+<span class="pc bpc" id="L277" title="3 of 6 branches missed.">            this.isFailingToConnect = scheduled != null || (previous.isConnecting() &amp;&amp; previous.connecting().isFailingToConnect);</span>
+<span class="fc" id="L278">        }</span>
+
+        /**
+         * Cancel the connection attempt
+         *
+         * No cleanup is needed here, as {@link #attempt} is only completed on the eventLoop,
+         * so we have either already invoked the callbacks and are no longer in {@link #state},
+         * or the {@link OutboundConnectionInitiator} will handle our successful cancellation
+         * when it comes to complete, by closing the channel (if we could not cancel it before then)
+         */
+        void cancel()
+        {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            if (scheduled != null)</span>
+<span class="nc" id="L291">                scheduled.cancel(true);</span>
+
+            // we guarantee that attempt is only ever completed by the eventLoop
+<span class="nc" id="L294">            boolean cancelled = attempt.cancel(true);</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            assert cancelled;</span>
+<span class="nc" id="L296">        }</span>
+    }
+
+    private volatile State state;
+
+    /** The connection is being permanently closed */
+    private volatile Future&lt;Void&gt; closing;
+    /** The connection is being permanently closed in the near future */
+    private volatile Future&lt;Void&gt; scheduledClose;
+
+    OutboundConnection(ConnectionType type, OutboundConnectionSettings settings, EndpointAndGlobal reserveCapacityInBytes)
+<span class="fc" id="L307">    {</span>
+<span class="fc" id="L308">        this.template = settings.withDefaults(ConnectionCategory.MESSAGING);</span>
+<span class="fc" id="L309">        this.type = type;</span>
+<span class="fc" id="L310">        this.eventLoop = template.socketFactory.defaultGroup().next();</span>
+<span class="fc" id="L311">        this.pendingCapacityInBytes = template.applicationSendQueueCapacityInBytes;</span>
+<span class="fc" id="L312">        this.reserveCapacityInBytes = reserveCapacityInBytes;</span>
+<span class="fc" id="L313">        this.callbacks = template.callbacks;</span>
+<span class="fc" id="L314">        this.debug = template.debug;</span>
+<span class="fc" id="L315">        this.queue = new OutboundMessageQueue(approxTime, this::onExpired);</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">        this.delivery = type == ConnectionType.LARGE_MESSAGES</span>
+<span class="fc" id="L317">                        ? new LargeMessageDelivery(template.socketFactory.synchronousWorkExecutor)</span>
+<span class="fc" id="L318">                        : new EventLoopDelivery();</span>
+<span class="fc" id="L319">        setDisconnected();</span>
+<span class="fc" id="L320">    }</span>
+
+    /**
+     * This is the main entry point for enqueuing a message to be sent to the remote peer.
+     */
+    public void enqueue(Message message) throws ClosedChannelException
+    {
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">        if (isClosing())</span>
+<span class="nc" id="L328">            throw new ClosedChannelException();</span>
+
+<span class="fc" id="L330">        final int canonicalSize = canonicalSize(message);</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">        if (canonicalSize &gt; DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())</span>
+<span class="nc" id="L332">            throw new Message.OversizedMessageException(canonicalSize);</span>
+
+<span class="fc" id="L334">        submittedUpdater.incrementAndGet(this);</span>
+<span class="pc bpc" id="L335" title="2 of 3 branches missed.">        switch (acquireCapacity(canonicalSize))</span>
+        {
+            case INSUFFICIENT_ENDPOINT:
+                // if we're overloaded to one endpoint, we may be accumulating expirable messages, so
+                // attempt an expiry to see if this makes room for our newer message.
+                // this is an optimisation only; messages will be expired on ~100ms cycle, and by Delivery when it runs
+<span class="nc bnc" id="L341" title="All 4 branches missed.">                if (queue.maybePruneExpired() &amp;&amp; SUCCESS == acquireCapacity(canonicalSize))</span>
+<span class="nc" id="L342">                    break;</span>
+            case INSUFFICIENT_GLOBAL:
+<span class="nc" id="L344">                onOverloaded(message);</span>
+<span class="nc" id="L345">                return;</span>
+        }
+
+<span class="fc" id="L348">        queue.add(message);</span>
+<span class="fc" id="L349">        delivery.execute();</span>
+
+        // we might race with the channel closing; if this happens, to ensure this message eventually arrives
+        // we need to remove ourselves from the queue and throw a ClosedChannelException, so that another channel
+        // can be opened in our place to try and send on.
+<span class="pc bpc" id="L354" title="3 of 4 branches missed.">        if (isClosing() &amp;&amp; queue.remove(message))</span>
+        {
+<span class="nc" id="L356">            releaseCapacity(1, canonicalSize);</span>
+<span class="nc" id="L357">            throw new ClosedChannelException();</span>
+        }
+<span class="fc" id="L359">    }</span>
+
+    /**
+     * Try to acquire the necessary resource permits for a number of pending bytes for this connection.
+     *
+     * Since the owner limit is shared amongst multiple connections, our semantics cannot be super trivial.
+     * Were they per-connection, we could simply perform an atomic increment of the queue size, then
+     * allocate any excess we need in the reserve, and on release free everything we see from both.
+     * Since we are coordinating two independent atomic variables we have to track every byte we allocate in reserve
+     * and ensure it is matched by a corresponding released byte. We also need to be sure we do not permit another
+     * releasing thread to release reserve bytes we have not yet - and may never - actually reserve.
+     *
+     * As such, we have to first check if we would need reserve bytes, then allocate them *before* we increment our
+     * queue size.  We only increment the queue size if the reserve bytes are definitely not needed, or we could first
+     * obtain them.  If in the process of obtaining any reserve bytes the queue size changes, we have some bytes that are
+     * reserved for us, but may be a different number to that we need.  So we must continue to track these.
+     *
+     * In the happy path, this is still efficient as we simply CAS
+     */
+    private Outcome acquireCapacity(long bytes)
+    {
+<span class="fc" id="L380">        return acquireCapacity(1, bytes);</span>
+    }
+
+    private Outcome acquireCapacity(long count, long bytes)
+    {
+<span class="fc" id="L385">        long increment = pendingCountAndBytes(count, bytes);</span>
+<span class="fc" id="L386">        long unusedClaimedReserve = 0;</span>
+<span class="fc" id="L387">        Outcome outcome = null;</span>
+        loop: while (true)
+        {
+<span class="fc" id="L390">            long current = pendingCountAndBytes;</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">            if (isMaxPendingCount(current))</span>
+            {
+<span class="nc" id="L393">                outcome = INSUFFICIENT_ENDPOINT;</span>
+<span class="nc" id="L394">                break;</span>
+            }
+
+<span class="fc" id="L397">            long next = current + increment;</span>
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">            if (pendingBytes(next) &lt;= pendingCapacityInBytes)</span>
+            {
+<span class="fc bfc" id="L400" title="All 2 branches covered.">                if (pendingCountAndBytesUpdater.compareAndSet(this, current, next))</span>
+                {
+<span class="fc" id="L402">                    outcome = SUCCESS;</span>
+<span class="fc" id="L403">                    break;</span>
+                }
+                continue;
+            }
+
+<span class="nc" id="L408">            State state = this.state;</span>
+<span class="nc bnc" id="L409" title="All 4 branches missed.">            if (state.isConnecting() &amp;&amp; state.connecting().isFailingToConnect)</span>
+            {
+<span class="nc" id="L411">                outcome = INSUFFICIENT_ENDPOINT;</span>
+<span class="nc" id="L412">                break;</span>
+            }
+
+<span class="nc" id="L415">            long requiredReserve = min(bytes, pendingBytes(next) - pendingCapacityInBytes);</span>
+<span class="nc bnc" id="L416" title="All 2 branches missed.">            if (unusedClaimedReserve &lt; requiredReserve)</span>
+            {
+<span class="nc" id="L418">                long extraGlobalReserve = requiredReserve - unusedClaimedReserve;</span>
+<span class="nc bnc" id="L419" title="All 3 branches missed.">                switch (outcome = reserveCapacityInBytes.tryAllocate(extraGlobalReserve))</span>
+                {
+                    case INSUFFICIENT_ENDPOINT:
+                    case INSUFFICIENT_GLOBAL:
+<span class="nc" id="L423">                        break loop;</span>
+                    case SUCCESS:
+<span class="nc" id="L425">                        unusedClaimedReserve += extraGlobalReserve;</span>
+                }
+            }
+
+<span class="nc bnc" id="L429" title="All 2 branches missed.">            if (pendingCountAndBytesUpdater.compareAndSet(this, current, next))</span>
+            {
+<span class="nc" id="L431">                unusedClaimedReserve -= requiredReserve;</span>
+<span class="nc" id="L432">                break;</span>
+            }
+<span class="nc" id="L434">        }</span>
+
+<span class="pc bpc" id="L436" title="1 of 2 branches missed.">        if (unusedClaimedReserve &gt; 0)</span>
+<span class="nc" id="L437">            reserveCapacityInBytes.release(unusedClaimedReserve);</span>
+
+<span class="fc" id="L439">        return outcome;</span>
+    }
+
+    /**
+     * Mark a number of pending bytes as flushed to the network, releasing their capacity for new outbound messages.
+     */
+    private void releaseCapacity(long count, long bytes)
+    {
+<span class="fc" id="L447">        long decrement = pendingCountAndBytes(count, bytes);</span>
+<span class="fc" id="L448">        long prev = pendingCountAndBytesUpdater.getAndAdd(this, -decrement);</span>
+<span class="pc bpc" id="L449" title="1 of 2 branches missed.">        if (pendingBytes(prev) &gt; pendingCapacityInBytes)</span>
+        {
+<span class="nc" id="L451">            long excess = min(pendingBytes(prev) - pendingCapacityInBytes, bytes);</span>
+<span class="nc" id="L452">            reserveCapacityInBytes.release(excess);</span>
+        }
+<span class="fc" id="L454">    }</span>
+
+    private void onOverloaded(Message&lt;?&gt; message)
+    {
+<span class="nc" id="L458">        overloadedCountUpdater.incrementAndGet(this);</span>
+        
+<span class="nc" id="L460">        int canonicalSize = canonicalSize(message);</span>
+<span class="nc" id="L461">        overloadedBytesUpdater.addAndGet(this, canonicalSize);</span>
+        
+<span class="nc" id="L463">        noSpamLogger.warn(&quot;{} overloaded; dropping {} message (queue: {} local, {} endpoint, {} global)&quot;,</span>
+<span class="nc" id="L464">                          this, FBUtilities.prettyPrintMemory(canonicalSize),</span>
+                          readablePendingBytes, readableReserveEndpointUsing, readableReserveGlobalUsing);
+        
+<span class="nc" id="L467">        callbacks.onOverloaded(message, template.to);</span>
+<span class="nc" id="L468">    }</span>
+
+    /**
+     * Take any necessary cleanup action after a message has been selected to be discarded from the queue.
+     *
+     * Only to be invoked while holding OutboundMessageQueue.WithLock
+     */
+    private boolean onExpired(Message&lt;?&gt; message)
+    {
+<span class="fc" id="L477">        noSpamLogger.warn(&quot;{} dropping message of type {} whose timeout expired before reaching the network&quot;, id(), message.verb());</span>
+<span class="fc" id="L478">        releaseCapacity(1, canonicalSize(message));</span>
+<span class="fc" id="L479">        expiredCount += 1;</span>
+<span class="fc" id="L480">        expiredBytes += canonicalSize(message);</span>
+<span class="fc" id="L481">        callbacks.onExpired(message, template.to);</span>
+<span class="fc" id="L482">        return true;</span>
+    }
+
+    /**
+     * Take any necessary cleanup action after a message has been selected to be discarded from the queue.
+     *
+     * Only to be invoked by the delivery thread
+     */
+    private void onFailedSerialize(Message&lt;?&gt; message, int messagingVersion, int bytesWrittenToNetwork, Throwable t)
+    {
+<span class="nc" id="L492">        logger.warn(&quot;{} dropping message of type {} due to error&quot;, id(), message.verb(), t);</span>
+<span class="nc" id="L493">        JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc" id="L494">        releaseCapacity(1, canonicalSize(message));</span>
+<span class="nc" id="L495">        errorCount += 1;</span>
+<span class="nc" id="L496">        errorBytes += message.serializedSize(messagingVersion);</span>
+<span class="nc" id="L497">        callbacks.onFailedSerialize(message, template.to, messagingVersion, bytesWrittenToNetwork, t);</span>
+<span class="nc" id="L498">    }</span>
+
+    /**
+     * Take any necessary cleanup action after a message has been selected to be discarded from the queue on close.
+     * Note that this is only for messages that were queued prior to closing without graceful flush, OR
+     * for those that are unceremoniously dropped when we decide close has been trying to complete for too long.
+     */
+    private void onClosed(Message&lt;?&gt; message)
+    {
+<span class="nc" id="L507">        releaseCapacity(1, canonicalSize(message));</span>
+<span class="nc" id="L508">        callbacks.onDiscardOnClose(message, template.to);</span>
+<span class="nc" id="L509">    }</span>
+
+    /**
+     * Delivery bundles the following:
+     *
+     *  - the work that is necessary to actually deliver messages safely, and handle any exceptional states
+     *  - the ability to schedule delivery for some time in the future
+     *  - the ability to schedule some non-delivery work to happen some time in the future, that is guaranteed
+     *    NOT to coincide with delivery for its duration, including any data that is being flushed (e.g. for closing channels)
+     *      - this feature is *not* efficient, and should only be used for infrequent operations
+     */
+    private abstract class Delivery extends AtomicInteger implements Runnable
+    {
+        final ExecutorService executor;
+
+        // the AtomicInteger we extend always contains some combination of these bit flags, representing our current run state
+
+        /** Not running, and will not be scheduled again until transitioned to a new state */
+        private static final int STOPPED               = 0;
+        /** Currently executing (may only be scheduled to execute, or may be about to terminate);
+         *  will stop at end of this run, without rescheduling */
+        private static final int EXECUTING             = 1;
+        /** Another execution has been requested; a new execution will begin some time after this state is taken */
+        private static final int EXECUTE_AGAIN         = 2;
+        /** We are currently executing and will submit another execution before we terminate */
+        private static final int EXECUTING_AGAIN       = EXECUTING | EXECUTE_AGAIN;
+        /** Will begin a new execution some time after this state is taken, but only once some condition is met.
+         *  This state will initially be taken in tandem with EXECUTING, but if delivery completes without clearing
+         *  the state, the condition will be held on its own until {@link #executeAgain} is invoked */
+        private static final int WAITING_TO_EXECUTE    = 4;
+
+        /**
+         * Force all task execution to stop, once any currently in progress work is completed
+         */
+        private volatile boolean terminated;
+
+        /**
+         * Is there asynchronous delivery work in progress.
+         *
+         * This temporarily prevents any {@link #stopAndRun} work from being performed.
+         * Once both inProgress and stopAndRun are set we perform no more delivery work until one is unset,
+         * to ensure we eventually run stopAndRun.
+         *
+         * This should be updated and read only on the Delivery thread.
+         */
+<span class="fc" id="L554">        private boolean inProgress = false;</span>
+
+        /**
+         * Request a task's execution while there is no delivery work in progress.
+         *
+         * This is to permit cleanly tearing down a connection without interrupting any messages that might be in flight.
+         * If stopAndRun is set, we should not enter doRun() until a corresponding setInProgress(false) occurs.
+         */
+<span class="fc" id="L562">        final AtomicReference&lt;Runnable&gt; stopAndRun = new AtomicReference&lt;&gt;();</span>
+
+        Delivery(ExecutorService executor)
+<span class="fc" id="L565">        {</span>
+<span class="fc" id="L566">            this.executor = executor;</span>
+<span class="fc" id="L567">        }</span>
+
+        /**
+         * Ensure that any messages or stopAndRun that were queued prior to this invocation will be seen by at least
+         * one future invocation of the delivery task, unless delivery has already been terminated.
+         */
+        public void execute()
+        {
+<span class="fc bfc" id="L575" title="All 6 branches covered.">            if (get() &lt; EXECUTE_AGAIN &amp;&amp; STOPPED == getAndUpdate(i -&gt; i == STOPPED ? EXECUTING: i | EXECUTE_AGAIN))</span>
+<span class="fc" id="L576">                executor.execute(this);</span>
+<span class="fc" id="L577">        }</span>
+
+        private boolean isExecuting(int state)
+        {
+<span class="fc bfc" id="L581" title="All 2 branches covered.">            return 0 != (state &amp; EXECUTING);</span>
+        }
+
+        /**
+         * This method is typically invoked after WAITING_TO_EXECUTE is set.
+         *
+         * However WAITING_TO_EXECUTE does not need to be set; all this method needs to ensure is that
+         * delivery unconditionally performs one new execution promptly.
+         */
+        void executeAgain()
+        {
+            // if we are already executing, set EXECUTING_AGAIN and leave scheduling to the currently running one.
+            // otherwise, set ourselves unconditionally to EXECUTING and schedule ourselves immediately
+<span class="fc bfc" id="L594" title="All 4 branches covered.">            if (!isExecuting(getAndUpdate(i -&gt; !isExecuting(i) ? EXECUTING : EXECUTING_AGAIN)))</span>
+<span class="fc" id="L595">                executor.execute(this);</span>
+<span class="fc" id="L596">        }</span>
+
+        /**
+         * Invoke this when we cannot make further progress now, but we guarantee that we will execute later when we can.
+         * This simply communicates to {@link #run} that we should not schedule ourselves again, just unset the EXECUTING bit.
+         */
+        void promiseToExecuteLater()
+        {
+<span class="fc" id="L604">            set(EXECUTING | WAITING_TO_EXECUTE);</span>
+<span class="fc" id="L605">        }</span>
+
+        /**
+         * Called when exiting {@link #run} to schedule another run if necessary.
+         *
+         * If we are currently executing, we only reschedule if the present state is EXECUTING_AGAIN.
+         * If this is the case, we clear the EXECUTE_AGAIN bit (setting ourselves to EXECUTING), and reschedule.
+         * Otherwise, we clear the EXECUTING bit and terminate, which will set us to either STOPPED or WAITING_TO_EXECUTE
+         * (or possibly WAITING_TO_EXECUTE | EXECUTE_AGAIN, which is logically the same as WAITING_TO_EXECUTE)
+         */
+        private void maybeExecuteAgain()
+        {
+<span class="fc bfc" id="L617" title="All 4 branches covered.">            if (EXECUTING_AGAIN == getAndUpdate(i -&gt; i == EXECUTING_AGAIN ? EXECUTING : (i &amp; ~EXECUTING)))</span>
+<span class="fc" id="L618">                executor.execute(this);</span>
+<span class="fc" id="L619">        }</span>
+
+        /**
+         * No more tasks or delivery will be executed, once any in progress complete.
+         */
+        public void terminate()
+        {
+<span class="fc" id="L626">            terminated = true;</span>
+<span class="fc" id="L627">        }</span>
+
+        /**
+         * Only to be invoked by the Delivery task.
+         *
+         * If true, indicates that we have begun asynchronous delivery work, so that
+         * we cannot safely stopAndRun until it completes.
+         *
+         * Once it completes, we ensure any stopAndRun task has a chance to execute
+         * by ensuring delivery is scheduled.
+         *
+         * If stopAndRun is also set, we should not enter doRun() until a corresponding
+         * setInProgress(false) occurs.
+         */
+        void setInProgress(boolean inProgress)
+        {
+<span class="nc" id="L643">            boolean wasInProgress = this.inProgress;</span>
+<span class="nc" id="L644">            this.inProgress = inProgress;</span>
+<span class="nc bnc" id="L645" title="All 4 branches missed.">            if (!inProgress &amp;&amp; wasInProgress)</span>
+<span class="nc" id="L646">                executeAgain();</span>
+<span class="nc" id="L647">        }</span>
+
+        /**
+         * Perform some delivery work.
+         *
+         * Must never be invoked directly, only via {@link #execute()}
+         */
+        public void run()
+        {
+            /* do/while handling setup for {@link #doRun()}, and repeat invocations thereof */
+            while (true)
+            {
+<span class="pc bpc" id="L659" title="1 of 2 branches missed.">                if (terminated)</span>
+<span class="nc" id="L660">                    return;</span>
+
+<span class="fc bfc" id="L662" title="All 2 branches covered.">                if (null != stopAndRun.get())</span>
+                {
+                    // if we have an external request to perform, attempt it - if no async delivery is in progress
+
+<span class="pc bpc" id="L666" title="1 of 2 branches missed.">                    if (inProgress)</span>
+                    {
+                        // if we are in progress, we cannot do anything;
+                        // so, exit and rely on setInProgress(false) executing us
+                        // (which must happen later, since it must happen on this thread)
+<span class="nc" id="L671">                        promiseToExecuteLater();</span>
+<span class="nc" id="L672">                        break;</span>
+                    }
+
+<span class="fc" id="L675">                    stopAndRun.getAndSet(null).run();</span>
+                }
+
+<span class="fc" id="L678">                State state = OutboundConnection.this.state;</span>
+<span class="fc bfc" id="L679" title="All 4 branches covered.">                if (!state.isEstablished() || !state.established().isConnected())</span>
+                {
+                    // if we have messages yet to deliver, or a task to run, we need to reconnect and try again
+                    // we try to reconnect before running another stopAndRun so that we do not infinite loop in close
+<span class="fc bfc" id="L683" title="All 4 branches covered.">                    if (hasPending() || null != stopAndRun.get())</span>
+                    {
+<span class="fc" id="L685">                        promiseToExecuteLater();</span>
+<span class="fc" id="L686">                        requestConnect().addListener(f -&gt; executeAgain());</span>
+                    }
+                    break;
+                }
+
+<span class="fc bfc" id="L691" title="All 2 branches covered.">                if (!doRun(state.established()))</span>
+<span class="fc" id="L692">                    break;</span>
+<span class="fc" id="L693">            }</span>
+
+<span class="fc" id="L695">            maybeExecuteAgain();</span>
+<span class="fc" id="L696">        }</span>
+
+        /**
+         * @return true if we should run again immediately;
+         *         always false for eventLoop executor, as want to service other channels
+         */
+        abstract boolean doRun(Established established);
+
+        /**
+         * Schedule a task to run later on the delivery thread while delivery is not in progress,
+         * i.e. there are no bytes in flight to the network buffer.
+         *
+         * Does not guarantee to run promptly if there is no current connection to the remote host.
+         * May wait until a new connection is established, or a connection timeout elapses, before executing.
+         *
+         * Update the shared atomic property containing work we want to interrupt message processing to perform,
+         * the invoke schedule() to be certain it gets run.
+         */
+        void stopAndRun(Runnable run)
+        {
+<span class="fc" id="L716">            stopAndRun.accumulateAndGet(run, OutboundConnection::andThen);</span>
+<span class="fc" id="L717">            execute();</span>
+<span class="fc" id="L718">        }</span>
+
+        /**
+         * Schedule a task to run on the eventLoop, guaranteeing that delivery will not occur while the task is performed.
+         */
+        abstract void stopAndRunOnEventLoop(Runnable run);
+
+    }
+
+    /**
+     * Delivery that runs entirely on the eventLoop
+     *
+     * Since this has single threaded access to most of its environment, it can be simple and efficient, however
+     * it must also have bounded run time, and limit its resource consumption to ensure other channels serviced by the
+     * eventLoop can also make progress.
+     *
+     * This operates on modest buffers, no larger than the {@link OutboundConnections#LARGE_MESSAGE_THRESHOLD} and
+     * filling at most one at a time before writing (potentially asynchronously) to the socket.
+     *
+     * We track the number of bytes we have in flight, ensuring no more than a user-defined maximum at any one time.
+     */
+<span class="fc" id="L739">    class EventLoopDelivery extends Delivery</span>
+    {
+        private int flushingBytes;
+<span class="fc" id="L742">        private boolean isWritable = true;</span>
+
+        EventLoopDelivery()
+<span class="fc" id="L745">        {</span>
+<span class="fc" id="L746">            super(eventLoop);</span>
+<span class="fc" id="L747">        }</span>
+
+        /**
+         * {@link Delivery#doRun}
+         *
+         * Since we are on the eventLoop, in order to ensure other channels are serviced
+         * we never return true to request another run immediately.
+         *
+         * If there is more work to be done, we submit ourselves for execution once the eventLoop has time.
+         */
+        @SuppressWarnings(&quot;resource&quot;)
+        boolean doRun(Established established)
+        {
+<span class="pc bpc" id="L760" title="1 of 2 branches missed.">            if (!isWritable)</span>
+<span class="nc" id="L761">                return false;</span>
+
+            // pendingBytes is updated before queue.size() (which triggers notEmpty, and begins delivery),
+            // so it is safe to use it here to exit delivery
+            // this number is inaccurate for old versions, but we don't mind terribly - we'll send at least one message,
+            // and get round to it eventually (though we could add a fudge factor for some room for older versions)
+<span class="fc" id="L767">            int maxSendBytes = (int) min(pendingBytes() - flushingBytes, LARGE_MESSAGE_THRESHOLD);</span>
+<span class="fc bfc" id="L768" title="All 2 branches covered.">            if (maxSendBytes == 0)</span>
+<span class="fc" id="L769">                return false;</span>
+
+<span class="fc" id="L771">            OutboundConnectionSettings settings = established.settings;</span>
+<span class="fc" id="L772">            int messagingVersion = established.messagingVersion;</span>
+
+<span class="fc" id="L774">            FrameEncoder.Payload sending = null;</span>
+<span class="fc" id="L775">            int canonicalSize = 0; // number of bytes we must use for our resource accounting</span>
+<span class="fc" id="L776">            int sendingBytes = 0;</span>
+<span class="fc" id="L777">            int sendingCount = 0;</span>
+<span class="fc" id="L778">            try (OutboundMessageQueue.WithLock withLock = queue.lockOrCallback(approxTime.now(), this::execute))</span>
+            {
+<span class="fc bfc" id="L780" title="All 2 branches covered.">                if (withLock == null)</span>
+<span class="fc" id="L781">                    return false; // we failed to acquire the queue lock, so return; we will be scheduled again when the lock is available</span>
+
+<span class="fc" id="L783">                sending = established.payloadAllocator.allocate(true, maxSendBytes);</span>
+<span class="fc" id="L784">                DataOutputBufferFixed out = new DataOutputBufferFixed(sending.buffer);</span>
+
+                Message&lt;?&gt; next;
+<span class="fc bfc" id="L787" title="All 2 branches covered.">                while ( null != (next = withLock.peek()) )</span>
+                {
+                    try
+                    {
+<span class="fc" id="L791">                        int messageSize = next.serializedSize(messagingVersion);</span>
+
+                        // actual message size for this version is larger than permitted maximum
+<span class="pc bpc" id="L794" title="1 of 2 branches missed.">                        if (messageSize &gt; DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())</span>
+<span class="nc" id="L795">                            throw new Message.OversizedMessageException(messageSize);</span>
+
+<span class="fc bfc" id="L797" title="All 2 branches covered.">                        if (messageSize &gt; sending.remaining())</span>
+                        {
+                            // if we don't have enough room to serialize the next message, we have either
+                            //  1) run out of room after writing some messages successfully; this might mean that we are
+                            //     overflowing our highWaterMark, or that we have just filled our buffer
+                            //  2) we have a message that is too large for this connection; this can happen if a message's
+                            //     size was calculated for the wrong messaging version when enqueued.
+                            //     In this case we want to write it anyway, so simply allocate a large enough buffer.
+
+<span class="fc bfc" id="L806" title="All 2 branches covered.">                            if (sendingBytes &gt; 0)</span>
+<span class="fc" id="L807">                                break;</span>
+
+<span class="fc" id="L809">                            sending.release();</span>
+<span class="fc" id="L810">                            sending = null; // set to null to prevent double-release if we fail to allocate our new buffer</span>
+<span class="fc" id="L811">                            sending = established.payloadAllocator.allocate(true, messageSize);</span>
+                            //noinspection IOResourceOpenedButNotSafelyClosed
+<span class="fc" id="L813">                            out = new DataOutputBufferFixed(sending.buffer);</span>
+                        }
+
+<span class="fc" id="L816">                        Tracing.instance.traceOutgoingMessage(next, messageSize, settings.connectTo);</span>
+<span class="fc" id="L817">                        Message.serializer.serialize(next, out, messagingVersion);</span>
+
+<span class="pc bpc" id="L819" title="1 of 2 branches missed.">                        if (sending.length() != sendingBytes + messageSize)</span>
+<span class="nc" id="L820">                            throw new InvalidSerializedSizeException(next.verb(), messageSize, sending.length() - sendingBytes);</span>
+
+<span class="fc" id="L822">                        canonicalSize += canonicalSize(next);</span>
+<span class="fc" id="L823">                        sendingCount += 1;</span>
+<span class="fc" id="L824">                        sendingBytes += messageSize;</span>
+                    }
+<span class="nc" id="L826">                    catch (Throwable t)</span>
+                    {
+<span class="nc" id="L828">                        onFailedSerialize(next, messagingVersion, 0, t);</span>
+
+<span class="nc bnc" id="L830" title="All 2 branches missed.">                        assert sending != null;</span>
+                        // reset the buffer to ignore the message we failed to serialize
+<span class="nc" id="L832">                        sending.trim(sendingBytes);</span>
+<span class="fc" id="L833">                    }</span>
+<span class="fc" id="L834">                    withLock.removeHead(next);</span>
+                }
+<span class="fc bfc" id="L836" title="All 2 branches covered.">                if (0 == sendingBytes)</span>
+<span class="fc" id="L837">                    return false;</span>
+
+<span class="fc" id="L839">                sending.finish();</span>
+<span class="fc" id="L840">                debug.onSendSmallFrame(sendingCount, sendingBytes);</span>
+<span class="fc" id="L841">                ChannelFuture flushResult = AsyncChannelPromise.writeAndFlush(established.channel, sending);</span>
+<span class="fc" id="L842">                sending = null;</span>
+
+<span class="pc bpc" id="L844" title="1 of 2 branches missed.">                if (flushResult.isSuccess())</span>
+                {
+<span class="fc" id="L846">                    sentCount += sendingCount;</span>
+<span class="fc" id="L847">                    sentBytes += sendingBytes;</span>
+<span class="fc" id="L848">                    debug.onSentSmallFrame(sendingCount, sendingBytes);</span>
+                }
+                else
+                {
+<span class="nc" id="L852">                    flushingBytes += canonicalSize;</span>
+<span class="nc" id="L853">                    setInProgress(true);</span>
+
+<span class="nc bnc" id="L855" title="All 2 branches missed.">                    boolean hasOverflowed = flushingBytes &gt;= settings.flushHighWaterMark;</span>
+<span class="nc bnc" id="L856" title="All 2 branches missed.">                    if (hasOverflowed)</span>
+                    {
+<span class="nc" id="L858">                        isWritable = false;</span>
+<span class="nc" id="L859">                        promiseToExecuteLater();</span>
+                    }
+
+<span class="nc" id="L862">                    int releaseBytesFinal = canonicalSize;</span>
+<span class="nc" id="L863">                    int sendingBytesFinal = sendingBytes;</span>
+<span class="nc" id="L864">                    int sendingCountFinal = sendingCount;</span>
+<span class="nc" id="L865">                    flushResult.addListener(future -&gt; {</span>
+
+<span class="nc" id="L867">                        releaseCapacity(sendingCountFinal, releaseBytesFinal);</span>
+<span class="nc" id="L868">                        flushingBytes -= releaseBytesFinal;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">                        if (flushingBytes == 0)</span>
+<span class="nc" id="L870">                            setInProgress(false);</span>
+
+<span class="nc bnc" id="L872" title="All 4 branches missed.">                        if (!isWritable &amp;&amp; flushingBytes &lt;= settings.flushLowWaterMark)</span>
+                        {
+<span class="nc" id="L874">                            isWritable = true;</span>
+<span class="nc" id="L875">                            executeAgain();</span>
+                        }
+
+<span class="nc bnc" id="L878" title="All 2 branches missed.">                        if (future.isSuccess())</span>
+                        {
+<span class="nc" id="L880">                            sentCount += sendingCountFinal;</span>
+<span class="nc" id="L881">                            sentBytes += sendingBytesFinal;</span>
+<span class="nc" id="L882">                            debug.onSentSmallFrame(sendingCountFinal, sendingBytesFinal);</span>
+                        }
+                        else
+                        {
+<span class="nc" id="L886">                            errorCount += sendingCountFinal;</span>
+<span class="nc" id="L887">                            errorBytes += sendingBytesFinal;</span>
+<span class="nc" id="L888">                            invalidateChannel(established, future.cause());</span>
+<span class="nc" id="L889">                            debug.onFailedSmallFrame(sendingCountFinal, sendingBytesFinal);</span>
+                        }
+<span class="nc" id="L891">                    });</span>
+<span class="nc" id="L892">                    canonicalSize = 0;</span>
+                }
+<span class="pc bpc" id="L894" title="2 of 4 branches missed.">            }</span>
+<span class="nc" id="L895">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L897">                errorCount += sendingCount;</span>
+<span class="nc" id="L898">                errorBytes += sendingBytes;</span>
+<span class="nc" id="L899">                invalidateChannel(established, t);</span>
+            }
+            finally
+            {
+<span class="fc bfc" id="L903" title="All 2 branches covered.">                if (canonicalSize &gt; 0)</span>
+<span class="fc" id="L904">                    releaseCapacity(sendingCount, canonicalSize);</span>
+
+<span class="fc bfc" id="L906" title="All 2 branches covered.">                if (sending != null)</span>
+<span class="fc" id="L907">                    sending.release();</span>
+
+<span class="pc bpc" id="L909" title="1 of 4 branches missed.">                if (pendingBytes() &gt; flushingBytes &amp;&amp; isWritable)</span>
+<span class="fc" id="L910">                    execute();</span>
+            }
+
+<span class="fc" id="L913">            return false;</span>
+        }
+
+        void stopAndRunOnEventLoop(Runnable run)
+        {
+<span class="fc" id="L918">            stopAndRun(run);</span>
+<span class="fc" id="L919">        }</span>
+    }
+
+    /**
+     * Delivery that coordinates between the eventLoop and another (non-dedicated) thread
+     *
+     * This is to service messages that are too large to fully serialize on the eventLoop, as they could block
+     * prompt service of other requests.  Since our serializers assume blocking IO, the easiest approach is to
+     * ensure a companion thread performs blocking IO that, under the hood, is serviced by async IO on the eventLoop.
+     *
+     * Most of the work here is handed off to {@link AsyncChannelOutputPlus}, with our main job being coordinating
+     * when and what we should run.
+     *
+     * To avoid allocating a huge number of threads across a cluster, we utilise the shared methods of {@link Delivery}
+     * to ensure that only one run() is actually scheduled to run at a time - this permits us to use any {@link ExecutorService}
+     * as a backing, with the number of threads defined only by the maximum concurrency needed to deliver all large messages.
+     * We use a shared caching {@link java.util.concurrent.ThreadPoolExecutor}, and rename the Threads that service
+     * our connection on entry and exit.
+     */
+    class LargeMessageDelivery extends Delivery
+    {
+        static final int DEFAULT_BUFFER_SIZE = 32 * 1024;
+
+        LargeMessageDelivery(ExecutorService executor)
+<span class="fc" id="L943">        {</span>
+<span class="fc" id="L944">            super(executor);</span>
+<span class="fc" id="L945">        }</span>
+
+        /**
+         * A simple wrapper of {@link Delivery#run} to set the current Thread name for the duration of its execution.
+         */
+        public void run()
+        {
+<span class="fc" id="L952">            String threadName, priorThreadName = null;</span>
+            try
+            {
+<span class="fc" id="L955">                priorThreadName = Thread.currentThread().getName();</span>
+<span class="fc" id="L956">                threadName = &quot;Messaging-OUT-&quot; + template.from() + &quot;-&gt;&quot; + template.to + '-' + type;</span>
+<span class="fc" id="L957">                Thread.currentThread().setName(threadName);</span>
+
+<span class="fc" id="L959">                super.run();</span>
+            }
+            finally
+            {
+<span class="pc bpc" id="L963" title="1 of 2 branches missed.">                if (priorThreadName != null)</span>
+<span class="fc" id="L964">                    Thread.currentThread().setName(priorThreadName);</span>
+            }
+<span class="fc" id="L966">        }</span>
+
+        @SuppressWarnings({ &quot;resource&quot;, &quot;RedundantSuppression&quot; }) // make eclipse warnings go away
+        boolean doRun(Established established)
+        {
+<span class="fc" id="L971">            Message&lt;?&gt; send = queue.tryPoll(approxTime.now(), this::execute);</span>
+<span class="fc bfc" id="L972" title="All 2 branches covered.">            if (send == null)</span>
+<span class="fc" id="L973">                return false;</span>
+
+<span class="fc" id="L975">            AsyncMessageOutputPlus out = null;</span>
+            try
+            {
+<span class="fc" id="L978">                int messageSize = send.serializedSize(established.messagingVersion);</span>
+<span class="fc" id="L979">                out = new AsyncMessageOutputPlus(established.channel, DEFAULT_BUFFER_SIZE, messageSize, established.payloadAllocator);</span>
+                // actual message size for this version is larger than permitted maximum
+<span class="pc bpc" id="L981" title="1 of 2 branches missed.">                if (messageSize &gt; DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())</span>
+<span class="nc" id="L982">                    throw new Message.OversizedMessageException(messageSize);</span>
+
+<span class="fc" id="L984">                Tracing.instance.traceOutgoingMessage(send, messageSize, established.settings.connectTo);</span>
+<span class="fc" id="L985">                Message.serializer.serialize(send, out, established.messagingVersion);</span>
+
+<span class="pc bpc" id="L987" title="1 of 2 branches missed.">                if (out.position() != messageSize)</span>
+<span class="nc" id="L988">                    throw new InvalidSerializedSizeException(send.verb(), messageSize, out.position());</span>
+
+<span class="fc" id="L990">                out.close();</span>
+<span class="fc" id="L991">                sentCount += 1;</span>
+<span class="fc" id="L992">                sentBytes += messageSize;</span>
+<span class="fc" id="L993">                releaseCapacity(1, canonicalSize(send));</span>
+<span class="fc" id="L994">                return hasPending();</span>
+            }
+<span class="nc" id="L996">            catch (Throwable t)</span>
+            {
+<span class="nc" id="L998">                boolean tryAgain = true;</span>
+
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">                if (out != null)</span>
+                {
+<span class="nc" id="L1002">                    out.discard();</span>
+<span class="nc bnc" id="L1003" title="All 2 branches missed.">                    if (out.flushed() &gt; 0 ||</span>
+<span class="nc bnc" id="L1004" title="All 8 branches missed.">                        isCausedBy(t, cause -&gt;    isConnectionReset(cause)</span>
+                                               || cause instanceof Errors.NativeIoException
+                                               || cause instanceof AsyncChannelOutputPlus.FlushException))
+                    {
+                        // close the channel, and wait for eventLoop to execute
+<span class="nc" id="L1009">                        disconnectNow(established).awaitUninterruptibly();</span>
+<span class="nc" id="L1010">                        tryAgain = false;</span>
+                        try
+                        {
+                            // after closing, wait until we are signalled about the in flight writes;
+                            // this ensures flushedToNetwork() is correct below
+<span class="nc" id="L1015">                            out.waitUntilFlushed(0, 0);</span>
+                        }
+<span class="nc" id="L1017">                        catch (Throwable ignore)</span>
+                        {
+                            // irrelevant
+<span class="nc" id="L1020">                        }</span>
+                    }
+                }
+
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">                onFailedSerialize(send, established.messagingVersion, out == null ? 0 : (int) out.flushedToNetwork(), t);</span>
+<span class="nc" id="L1025">                return tryAgain;</span>
+            }
+        }
+
+        void stopAndRunOnEventLoop(Runnable run)
+        {
+<span class="fc" id="L1031">            stopAndRun(() -&gt; {</span>
+                try
+                {
+<span class="fc" id="L1034">                    runOnEventLoop(run).await();</span>
+                }
+<span class="nc" id="L1036">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L1038">                    throw new UncheckedInterruptedException(e);</span>
+<span class="fc" id="L1039">                }</span>
+<span class="fc" id="L1040">            });</span>
+<span class="fc" id="L1041">        }</span>
+    }
+
+    /*
+     * Size used for capacity enforcement purposes. Using current messaging version no matter what the peer's version is.
+     */
+    private int canonicalSize(Message&lt;?&gt; message)
+    {
+<span class="fc" id="L1049">        return message.serializedSize(current_version);</span>
+    }
+
+    private void invalidateChannel(Established established, Throwable cause)
+    {
+<span class="fc" id="L1054">        JVMStabilityInspector.inspectThrowable(cause);</span>
+
+<span class="pc bpc" id="L1056" title="1 of 2 branches missed.">        if (state != established)</span>
+<span class="nc" id="L1057">            return; // do nothing; channel already invalidated</span>
+
+<span class="pc bpc" id="L1059" title="1 of 2 branches missed.">        if (isCausedByConnectionReset(cause))</span>
+<span class="fc" id="L1060">            logger.info(&quot;{} channel closed by provider&quot;, id(), cause);</span>
+        else
+<span class="nc" id="L1062">            logger.error(&quot;{} channel in potentially inconsistent state after error; closing&quot;, id(), cause);</span>
+
+<span class="fc" id="L1064">        disconnectNow(established);</span>
+<span class="fc" id="L1065">    }</span>
+
+    /**
+     *  Attempt to open a new channel to the remote endpoint.
+     *
+     *  Most of the actual work is performed by OutboundConnectionInitiator, this method just manages
+     *  our book keeping on either success or failure.
+     *
+     *  This method is only to be invoked by the eventLoop, and the inner class' methods should only be evaluated by the eventtLoop
+     */
+    Future&lt;?&gt; initiate()
+    {
+<span class="fc" id="L1077">        class Initiate</span>
+        {
+            /**
+             * If we fail to connect, we want to try and connect again before any messages timeout.
+             * However, we update this each time to ensure we do not retry unreasonably often, and settle on a periodicity
+             * that might lead to timeouts in some aggressive systems.
+             */
+<span class="fc" id="L1084">            long retryRateMillis = DatabaseDescriptor.getMinRpcTimeout(MILLISECONDS) / 2;</span>
+
+            // our connection settings, possibly updated on retry
+<span class="fc" id="L1087">            int messagingVersion = template.endpointToVersion().get(template.to);</span>
+            OutboundConnectionSettings settings;
+
+            /**
+             * If we failed for any reason, try again
+             */
+            void onFailure(Throwable cause)
+            {
+<span class="pc bpc" id="L1095" title="1 of 2 branches missed.">                if (cause instanceof ConnectException)</span>
+<span class="fc" id="L1096">                    noSpamLogger.info(&quot;{} failed to connect&quot;, id(), cause);</span>
+                else
+<span class="nc" id="L1098">                    noSpamLogger.error(&quot;{} failed to connect&quot;, id(), cause);</span>
+
+<span class="fc" id="L1100">                JVMStabilityInspector.inspectThrowable(cause);</span>
+
+<span class="fc bfc" id="L1102" title="All 2 branches covered.">                if (hasPending())</span>
+                {
+<span class="fc" id="L1104">                    boolean isSSLFailure = isSSLError(cause);</span>
+<span class="fc" id="L1105">                    Promise&lt;Result&lt;MessagingSuccess&gt;&gt; result = AsyncPromise.withExecutor(eventLoop);</span>
+<span class="fc" id="L1106">                    state = new Connecting(state.disconnected(), result, eventLoop.schedule(() -&gt; attempt(result, isSSLFailure), max(100, retryRateMillis), MILLISECONDS));</span>
+<span class="fc" id="L1107">                    retryRateMillis = min(1000, retryRateMillis * 2);</span>
+<span class="fc" id="L1108">                }</span>
+                else
+                {
+                    // this Initiate will be discarded
+<span class="fc" id="L1112">                    state = Disconnected.dormant(state.disconnected().maintenance);</span>
+                }
+<span class="fc" id="L1114">            }</span>
+
+            void onCompletedHandshake(Result&lt;MessagingSuccess&gt; result)
+            {
+<span class="pc bpc" id="L1118" title="3 of 4 branches missed.">                switch (result.outcome)</span>
+                {
+                    case SUCCESS:
+                        // it is expected that close, if successful, has already cancelled us; so we do not need to worry about leaking connections
+<span class="pc bpc" id="L1122" title="1 of 2 branches missed.">                        assert !state.isClosed();</span>
+
+<span class="fc" id="L1124">                        MessagingSuccess success = result.success();</span>
+<span class="fc" id="L1125">                        debug.onConnect(success.messagingVersion, settings);</span>
+<span class="fc" id="L1126">                        state.disconnected().maintenance.cancel(false);</span>
+
+<span class="fc" id="L1128">                        FrameEncoder.PayloadAllocator payloadAllocator = success.allocator;</span>
+<span class="fc" id="L1129">                        Channel channel = success.channel;</span>
+<span class="fc" id="L1130">                        Established established = new Established(success.messagingVersion, channel, payloadAllocator, settings);</span>
+<span class="fc" id="L1131">                        state = established;</span>
+<span class="fc" id="L1132">                        channel.pipeline().addLast(&quot;handleExceptionalStates&quot;, new ChannelInboundHandlerAdapter() {</span>
+                            @Override
+                            public void channelInactive(ChannelHandlerContext ctx)
+                            {
+<span class="fc" id="L1136">                                disconnectNow(established);</span>
+<span class="fc" id="L1137">                                ctx.fireChannelInactive();</span>
+<span class="fc" id="L1138">                            }</span>
+
+                            @Override
+                            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause)
+                            {
+                                try
+                                {
+<span class="fc" id="L1145">                                    invalidateChannel(established, cause);</span>
+                                }
+<span class="nc" id="L1147">                                catch (Throwable t)</span>
+                                {
+<span class="nc" id="L1149">                                    logger.error(&quot;Unexpected exception in {}.exceptionCaught&quot;, this.getClass().getSimpleName(), t);</span>
+<span class="fc" id="L1150">                                }</span>
+<span class="fc" id="L1151">                            }</span>
+                        });
+<span class="fc" id="L1153">                        ++successfulConnections;</span>
+
+<span class="fc" id="L1155">                        logger.info(&quot;{} successfully connected, version = {}, framing = {}, encryption = {}&quot;,</span>
+<span class="fc" id="L1156">                                    id(true),</span>
+<span class="fc" id="L1157">                                    success.messagingVersion,</span>
+                                    settings.framing,
+<span class="fc" id="L1159">                                    encryptionConnectionSummary(channel));</span>
+<span class="fc" id="L1160">                        break;</span>
+
+                    case RETRY:
+<span class="nc bnc" id="L1163" title="All 2 branches missed.">                        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L1164">                            logger.trace(&quot;{} incorrect legacy peer version predicted; reconnecting&quot;, id());</span>
+
+                        // the messaging version we connected with was incorrect; try again with the one supplied by the remote host
+<span class="nc" id="L1167">                        messagingVersion = result.retry().withMessagingVersion;</span>
+<span class="nc" id="L1168">                        settings.endpointToVersion.set(settings.to, messagingVersion);</span>
+
+<span class="nc" id="L1170">                        initiate();</span>
+<span class="nc" id="L1171">                        break;</span>
+
+                    case INCOMPATIBLE:
+                        // we cannot communicate with this peer given its messaging version; mark this as any other failure, and continue trying
+<span class="nc" id="L1175">                        Throwable t = new IOException(String.format(&quot;Incompatible peer: %s, messaging version: %s&quot;,</span>
+<span class="nc" id="L1176">                                                                    settings.to, result.incompatible().maxMessagingVersion));</span>
+<span class="nc" id="L1177">                        t.fillInStackTrace();</span>
+<span class="nc" id="L1178">                        onFailure(t);</span>
+<span class="nc" id="L1179">                        break;</span>
+
+                    default:
+<span class="nc" id="L1182">                        throw new AssertionError();</span>
+                }
+<span class="fc" id="L1184">            }</span>
+
+            /**
+             * Initiate all the actions required to establish a working, valid connection. This includes
+             * opening the socket, negotiating the internode messaging handshake, and setting up the working
+             * Netty {@link Channel}. However, this method will not block for all those actions: it will only
+             * kick off the connection attempt, setting the @{link #connecting} future to track its completion.
+             *
+             * Note: this should only be invoked on the event loop.
+             */
+            private void attempt(Promise&lt;Result&lt;MessagingSuccess&gt;&gt; result, boolean sslFallbackEnabled)
+            {
+<span class="fc" id="L1196">                ++connectionAttempts;</span>
+
+                /*
+                 * Re-evaluate messagingVersion before re-attempting the connection in case
+                 * endpointToVersion were updated. This happens if the outbound connection
+                 * is made before the endpointToVersion table is initially constructed or out
+                 * of date (e.g. if outbound connections are established for gossip
+                 * as a result of an inbound connection) and can result in the wrong outbound
+                 * port being selected if configured with legacy_ssl_storage_port_enabled=true.
+                 */
+<span class="fc" id="L1206">                int knownMessagingVersion = messagingVersion();</span>
+<span class="pc bpc" id="L1207" title="1 of 2 branches missed.">                if (knownMessagingVersion != messagingVersion)</span>
+                {
+<span class="nc" id="L1209">                    logger.trace(&quot;Endpoint version changed from {} to {} since connection initialized, updating.&quot;,</span>
+<span class="nc" id="L1210">                                 messagingVersion, knownMessagingVersion);</span>
+<span class="nc" id="L1211">                    messagingVersion = knownMessagingVersion;</span>
+                }
+
+<span class="fc" id="L1214">                settings = template;</span>
+<span class="pc bpc" id="L1215" title="1 of 2 branches missed.">                if (messagingVersion &gt; settings.acceptVersions.max)</span>
+<span class="nc" id="L1216">                    messagingVersion = settings.acceptVersions.max;</span>
+
+                // In mixed mode operation, some nodes might be configured to use SSL for internode connections and
+                // others might be configured to not use SSL. When a node is configured in optional SSL mode, It should
+                // be able to handle SSL and Non-SSL internode connections. We take care of this when accepting NON-SSL
+                // connection in Inbound connection by having optional SSL handler for inbound connections.
+                // For outbound connections, if the authentication fails, we should fall back to other SSL strategies
+                // while talking to older nodes in the cluster which are configured to make NON-SSL connections
+<span class="fc" id="L1224">                SslFallbackConnectionType[] fallBackSslFallbackConnectionTypes = SslFallbackConnectionType.values();</span>
+<span class="pc bpc" id="L1225" title="5 of 6 branches missed.">                int index = sslFallbackEnabled &amp;&amp; settings.withEncryption() &amp;&amp; settings.encryption.getOptional() ?</span>
+<span class="pc" id="L1226">                            (int) (connectionAttempts - 1) % fallBackSslFallbackConnectionTypes.length : 0;</span>
+<span class="pc bpc" id="L1227" title="1 of 2 branches missed.">                if (fallBackSslFallbackConnectionTypes[index] != SslFallbackConnectionType.SERVER_CONFIG)</span>
+                {
+<span class="nc" id="L1229">                    logger.info(&quot;ConnectionId {} is falling back to {} reconnect strategy for retry&quot;, id(), fallBackSslFallbackConnectionTypes[index]);</span>
+                }
+<span class="fc" id="L1231">                initiateMessaging(eventLoop, type, fallBackSslFallbackConnectionTypes[index], settings, result)</span>
+<span class="fc" id="L1232">                .addListener(future -&gt; {</span>
+<span class="pc bpc" id="L1233" title="1 of 2 branches missed.">                    if (future.isCancelled())</span>
+<span class="nc" id="L1234">                        return;</span>
+<span class="fc bfc" id="L1235" title="All 2 branches covered.">                    if (future.isSuccess()) //noinspection unchecked</span>
+<span class="fc" id="L1236">                        onCompletedHandshake((Result&lt;MessagingSuccess&gt;) future.getNow());</span>
+                    else
+<span class="fc" id="L1238">                        onFailure(future.cause());</span>
+<span class="fc" id="L1239">                });</span>
+<span class="fc" id="L1240">            }</span>
+
+            Future&lt;Result&lt;MessagingSuccess&gt;&gt; initiate()
+            {
+<span class="fc" id="L1244">                Promise&lt;Result&lt;MessagingSuccess&gt;&gt; result = AsyncPromise.withExecutor(eventLoop);</span>
+<span class="fc" id="L1245">                state = new Connecting(state.disconnected(), result);</span>
+<span class="fc" id="L1246">                attempt(result, false);</span>
+<span class="fc" id="L1247">                return result;</span>
+            }
+        }
+
+<span class="fc" id="L1251">        return new Initiate().initiate();</span>
+    }
+
+    /**
+     * Returns a future that completes when we are _maybe_ reconnected.
+     *
+     * The connection attempt is guaranteed to have completed (successfully or not) by the time any listeners are invoked,
+     * so if a reconnection attempt is needed, it is already scheduled.
+     */
+    private Future&lt;?&gt; requestConnect()
+    {
+        // we may race with updates to this variable, but this is fine, since we only guarantee that we see a value
+        // that did at some point represent an active connection attempt - if it is stale, it will have been completed
+        // and the caller can retry (or utilise the successfully established connection)
+        {
+<span class="fc" id="L1266">            State state = this.state;</span>
+<span class="fc bfc" id="L1267" title="All 2 branches covered.">            if (state.isConnecting())</span>
+<span class="fc" id="L1268">                return state.connecting().attempt;</span>
+        }
+
+<span class="fc" id="L1271">        Promise&lt;Object&gt; promise = AsyncPromise.uncancellable(eventLoop);</span>
+<span class="fc" id="L1272">        runOnEventLoop(() -&gt; {</span>
+<span class="pc bpc" id="L1273" title="1 of 2 branches missed.">            if (isClosed()) // never going to connect</span>
+            {
+<span class="nc" id="L1275">                promise.tryFailure(new ClosedChannelException());</span>
+            }
+<span class="pc bpc" id="L1277" title="3 of 4 branches missed.">            else if (state.isEstablished() &amp;&amp; state.established().isConnected())  // already connected</span>
+            {
+<span class="nc" id="L1279">                promise.trySuccess(null);</span>
+            }
+            else
+            {
+<span class="pc bpc" id="L1283" title="1 of 2 branches missed.">                if (state.isEstablished())</span>
+<span class="nc" id="L1284">                    setDisconnected();</span>
+
+<span class="pc bpc" id="L1286" title="1 of 2 branches missed.">                if (!state.isConnecting())</span>
+                {
+<span class="pc bpc" id="L1288" title="1 of 2 branches missed.">                    assert eventLoop.inEventLoop();</span>
+<span class="pc bpc" id="L1289" title="1 of 2 branches missed.">                    assert !isConnected();</span>
+<span class="fc" id="L1290">                    initiate().addListener(new PromiseNotifier&lt;&gt;(promise));</span>
+                }
+                else
+                {
+<span class="nc" id="L1294">                    state.connecting().attempt.addListener(new PromiseNotifier&lt;&gt;(promise));</span>
+                }
+            }
+<span class="fc" id="L1297">        });</span>
+<span class="fc" id="L1298">        return promise;</span>
+    }
+
+    /**
+     * Change the IP address on which we connect to the peer. We will attempt to connect to the new address if there
+     * was a previous connection, and new incoming messages as well as existing {@link #queue} messages will be sent there.
+     * Any outstanding messages in the existing channel will still be sent to the previous address (we won't/can't move them from
+     * one channel to another).
+     *
+     * Returns null if the connection is closed.
+     */
+    Future&lt;Void&gt; reconnectWith(OutboundConnectionSettings reconnectWith)
+    {
+<span class="nc" id="L1311">        OutboundConnectionSettings newTemplate = reconnectWith.withDefaults(ConnectionCategory.MESSAGING);</span>
+<span class="nc bnc" id="L1312" title="All 2 branches missed.">        if (newTemplate.socketFactory != template.socketFactory) throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L1313" title="All 2 branches missed.">        if (newTemplate.callbacks != template.callbacks) throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L1314" title="All 2 branches missed.">        if (!Objects.equals(newTemplate.applicationSendQueueCapacityInBytes, template.applicationSendQueueCapacityInBytes)) throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L1315" title="All 2 branches missed.">        if (!Objects.equals(newTemplate.applicationSendQueueReserveEndpointCapacityInBytes, template.applicationSendQueueReserveEndpointCapacityInBytes)) throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">        if (newTemplate.applicationSendQueueReserveGlobalCapacityInBytes != template.applicationSendQueueReserveGlobalCapacityInBytes) throw new IllegalArgumentException();</span>
+
+<span class="nc" id="L1318">        logger.info(&quot;{} updating connection settings&quot;, id());</span>
+
+<span class="nc" id="L1320">        Promise&lt;Void&gt; done = AsyncPromise.uncancellable(eventLoop);</span>
+<span class="nc" id="L1321">        delivery.stopAndRunOnEventLoop(() -&gt; {</span>
+<span class="nc" id="L1322">            template = newTemplate;</span>
+            // delivery will immediately continue after this, triggering a reconnect if necessary;
+            // this might mean a slight delay for large message delivery, as the connect will be scheduled
+            // asynchronously, so we must wait for a second turn on the eventLoop
+<span class="nc bnc" id="L1326" title="All 2 branches missed.">            if (state.isEstablished())</span>
+            {
+<span class="nc" id="L1328">                disconnectNow(state.established());</span>
+            }
+<span class="nc bnc" id="L1330" title="All 2 branches missed.">            else if (state.isConnecting())</span>
+            {
+                // cancel any in-flight connection attempt and restart with new template
+<span class="nc" id="L1333">                state.connecting().cancel();</span>
+<span class="nc" id="L1334">                initiate();</span>
+            }
+<span class="nc" id="L1336">            done.setSuccess(null);</span>
+<span class="nc" id="L1337">        });</span>
+<span class="nc" id="L1338">        return done;</span>
+    }
+
+    /**
+     * Close any currently open connection, forcing a reconnect if there are messages outstanding
+     * (or leaving it closed for now otherwise)
+     */
+    public boolean interrupt()
+    {
+<span class="fc" id="L1347">        State state = this.state;</span>
+<span class="fc bfc" id="L1348" title="All 2 branches covered.">        if (!state.isEstablished())</span>
+<span class="fc" id="L1349">            return false;</span>
+
+<span class="fc" id="L1351">        disconnectGracefully(state.established());</span>
+<span class="fc" id="L1352">        return true;</span>
+    }
+
+    /**
+     * Schedule a safe close of the provided channel, if it has not already been closed.
+     *
+     * This means ensuring that delivery has stopped so that we do not corrupt or interrupt any
+     * in progress transmissions.
+     *
+     * The actual closing of the channel is performed asynchronously, to simplify our internal state management
+     * and promptly get the connection going again; the close is considered to have succeeded as soon as we
+     * have set our internal state.
+     */
+    private void disconnectGracefully(Established closeIfIs)
+    {
+        // delivery will immediately continue after this, triggering a reconnect if necessary;
+        // this might mean a slight delay for large message delivery, as the connect will be scheduled
+        // asynchronously, so we must wait for a second turn on the eventLoop
+<span class="fc" id="L1370">        delivery.stopAndRunOnEventLoop(() -&gt; disconnectNow(closeIfIs));</span>
+<span class="fc" id="L1371">    }</span>
+
+    /**
+     * The channel is already known to be invalid, so there's no point waiting for a clean break in delivery.
+     *
+     * Delivery will be executed again as soon as we have logically closed the channel; we do not wait
+     * for the channel to actually be closed.
+     *
+     * The Future returned _does_ wait for the channel to be completely closed, so that callers can wait to be sure
+     * all writes have been completed either successfully or not.
+     */
+    private Future&lt;?&gt; disconnectNow(Established closeIfIs)
+    {
+<span class="fc" id="L1384">        return runOnEventLoop(() -&gt; {</span>
+<span class="fc bfc" id="L1385" title="All 2 branches covered.">            if (state == closeIfIs)</span>
+            {
+                // no need to wait until the channel is closed to set ourselves as disconnected (and potentially open a new channel)
+<span class="fc" id="L1388">                setDisconnected();</span>
+<span class="fc bfc" id="L1389" title="All 2 branches covered.">                if (hasPending())</span>
+<span class="fc" id="L1390">                    delivery.execute();</span>
+<span class="fc" id="L1391">                closeIfIs.channel.close()</span>
+<span class="fc" id="L1392">                                 .addListener(future -&gt; {</span>
+<span class="pc bpc" id="L1393" title="1 of 2 branches missed.">                                     if (!future.isSuccess())</span>
+<span class="nc" id="L1394">                                         logger.info(&quot;Problem closing channel {}&quot;, closeIfIs, future.cause());</span>
+<span class="fc" id="L1395">                                 });</span>
+            }
+<span class="fc" id="L1397">        });</span>
+    }
+
+    /**
+     * Schedules regular cleaning of the connection's state while it is disconnected from its remote endpoint.
+     *
+     * To be run only by the eventLoop or in the constructor
+     */
+    private void setDisconnected()
+    {
+<span class="pc bpc" id="L1407" title="1 of 4 branches missed.">        assert state == null || state.isEstablished();</span>
+<span class="fc" id="L1408">        state = Disconnected.dormant(eventLoop.scheduleAtFixedRate(queue::maybePruneExpired, 100L, 100L, TimeUnit.MILLISECONDS));</span>
+<span class="fc" id="L1409">    }</span>
+
+    /**
+     * Schedule this connection to be permanently closed; only one close may be scheduled,
+     * any future scheduled closes are referred to the original triggering one (which may have a different schedule)
+     */
+    Future&lt;Void&gt; scheduleClose(long time, TimeUnit unit, boolean flushQueue)
+    {
+<span class="fc" id="L1417">        Promise&lt;Void&gt; scheduledClose = AsyncPromise.uncancellable(eventLoop);</span>
+<span class="pc bpc" id="L1418" title="1 of 2 branches missed.">        if (!scheduledCloseUpdater.compareAndSet(this, null, scheduledClose))</span>
+<span class="nc" id="L1419">            return this.scheduledClose;</span>
+
+<span class="pc" id="L1421">        eventLoop.schedule(() -&gt; close(flushQueue).addListener(new PromiseNotifier&lt;&gt;(scheduledClose)), time, unit);</span>
+<span class="fc" id="L1422">        return scheduledClose;</span>
+    }
+
+    /**
+     * Permanently close this connection.
+     *
+     * Immediately prevent any new messages from being enqueued - these will throw ClosedChannelException.
+     * The close itself happens asynchronously on the eventLoop, so a Future is returned to help callers
+     * wait for its completion.
+     *
+     * The flushQueue parameter indicates if any outstanding messages should be delivered before closing the connection.
+     *
+     *  - If false, any already flushed or in-progress messages are completed, and the remaining messages are cleared
+     *    before the connection is promptly torn down.
+     *
+     * - If true, we attempt delivery of all queued messages.  If necessary, we will continue to open new connections
+     *    to the remote host until they have been delivered.  Only if we continue to fail to open a connection for
+     *    an extended period of time will we drop any outstanding messages and close the connection.
+     */
+    public Future&lt;Void&gt; close(boolean flushQueue)
+    {
+        // ensure only one close attempt can be in flight
+<span class="fc" id="L1444">        Promise&lt;Void&gt; closing = AsyncPromise.uncancellable(eventLoop);</span>
+<span class="pc bpc" id="L1445" title="1 of 2 branches missed.">        if (!closingUpdater.compareAndSet(this, null, closing))</span>
+<span class="nc" id="L1446">            return this.closing;</span>
+
+        /*
+         * Now define a cleanup closure, that will be deferred until it is safe to do so.
+         * Once run it:
+         *   - immediately _logically_ closes the channel by updating this object's fields, but defers actually closing
+         *   - cancels any in-flight connection attempts
+         *   - cancels any maintenance work that might be scheduled
+         *   - clears any waiting messages on the queue
+         *   - terminates the delivery thread
+         *   - finally, schedules any open channel's closure, and propagates its completion to the close promise
+         */
+<span class="fc" id="L1458">        Runnable eventLoopCleanup = () -&gt; {</span>
+<span class="fc" id="L1459">            Runnable onceNotConnecting = () -&gt; {</span>
+                // start by setting ourselves to definitionally closed
+<span class="fc" id="L1461">                State state = this.state;</span>
+<span class="fc" id="L1462">                this.state = State.CLOSED;</span>
+
+                try
+                {
+                    // note that we never clear the queue, to ensure that an enqueue has the opportunity to remove itself
+                    // if it raced with close, to potentially requeue the message on a replacement connection
+
+                    // we terminate delivery here, to ensure that any listener to {@link connecting} do not schedule more work
+<span class="fc" id="L1470">                    delivery.terminate();</span>
+
+                    // stop periodic cleanup
+<span class="fc bfc" id="L1473" title="All 2 branches covered.">                    if (state.isDisconnected())</span>
+                    {
+<span class="fc" id="L1475">                        state.disconnected().maintenance.cancel(true);</span>
+<span class="fc" id="L1476">                        closing.setSuccess(null);</span>
+                    }
+                    else
+                    {
+<span class="pc bpc" id="L1480" title="1 of 2 branches missed.">                        assert state.isEstablished();</span>
+<span class="fc" id="L1481">                        state.established().channel.close()</span>
+<span class="fc" id="L1482">                                                   .addListener(new PromiseNotifier&lt;&gt;(closing));</span>
+                    }
+                }
+<span class="nc" id="L1485">                catch (Throwable t)</span>
+                {
+                    // in case of unexpected exception, signal completion and try to close the channel
+<span class="nc" id="L1488">                    closing.trySuccess(null);</span>
+                    try
+                    {
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">                        if (state.isEstablished())</span>
+<span class="nc" id="L1492">                            state.established().channel.close();</span>
+                    }
+<span class="nc" id="L1494">                    catch (Throwable t2)</span>
+                    {
+<span class="nc" id="L1496">                        t.addSuppressed(t2);</span>
+<span class="nc" id="L1497">                        logger.error(&quot;Failed to close connection cleanly:&quot;, t);</span>
+<span class="nc" id="L1498">                    }</span>
+<span class="nc" id="L1499">                    throw t;</span>
+<span class="fc" id="L1500">                }</span>
+<span class="fc" id="L1501">            };</span>
+
+<span class="pc bpc" id="L1503" title="1 of 2 branches missed.">            if (state.isConnecting())</span>
+            {
+                // stop any in-flight connection attempts; these should be running on the eventLoop, so we should
+                // be able to cleanly cancel them, but executing on a listener guarantees correct semantics either way
+<span class="nc" id="L1507">                Connecting connecting = state.connecting();</span>
+<span class="nc" id="L1508">                connecting.cancel();</span>
+<span class="nc" id="L1509">                connecting.attempt.addListener(future -&gt; onceNotConnecting.run());</span>
+<span class="nc" id="L1510">            }</span>
+            else
+            {
+<span class="fc" id="L1513">                onceNotConnecting.run();</span>
+            }
+<span class="fc" id="L1515">        };</span>
+
+        /*
+         * If we want to shutdown gracefully, flushing any outstanding messages, we have to do it very carefully.
+         * Things to note:
+         *
+         *  - It is possible flushing messages will require establishing a new connection
+         *    (However, if a connection cannot be established, we do not want to keep trying)
+         *  - We have to negotiate with a separate thread, so we must be sure it is not in-progress before we stop (like channel close)
+         *  - Cleanup must still happen on the eventLoop
+         *
+         *  To achieve all of this, we schedule a recurring operation on the delivery thread, executing while delivery
+         *  is between messages, that checks if the queue is empty; if it is, it schedules cleanup on the eventLoop.
+         */
+
+<span class="fc" id="L1530">        Runnable clearQueue = () -&gt;</span>
+        {
+<span class="fc" id="L1532">            CountDownLatch done = newCountDownLatch(1);</span>
+<span class="fc" id="L1533">            queue.runEventually(withLock -&gt; {</span>
+<span class="fc" id="L1534">                withLock.consume(this::onClosed);</span>
+<span class="fc" id="L1535">                done.decrement();</span>
+<span class="fc" id="L1536">            });</span>
+<span class="fc" id="L1537">            done.awaitUninterruptibly();</span>
+<span class="fc" id="L1538">        };</span>
+
+<span class="fc bfc" id="L1540" title="All 2 branches covered.">        if (flushQueue)</span>
+        {
+            // just keep scheduling on delivery executor a check to see if we're done; there should always be one
+            // delivery attempt between each invocation, unless there is a wider problem with delivery scheduling
+<span class="fc" id="L1544">            class FinishDelivery implements Runnable</span>
+            {
+                public void run()
+                {
+<span class="pc bpc" id="L1548" title="1 of 2 branches missed.">                    if (!hasPending())</span>
+<span class="fc" id="L1549">                        delivery.stopAndRunOnEventLoop(eventLoopCleanup);</span>
+                    else
+<span class="nc" id="L1551">                        delivery.stopAndRun(() -&gt; {</span>
+<span class="nc bnc" id="L1552" title="All 4 branches missed.">                            if (state.isConnecting() &amp;&amp; state.connecting().isFailingToConnect)</span>
+<span class="nc" id="L1553">                                clearQueue.run();</span>
+<span class="nc" id="L1554">                            run();</span>
+<span class="nc" id="L1555">                        });</span>
+<span class="fc" id="L1556">                }</span>
+            }
+
+<span class="fc" id="L1559">            delivery.stopAndRun(new FinishDelivery());</span>
+        }
+        else
+        {
+<span class="fc" id="L1563">            delivery.stopAndRunOnEventLoop(() -&gt; {</span>
+<span class="fc" id="L1564">                clearQueue.run();</span>
+<span class="fc" id="L1565">                eventLoopCleanup.run();</span>
+<span class="fc" id="L1566">            });</span>
+        }
+
+<span class="fc" id="L1569">        return closing;</span>
+    }
+
+    /**
+     * Run the task immediately if we are the eventLoop, otherwise queue it for execution on the eventLoop.
+     */
+    private Future&lt;?&gt; runOnEventLoop(Runnable runnable)
+    {
+<span class="fc bfc" id="L1577" title="All 2 branches covered.">        if (!eventLoop.inEventLoop())</span>
+<span class="fc" id="L1578">            return eventLoop.submit(runnable);</span>
+
+<span class="fc" id="L1580">        runnable.run();</span>
+<span class="fc" id="L1581">        return new SucceededFuture&lt;&gt;(eventLoop, null);</span>
+    }
+
+    public boolean isConnected()
+    {
+<span class="fc" id="L1586">        State state = this.state;</span>
+<span class="pc bpc" id="L1587" title="3 of 4 branches missed.">        return state.isEstablished() &amp;&amp; state.established().isConnected();</span>
+    }
+
+    boolean isClosing()
+    {
+<span class="pc bpc" id="L1592" title="1 of 2 branches missed.">        return closing != null;</span>
+    }
+
+    boolean isClosed()
+    {
+<span class="fc" id="L1597">        return state.isClosed();</span>
+    }
+
+    private String id(boolean includeReal)
+    {
+<span class="fc" id="L1602">        State state = this.state;</span>
+<span class="pc bpc" id="L1603" title="2 of 4 branches missed.">        if (!includeReal || !state.isEstablished())</span>
+<span class="nc" id="L1604">            return id();</span>
+<span class="fc" id="L1605">        Established established = state.established();</span>
+<span class="fc" id="L1606">        Channel channel = established.channel;</span>
+<span class="fc" id="L1607">        OutboundConnectionSettings settings = established.settings;</span>
+<span class="fc" id="L1608">        return SocketFactory.channelId(settings.from, (InetSocketAddress) channel.localAddress(),</span>
+<span class="fc" id="L1609">                                       settings.to, (InetSocketAddress) channel.remoteAddress(),</span>
+<span class="fc" id="L1610">                                       type, channel.id().asShortText());</span>
+    }
+
+    private String id()
+    {
+<span class="fc" id="L1615">        State state = this.state;</span>
+<span class="fc" id="L1616">        Channel channel = null;</span>
+<span class="fc" id="L1617">        OutboundConnectionSettings settings = template;</span>
+<span class="fc bfc" id="L1618" title="All 2 branches covered.">        if (state.isEstablished())</span>
+        {
+<span class="fc" id="L1620">            channel = state.established().channel;</span>
+<span class="fc" id="L1621">            settings = state.established().settings;</span>
+        }
+<span class="fc bfc" id="L1623" title="All 2 branches covered.">        String channelId = channel != null ? channel.id().asShortText() : &quot;[no-channel]&quot;;</span>
+<span class="fc" id="L1624">        return SocketFactory.channelId(settings.from(), settings.to, type, channelId);</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L1630">        return id();</span>
+    }
+
+    public boolean hasPending()
+    {
+<span class="fc bfc" id="L1635" title="All 2 branches covered.">        return 0 != pendingCountAndBytes;</span>
+    }
+
+    public int pendingCount()
+    {
+<span class="nc" id="L1640">        return pendingCount(pendingCountAndBytes);</span>
+    }
+
+    public long pendingBytes()
+    {
+<span class="fc" id="L1645">        return pendingBytes(pendingCountAndBytes);</span>
+    }
+
+    public long sentCount()
+    {
+        // not volatile, but shouldn't matter
+<span class="nc" id="L1651">        return sentCount;</span>
+    }
+
+    public long sentBytes()
+    {
+        // not volatile, but shouldn't matter
+<span class="nc" id="L1657">        return sentBytes;</span>
+    }
+
+    public long submittedCount()
+    {
+        // not volatile, but shouldn't matter
+<span class="nc" id="L1663">        return submittedCount;</span>
+    }
+
+    public long dropped()
+    {
+<span class="nc" id="L1668">        return overloadedCount + expiredCount;</span>
+    }
+
+    public long overloadedBytes()
+    {
+<span class="nc" id="L1673">        return overloadedBytes;</span>
+    }
+
+    public long overloadedCount()
+    {
+<span class="nc" id="L1678">        return overloadedCount;</span>
+    }
+
+    public long expiredCount()
+    {
+<span class="nc" id="L1683">        return expiredCount;</span>
+    }
+
+    public long expiredBytes()
+    {
+<span class="nc" id="L1688">        return expiredBytes;</span>
+    }
+
+    public long errorCount()
+    {
+<span class="nc" id="L1693">        return errorCount;</span>
+    }
+
+    public long errorBytes()
+    {
+<span class="nc" id="L1698">        return errorBytes;</span>
+    }
+
+    public long successfulConnections()
+    {
+<span class="nc" id="L1703">        return successfulConnections;</span>
+    }
+
+    public long connectionAttempts()
+    {
+<span class="nc" id="L1708">        return connectionAttempts;</span>
+    }
+
+    private static Runnable andThen(Runnable a, Runnable b)
+    {
+<span class="pc bpc" id="L1713" title="3 of 4 branches missed.">        if (a == null || b == null)</span>
+<span class="pc bpc" id="L1714" title="1 of 2 branches missed.">            return a == null ? b : a;</span>
+<span class="nc" id="L1715">        return () -&gt; { a.run(); b.run(); };</span>
+    }
+
+    @VisibleForTesting
+    public ConnectionType type()
+    {
+<span class="nc" id="L1721">        return type;</span>
+    }
+
+    @VisibleForTesting
+    OutboundConnectionSettings settings()
+    {
+<span class="nc" id="L1727">        State state = this.state;</span>
+<span class="nc bnc" id="L1728" title="All 2 branches missed.">        return state.isEstablished() ? state.established().settings : template;</span>
+    }
+
+    @VisibleForTesting
+    int messagingVersion()
+    {
+<span class="fc" id="L1734">        State state = this.state;</span>
+<span class="pc bpc" id="L1735" title="1 of 2 branches missed.">        return state.isEstablished() ? state.established().messagingVersion</span>
+<span class="fc" id="L1736">                                     : template.endpointToVersion().get(template.to);</span>
+    }
+
+    @VisibleForTesting
+    void unsafeRunOnDelivery(Runnable run)
+    {
+<span class="nc" id="L1742">        delivery.stopAndRun(run);</span>
+<span class="nc" id="L1743">    }</span>
+
+    @VisibleForTesting
+    Channel unsafeGetChannel()
+    {
+<span class="nc" id="L1748">        State state = this.state;</span>
+<span class="nc bnc" id="L1749" title="All 2 branches missed.">        return state.isEstablished() ? state.established().channel : null;</span>
+    }
+
+    @VisibleForTesting
+    boolean unsafeAcquireCapacity(long amount)
+    {
+<span class="nc bnc" id="L1755" title="All 2 branches missed.">        return SUCCESS == acquireCapacity(amount);</span>
+    }
+
+    @VisibleForTesting
+    boolean unsafeAcquireCapacity(long count, long amount)
+    {
+<span class="nc bnc" id="L1761" title="All 2 branches missed.">        return SUCCESS == acquireCapacity(count, amount);</span>
+    }
+
+    @VisibleForTesting
+    void unsafeReleaseCapacity(long amount)
+    {
+<span class="nc" id="L1767">        releaseCapacity(1, amount);</span>
+<span class="nc" id="L1768">    }</span>
+
+    @VisibleForTesting
+    void unsafeReleaseCapacity(long count, long amount)
+    {
+<span class="nc" id="L1773">        releaseCapacity(count, amount);</span>
+<span class="nc" id="L1774">    }</span>
+
+    @VisibleForTesting
+    Limit unsafeGetEndpointReserveLimits()
+    {
+<span class="nc" id="L1779">        return reserveCapacityInBytes.endpoint;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

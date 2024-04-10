@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>KeyLookup.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai.disk.v1.keystore</a> &gt; <span class="el_source">KeyLookup.java</span></div><h1>KeyLookup.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.index.sai.disk.v1.keystore;
+
+import java.io.IOException;
+import javax.annotation.Nonnull;
+import javax.annotation.concurrent.NotThreadSafe;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.index.sai.disk.io.IndexInputReader;
+import org.apache.cassandra.index.sai.disk.v1.LongArray;
+import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
+import org.apache.cassandra.index.sai.disk.v1.bitpack.MonotonicBlockPackedReader;
+import org.apache.cassandra.index.sai.disk.v1.bitpack.NumericValuesMeta;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.utils.FastByteOperations;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
+
+/**
+ * Provides read access to an on-disk sequence of partition or clustering keys written by {@link KeyStoreWriter}.
+ * &lt;p&gt;
+ * Care has been taken to make this structure as efficient as possible.
+ * Reading keys does not require allocating data heap buffers per each read operation.
+ * Only one key at a time is loaded to memory.
+ * Low complexity algorithms are used – a lookup of the key by point id is constant time,
+ * and a lookup of the point id by the key is logarithmic.
+ * &lt;p&gt;
+ * Because the blocks are prefix compressed, random access applies only to the locating the whole block.
+ * In order to jump to a concrete key inside the block, the block keys are iterated from the block beginning.
+ *
+ * @see KeyStoreWriter
+ */
+@NotThreadSafe
+public class KeyLookup
+{
+    public static final String INDEX_OUT_OF_BOUNDS = &quot;The target point id [%d] cannot be less than 0 or greater than or equal to the key count [%d]&quot;;
+
+    private final FileHandle keysFileHandle;
+    private final KeyLookupMeta keyLookupMeta;
+    private final LongArray.Factory keyBlockOffsetsFactory;
+
+    /**
+     * Creates a new reader based on its data components.
+     * &lt;p&gt;
+     * It does not own the components, so you must close them separately after you're done with the reader.
+     * @param keysFileHandle handle to the file with a sequence of prefix-compressed blocks
+     *                       each storing a fixed number of keys
+     * @param keysBlockOffsets handle to the file containing an encoded sequence of the file offsets pointing to the blocks
+     * @param keyLookupMeta metadata object created earlier by the writer
+     * @param keyBlockOffsetsMeta metadata object for the block offsets
+     */
+    public KeyLookup(@Nonnull FileHandle keysFileHandle,
+                     @Nonnull FileHandle keysBlockOffsets,
+                     @Nonnull KeyLookupMeta keyLookupMeta,
+                     @Nonnull NumericValuesMeta keyBlockOffsetsMeta) throws IOException
+<span class="fc" id="L77">    {</span>
+<span class="fc" id="L78">        this.keysFileHandle = keysFileHandle;</span>
+<span class="fc" id="L79">        this.keyLookupMeta = keyLookupMeta;</span>
+<span class="fc" id="L80">        this.keyBlockOffsetsFactory = new MonotonicBlockPackedReader(keysBlockOffsets, keyBlockOffsetsMeta);</span>
+<span class="fc" id="L81">    }</span>
+
+    /**
+     * Opens a cursor over the keys stored in the keys file.
+     * &lt;p&gt;
+     * This will read the first key into the key buffer and point to the first point in the keys file.
+     * &lt;p&gt;
+     * The cursor is to be used in a single thread.
+     * The cursor is valid as long this object hasn't been closed.
+     * You must close the cursor when you no longer need it.
+     */
+    public @Nonnull Cursor openCursor() throws IOException
+    {
+<span class="fc" id="L94">        return new Cursor(keysFileHandle, keyBlockOffsetsFactory);</span>
+    }
+
+    /**
+     * Allows reading the keys from the keys file.
+     * Can quickly seek to a random key by point id.
+     * &lt;p&gt;
+     * This object is stateful and not thread safe.
+     * It maintains a position to the current key as well as a buffer that can hold one key.
+     */
+<span class="fc" id="L104">    @NotThreadSafe</span>
+    public class Cursor implements AutoCloseable
+    {
+        private final IndexInputReader keysInput;
+        private final int blockShift;
+        private final int blockMask;
+        private final boolean clustering;
+        private final long keysFilePointer;
+        private final LongArray blockOffsets;
+
+        // The key the cursor currently points to. Initially empty.
+        private final BytesRef currentKey;
+
+        // A temporary buffer used to hold the key at the start of the next block.
+        private final BytesRef nextBlockKey;
+
+        // The point id the cursor currently points to.
+        private long currentPointId;
+        private long currentBlockIndex;
+
+        Cursor(FileHandle keysFileHandle, LongArray.Factory blockOffsetsFactory) throws IOException
+<span class="fc" id="L125">        {</span>
+<span class="fc" id="L126">            this.keysInput = IndexInputReader.create(keysFileHandle);</span>
+<span class="fc" id="L127">            SAICodecUtils.validate(this.keysInput);</span>
+<span class="fc" id="L128">            this.blockShift = this.keysInput.readVInt();</span>
+<span class="fc" id="L129">            this.blockMask = (1 &lt;&lt; this.blockShift) - 1;</span>
+<span class="fc bfc" id="L130" title="All 2 branches covered.">            this.clustering = this.keysInput.readByte() == 1;</span>
+<span class="fc" id="L131">            this.keysFilePointer = this.keysInput.getFilePointer();</span>
+<span class="fc" id="L132">            this.blockOffsets = new LongArray.DeferredLongArray(blockOffsetsFactory::open);</span>
+<span class="fc" id="L133">            this.currentKey = new BytesRef(keyLookupMeta.maxKeyLength);</span>
+<span class="fc" id="L134">            this.nextBlockKey = new BytesRef(keyLookupMeta.maxKeyLength);</span>
+<span class="fc" id="L135">            keysInput.seek(keysFilePointer);</span>
+<span class="fc" id="L136">            readKey(currentPointId, currentKey);</span>
+<span class="fc" id="L137">        }</span>
+
+        /**
+         * Positions the cursor on the target point id and reads the key at the target to the current key buffer.
+         * &lt;p&gt;
+         * It is allowed to position the cursor before the first item or after the last item;
+         * in these cases the internal buffer is cleared.
+         *
+         * @param pointId point id to lookup
+         * @return The {@link ByteSource} containing the key
+         * @throws IndexOutOfBoundsException if the target point id is less than -1 or greater than the number of keys
+         */
+        public @Nonnull ByteSource seekToPointId(long pointId)
+        {
+<span class="pc bpc" id="L151" title="2 of 4 branches missed.">            if (pointId &lt; 0 || pointId &gt;= keyLookupMeta.keyCount)</span>
+<span class="nc" id="L152">                throw new IndexOutOfBoundsException(String.format(INDEX_OUT_OF_BOUNDS, pointId, keyLookupMeta.keyCount));</span>
+
+<span class="fc bfc" id="L154" title="All 2 branches covered.">            if (pointId != currentPointId)</span>
+            {
+<span class="fc" id="L156">                long blockIndex = pointId &gt;&gt;&gt; blockShift;</span>
+                // We need to reset the block if the block index has changed or the pointId &lt; currentPointId.
+                // We can read forward in the same block without a reset, but we can't read backwards, and token
+                // collision can result in us moving backwards.
+<span class="pc bpc" id="L160" title="2 of 4 branches missed.">                if (blockIndex != currentBlockIndex || pointId &lt; currentPointId)</span>
+                {
+<span class="nc" id="L162">                    currentBlockIndex = blockIndex;</span>
+<span class="nc" id="L163">                    resetToCurrentBlock();</span>
+                }
+            }
+<span class="fc bfc" id="L166" title="All 2 branches covered.">            while (currentPointId &lt; pointId)</span>
+            {
+<span class="fc" id="L168">                currentPointId++;</span>
+<span class="fc" id="L169">                readCurrentKey();</span>
+<span class="fc" id="L170">                updateCurrentBlockIndex(currentPointId);</span>
+            }
+
+<span class="fc" id="L173">            return ByteSource.fixedLength(currentKey.bytes, currentKey.offset, currentKey.length);</span>
+        }
+
+        /**
+         * Finds the pointId for a clustering key within a range of pointIds. The start and end of the range must not
+         * exceed the number of keys available. The keys within the range are expected to be in lexographical order.
+         * &lt;p&gt;
+         * If the key is not in the block containing the start of the range a binary search is done to find
+         * the block containing the search key. That block is then searched to return the pointId that corresponds
+         * to the key that is either equal to or next highest to the search key.
+         *
+         * @param key The key to seek for with the partition
+         * @param startingPointId the inclusive starting point for the partition
+         * @param endingPointId the exclusive ending point for the partition.
+         *                      Note: this can be equal to the number of keys if this is the last partition
+         * @return a {@code long} representing the pointId of the key that is &gt;= to the key passed to the method, or
+         *         -1 if the key passed is &gt; all the keys.
+         */
+        public long clusteredSeekToKey(ByteComparable key, long startingPointId, long endingPointId)
+        {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            assert clustering : &quot;Cannot do a clustered seek to a key on non-clustered keys&quot;;</span>
+
+<span class="nc" id="L195">            BytesRef skipKey = asBytesRef(key);</span>
+
+<span class="nc" id="L197">            updateCurrentBlockIndex(startingPointId);</span>
+<span class="nc" id="L198">            resetToCurrentBlock();</span>
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (compareKeys(currentKey, skipKey) == 0)</span>
+<span class="nc" id="L201">                return startingPointId;</span>
+
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (notInCurrentBlock(startingPointId, skipKey))</span>
+            {
+<span class="nc" id="L205">                long split = (endingPointId - startingPointId) &gt;&gt;&gt; blockShift;</span>
+<span class="nc" id="L206">                long splitPointId = startingPointId;</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                while (split &gt; 0)</span>
+                {
+<span class="nc" id="L209">                    updateCurrentBlockIndex(Math.min((splitPointId &gt;&gt;&gt; blockShift) + split, blockOffsets.length() - 1));</span>
+<span class="nc" id="L210">                    resetToCurrentBlock();</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">                    if (currentPointId &gt;= endingPointId)</span>
+                    {
+<span class="nc" id="L214">                        updateCurrentBlockIndex((endingPointId - 1));</span>
+<span class="nc" id="L215">                        resetToCurrentBlock();</span>
+                    }
+
+<span class="nc" id="L218">                    int cmp = compareKeys(currentKey, skipKey);</span>
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                    if (cmp == 0)</span>
+<span class="nc" id="L221">                        return currentPointId;</span>
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                    if (cmp &lt; 0)</span>
+<span class="nc" id="L224">                        splitPointId = currentPointId;</span>
+
+<span class="nc" id="L226">                    split /= 2;</span>
+<span class="nc" id="L227">                }</span>
+                // After we finish the binary search we need to move the block back till we hit a block that has
+                // a starting key that is less than or equal to the skip key
+<span class="nc bnc" id="L230" title="All 4 branches missed.">                while (currentBlockIndex &gt; 0 &amp;&amp; compareKeys(currentKey, skipKey) &gt; 0)</span>
+                {
+<span class="nc" id="L232">                    currentBlockIndex--;</span>
+<span class="nc" id="L233">                    resetToCurrentBlock();</span>
+                }
+            }
+
+            // Depending on where we are in the block we may need to move forwards to the starting point ID
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            while (currentPointId &lt; startingPointId)</span>
+            {
+<span class="nc" id="L240">                currentPointId++;</span>
+<span class="nc" id="L241">                readCurrentKey();</span>
+<span class="nc" id="L242">                updateCurrentBlockIndex(currentPointId);</span>
+            }
+
+            // Move forward to the ending point ID, returning the point ID if we find our key
+<span class="nc bnc" id="L246" title="All 2 branches missed.">            while (currentPointId &lt; endingPointId)</span>
+            {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                if (compareKeys(currentKey, skipKey) &gt;= 0)</span>
+<span class="nc" id="L249">                    return currentPointId;</span>
+<span class="nc" id="L250">                currentPointId++;</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">                if (currentPointId == keyLookupMeta.keyCount)</span>
+<span class="nc" id="L252">                    return -1;</span>
+<span class="nc" id="L253">                readCurrentKey();</span>
+<span class="nc" id="L254">                updateCurrentBlockIndex(currentPointId);</span>
+            }
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            return endingPointId &lt; keyLookupMeta.keyCount ? endingPointId : -1;</span>
+        }
+
+        @VisibleForTesting
+        public void reset() throws IOException
+        {
+<span class="nc" id="L262">            currentPointId = 0;</span>
+<span class="nc" id="L263">            currentBlockIndex = 0;</span>
+<span class="nc" id="L264">            keysInput.seek(keysFilePointer);</span>
+<span class="nc" id="L265">            readCurrentKey();</span>
+<span class="nc" id="L266">        }</span>
+
+
+        @Override
+        public void close()
+        {
+<span class="fc" id="L272">            keysInput.close();</span>
+<span class="fc" id="L273">        }</span>
+
+        private void updateCurrentBlockIndex(long pointId)
+        {
+<span class="fc" id="L277">            currentBlockIndex = pointId &gt;&gt;&gt; blockShift;</span>
+<span class="fc" id="L278">        }</span>
+
+        private boolean notInCurrentBlock(long pointId, BytesRef key)
+        {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">            if (inLastBlock(pointId))</span>
+<span class="nc" id="L283">                return false;</span>
+
+            // Load the starting value of the next block into nextBlockKey.
+<span class="nc" id="L286">            long blockIndex = (pointId &gt;&gt;&gt; blockShift) + 1;</span>
+<span class="nc" id="L287">            long currentFp = keysInput.getFilePointer();</span>
+<span class="nc" id="L288">            keysInput.seek(blockOffsets.get(blockIndex) + keysFilePointer);</span>
+<span class="nc" id="L289">            readKey(blockIndex &lt;&lt; blockShift, nextBlockKey);</span>
+<span class="nc" id="L290">            keysInput.seek(currentFp);</span>
+
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            return compareKeys(key, nextBlockKey) &gt;= 0;</span>
+        }
+
+        private boolean inLastBlock(long pointId)
+        {
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            return pointId &gt;&gt;&gt; blockShift == blockOffsets.length() - 1;</span>
+        }
+
+        // Reset currentPointId and currentKey to be at the start of the block
+        // pointed to by currentBlockIndex.
+        private void resetToCurrentBlock()
+        {
+<span class="nc" id="L304">            keysInput.seek(blockOffsets.get(currentBlockIndex) + keysFilePointer);</span>
+<span class="nc" id="L305">            currentPointId = currentBlockIndex &lt;&lt; blockShift;</span>
+<span class="nc" id="L306">            readCurrentKey();</span>
+<span class="nc" id="L307">        }</span>
+
+        private void readCurrentKey()
+        {
+<span class="fc" id="L311">            readKey(currentPointId, currentKey);</span>
+<span class="fc" id="L312">        }</span>
+
+        // Read the next key indicated by pointId.
+        //
+        // Note: pointId is only used to determine whether we are at the start of a block. It is
+        // important that resetPosition is called prior to multiple calls to readKey. It is
+        // easy to get out of position.
+        private void readKey(long pointId, BytesRef key)
+        {
+            try
+            {
+                int prefixLength;
+                int suffixLength;
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                if ((pointId &amp; blockMask) == 0L)</span>
+                {
+<span class="fc" id="L327">                    prefixLength = 0;</span>
+<span class="fc" id="L328">                    suffixLength = keysInput.readVInt();</span>
+                }
+                else
+                {
+                    // Read the prefix and suffix lengths following the compression mechanism described
+                    // in the KeyStoreWriterWriter. If the lengths contained in the starting byte are less
+                    // than the 4 bit maximum then nothing further is read. Otherwise, the lengths in the
+                    // following vints are added.
+<span class="fc" id="L336">                    int compressedLengths = Byte.toUnsignedInt(keysInput.readByte());</span>
+<span class="fc" id="L337">                    prefixLength = compressedLengths &amp; 0x0F;</span>
+<span class="fc" id="L338">                    suffixLength = compressedLengths &gt;&gt;&gt; 4;</span>
+<span class="pc bpc" id="L339" title="1 of 2 branches missed.">                    if (prefixLength == 15)</span>
+<span class="nc" id="L340">                        prefixLength += keysInput.readVInt();</span>
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">                    if (suffixLength == 15)</span>
+<span class="nc" id="L342">                        suffixLength += keysInput.readVInt();</span>
+                }
+
+<span class="pc bpc" id="L345" title="1 of 2 branches missed.">                assert prefixLength + suffixLength &lt;= keyLookupMeta.maxKeyLength;</span>
+<span class="pc bpc" id="L346" title="1 of 2 branches missed.">                if (prefixLength + suffixLength &gt; 0)</span>
+                {
+<span class="fc" id="L348">                    key.length = prefixLength + suffixLength;</span>
+                    // The currentKey is appended to as the suffix for the current key is
+                    // added to the existing prefix.
+<span class="fc" id="L351">                    keysInput.readBytes(key.bytes, prefixLength, suffixLength);</span>
+                }
+            }
+<span class="nc" id="L354">            catch (IOException e)</span>
+            {
+<span class="nc" id="L356">                throw Throwables.cleaned(e);</span>
+<span class="fc" id="L357">            }</span>
+<span class="fc" id="L358">        }</span>
+
+        private int compareKeys(BytesRef left, BytesRef right)
+        {
+<span class="nc" id="L362">            return FastByteOperations.compareUnsigned(left.bytes, left.offset, left.offset + left.length,</span>
+                                                      right.bytes, right.offset, right.offset + right.length);
+        }
+
+        private BytesRef asBytesRef(ByteComparable source)
+        {
+<span class="nc" id="L368">            BytesRefBuilder builder = new BytesRefBuilder();</span>
+
+<span class="nc" id="L370">            ByteSource byteSource = source.asComparableBytes(ByteComparable.Version.OSS50);</span>
+            int val;
+<span class="nc bnc" id="L372" title="All 2 branches missed.">            while ((val = byteSource.next()) != ByteSource.END_OF_STREAM)</span>
+<span class="nc" id="L373">                builder.append((byte) val);</span>
+<span class="nc" id="L374">            return builder.get();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

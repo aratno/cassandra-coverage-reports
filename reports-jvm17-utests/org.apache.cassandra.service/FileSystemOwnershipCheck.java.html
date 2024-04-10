@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FileSystemOwnershipCheck.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service</a> &gt; <span class="el_source">FileSystemOwnershipCheck.java</span></div><h1>FileSystemOwnershipCheck.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service;
+
+import java.io.BufferedReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Multimap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.StartupChecksOptions;
+import org.apache.cassandra.exceptions.StartupException;
+import org.apache.cassandra.io.util.File;
+
+import static org.apache.cassandra.service.StartupChecks.StartupCheckType.check_filesystem_ownership;
+
+/**
+ * Ownership markers on disk are compatible with the java property file format.
+ * (https://docs.oracle.com/javase/8/docs/api/java/util/Properties.html#load-java.io.Reader-)
+ *
+ * This simple formatting is intended to enable them to be created either
+ * manually or by automated tooling using minimal standard tools (editor/shell
+ * builtins/etc).
+ * The only mandatory property is version, which must be parseable as an int
+ * and upon which the futher set of required properties will depend.
+ *
+ * In version 1, two further property values are required:
+ * - volume_count
+ *   to be parsed as an int representing the number of mounted volumes where
+ *   a marker file is expected.
+ * - ownership_token
+ *   must contain a non-empty token string that can be compared to one
+ *   derived from system properties. For version 1, this is simply the cluster name.
+ *
+ * For this check to succeed as of version 1 then:
+ * - There must be a single properties file found in the fs tree for each
+ *   target directory.
+ * - Every file found must contain the mandatory version property with the
+ *   literal value '1'.
+ * - The value of the ownership_token property in each file must match the
+ *   cluster name
+ * - The value of the volume_count property must be an int which must matches
+ *   the number of distinct marker files found when traversing the filesystem.
+ *
+ * In overridden implementations, you will need to override {@link #constructTokenFromProperties(Map)}
+ * and add the related *_PROPERTY values you will want the system to check on startup to confirm ownership.
+ */
+public class FileSystemOwnershipCheck implements StartupCheck
+{
+<span class="fc" id="L76">    private static final Logger logger = LoggerFactory.getLogger(FileSystemOwnershipCheck.class);</span>
+
+    public static final String FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN = &quot;CassandraOwnershipToken&quot;;
+    public static final String DEFAULT_FS_OWNERSHIP_FILENAME = &quot;.cassandra_fs_ownership&quot;;
+
+    // Ownership file properties
+    static final String VERSION                                 = &quot;version&quot;;
+    static final String VOLUME_COUNT                            = &quot;volume_count&quot;;
+    static final String TOKEN                                   = &quot;ownership_token&quot;;
+
+    // Error strings
+    static final String ERROR_PREFIX                            = &quot;FS ownership check failed; &quot;;
+    static final String MISSING_PROPERTY                        = &quot;property '%s' required for fs ownership check not supplied&quot;;
+    static final String NO_OWNERSHIP_FILE                       = &quot;no file found in tree for %s&quot;;
+    static final String MULTIPLE_OWNERSHIP_FILES                = &quot;multiple files found in tree for %s&quot;;
+    static final String INCONSISTENT_FILES_FOUND                = &quot;inconsistent ownership files found on disk: %s&quot;;
+    static final String INVALID_FILE_COUNT                      = &quot;number of ownership files found doesn't match expected&quot;;
+    static final String MISMATCHING_TOKEN                       = &quot;token found on disk does not match supplied&quot;;
+    static final String UNSUPPORTED_VERSION                     = &quot;unsupported version '%s' in ownership file&quot;;
+    static final String INVALID_PROPERTY_VALUE                  = &quot;invalid or missing value for property '%s'&quot;;
+    static final String READ_EXCEPTION                          = &quot;error when checking for fs ownership file&quot;;
+
+    private final Supplier&lt;Iterable&lt;String&gt;&gt; dirs;
+
+    FileSystemOwnershipCheck()
+    {
+<span class="pc" id="L102">        this(() -&gt; Iterables.concat(Arrays.asList(DatabaseDescriptor.getAllDataFileLocations()),</span>
+<span class="nc" id="L103">                                    Arrays.asList(DatabaseDescriptor.getCommitLogLocation(),</span>
+<span class="nc" id="L104">                                                  DatabaseDescriptor.getSavedCachesLocation(),</span>
+<span class="nc" id="L105">                                                  DatabaseDescriptor.getHintsDirectory().absolutePath())));</span>
+<span class="fc" id="L106">    }</span>
+
+    @VisibleForTesting
+    FileSystemOwnershipCheck(Supplier&lt;Iterable&lt;String&gt;&gt; dirs)
+<span class="fc" id="L110">    {</span>
+<span class="fc" id="L111">        this.dirs = dirs;</span>
+<span class="fc" id="L112">    }</span>
+
+    @Override
+    public StartupChecks.StartupCheckType getStartupCheckType()
+    {
+<span class="fc" id="L117">        return check_filesystem_ownership;</span>
+    }
+
+    @Override
+    public void execute(StartupChecksOptions options) throws StartupException
+    {
+<span class="fc bfc" id="L123" title="All 2 branches covered.">        if (!isEnabled(options))</span>
+        {
+<span class="fc" id="L125">            logger.info(&quot;Filesystem ownership check is not enabled.&quot;);</span>
+<span class="fc" id="L126">            return;</span>
+        }
+
+<span class="fc" id="L129">        Map&lt;String, Object&gt; config = options.getConfig(getStartupCheckType());</span>
+
+<span class="fc" id="L131">        String expectedToken = constructTokenFromProperties(config);</span>
+<span class="fc" id="L132">        String tokenFilename = getFsOwnershipFilename(config);</span>
+<span class="fc" id="L133">        Map&lt;String, Integer&gt; foundPerTargetDir = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L134">        Map&lt;Path, Properties&gt; foundProperties = new HashMap&lt;&gt;();</span>
+
+        // Step 1: Traverse the filesystem from each target dir upward, looking for marker files
+<span class="fc bfc" id="L137" title="All 2 branches covered.">        for (String dataDir : dirs.get())</span>
+        {
+<span class="fc" id="L139">            logger.info(&quot;Checking for fs ownership details in file hierarchy for {}&quot;, dataDir);</span>
+<span class="fc" id="L140">            int foundFiles = 0;</span>
+<span class="fc" id="L141">            Path dir = File.getPath(dataDir).normalize();</span>
+            do
+            {
+<span class="fc" id="L144">                File tokenFile = resolve(dir, tokenFilename);</span>
+<span class="fc bfc" id="L145" title="All 2 branches covered.">                if (tokenFile.exists())</span>
+                {
+<span class="fc" id="L147">                    foundFiles++;</span>
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                    if (!foundProperties.containsKey(tokenFile.toPath().toAbsolutePath()))</span>
+                    {
+<span class="fc" id="L150">                        try (BufferedReader reader = Files.newBufferedReader(tokenFile.toPath()))</span>
+                        {
+<span class="fc" id="L152">                            Properties props = new Properties();</span>
+<span class="fc" id="L153">                            props.load(reader);</span>
+<span class="fc" id="L154">                            foundProperties.put(tokenFile.toPath().toAbsolutePath(), props);</span>
+                        }
+<span class="fc" id="L156">                        catch (Exception e)</span>
+                        {
+<span class="fc" id="L158">                            logger.error(&quot;Error reading fs ownership file from disk&quot;, e);</span>
+<span class="fc" id="L159">                            throw exception(READ_EXCEPTION);</span>
+<span class="fc" id="L160">                        }</span>
+                    }
+                }
+<span class="fc" id="L163">                dir = dir.getParent();</span>
+<span class="fc bfc" id="L164" title="All 2 branches covered.">            } while (dir != null);</span>
+
+<span class="fc" id="L166">            foundPerTargetDir.put(dataDir, foundFiles);</span>
+<span class="fc" id="L167">        }</span>
+
+        // If a marker file couldn't be found for every target directory, error.
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        if (foundPerTargetDir.containsValue(0))</span>
+        {
+<span class="fc" id="L172">            throw exception(String.format(NO_OWNERSHIP_FILE, foundPerTargetDir.entrySet()</span>
+<span class="fc" id="L173">                                                                              .stream()</span>
+<span class="fc bfc" id="L174" title="All 2 branches covered.">                                                                              .filter(e -&gt; e.getValue() == 0)</span>
+<span class="fc" id="L175">                                                                              .map(Map.Entry::getKey)</span>
+<span class="fc" id="L176">                                                                              .collect(Collectors.joining(&quot;', '&quot;, &quot;'&quot;, &quot;'&quot;))));</span>
+        }
+
+        // If more than one marker file was found in the tree for any target directory, error
+<span class="fc" id="L180">        Set&lt;String&gt; multipleTokens = foundPerTargetDir.entrySet()</span>
+<span class="fc" id="L181">                                                      .stream()</span>
+<span class="fc bfc" id="L182" title="All 2 branches covered.">                                                      .filter(e -&gt; e.getValue() &gt; 1)</span>
+<span class="fc" id="L183">                                                      .map(Map.Entry::getKey)</span>
+<span class="fc" id="L184">                                                      .collect(Collectors.toSet());</span>
+<span class="fc bfc" id="L185" title="All 2 branches covered.">        if (!multipleTokens.isEmpty())</span>
+<span class="fc" id="L186">            throw exception(String.format(MULTIPLE_OWNERSHIP_FILES, String.join(&quot;,&quot;, multipleTokens)));</span>
+
+        // Step 2: assert that the content of each file is identical
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">        assert !foundProperties.isEmpty();</span>
+<span class="fc" id="L190">        Multimap&lt;Integer, Path&gt; byHash = HashMultimap.create();</span>
+<span class="fc" id="L191">        foundProperties.forEach((key, value) -&gt; byHash.put(value.hashCode(), key));</span>
+<span class="fc bfc" id="L192" title="All 2 branches covered.">        if (byHash.keySet().size() &gt; 1)</span>
+        {
+            // Group identical files to highlight where the mismatches are, worst case is
+            // they're all unique, but even then the number of individual files should be low
+<span class="fc" id="L196">            throw exception(String.format(INCONSISTENT_FILES_FOUND,</span>
+<span class="fc" id="L197">                                          byHash.keySet()</span>
+<span class="fc" id="L198">                                                .stream()</span>
+<span class="fc" id="L199">                                                .map(hash -&gt; byHash.get(hash)</span>
+<span class="fc" id="L200">                                                                   .stream()</span>
+<span class="fc" id="L201">                                                                   .map(Path::toString)</span>
+<span class="fc" id="L202">                                                                   .sorted()</span>
+<span class="fc" id="L203">                                                                   .collect(Collectors.joining(&quot;', '&quot;, &quot;['&quot;, &quot;']&quot;)))</span>
+<span class="fc" id="L204">                                                .sorted()</span>
+<span class="fc" id="L205">                                                .collect(Collectors.joining(&quot;, &quot;))));</span>
+        }
+
+        // Step 3: validate the content of the properties from disk
+        // Currently, only version 1 is supported which requires:
+        //   volume_count       that matches the number of unique files we found
+        //   ownership_token    that matches the one constructed from system props
+<span class="fc" id="L212">        Properties fromDisk = foundProperties.entrySet().iterator().next().getValue();</span>
+<span class="fc" id="L213">        int version = getIntProperty(fromDisk, VERSION);</span>
+<span class="fc bfc" id="L214" title="All 2 branches covered.">        if (version != 1)</span>
+<span class="fc" id="L215">            throw exception(String.format(UNSUPPORTED_VERSION, version));</span>
+
+<span class="fc" id="L217">        int volumeCount = getIntProperty(fromDisk, VOLUME_COUNT);</span>
+<span class="fc bfc" id="L218" title="All 2 branches covered.">        if (volumeCount != foundProperties.size())</span>
+<span class="fc" id="L219">            throw exception(INVALID_FILE_COUNT);</span>
+
+<span class="fc" id="L221">        String token = getRequiredProperty(fromDisk, TOKEN);</span>
+<span class="fc bfc" id="L222" title="All 2 branches covered.">        if (!expectedToken.equals(token))</span>
+<span class="fc" id="L223">            throw exception(MISMATCHING_TOKEN);</span>
+
+<span class="fc" id="L225">        logger.info(&quot;Successfully verified fs ownership&quot;);</span>
+<span class="fc" id="L226">    }</span>
+
+    /** In version 1, we check and return the ownership token. Extend this for custom ownership hierarchies. */
+    protected String constructTokenFromProperties(Map&lt;String, Object&gt; config) throws StartupException
+    {
+<span class="fc" id="L231">        String cluster = getOwnershipToken(config);</span>
+<span class="fc bfc" id="L232" title="All 4 branches covered.">        if (null == cluster || cluster.isEmpty())</span>
+<span class="fc" id="L233">            throw exception(String.format(MISSING_PROPERTY, FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN));</span>
+<span class="fc" id="L234">        return cluster;</span>
+    }
+
+    private int getIntProperty(Properties props, String key) throws StartupException
+    {
+<span class="fc" id="L239">        String val = getRequiredProperty(props, key);</span>
+        try
+        {
+<span class="fc" id="L242">            return Integer.parseInt(val);</span>
+        }
+<span class="fc" id="L244">        catch (NumberFormatException e)</span>
+        {
+<span class="fc" id="L246">            throw exception(String.format(INVALID_PROPERTY_VALUE, key));</span>
+        }
+    }
+
+    private String getRequiredProperty(Properties props, String key) throws StartupException
+    {
+<span class="fc" id="L252">        String s = props.getProperty(key);</span>
+<span class="fc bfc" id="L253" title="All 4 branches covered.">        if (null == s || s.isEmpty())</span>
+<span class="fc" id="L254">            throw exception(String.format(INVALID_PROPERTY_VALUE, key));</span>
+<span class="fc" id="L255">        return s;</span>
+    }
+
+    private File resolve(Path dir, String filename) throws StartupException
+    {
+        try
+        {
+<span class="fc" id="L262">            return new File(dir.resolve(filename));</span>
+        }
+<span class="nc" id="L264">        catch (Exception e)</span>
+        {
+<span class="nc" id="L266">            logger.error(&quot;Encountered error resolving path ownership file {} relative to dir {}&quot;, filename, dir);</span>
+<span class="nc" id="L267">            throw exception(READ_EXCEPTION);</span>
+        }
+    }
+
+    private StartupException exception(String message)
+    {
+<span class="fc" id="L273">        return new StartupException(StartupException.ERR_WRONG_DISK_STATE, ERROR_PREFIX + message);</span>
+    }
+
+    public boolean isEnabled(StartupChecksOptions options)
+    {
+<span class="fc" id="L278">        boolean enabledFromYaml = options.isEnabled(getStartupCheckType());</span>
+<span class="fc" id="L279">        return CassandraRelevantProperties.FILE_SYSTEM_CHECK_ENABLE.getBoolean(enabledFromYaml);</span>
+    }
+
+    public String getFsOwnershipFilename(Map&lt;String, Object&gt; config)
+    {
+<span class="fc bfc" id="L284" title="All 2 branches covered.">        if (CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_FILENAME.isPresent())</span>
+        {
+<span class="fc" id="L286">            logger.warn(String.format(&quot;Cassandra system property flag %s is deprecated and you should &quot; +</span>
+                                      &quot;use startup check configuration in cassandra.yaml&quot;,
+<span class="fc" id="L288">                                      CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_FILENAME.getKey()));</span>
+<span class="fc" id="L289">            return CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_FILENAME.getString();</span>
+        }
+        else
+        {
+<span class="fc" id="L293">            Object fsOwnershipFilename = config.get(&quot;ownership_filename&quot;);</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">            return fsOwnershipFilename == null</span>
+<span class="fc" id="L295">                   ? CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_FILENAME.getDefaultValue()</span>
+<span class="nc" id="L296">                   : (String) fsOwnershipFilename;</span>
+        }
+    }
+
+    public String getOwnershipToken(Map&lt;String, Object&gt; config)
+    {
+<span class="fc bfc" id="L302" title="All 2 branches covered.">        if (CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN.isPresent())</span>
+        {
+<span class="fc" id="L304">            logger.warn(String.format(&quot;Cassandra system property flag %s is deprecated and you should &quot; +</span>
+                                      &quot;use startup check configuration in cassandra.yaml&quot;,
+<span class="fc" id="L306">                                      CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN.getKey()));</span>
+<span class="fc" id="L307">            return CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN.getString();</span>
+        }
+        else
+        {
+<span class="fc" id="L311">            Object ownershipToken = config.get(&quot;ownership_token&quot;);</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            return ownershipToken == null</span>
+<span class="fc" id="L313">                   ? CassandraRelevantProperties.FILE_SYSTEM_CHECK_OWNERSHIP_TOKEN.getDefaultValue()</span>
+<span class="fc" id="L314">                   : (String) ownershipToken;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

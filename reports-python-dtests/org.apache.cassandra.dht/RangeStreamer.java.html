@@ -1,0 +1,780 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RangeStreamer.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.dht</a> &gt; <span class="el_source">RangeStreamer.java</span></div><h1>RangeStreamer.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.dht;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableMultimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Multimap;
+
+import org.apache.commons.lang3.StringUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.Endpoints;
+import org.apache.cassandra.locator.EndpointsByRange;
+import org.apache.cassandra.locator.EndpointsByReplica;
+import org.apache.cassandra.locator.EndpointsForRange;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.LocalStrategy;
+import org.apache.cassandra.locator.NetworkTopologyStrategy;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
+import org.apache.cassandra.locator.Replicas;
+import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.streaming.PreviewKind;
+import org.apache.cassandra.streaming.StreamOperation;
+import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamResultFuture;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static com.google.common.base.Predicates.and;
+import static com.google.common.base.Predicates.not;
+import static com.google.common.collect.Iterables.all;
+import static com.google.common.collect.Iterables.any;
+import static org.apache.cassandra.config.CassandraRelevantProperties.RESET_BOOTSTRAP_PROGRESS;
+import static org.apache.cassandra.locator.Replica.fullReplica;
+
+/**
+ * Assists in streaming ranges to this node.
+ */
+public class RangeStreamer
+{
+<span class="fc" id="L82">    private static final Logger logger = LoggerFactory.getLogger(RangeStreamer.class);</span>
+
+<span class="fc" id="L84">    public static Predicate&lt;Replica&gt; ALIVE_PREDICATE = replica -&gt;</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">                                                             (!Gossiper.instance.isEnabled() ||</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">                                                              (Gossiper.instance.getEndpointStateForEndpoint(replica.endpoint()) == null ||</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">                                                               Gossiper.instance.getEndpointStateForEndpoint(replica.endpoint()).isAlive())) &amp;&amp;</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">                                                             FailureDetector.instance.isAlive(replica.endpoint());</span>
+
+    /* bootstrap tokens. can be null if replacing the node. */
+    private final Collection&lt;Token&gt; tokens;
+    /* current token ring */
+    private final TokenMetadata metadata;
+    /* address of this node */
+    private final InetAddressAndPort address;
+    /* streaming description */
+    private final String description;
+<span class="fc" id="L98">    private final Map&lt;String, Multimap&lt;InetAddressAndPort, FetchReplica&gt;&gt; toFetch = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L99">    private final List&lt;SourceFilter&gt; sourceFilters = new ArrayList&lt;&gt;();</span>
+    private final StreamPlan streamPlan;
+    private final boolean useStrictConsistency;
+    private final IEndpointSnitch snitch;
+    private final StreamStateStore stateStore;
+
+<span class="fc" id="L105">    public static class FetchReplica</span>
+    {
+        public final Replica local;
+        // Source replica
+        public final Replica remote;
+
+        public FetchReplica(Replica local, Replica remote)
+<span class="fc" id="L112">        {</span>
+<span class="fc" id="L113">            Preconditions.checkNotNull(local);</span>
+<span class="fc" id="L114">            Preconditions.checkNotNull(remote);</span>
+<span class="pc bpc" id="L115" title="2 of 4 branches missed.">            assert local.isSelf() &amp;&amp; !remote.isSelf();</span>
+<span class="fc" id="L116">            this.local = local;</span>
+<span class="fc" id="L117">            this.remote = remote;</span>
+<span class="fc" id="L118">        }</span>
+
+        public String toString()
+        {
+<span class="fc" id="L122">            return &quot;FetchReplica{&quot; +</span>
+                   &quot;local=&quot; + local +
+                   &quot;, remote=&quot; + remote +
+                   '}';
+        }
+
+        public boolean equals(Object o)
+        {
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="pc bpc" id="L131" title="2 of 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="fc" id="L133">            FetchReplica that = (FetchReplica) o;</span>
+
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">            if (!local.equals(that.local)) return false;</span>
+<span class="nc" id="L136">            return remote.equals(that.remote);</span>
+        }
+
+        public int hashCode()
+        {
+<span class="fc" id="L141">            int result = local.hashCode();</span>
+<span class="fc" id="L142">            result = 31 * result + remote.hashCode();</span>
+<span class="fc" id="L143">            return result;</span>
+        }
+    }
+
+    public interface SourceFilter extends Predicate&lt;Replica&gt;
+    {
+        public boolean apply(Replica replica);
+        public String message(Replica replica);
+    }
+
+    /**
+     * Source filter which excludes any endpoints that are not alive according to a
+     * failure detector.
+     */
+    public static class FailureDetectorSourceFilter implements SourceFilter
+    {
+        private final IFailureDetector fd;
+
+        public FailureDetectorSourceFilter(IFailureDetector fd)
+<span class="fc" id="L162">        {</span>
+<span class="fc" id="L163">            this.fd = fd;</span>
+<span class="fc" id="L164">        }</span>
+
+        @Override
+        public boolean apply(Replica replica)
+        {
+<span class="fc" id="L169">            return fd.isAlive(replica.endpoint());</span>
+        }
+
+        @Override
+        public String message(Replica replica)
+        {
+<span class="fc" id="L175">            return &quot;Filtered &quot; + replica + &quot; out because it was down&quot;;</span>
+        }
+    }
+
+    /**
+     * Source filter which excludes any endpoints that are not in a specific data center.
+     */
+    public static class SingleDatacenterFilter implements SourceFilter
+    {
+        private final String sourceDc;
+        private final IEndpointSnitch snitch;
+
+        public SingleDatacenterFilter(IEndpointSnitch snitch, String sourceDc)
+<span class="fc" id="L188">        {</span>
+<span class="fc" id="L189">            this.sourceDc = sourceDc;</span>
+<span class="fc" id="L190">            this.snitch = snitch;</span>
+<span class="fc" id="L191">        }</span>
+
+        @Override
+        public boolean apply(Replica replica)
+        {
+<span class="fc" id="L196">            return snitch.getDatacenter(replica).equals(sourceDc);</span>
+        }
+
+        @Override
+        public String message(Replica replica)
+        {
+<span class="nc" id="L202">            return &quot;Filtered &quot; + replica + &quot; out because it does not belong to &quot; + sourceDc + &quot; datacenter&quot;;</span>
+        }
+    }
+
+    /**
+    * Source filter which excludes nodes from local DC.
+    */
+    public static class ExcludeLocalDatacenterFilter implements SourceFilter
+    {
+        private final IEndpointSnitch snitch;
+        private final String localDc;
+
+        public ExcludeLocalDatacenterFilter(IEndpointSnitch snitch)
+<span class="nc" id="L215">        {</span>
+<span class="nc" id="L216">            this.snitch = snitch;</span>
+<span class="nc" id="L217">            this.localDc = snitch.getLocalDatacenter();</span>
+<span class="nc" id="L218">        }</span>
+
+        @Override
+        public boolean apply(Replica replica)
+        {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            return !snitch.getDatacenter(replica).equals(localDc);</span>
+        }
+
+        @Override
+        public String message(Replica replica)
+        {
+<span class="nc" id="L229">            return &quot;Filtered &quot; + replica + &quot; out because it belongs to the local datacenter&quot;;</span>
+        }
+    }
+
+    /**
+     * Source filter which excludes the current node from source calculations
+     */
+<span class="fc" id="L236">    public static class ExcludeLocalNodeFilter implements SourceFilter</span>
+    {
+        @Override
+        public boolean apply(Replica replica)
+        {
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            return !replica.isSelf();</span>
+        }
+
+        @Override
+        public String message(Replica replica)
+        {
+<span class="nc" id="L247">            return &quot;Filtered &quot; + replica + &quot; out because it is local&quot;;</span>
+        }
+    }
+
+    /**
+     * Source filter which only includes endpoints contained within a provided set.
+     */
+    public static class AllowedSourcesFilter implements SourceFilter
+    {
+        private final Set&lt;InetAddressAndPort&gt; allowedSources;
+
+        public AllowedSourcesFilter(Set&lt;InetAddressAndPort&gt; allowedSources)
+<span class="nc" id="L259">        {</span>
+<span class="nc" id="L260">            this.allowedSources = allowedSources;</span>
+<span class="nc" id="L261">        }</span>
+
+        public boolean apply(Replica replica)
+        {
+<span class="nc" id="L265">            return allowedSources.contains(replica.endpoint());</span>
+        }
+
+        @Override
+        public String message(Replica replica)
+        {
+<span class="nc" id="L271">            return &quot;Filtered &quot; + replica + &quot; out because it was not in the allowed set: &quot; + allowedSources;</span>
+        }
+    }
+
+    public RangeStreamer(TokenMetadata metadata,
+                         Collection&lt;Token&gt; tokens,
+                         InetAddressAndPort address,
+                         StreamOperation streamOperation,
+                         boolean useStrictConsistency,
+                         IEndpointSnitch snitch,
+                         StreamStateStore stateStore,
+                         boolean connectSequentially,
+                         int connectionsPerHost)
+    {
+<span class="fc" id="L285">        this(metadata, tokens, address, streamOperation, useStrictConsistency, snitch, stateStore,</span>
+             FailureDetector.instance, connectSequentially, connectionsPerHost);
+<span class="fc" id="L287">    }</span>
+
+    RangeStreamer(TokenMetadata metadata,
+                  Collection&lt;Token&gt; tokens,
+                  InetAddressAndPort address,
+                  StreamOperation streamOperation,
+                  boolean useStrictConsistency,
+                  IEndpointSnitch snitch,
+                  StreamStateStore stateStore,
+                  IFailureDetector failureDetector,
+                  boolean connectSequentially,
+                  int connectionsPerHost)
+<span class="fc" id="L299">    {</span>
+<span class="pc bpc" id="L300" title="1 of 4 branches missed.">        Preconditions.checkArgument(streamOperation == StreamOperation.BOOTSTRAP || streamOperation == StreamOperation.REBUILD, streamOperation);</span>
+<span class="fc" id="L301">        this.metadata = metadata;</span>
+<span class="fc" id="L302">        this.tokens = tokens;</span>
+<span class="fc" id="L303">        this.address = address;</span>
+<span class="fc" id="L304">        this.description = streamOperation.getDescription();</span>
+<span class="fc" id="L305">        this.streamPlan = new StreamPlan(streamOperation, connectionsPerHost, connectSequentially, null, PreviewKind.NONE);</span>
+<span class="fc" id="L306">        this.useStrictConsistency = useStrictConsistency;</span>
+<span class="fc" id="L307">        this.snitch = snitch;</span>
+<span class="fc" id="L308">        this.stateStore = stateStore;</span>
+<span class="fc" id="L309">        streamPlan.listeners(this.stateStore);</span>
+
+        // We're _always_ filtering out a local node and down sources
+<span class="fc" id="L312">        addSourceFilter(new RangeStreamer.FailureDetectorSourceFilter(failureDetector));</span>
+<span class="fc" id="L313">        addSourceFilter(new RangeStreamer.ExcludeLocalNodeFilter());</span>
+<span class="fc" id="L314">    }</span>
+
+    public void addSourceFilter(SourceFilter filter)
+    {
+<span class="fc" id="L318">        sourceFilters.add(filter);</span>
+<span class="fc" id="L319">    }</span>
+
+    // Creates error message from source filters
+    private static String buildErrorMessage(Collection&lt;SourceFilter&gt; sourceFilters, ReplicaCollection&lt;?&gt; replicas)
+    {
+<span class="fc" id="L324">        StringBuilder failureMessage = new StringBuilder();</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        for (Replica r : replicas)</span>
+        {
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">            for (SourceFilter filter : sourceFilters)</span>
+            {
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">                if (!filter.apply(r))</span>
+                {
+<span class="fc" id="L331">                    failureMessage.append(filter.message(r));</span>
+<span class="fc" id="L332">                    break;</span>
+                }
+<span class="nc" id="L334">            }</span>
+<span class="fc" id="L335">        }</span>
+<span class="fc" id="L336">        return failureMessage.toString();</span>
+    }
+    /**
+     * Add ranges to be streamed for given keyspace.
+     *
+     * @param keyspaceName keyspace name
+     * @param replicas ranges to be streamed
+     */
+    public void addRanges(String keyspaceName, ReplicaCollection&lt;?&gt; replicas)
+    {
+<span class="fc" id="L346">        Keyspace keyspace = Keyspace.open(keyspaceName);</span>
+<span class="fc" id="L347">        AbstractReplicationStrategy strat = keyspace.getReplicationStrategy();</span>
+<span class="pc bpc" id="L348" title="1 of 2 branches missed.">        if(strat instanceof LocalStrategy)</span>
+        {
+<span class="nc" id="L350">            logger.info(&quot;Not adding ranges for Local Strategy keyspace={}&quot;, keyspaceName);</span>
+<span class="nc" id="L351">            return;</span>
+        }
+
+<span class="fc" id="L354">        boolean useStrictSource = useStrictSourcesForRanges(strat);</span>
+<span class="fc" id="L355">        EndpointsByReplica fetchMap = calculateRangesToFetchWithPreferredEndpoints(replicas, keyspace, useStrictSource);</span>
+
+<span class="fc bfc" id="L357" title="All 2 branches covered.">        for (Map.Entry&lt;Replica, Replica&gt; entry : fetchMap.flattenEntries())</span>
+<span class="fc" id="L358">            logger.info(&quot;{}: range {} exists on {} for keyspace {}&quot;, description, entry.getKey(), entry.getValue(), keyspaceName);</span>
+
+        Multimap&lt;InetAddressAndPort, FetchReplica&gt; workMap;
+        //Only use the optimized strategy if we don't care about strict sources, have a replication factor &gt; 1, and no
+        //transient replicas.
+<span class="pc bpc" id="L363" title="2 of 8 branches missed.">        if (useStrictSource || strat == null || strat.getReplicationFactor().allReplicas == 1 || strat.getReplicationFactor().hasTransientReplicas())</span>
+        {
+<span class="fc" id="L365">            workMap = convertPreferredEndpointsToWorkMap(fetchMap);</span>
+        }
+        else
+        {
+<span class="fc" id="L369">            workMap = getOptimizedWorkMap(fetchMap, sourceFilters, keyspaceName);</span>
+        }
+
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">        if (toFetch.put(keyspaceName, workMap) != null)</span>
+<span class="nc" id="L373">            throw new IllegalArgumentException(&quot;Keyspace is already added to fetch map&quot;);</span>
+
+<span class="pc bpc" id="L375" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+        {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            for (Map.Entry&lt;InetAddressAndPort, Collection&lt;FetchReplica&gt;&gt; entry : workMap.asMap().entrySet())</span>
+            {
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                for (FetchReplica r : entry.getValue())</span>
+<span class="nc" id="L380">                    logger.trace(&quot;{}: range source {} local range {} for keyspace {}&quot;, description, r.remote, r.local, keyspaceName);</span>
+<span class="nc" id="L381">            }</span>
+        }
+<span class="fc" id="L383">    }</span>
+
+    /**
+     * @param strat AbstractReplicationStrategy of keyspace to check
+     * @return true when the node is bootstrapping, useStrictConsistency is true and # of nodes in the cluster is more than # of replica
+     */
+    private boolean useStrictSourcesForRanges(AbstractReplicationStrategy strat)
+    {
+<span class="fc bfc" id="L391" title="All 4 branches covered.">        boolean res = useStrictConsistency &amp;&amp; tokens != null;</span>
+        
+<span class="fc bfc" id="L393" title="All 2 branches covered.">        if (res)</span>
+        {
+<span class="fc" id="L395">            int nodes = 0;</span>
+
+<span class="fc bfc" id="L397" title="All 2 branches covered.">            if (strat instanceof NetworkTopologyStrategy)</span>
+            {
+<span class="fc" id="L399">                ImmutableMultimap&lt;String, InetAddressAndPort&gt; dc2Nodes = metadata.getDC2AllEndpoints(snitch);</span>
+
+<span class="fc" id="L401">                NetworkTopologyStrategy ntps = (NetworkTopologyStrategy) strat;</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">                for (String dc : dc2Nodes.keySet())</span>
+<span class="pc bpc" id="L403" title="1 of 2 branches missed.">                    nodes += ntps.getReplicationFactor(dc).allReplicas &gt; 0 ? dc2Nodes.get(dc).size() : 0;</span>
+<span class="fc" id="L404">            }</span>
+            else
+<span class="fc" id="L406">                nodes = metadata.getSizeOfAllEndpoints();</span>
+    
+<span class="fc bfc" id="L408" title="All 2 branches covered.">            res = nodes &gt; strat.getReplicationFactor().allReplicas;</span>
+        }
+        
+<span class="fc" id="L411">        return res;</span>
+    }
+
+    /**
+     * Wrapper method to assemble the arguments for invoking the implementation with RangeStreamer's parameters
+     */
+    private EndpointsByReplica calculateRangesToFetchWithPreferredEndpoints(ReplicaCollection&lt;?&gt; fetchRanges, Keyspace keyspace, boolean useStrictConsistency)
+    {
+<span class="fc" id="L419">        AbstractReplicationStrategy strat = keyspace.getReplicationStrategy();</span>
+
+<span class="fc" id="L421">        TokenMetadata tmd = metadata.cloneOnlyTokenMap();</span>
+
+<span class="fc" id="L423">        TokenMetadata tmdAfter = null;</span>
+
+<span class="fc bfc" id="L425" title="All 2 branches covered.">        if (tokens != null)</span>
+        {
+            // Pending ranges
+<span class="fc" id="L428">            tmdAfter = tmd.cloneOnlyTokenMap();</span>
+<span class="fc" id="L429">            tmdAfter.updateNormalTokens(tokens, address);</span>
+        }
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">        else if (useStrictConsistency)</span>
+        {
+<span class="nc" id="L433">            throw new IllegalArgumentException(&quot;Can't ask for strict consistency and not supply tokens&quot;);</span>
+        }
+
+<span class="fc" id="L436">        return calculateRangesToFetchWithPreferredEndpoints(snitch::sortedByProximity,</span>
+                                                            strat,
+                                                            fetchRanges,
+                                                            useStrictConsistency,
+                                                            tmd,
+                                                            tmdAfter,
+<span class="fc" id="L442">                                                            keyspace.getName(),</span>
+                                                            sourceFilters);
+
+    }
+
+    /**
+     * Get a map of all ranges and the source that will be cleaned up once this bootstrapped node is added for the given ranges.
+     * For each range, the list should only contain a single source. This allows us to consistently migrate data without violating
+     * consistency.
+     **/
+     public static EndpointsByReplica
+     calculateRangesToFetchWithPreferredEndpoints(BiFunction&lt;InetAddressAndPort, EndpointsForRange, EndpointsForRange&gt; snitchGetSortedListByProximity,
+                                                  AbstractReplicationStrategy strat,
+                                                  ReplicaCollection&lt;?&gt; fetchRanges,
+                                                  boolean useStrictConsistency,
+                                                  TokenMetadata tmdBefore,
+                                                  TokenMetadata tmdAfter,
+                                                  String keyspace,
+                                                  Collection&lt;SourceFilter&gt; sourceFilters)
+     {
+<span class="fc" id="L462">         EndpointsByRange rangeAddresses = strat.getRangeAddresses(tmdBefore);</span>
+
+<span class="fc" id="L464">         InetAddressAndPort localAddress = FBUtilities.getBroadcastAddressAndPort();</span>
+<span class="fc" id="L465">         logger.debug (&quot;Keyspace: {}&quot;, keyspace);</span>
+<span class="fc" id="L466">         logger.debug(&quot;To fetch RN: {}&quot;, fetchRanges);</span>
+<span class="fc" id="L467">         logger.debug(&quot;Fetch ranges: {}&quot;, rangeAddresses);</span>
+
+<span class="fc" id="L469">         Predicate&lt;Replica&gt; testSourceFilters = and(sourceFilters);</span>
+<span class="fc" id="L470">         Function&lt;EndpointsForRange, EndpointsForRange&gt; sorted =</span>
+<span class="fc" id="L471">         endpoints -&gt; snitchGetSortedListByProximity.apply(localAddress, endpoints);</span>
+
+         //This list of replicas is just candidates. With strict consistency it's going to be a narrow list.
+<span class="fc" id="L474">         EndpointsByReplica.Builder rangesToFetchWithPreferredEndpoints = new EndpointsByReplica.Builder();</span>
+<span class="fc bfc" id="L475" title="All 2 branches covered.">         for (Replica toFetch : fetchRanges)</span>
+         {
+             //Replica that is sufficient to provide the data we need
+             //With strict consistency and transient replication we may end up with multiple types
+             //so this isn't used with strict consistency
+<span class="pc bpc" id="L480" title="2 of 4 branches missed.">             Predicate&lt;Replica&gt; isSufficient = r -&gt; toFetch.isTransient() || r.isFull();</span>
+
+<span class="fc" id="L482">             logger.debug(&quot;To fetch {}&quot;, toFetch);</span>
+<span class="fc bfc" id="L483" title="All 2 branches covered.">             for (Range&lt;Token&gt; range : rangeAddresses.keySet())</span>
+             {
+<span class="fc bfc" id="L485" title="All 2 branches covered.">                 if (!range.contains(toFetch.range()))</span>
+<span class="fc" id="L486">                     continue;</span>
+
+<span class="fc" id="L488">                 final EndpointsForRange oldEndpoints = sorted.apply(rangeAddresses.get(range));</span>
+
+                 //Ultimately we populate this with whatever is going to be fetched from to satisfy toFetch
+                 //It could be multiple endpoints and we must fetch from all of them if they are there
+                 //With transient replication and strict consistency this is to get the full data from a full replica and
+                 //transient data from the transient replica losing data
+                 EndpointsForRange sources;
+                 //Due to CASSANDRA-5953 we can have a higher RF than we have endpoints.
+                 //So we need to be careful to only be strict when endpoints == RF
+<span class="fc bfc" id="L497" title="All 4 branches covered.">                 boolean isStrictConsistencyApplicable = useStrictConsistency &amp;&amp; (oldEndpoints.size() == strat.getReplicationFactor().allReplicas);</span>
+<span class="fc bfc" id="L498" title="All 2 branches covered.">                 if (isStrictConsistencyApplicable)</span>
+                 {
+                     EndpointsForRange strictEndpoints;
+
+                     //Start with two sets of who replicates the range before and who replicates it after
+<span class="fc" id="L503">                     EndpointsForRange newEndpoints = strat.calculateNaturalReplicas(toFetch.range().right, tmdAfter);</span>
+<span class="fc" id="L504">                     logger.debug(&quot;Old endpoints {}&quot;, oldEndpoints);</span>
+<span class="fc" id="L505">                     logger.debug(&quot;New endpoints {}&quot;, newEndpoints);</span>
+
+                     // Remove new endpoints from old endpoints based on address
+<span class="fc" id="L508">                     strictEndpoints = oldEndpoints.without(newEndpoints.endpoints());</span>
+
+<span class="pc bpc" id="L510" title="1 of 2 branches missed.">                     if (strictEndpoints.size() &gt; 1)</span>
+<span class="nc" id="L511">                         throw new AssertionError(&quot;Expected &lt;= 1 endpoint but found &quot; + strictEndpoints);</span>
+
+                     //We have to check the source filters here to see if they will remove any replicas
+                     //required for strict consistency
+<span class="fc bfc" id="L515" title="All 2 branches covered.">                     if (!all(strictEndpoints, testSourceFilters))</span>
+<span class="fc" id="L516">                         throw new IllegalStateException(&quot;Necessary replicas for strict consistency were removed by source filters: &quot; + buildErrorMessage(sourceFilters, strictEndpoints));</span>
+
+                     //If we are transitioning from transient to full and and the set of replicas for the range is not changing
+                     //we might end up with no endpoints to fetch from by address. In that case we can pick any full replica safely
+                     //since we are already a transient replica and the existing replica remains.
+                     //The old behavior where we might be asked to fetch ranges we don't need shouldn't occur anymore.
+                     //So it's an error if we don't find what we need.
+<span class="pc bpc" id="L523" title="3 of 4 branches missed.">                     if (strictEndpoints.isEmpty() &amp;&amp; toFetch.isTransient())</span>
+<span class="nc" id="L524">                         throw new AssertionError(&quot;If there are no endpoints to fetch from then we must be transitioning from transient to full for range &quot; + toFetch);</span>
+
+<span class="pc bpc" id="L526" title="1 of 2 branches missed.">                     if (!any(strictEndpoints, isSufficient))</span>
+                     {
+                         // need an additional replica; include all our filters, to ensure we include a matching node
+<span class="nc" id="L529">                         Optional&lt;Replica&gt; fullReplica = Iterables.&lt;Replica&gt;tryFind(oldEndpoints, and(isSufficient, testSourceFilters)).toJavaUtil();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                         if (fullReplica.isPresent())</span>
+<span class="nc" id="L531">                             strictEndpoints = Endpoints.concat(strictEndpoints, EndpointsForRange.of(fullReplica.get()));</span>
+                         else
+<span class="nc" id="L533">                             throw new IllegalStateException(&quot;Couldn't find any matching sufficient replica out of &quot; + buildErrorMessage(sourceFilters, oldEndpoints));</span>
+                     }
+
+<span class="fc" id="L536">                     sources = strictEndpoints;</span>
+<span class="fc" id="L537">                 }</span>
+                 else
+                 {
+                     //Without strict consistency we have given up on correctness so no point in fetching from
+                     //a random full + transient replica since it's also likely to lose data
+                     //Also apply testSourceFilters that were given to us so we can safely select a single source
+<span class="fc" id="L543">                     sources = sorted.apply(oldEndpoints.filter(and(isSufficient, testSourceFilters)));</span>
+                     //Limit it to just the first possible source, we don't need more than one and downstream
+                     //will fetch from every source we supply
+<span class="fc bfc" id="L546" title="All 2 branches covered.">                     sources = sources.size() &gt; 0 ? sources.subList(0, 1) : sources;</span>
+                 }
+
+                 // storing range and preferred endpoint set
+<span class="fc" id="L550">                 rangesToFetchWithPreferredEndpoints.putAll(toFetch, sources, Conflict.NONE);</span>
+<span class="fc" id="L551">                 logger.debug(&quot;Endpoints to fetch for {} are {}&quot;, toFetch, sources);</span>
+<span class="fc" id="L552">             }</span>
+
+<span class="fc" id="L554">             EndpointsForRange addressList = rangesToFetchWithPreferredEndpoints.getIfPresent(toFetch);</span>
+<span class="pc bpc" id="L555" title="1 of 2 branches missed.">             if (addressList == null)</span>
+<span class="nc" id="L556">                 throw new IllegalStateException(&quot;Failed to find endpoints to fetch &quot; + toFetch);</span>
+
+             /*
+              * When we move forwards (shrink our bucket) we are the one losing a range and no one else loses
+              * from that action (we also don't gain). When we move backwards there are two people losing a range. One is a full replica
+              * and the other is a transient replica. So we must need fetch from two places in that case for the full range we gain.
+              * For a transient range we only need to fetch from one.
+              */
+<span class="pc bpc" id="L564" title="5 of 8 branches missed.">             if (useStrictConsistency &amp;&amp; addressList.size() &gt; 1 &amp;&amp; (addressList.filter(Replica::isFull).size() &gt; 1 || addressList.filter(Replica::isTransient).size() &gt; 1))</span>
+<span class="nc" id="L565">                 throw new IllegalStateException(String.format(&quot;Multiple strict sources found for %s, sources: %s&quot;, toFetch, addressList));</span>
+
+             //We must have enough stuff to fetch from
+<span class="fc bfc" id="L568" title="All 2 branches covered.">             if (!any(addressList, isSufficient))</span>
+             {
+<span class="pc bpc" id="L570" title="1 of 2 branches missed.">                 if (strat.getReplicationFactor().allReplicas == 1)</span>
+                 {
+<span class="pc bpc" id="L572" title="1 of 2 branches missed.">                     if (useStrictConsistency)</span>
+                     {
+<span class="nc" id="L574">                         logger.warn(&quot;A node required to move the data consistently is down&quot;);</span>
+<span class="nc" id="L575">                         throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + toFetch + &quot; in keyspace &quot; + keyspace + &quot; with RF=1. &quot; +</span>
+                                                         &quot;Ensure this keyspace contains replicas in the source datacenter.&quot;);
+                     }
+                     else
+<span class="fc" id="L579">                         logger.warn(&quot;Unable to find sufficient sources for streaming range {} in keyspace {} with RF=1. &quot; +</span>
+                                     &quot;Keyspace might be missing data.&quot;, toFetch, keyspace);
+                 }
+                 else
+                 {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">                     if (useStrictConsistency)</span>
+<span class="nc" id="L585">                         logger.warn(&quot;A node required to move the data consistently is down&quot;);</span>
+<span class="nc" id="L586">                     throw new IllegalStateException(&quot;Unable to find sufficient sources for streaming range &quot; + toFetch + &quot; in keyspace &quot; + keyspace);</span>
+                 }
+             }
+<span class="fc" id="L589">         }</span>
+<span class="fc" id="L590">         return rangesToFetchWithPreferredEndpoints.build();</span>
+     }
+
+    /**
+     * The preferred endpoint list is the wrong format because it is keyed by Replica (this node) rather than the source
+     * endpoint we will fetch from which streaming wants.
+     */
+    public static Multimap&lt;InetAddressAndPort, FetchReplica&gt; convertPreferredEndpointsToWorkMap(EndpointsByReplica preferredEndpoints)
+    {
+<span class="fc" id="L599">        Multimap&lt;InetAddressAndPort, FetchReplica&gt; workMap = HashMultimap.create();</span>
+<span class="fc bfc" id="L600" title="All 2 branches covered.">        for (Map.Entry&lt;Replica, EndpointsForRange&gt; e : preferredEndpoints.entrySet())</span>
+        {
+<span class="fc bfc" id="L602" title="All 2 branches covered.">            for (Replica source : e.getValue())</span>
+            {
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">                assert (e.getKey()).isSelf();</span>
+<span class="pc bpc" id="L605" title="1 of 2 branches missed.">                assert !source.isSelf();</span>
+<span class="fc" id="L606">                workMap.put(source.endpoint(), new FetchReplica(e.getKey(), source));</span>
+<span class="fc" id="L607">            }</span>
+<span class="fc" id="L608">        }</span>
+<span class="fc" id="L609">        logger.debug(&quot;Work map {}&quot;, workMap);</span>
+<span class="fc" id="L610">        return workMap;</span>
+    }
+
+    /**
+     * Optimized version that also outputs the final work map
+     */
+    private static Multimap&lt;InetAddressAndPort, FetchReplica&gt; getOptimizedWorkMap(EndpointsByReplica rangesWithSources,
+                                                                                  Collection&lt;SourceFilter&gt; sourceFilters,
+                                                                                  String keyspace)
+    {
+        //For now we just aren't going to use the optimized range fetch map with transient replication to shrink
+        //the surface area to test and introduce bugs.
+        //In the future it's possible we could run it twice once for full ranges with only full replicas
+        //and once with transient ranges and all replicas. Then merge the result.
+<span class="fc" id="L624">        EndpointsByRange.Builder unwrapped = new EndpointsByRange.Builder();</span>
+<span class="fc bfc" id="L625" title="All 2 branches covered.">        for (Map.Entry&lt;Replica, Replica&gt; entry : rangesWithSources.flattenEntries())</span>
+        {
+<span class="fc" id="L627">            Replicas.temporaryAssertFull(entry.getValue());</span>
+<span class="fc" id="L628">            unwrapped.put(entry.getKey().range(), entry.getValue());</span>
+<span class="fc" id="L629">        }</span>
+
+<span class="fc" id="L631">        EndpointsByRange unwrappedView = unwrapped.build();</span>
+<span class="fc" id="L632">        RangeFetchMapCalculator calculator = new RangeFetchMapCalculator(unwrappedView, sourceFilters, keyspace);</span>
+<span class="fc" id="L633">        Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; rangeFetchMapMap = calculator.getRangeFetchMap();</span>
+<span class="fc" id="L634">        logger.info(&quot;Output from RangeFetchMapCalculator for keyspace {}&quot;, keyspace);</span>
+<span class="fc" id="L635">        validateRangeFetchMap(unwrappedView, rangeFetchMapMap, keyspace);</span>
+
+        //Need to rewrap as Replicas
+<span class="fc" id="L638">        Multimap&lt;InetAddressAndPort, FetchReplica&gt; wrapped = HashMultimap.create();</span>
+<span class="fc bfc" id="L639" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; entry : rangeFetchMapMap.entries())</span>
+        {
+<span class="fc" id="L641">            Replica toFetch = null;</span>
+<span class="fc bfc" id="L642" title="All 2 branches covered.">            for (Replica r : rangesWithSources.keySet())</span>
+            {
+<span class="fc bfc" id="L644" title="All 2 branches covered.">                if (r.range().equals(entry.getValue()))</span>
+                {
+<span class="pc bpc" id="L646" title="1 of 2 branches missed.">                    if (toFetch != null)</span>
+<span class="nc" id="L647">                        throw new AssertionError(String.format(&quot;There shouldn't be multiple replicas for range %s, replica %s and %s here&quot;, r.range(), r, toFetch));</span>
+<span class="fc" id="L648">                    toFetch = r;</span>
+                }
+<span class="fc" id="L650">            }</span>
+<span class="pc bpc" id="L651" title="1 of 2 branches missed.">            if (toFetch == null)</span>
+<span class="nc" id="L652">                throw new AssertionError(&quot;Shouldn't be possible for the Replica we fetch to be null here&quot;);</span>
+            //Committing the cardinal sin of synthesizing a Replica, but it's ok because we assert earlier all of them
+            //are full and optimized range fetch map doesn't support transient replication yet.
+<span class="fc" id="L655">            wrapped.put(entry.getKey(), new FetchReplica(toFetch, fullReplica(entry.getKey(), entry.getValue())));</span>
+<span class="fc" id="L656">        }</span>
+
+<span class="fc" id="L658">        return wrapped;</span>
+    }
+
+    /**
+     * Verify that source returned for each range is correct
+     */
+    @VisibleForTesting
+    static void validateRangeFetchMap(EndpointsByRange rangesWithSources, Multimap&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; rangeFetchMapMap, String keyspace)
+    {
+<span class="fc bfc" id="L667" title="All 2 branches covered.">        for (Map.Entry&lt;InetAddressAndPort, Range&lt;Token&gt;&gt; entry : rangeFetchMapMap.entries())</span>
+        {
+<span class="pc bpc" id="L669" title="1 of 2 branches missed.">            if(entry.getKey().equals(FBUtilities.getBroadcastAddressAndPort()))</span>
+            {
+<span class="nc" id="L671">                throw new IllegalStateException(&quot;Trying to stream locally. Range: &quot; + entry.getValue()</span>
+                                        + &quot; in keyspace &quot; + keyspace);
+            }
+
+<span class="pc bpc" id="L675" title="1 of 2 branches missed.">            if (!rangesWithSources.get(entry.getValue()).endpoints().contains(entry.getKey()))</span>
+            {
+<span class="nc" id="L677">                throw new IllegalStateException(&quot;Trying to stream from wrong endpoint. Range: &quot; + entry.getValue()</span>
+<span class="nc" id="L678">                                                + &quot; in keyspace &quot; + keyspace + &quot; from endpoint: &quot; + entry.getKey());</span>
+            }
+
+<span class="fc" id="L681">            logger.info(&quot;Streaming range {} from endpoint {} for keyspace {}&quot;, entry.getValue(), entry.getKey(), keyspace);</span>
+<span class="fc" id="L682">        }</span>
+<span class="fc" id="L683">    }</span>
+
+    // For testing purposes
+    @VisibleForTesting
+    Map&lt;String, Multimap&lt;InetAddressAndPort, FetchReplica&gt;&gt; toFetch()
+    {
+<span class="nc" id="L689">        return toFetch;</span>
+    }
+
+    public StreamResultFuture fetchAsync()
+    {
+<span class="fc" id="L694">        toFetch.forEach((keyspace, sources) -&gt; {</span>
+<span class="fc" id="L695">            logger.debug(&quot;Keyspace {} Sources {}&quot;, keyspace, sources);</span>
+<span class="fc" id="L696">            sources.asMap().forEach((source, fetchReplicas) -&gt; {</span>
+
+                List&lt;FetchReplica&gt; remaining;
+
+                // If the operator's specified they want to reset bootstrap progress, we don't check previous attempted
+                // bootstraps and just restart with all.
+<span class="fc bfc" id="L702" title="All 2 branches covered.">                if (RESET_BOOTSTRAP_PROGRESS.getBoolean())</span>
+                {
+                    // TODO: Also remove the files on disk. See discussion in CASSANDRA-17679
+<span class="fc" id="L705">                    SystemKeyspace.resetAvailableStreamedRangesForKeyspace(keyspace);</span>
+<span class="fc" id="L706">                    remaining = new ArrayList&lt;&gt;(fetchReplicas);</span>
+                }
+                else
+                {
+                    // Filter out already streamed ranges
+<span class="fc" id="L711">                    SystemKeyspace.AvailableRanges available = stateStore.getAvailableRanges(keyspace, metadata.partitioner);</span>
+
+<span class="fc" id="L713">                    Predicate&lt;FetchReplica&gt; isAvailable = fetch -&gt; {</span>
+<span class="fc" id="L714">                        boolean isInFull = available.full.contains(fetch.local.range());</span>
+<span class="fc" id="L715">                        boolean isInTrans = available.trans.contains(fetch.local.range());</span>
+
+<span class="pc bpc" id="L717" title="1 of 4 branches missed.">                        if (!isInFull &amp;&amp; !isInTrans)</span>
+                            // Range is unavailable
+<span class="fc" id="L719">                            return false;</span>
+
+<span class="pc bpc" id="L721" title="1 of 2 branches missed.">                        if (fetch.local.isFull())</span>
+                            // For full, pick only replicas with matching transientness
+<span class="pc bpc" id="L723" title="1 of 2 branches missed.">                            return isInFull == fetch.remote.isFull();</span>
+
+                        // Any transient or full will do
+<span class="nc" id="L726">                        return true;</span>
+                    };
+
+<span class="fc" id="L729">                    remaining = fetchReplicas.stream().filter(not(isAvailable)).collect(Collectors.toList());</span>
+
+<span class="fc bfc" id="L731" title="All 2 branches covered.">                    if (remaining.size() &lt; available.full.size() + available.trans.size())</span>
+                    {
+                        // If the operator hasn't specified what to do when we discover a previous partially successful bootstrap,
+                        // we error out and tell them to manually reconcile it. See CASSANDRA-17679.
+<span class="pc bpc" id="L735" title="1 of 2 branches missed.">                        if (!RESET_BOOTSTRAP_PROGRESS.isPresent())</span>
+                        {
+<span class="nc" id="L737">                            List&lt;FetchReplica&gt; skipped = fetchReplicas.stream().filter(isAvailable).collect(Collectors.toList());</span>
+<span class="nc" id="L738">                            String msg = String.format(&quot;Discovered existing bootstrap data and %s &quot; +</span>
+                                                       &quot;is not configured; aborting bootstrap. Please clean up local files manually &quot; +
+                                                       &quot;and try again or set cassandra.reset_bootstrap_progress=true to ignore. &quot; +
+                                                       &quot;Found: %s. Fully available: %s. Transiently available: %s&quot;,
+<span class="nc" id="L742">                                                       RESET_BOOTSTRAP_PROGRESS.getKey(), skipped, available.full, available.trans);</span>
+<span class="nc" id="L743">                            logger.error(msg);</span>
+<span class="nc" id="L744">                            throw new IllegalStateException(msg);</span>
+                        }
+
+<span class="pc bpc" id="L747" title="1 of 2 branches missed.">                        if (!RESET_BOOTSTRAP_PROGRESS.getBoolean())</span>
+                        {
+<span class="fc" id="L749">                            List&lt;FetchReplica&gt; skipped = fetchReplicas.stream().filter(isAvailable).collect(Collectors.toList());</span>
+<span class="fc" id="L750">                            logger.info(&quot;Some ranges of {} are already available. Skipping streaming those ranges. Skipping {}. Fully available {} Transiently available {}&quot;,</span>
+                                        fetchReplicas, skipped, available.full, available.trans);
+                        }
+                    }
+                }
+
+<span class="pc bpc" id="L756" title="1 of 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L757">                    logger.trace(&quot;{}ing from {} ranges {}&quot;, description, source, StringUtils.join(remaining, &quot;, &quot;));</span>
+
+<span class="fc" id="L759">                InetAddressAndPort self = FBUtilities.getBroadcastAddressAndPort();</span>
+<span class="fc" id="L760">                RangesAtEndpoint full = remaining.stream()</span>
+<span class="fc" id="L761">                        .filter(pair -&gt; pair.remote.isFull())</span>
+<span class="fc" id="L762">                        .map(pair -&gt; pair.local)</span>
+<span class="fc" id="L763">                        .collect(RangesAtEndpoint.collector(self));</span>
+<span class="fc" id="L764">                RangesAtEndpoint transientReplicas = remaining.stream()</span>
+<span class="fc" id="L765">                        .filter(pair -&gt; pair.remote.isTransient())</span>
+<span class="pc" id="L766">                        .map(pair -&gt; pair.local)</span>
+<span class="fc" id="L767">                        .collect(RangesAtEndpoint.collector(self));</span>
+
+<span class="fc" id="L769">                logger.debug(&quot;Source and our replicas {}&quot;, fetchReplicas);</span>
+<span class="fc" id="L770">                logger.debug(&quot;Source {} Keyspace {}  streaming full {} transient {}&quot;, source, keyspace, full, transientReplicas);</span>
+
+                /* Send messages to respective folks to stream data over to me */
+<span class="fc" id="L773">                streamPlan.requestRanges(source, keyspace, full, transientReplicas);</span>
+<span class="fc" id="L774">            });</span>
+<span class="fc" id="L775">        });</span>
+
+<span class="fc" id="L777">        return streamPlan.execute();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,736 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>UDFunction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.functions</a> &gt; <span class="el_source">UDFunction.java</span></div><h1>UDFunction.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.functions;
+
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
+import java.net.InetAddress;
+import java.net.URL;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture; // checkstyle: permit this import
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.base.Objects;
+import com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ImmediateExecutor;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.cql3.functions.types.TypeCodec;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.exceptions.FunctionExecutionException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+/**
+ * Base class for User Defined Functions.
+ */
+public abstract class UDFunction extends UserFunction implements ScalarFunction
+{
+<span class="nc" id="L69">    protected static final Logger logger = LoggerFactory.getLogger(UDFunction.class);</span>
+
+<span class="nc" id="L71">    static final ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();</span>
+
+    protected final List&lt;ColumnIdentifier&gt; argNames;
+
+    protected final String language;
+    protected final String body;
+
+    protected final List&lt;UDFDataType&gt; argumentTypes;
+    protected final UDFDataType resultType;
+    protected final boolean calledOnNullInput;
+
+    protected final UDFContext udfContext;
+
+    //
+    // Access to classes is controlled via allow and disallow lists.
+    //
+    // When a class is requested (both during compilation and runtime),
+    // the allowedPatterns array is searched first, whether the
+    // requested name matches one of the patterns. If not, nothing is
+    // returned from the class-loader - meaning ClassNotFoundException
+    // during runtime and &quot;type could not resolved&quot; during compilation.
+    //
+    // If an allowed pattern has been found, the disallowedPatterns
+    // array is searched for a match. If a match is found, class-loader
+    // rejects access. Otherwise the class/resource can be loaded.
+    //
+<span class="nc" id="L97">    private static final String[] allowedPatterns =</span>
+    {
+    &quot;com/google/common/reflect/TypeToken&quot;,
+    &quot;java/io/IOException.class&quot;,
+    &quot;java/io/Serializable.class&quot;,
+    &quot;java/lang/&quot;,
+    &quot;java/math/&quot;,
+    &quot;java/net/InetAddress.class&quot;,
+    &quot;java/net/Inet4Address.class&quot;,
+    &quot;java/net/Inet6Address.class&quot;,
+    &quot;java/net/UnknownHostException.class&quot;, // req'd by InetAddress
+    &quot;java/net/NetworkInterface.class&quot;, // req'd by InetAddress
+    &quot;java/net/SocketException.class&quot;, // req'd by InetAddress
+    &quot;java/nio/Buffer.class&quot;,
+    &quot;java/nio/ByteBuffer.class&quot;,
+    &quot;java/text/&quot;,
+    &quot;java/time/&quot;,
+    &quot;java/util/&quot;,
+    &quot;org/apache/cassandra/cql3/functions/types/&quot;,
+    &quot;org/apache/cassandra/cql3/functions/Arguments.class&quot;,
+    &quot;org/apache/cassandra/cql3/functions/UDFDataType.class&quot;,
+    &quot;org/apache/cassandra/cql3/functions/JavaUDF.class&quot;,
+    &quot;org/apache/cassandra/cql3/functions/UDFContext.class&quot;,
+    &quot;org/apache/cassandra/exceptions/&quot;,
+    &quot;org/apache/cassandra/transport/ProtocolVersion.class&quot;
+    };
+    // Only need to disallow a pattern, if it would otherwise be allowed via allowedPatterns
+<span class="nc" id="L124">    private static final String[] disallowedPatterns =</span>
+    {
+    &quot;com/datastax/driver/core/Cluster.class&quot;,
+    &quot;com/datastax/driver/core/Metrics.class&quot;,
+    &quot;com/datastax/driver/core/NettyOptions.class&quot;,
+    &quot;com/datastax/driver/core/Session.class&quot;,
+    &quot;com/datastax/driver/core/Statement.class&quot;,
+    &quot;com/datastax/driver/core/TimestampGenerator.class&quot;, // indirectly covers ServerSideTimestampGenerator + ThreadLocalMonotonicTimestampGenerator
+    &quot;java/lang/Compiler.class&quot;,
+    &quot;java/lang/InheritableThreadLocal.class&quot;,
+    &quot;java/lang/Package.class&quot;,
+    &quot;java/lang/Process.class&quot;,
+    &quot;java/lang/ProcessBuilder.class&quot;,
+    &quot;java/lang/ProcessEnvironment.class&quot;,
+    &quot;java/lang/ProcessImpl.class&quot;,
+    &quot;java/lang/Runnable.class&quot;,
+    &quot;java/lang/Runtime.class&quot;,
+    &quot;java/lang/Shutdown.class&quot;,
+    &quot;java/lang/Thread.class&quot;,
+    &quot;java/lang/ThreadGroup.class&quot;,
+    &quot;java/lang/ThreadLocal.class&quot;,
+    &quot;java/lang/instrument/&quot;,
+    &quot;java/lang/invoke/&quot;,
+    &quot;java/lang/management/&quot;,
+    &quot;java/lang/ref/&quot;,
+    &quot;java/lang/reflect/&quot;,
+    &quot;java/util/ServiceLoader.class&quot;,
+    &quot;java/util/Timer.class&quot;,
+    &quot;java/util/concurrent/&quot;,
+    &quot;java/util/function/&quot;,
+    &quot;java/util/jar/&quot;,
+    &quot;java/util/logging/&quot;,
+    &quot;java/util/prefs/&quot;,
+    &quot;java/util/spi/&quot;,
+    &quot;java/util/stream/&quot;,
+    &quot;java/util/zip/&quot;,
+    };
+
+<span class="nc" id="L162">    private static final String[] disallowedPatternsSyncUDF =</span>
+    {
+    &quot;java/lang/System.class&quot;
+    };
+
+    static boolean secureResource(String resource)
+    {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        while (resource.startsWith(&quot;/&quot;))</span>
+<span class="nc" id="L170">            resource = resource.substring(1);</span>
+
+<span class="nc bnc" id="L172" title="All 2 branches missed.">        for (String allowed : allowedPatterns)</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">            if (resource.startsWith(allowed))</span>
+            {
+                // resource is in allowedPatterns, let's see if it is not explicitly disallowed
+<span class="nc bnc" id="L176" title="All 2 branches missed.">                for (String disallowed : disallowedPatterns)</span>
+                {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                    if (resource.startsWith(disallowed))</span>
+                    {
+<span class="nc" id="L180">                        logger.trace(&quot;access denied: resource {}&quot;, resource);</span>
+<span class="nc" id="L181">                        return false;</span>
+                    }
+                }
+<span class="nc bnc" id="L184" title="All 4 branches missed.">                if (!DatabaseDescriptor.enableUserDefinedFunctionsThreads() &amp;&amp; !DatabaseDescriptor.allowExtraInsecureUDFs())</span>
+                {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                    for (String disallowed : disallowedPatternsSyncUDF)</span>
+                    {
+<span class="nc bnc" id="L188" title="All 2 branches missed.">                        if (resource.startsWith(disallowed))</span>
+                        {
+<span class="nc" id="L190">                            logger.trace(&quot;access denied: resource {}&quot;, resource);</span>
+<span class="nc" id="L191">                            return false;</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L196">                return true;</span>
+            }
+
+<span class="nc" id="L199">        logger.trace(&quot;access denied: resource {}&quot;, resource);</span>
+<span class="nc" id="L200">        return false;</span>
+    }
+
+    // setup the UDF class loader with a context class loader as a parent so that we have full control about what class/resource UDF uses
+<span class="nc" id="L204">    static final ClassLoader udfClassLoader = new UDFClassLoader();</span>
+
+    protected UDFunction(FunctionName name,
+                         List&lt;ColumnIdentifier&gt; argNames,
+                         List&lt;AbstractType&lt;?&gt;&gt; argTypes,
+                         AbstractType&lt;?&gt; returnType,
+                         boolean calledOnNullInput,
+                         String language,
+                         String body)
+    {
+<span class="nc" id="L214">        super(name, argTypes, returnType);</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">        assert new HashSet&lt;&gt;(argNames).size() == argNames.size() : &quot;duplicate argument names&quot;;</span>
+<span class="nc" id="L216">        this.argNames = argNames;</span>
+<span class="nc" id="L217">        this.language = language;</span>
+<span class="nc" id="L218">        this.body = body;</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        this.argumentTypes = UDFDataType.wrap(argTypes, !calledOnNullInput);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        this.resultType = UDFDataType.wrap(returnType, !calledOnNullInput);</span>
+<span class="nc" id="L221">        this.calledOnNullInput = calledOnNullInput;</span>
+<span class="nc" id="L222">        this.udfContext = new UDFContextImpl(argNames, argumentTypes, resultType, name.keyspace);</span>
+<span class="nc" id="L223">    }</span>
+
+    @Override
+    public Arguments newArguments(ProtocolVersion version)
+    {
+<span class="nc" id="L228">        return FunctionArguments.newInstanceForUdf(version, argumentTypes);</span>
+    }
+
+    public static UDFunction tryCreate(FunctionName name,
+                                       List&lt;ColumnIdentifier&gt; argNames,
+                                       List&lt;AbstractType&lt;?&gt;&gt; argTypes,
+                                       AbstractType&lt;?&gt; returnType,
+                                       boolean calledOnNullInput,
+                                       String language,
+                                       String body)
+    {
+        try
+        {
+<span class="nc" id="L241">            return create(name, argNames, argTypes, returnType, calledOnNullInput, language, body);</span>
+        }
+<span class="nc" id="L243">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L245">            return createBrokenFunction(name, argNames, argTypes, returnType, calledOnNullInput, language, body, e);</span>
+        }
+    }
+
+    public static UDFunction create(FunctionName name,
+                                    List&lt;ColumnIdentifier&gt; argNames,
+                                    List&lt;AbstractType&lt;?&gt;&gt; argTypes,
+                                    AbstractType&lt;?&gt; returnType,
+                                    boolean calledOnNullInput,
+                                    String language,
+                                    String body)
+    {
+<span class="nc" id="L257">        assertUdfsEnabled(language);</span>
+
+<span class="nc" id="L259">        return new JavaBasedUDFunction(name, argNames, argTypes, returnType, calledOnNullInput, body);</span>
+    }
+
+    /**
+     * It can happen that a function has been declared (is listed in the scheam) but cannot
+     * be loaded (maybe only on some nodes). This is the case for instance if the class defining
+     * the class is not on the classpath for some of the node, or after a restart. In that case,
+     * we create a &quot;fake&quot; function so that:
+     *  1) the broken function can be dropped easily if that is what people want to do.
+     *  2) we return a meaningful error message if the function is executed (something more precise
+     *     than saying that the function doesn't exist)
+     */
+    public static UDFunction createBrokenFunction(FunctionName name,
+                                                  List&lt;ColumnIdentifier&gt; argNames,
+                                                  List&lt;AbstractType&lt;?&gt;&gt; argTypes,
+                                                  AbstractType&lt;?&gt; returnType,
+                                                  boolean calledOnNullInput,
+                                                  String language,
+                                                  String body,
+                                                  InvalidRequestException reason)
+    {
+<span class="nc" id="L280">        return new UDFunction(name, argNames, argTypes, returnType, calledOnNullInput, language, body)</span>
+<span class="nc" id="L281">        {</span>
+            protected ExecutorService executor()
+            {
+<span class="nc" id="L284">                return ImmediateExecutor.INSTANCE;</span>
+            }
+
+            @Override
+            protected Object executeAggregateUserDefined(Object firstParam, Arguments arguments)
+            {
+<span class="nc" id="L290">                throw broken();</span>
+            }
+
+            @Override
+            public ByteBuffer executeUserDefined(Arguments arguments)
+            {
+<span class="nc" id="L296">                throw broken();</span>
+            }
+
+            private InvalidRequestException broken()
+            {
+<span class="nc" id="L301">                return new InvalidRequestException(String.format(&quot;Function '%s' exists but hasn't been loaded successfully &quot;</span>
+                                                                 + &quot;for the following reason: %s. Please see the server log for details&quot;,
+                                                                 this,
+<span class="nc" id="L304">                                                                 reason.getMessage()));</span>
+            }
+        };
+    }
+
+    @Override
+    public SchemaElementType elementType()
+    {
+<span class="nc" id="L312">        return SchemaElementType.FUNCTION;</span>
+    }
+
+    @Override
+    public String toCqlString(boolean withInternals, boolean ifNotExists)
+    {
+<span class="nc" id="L318">        CqlBuilder builder = new CqlBuilder();</span>
+<span class="nc" id="L319">        builder.append(&quot;CREATE FUNCTION &quot;);</span>
+
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (ifNotExists)</span>
+        {
+<span class="nc" id="L323">            builder.append(&quot;IF NOT EXISTS &quot;);</span>
+        }
+
+<span class="nc" id="L326">        builder.append(name()).append(&quot;(&quot;);</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        for (int i = 0, m = argNames().size(); i &lt; m; i++)</span>
+        {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if (i &gt; 0)</span>
+<span class="nc" id="L331">                builder.append(&quot;, &quot;);</span>
+<span class="nc" id="L332">            builder.append(argNames().get(i))</span>
+<span class="nc" id="L333">                   .append(' ')</span>
+<span class="nc" id="L334">                   .append(toCqlString(argTypes().get(i)));</span>
+        }
+
+<span class="nc" id="L337">        builder.append(')')</span>
+<span class="nc" id="L338">               .newLine()</span>
+<span class="nc" id="L339">               .increaseIndent()</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">               .append(isCalledOnNullInput() ? &quot;CALLED&quot; : &quot;RETURNS NULL&quot;)</span>
+<span class="nc" id="L341">               .append(&quot; ON NULL INPUT&quot;)</span>
+<span class="nc" id="L342">               .newLine()</span>
+<span class="nc" id="L343">               .append(&quot;RETURNS &quot;)</span>
+<span class="nc" id="L344">               .append(toCqlString(returnType()))</span>
+<span class="nc" id="L345">               .newLine()</span>
+<span class="nc" id="L346">               .append(&quot;LANGUAGE &quot;)</span>
+<span class="nc" id="L347">               .append(language())</span>
+<span class="nc" id="L348">               .newLine()</span>
+<span class="nc" id="L349">               .append(&quot;AS $$&quot;)</span>
+<span class="nc" id="L350">               .append(body())</span>
+<span class="nc" id="L351">               .append(&quot;$$;&quot;);</span>
+
+<span class="nc" id="L353">        return builder.toString();</span>
+    }
+
+    @Override
+    public boolean isPure()
+    {
+        // Right now, we have no way to check if an UDF is pure. Due to that we consider them as non pure to avoid any risk.
+<span class="nc" id="L360">        return false;</span>
+    }
+
+    @Override
+    public final ByteBuffer execute(Arguments arguments)
+    {
+<span class="nc" id="L366">        assertUdfsEnabled(language);</span>
+
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if (!isCallableWrtNullable(arguments))</span>
+<span class="nc" id="L369">            return null;</span>
+
+<span class="nc" id="L371">        long tStart = nanoTime();</span>
+
+        try
+        {
+            // Using async UDF execution is expensive (adds about 100us overhead per invocation on a Core-i7 MBPr).
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            ByteBuffer result = DatabaseDescriptor.enableUserDefinedFunctionsThreads()</span>
+<span class="nc" id="L377">                                ? executeAsync(arguments)</span>
+<span class="nc" id="L378">                                : executeUserDefined(arguments);</span>
+
+<span class="nc" id="L380">            Tracing.trace(&quot;Executed UDF {} in {}\u03bcs&quot;, name(), (nanoTime() - tStart) / 1000);</span>
+<span class="nc" id="L381">            return result;</span>
+        }
+<span class="nc" id="L383">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L385">            throw e;</span>
+        }
+<span class="nc" id="L387">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L389">            logger.trace(&quot;Invocation of user-defined function '{}' failed&quot;, this, t);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            if (t instanceof VirtualMachineError)</span>
+<span class="nc" id="L391">                throw (VirtualMachineError) t;</span>
+<span class="nc" id="L392">            throw FunctionExecutionException.create(this, t);</span>
+        }
+    }
+
+    public final Object executeForAggregate(Object state, Arguments arguments)
+    {
+<span class="nc" id="L398">        assertUdfsEnabled(language);</span>
+
+<span class="nc bnc" id="L400" title="All 6 branches missed.">        if (!calledOnNullInput &amp;&amp; state == null || !isCallableWrtNullable(arguments))</span>
+<span class="nc" id="L401">            return null;</span>
+
+<span class="nc" id="L403">        long tStart = nanoTime();</span>
+
+        try
+        {
+            // Using async UDF execution is expensive (adds about 100us overhead per invocation on a Core-i7 MBPr).
+<span class="nc bnc" id="L408" title="All 2 branches missed.">            Object result = DatabaseDescriptor.enableUserDefinedFunctionsThreads()</span>
+<span class="nc" id="L409">                                ? executeAggregateAsync(state, arguments)</span>
+<span class="nc" id="L410">                                : executeAggregateUserDefined(state, arguments);</span>
+<span class="nc" id="L411">            Tracing.trace(&quot;Executed UDF {} in {}\u03bcs&quot;, name(), (nanoTime() - tStart) / 1000);</span>
+<span class="nc" id="L412">            return result;</span>
+        }
+<span class="nc" id="L414">        catch (InvalidRequestException e)</span>
+        {
+<span class="nc" id="L416">            throw e;</span>
+        }
+<span class="nc" id="L418">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L420">            logger.debug(&quot;Invocation of user-defined function '{}' failed&quot;, this, t);</span>
+<span class="nc bnc" id="L421" title="All 2 branches missed.">            if (t instanceof VirtualMachineError)</span>
+<span class="nc" id="L422">                throw (VirtualMachineError) t;</span>
+<span class="nc" id="L423">            throw FunctionExecutionException.create(this, t);</span>
+        }
+    }
+
+    public static void assertUdfsEnabled(String language)
+    {
+<span class="nc bnc" id="L429" title="All 2 branches missed.">        if (!DatabaseDescriptor.enableUserDefinedFunctions())</span>
+<span class="nc" id="L430">            throw new InvalidRequestException(&quot;User-defined functions are disabled in cassandra.yaml - set user_defined_functions_enabled=true to enable&quot;);</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">        if (!&quot;java&quot;.equalsIgnoreCase(language))</span>
+<span class="nc" id="L432">            throw new InvalidRequestException(&quot;Currently only Java UDFs are available in Cassandra. For more information - CASSANDRA-18252 and CASSANDRA-17281&quot;);</span>
+<span class="nc" id="L433">    }</span>
+
+    static void initializeThread()
+    {
+        // Get the TypeCodec stuff in Java Driver initialized.
+        // This is to get the classes loaded outside of the restricted sandbox's security context of a UDF.
+<span class="nc" id="L439">        TypeCodec.inet().format(InetAddress.getLoopbackAddress());</span>
+<span class="nc" id="L440">        TypeCodec.ascii().format(&quot;&quot;);</span>
+<span class="nc" id="L441">    }</span>
+
+    private static final class ThreadIdAndCpuTime extends CompletableFuture&lt;Object&gt;
+    {
+        long threadId;
+        long cpuTime;
+
+        ThreadIdAndCpuTime()
+<span class="nc" id="L449">        {</span>
+            // Looks weird?
+            // This call &quot;just&quot; links this class to java.lang.management - otherwise UDFs (script UDFs) might fail due to
+            //      java.security.AccessControlException: access denied: (&quot;java.lang.RuntimePermission&quot; &quot;accessClassInPackage.java.lang.management&quot;)
+            // because class loading would be deferred until setup() is executed - but setup() is called with
+            // limited privileges.
+<span class="nc" id="L455">            threadMXBean.getCurrentThreadCpuTime();</span>
+<span class="nc" id="L456">        }</span>
+
+        void setup()
+        {
+<span class="nc" id="L460">            this.threadId = Thread.currentThread().getId();</span>
+<span class="nc" id="L461">            this.cpuTime = threadMXBean.getCurrentThreadCpuTime();</span>
+<span class="nc" id="L462">            complete(null);</span>
+<span class="nc" id="L463">        }</span>
+    }
+
+    private ByteBuffer executeAsync(Arguments arguments)
+    {
+<span class="nc" id="L468">        ThreadIdAndCpuTime threadIdAndCpuTime = new ThreadIdAndCpuTime();</span>
+
+<span class="nc" id="L470">        return async(threadIdAndCpuTime, () -&gt; {</span>
+<span class="nc" id="L471">            threadIdAndCpuTime.setup();</span>
+<span class="nc" id="L472">            return executeUserDefined(arguments);</span>
+        });
+    }
+
+    private Object executeAggregateAsync(Object state, Arguments arguments)
+    {
+<span class="nc" id="L478">        ThreadIdAndCpuTime threadIdAndCpuTime = new ThreadIdAndCpuTime();</span>
+
+<span class="nc" id="L480">        return async(threadIdAndCpuTime, () -&gt; {</span>
+<span class="nc" id="L481">            threadIdAndCpuTime.setup();</span>
+<span class="nc" id="L482">            return executeAggregateUserDefined(state, arguments);</span>
+        });
+    }
+
+    private &lt;T&gt; T async(ThreadIdAndCpuTime threadIdAndCpuTime, Callable&lt;T&gt; callable)
+    {
+<span class="nc" id="L488">        Future&lt;T&gt; future = executor().submit(callable);</span>
+
+        try
+        {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">            if (DatabaseDescriptor.getUserDefinedFunctionWarnTimeout() &gt; 0)</span>
+                try
+                {
+<span class="nc" id="L495">                    return future.get(DatabaseDescriptor.getUserDefinedFunctionWarnTimeout(), TimeUnit.MILLISECONDS);</span>
+                }
+<span class="nc" id="L497">                catch (TimeoutException e)</span>
+                {
+
+                    // log and emit a warning that UDF execution took long
+<span class="nc" id="L501">                    String warn = String.format(&quot;User defined function %s ran longer than %dms&quot;, this, DatabaseDescriptor.getUserDefinedFunctionWarnTimeout());</span>
+<span class="nc" id="L502">                    logger.warn(warn);</span>
+<span class="nc" id="L503">                    ClientWarn.instance.warn(warn);</span>
+                }
+
+            // retry with difference of warn-timeout to fail-timeout
+<span class="nc" id="L507">            return future.get(DatabaseDescriptor.getUserDefinedFunctionFailTimeout() - DatabaseDescriptor.getUserDefinedFunctionWarnTimeout(), TimeUnit.MILLISECONDS);</span>
+        }
+<span class="nc" id="L509">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L511">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L512">            throw new UncheckedInterruptedException(e);</span>
+        }
+<span class="nc" id="L514">        catch (ExecutionException e)</span>
+        {
+<span class="nc" id="L516">            Throwable c = e.getCause();</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">            if (c instanceof RuntimeException)</span>
+<span class="nc" id="L518">                throw (RuntimeException) c;</span>
+<span class="nc" id="L519">            throw new RuntimeException(c);</span>
+        }
+<span class="nc" id="L521">        catch (TimeoutException e)</span>
+        {
+            // retry a last time with the difference of UDF-fail-timeout to consumed CPU time (just in case execution hit a badly timed GC)
+            try
+            {
+                //The threadIdAndCpuTime shouldn't take a long time to be set so this should return immediately
+<span class="nc" id="L527">                threadIdAndCpuTime.get(1, TimeUnit.SECONDS);</span>
+
+<span class="nc" id="L529">                long cpuTimeMillis = threadMXBean.getThreadCpuTime(threadIdAndCpuTime.threadId) - threadIdAndCpuTime.cpuTime;</span>
+<span class="nc" id="L530">                cpuTimeMillis /= 1000000L;</span>
+
+<span class="nc" id="L532">                return future.get(Math.max(DatabaseDescriptor.getUserDefinedFunctionFailTimeout() - cpuTimeMillis, 0L),</span>
+                                  TimeUnit.MILLISECONDS);
+            }
+<span class="nc" id="L535">            catch (InterruptedException e1)</span>
+            {
+<span class="nc" id="L537">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L538">                throw new UncheckedInterruptedException(e1);</span>
+            }
+<span class="nc" id="L540">            catch (ExecutionException e1)</span>
+            {
+<span class="nc" id="L542">                Throwable c = e.getCause();</span>
+<span class="nc bnc" id="L543" title="All 2 branches missed.">                if (c instanceof RuntimeException)</span>
+<span class="nc" id="L544">                    throw (RuntimeException) c;</span>
+<span class="nc" id="L545">                throw new RuntimeException(c);</span>
+            }
+<span class="nc" id="L547">            catch (TimeoutException e1)</span>
+            {
+<span class="nc" id="L549">                TimeoutException cause = new TimeoutException(String.format(&quot;User defined function %s ran longer than %dms%s&quot;,</span>
+                                                                            this,
+<span class="nc" id="L551">                                                                            DatabaseDescriptor.getUserDefinedFunctionFailTimeout(),</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">                                                                            DatabaseDescriptor.getUserFunctionTimeoutPolicy() == Config.UserFunctionTimeoutPolicy.ignore</span>
+<span class="nc" id="L553">                                                                            ? &quot;&quot; : &quot; - will stop Cassandra VM&quot;));</span>
+<span class="nc" id="L554">                FunctionExecutionException fe = FunctionExecutionException.create(this, cause);</span>
+<span class="nc" id="L555">                JVMStabilityInspector.userFunctionTimeout(cause);</span>
+<span class="nc" id="L556">                throw fe;</span>
+            }
+        }
+    }
+
+    protected abstract ExecutorService executor();
+
+    public boolean isCallableWrtNullable(Arguments arguments)
+    {
+<span class="nc bnc" id="L565" title="All 4 branches missed.">        return calledOnNullInput || !arguments.containsNulls();</span>
+    }
+
+    protected abstract ByteBuffer executeUserDefined(Arguments arguments);
+
+    protected abstract Object executeAggregateUserDefined(Object firstParam, Arguments arguments);
+
+    public boolean isAggregate()
+    {
+<span class="nc" id="L574">        return false;</span>
+    }
+
+    public boolean isCalledOnNullInput()
+    {
+<span class="nc" id="L579">        return calledOnNullInput;</span>
+    }
+
+    public List&lt;ColumnIdentifier&gt; argNames()
+    {
+<span class="nc" id="L584">        return argNames;</span>
+    }
+
+    public String body()
+    {
+<span class="nc" id="L589">        return body;</span>
+    }
+
+    public String language()
+    {
+<span class="nc" id="L594">        return language;</span>
+    }
+
+    /**
+     * Used by UDF implementations (both Java code generated by {@link JavaBasedUDFunction}) to convert the Java
+     * object representation for the return value to the C* serialized representation.
+     *
+     * @param protocolVersion the native protocol version used for serialization
+     */
+    protected ByteBuffer decompose(ProtocolVersion protocolVersion, Object value)
+    {
+<span class="nc" id="L605">        return resultType.decompose(protocolVersion, value);</span>
+    }
+
+    @Override
+    public boolean referencesUserType(ByteBuffer name)
+    {
+<span class="nc bnc" id="L611" title="All 4 branches missed.">        return any(argTypes(), t -&gt; t.referencesUserType(name)) || returnType.referencesUserType(name);</span>
+    }
+
+    public UDFunction withUpdatedUserType(UserType udt)
+    {
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        if (!referencesUserType(udt.name))</span>
+<span class="nc" id="L617">            return this;</span>
+
+<span class="nc" id="L619">        return tryCreate(name,</span>
+                         argNames,
+<span class="nc" id="L621">                         Lists.newArrayList(transform(argTypes, t -&gt; t.withUpdatedUserType(udt))),</span>
+<span class="nc" id="L622">                         returnType.withUpdatedUserType(udt),</span>
+                         calledOnNullInput,
+                         language,
+                         body);
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (!(o instanceof UDFunction))</span>
+<span class="nc" id="L632">            return false;</span>
+
+<span class="nc" id="L634">        UDFunction that = (UDFunction)o;</span>
+<span class="nc bnc" id="L635" title="All 2 branches missed.">        return equalsWithoutTypes(that)</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">            &amp;&amp; argTypes.equals(that.argTypes)</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            &amp;&amp; returnType.equals(that.returnType);</span>
+    }
+
+    private boolean equalsWithoutTypes(UDFunction other)
+    {
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        return name.equals(other.name)</span>
+<span class="nc bnc" id="L643" title="All 2 branches missed.">            &amp;&amp; argTypes.size() == other.argTypes.size()</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            &amp;&amp; argNames.equals(other.argNames)</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            &amp;&amp; body.equals(other.body)</span>
+<span class="nc bnc" id="L646" title="All 4 branches missed.">            &amp;&amp; language.equals(other.language)</span>
+            &amp;&amp; calledOnNullInput == other.calledOnNullInput;
+    }
+
+    @Override
+    public Optional&lt;Difference&gt; compare(Function function)
+    {
+<span class="nc bnc" id="L653" title="All 2 branches missed.">        if (!(function instanceof UDFunction))</span>
+<span class="nc" id="L654">            throw new IllegalArgumentException();</span>
+
+<span class="nc" id="L656">        UDFunction other = (UDFunction) function;</span>
+
+<span class="nc bnc" id="L658" title="All 2 branches missed.">        if (!equalsWithoutTypes(other))</span>
+<span class="nc" id="L659">            return Optional.of(Difference.SHALLOW);</span>
+
+<span class="nc" id="L661">        boolean typesDifferDeeply = false;</span>
+
+<span class="nc bnc" id="L663" title="All 2 branches missed.">        if (!returnType.equals(other.returnType))</span>
+        {
+<span class="nc bnc" id="L665" title="All 2 branches missed.">            if (returnType.asCQL3Type().toString().equals(other.returnType.asCQL3Type().toString()))</span>
+<span class="nc" id="L666">                typesDifferDeeply = true;</span>
+            else
+<span class="nc" id="L668">                return Optional.of(Difference.SHALLOW);</span>
+        }
+
+<span class="nc bnc" id="L671" title="All 2 branches missed.">        for (int i = 0; i &lt; argTypes().size(); i++)</span>
+        {
+<span class="nc" id="L673">            AbstractType&lt;?&gt; thisType = argTypes.get(i);</span>
+<span class="nc" id="L674">            AbstractType&lt;?&gt; thatType = other.argTypes.get(i);</span>
+
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (!thisType.equals(thatType))</span>
+            {
+<span class="nc bnc" id="L678" title="All 2 branches missed.">                if (thisType.asCQL3Type().toString().equals(thatType.asCQL3Type().toString()))</span>
+<span class="nc" id="L679">                    typesDifferDeeply = true;</span>
+                else
+<span class="nc" id="L681">                    return Optional.of(Difference.SHALLOW);</span>
+            }
+        }
+
+<span class="nc bnc" id="L685" title="All 2 branches missed.">        return typesDifferDeeply ? Optional.of(Difference.DEEP) : Optional.empty();</span>
+    }
+
+    @Override
+    public int hashCode()
+    {
+<span class="nc" id="L691">        return Objects.hashCode(name, UserFunctions.typeHashCode(argTypes), returnType, language, body);</span>
+    }
+
+    private static class UDFClassLoader extends ClassLoader
+    {
+        // insecureClassLoader is the C* class loader
+<span class="nc" id="L697">        static final ClassLoader insecureClassLoader = UDFClassLoader.class.getClassLoader();</span>
+
+        private UDFClassLoader()
+        {
+<span class="nc" id="L701">            super(insecureClassLoader);</span>
+<span class="nc" id="L702">        }</span>
+
+        public URL getResource(String name)
+        {
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            if (!secureResource(name))</span>
+<span class="nc" id="L707">                return null;</span>
+<span class="nc" id="L708">            return insecureClassLoader.getResource(name);</span>
+        }
+
+        protected URL findResource(String name)
+        {
+<span class="nc" id="L713">            return getResource(name);</span>
+        }
+
+        public Enumeration&lt;URL&gt; getResources(String name)
+        {
+<span class="nc" id="L718">            return Collections.emptyEnumeration();</span>
+        }
+
+        protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException
+        {
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (!secureResource(name.replace('.', '/') + &quot;.class&quot;))</span>
+<span class="nc" id="L724">                throw new ClassNotFoundException(name);</span>
+<span class="nc" id="L725">            return insecureClassLoader.loadClass(name);</span>
+        }
+
+        public Class&lt;?&gt; loadClass(String name) throws ClassNotFoundException
+        {
+<span class="nc bnc" id="L730" title="All 2 branches missed.">            if (!secureResource(name.replace('.', '/') + &quot;.class&quot;))</span>
+<span class="nc" id="L731">                throw new ClassNotFoundException(name);</span>
+<span class="nc" id="L732">            return super.loadClass(name);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

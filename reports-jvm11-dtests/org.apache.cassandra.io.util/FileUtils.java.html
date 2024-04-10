@@ -1,0 +1,802 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>FileUtils.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">FileUtils.java</span></div><h1>FileUtils.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.util;
+
+import java.io.BufferedWriter;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.text.DecimalFormat;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.io.FSError;
+import org.apache.cassandra.io.FSErrorHandler;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.SyncUtil;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_IO_TMPDIR;
+import static org.apache.cassandra.utils.Throwables.maybeFail;
+
+public final class FileUtils
+{
+<span class="fc" id="L71">    public static final Charset CHARSET = StandardCharsets.UTF_8;</span>
+
+<span class="fc" id="L73">    private static final Logger logger = LoggerFactory.getLogger(FileUtils.class);</span>
+
+    public static final long ONE_KIB = 1024;
+    public static final long ONE_MIB = 1024 * ONE_KIB;
+    public static final long ONE_GIB = 1024 * ONE_MIB;
+    public static final long ONE_TIB = 1024 * ONE_GIB;
+
+<span class="fc" id="L80">    private static final DecimalFormat df = new DecimalFormat(&quot;#.##&quot;);</span>
+<span class="fc" id="L81">    private static final AtomicReference&lt;Optional&lt;FSErrorHandler&gt;&gt; fsErrorHandler = new AtomicReference&lt;&gt;(Optional.empty());</span>
+
+    private static final Class clsDirectBuffer;
+    private static final MethodHandle mhDirectBufferCleaner;
+    private static final MethodHandle mhCleanerClean;
+
+    static
+    {
+        try
+        {
+<span class="fc" id="L91">            clsDirectBuffer = Class.forName(&quot;sun.nio.ch.DirectBuffer&quot;);</span>
+<span class="fc" id="L92">            Method mDirectBufferCleaner = clsDirectBuffer.getMethod(&quot;cleaner&quot;);</span>
+<span class="fc" id="L93">            mhDirectBufferCleaner = MethodHandles.lookup().unreflect(mDirectBufferCleaner);</span>
+<span class="fc" id="L94">            Method mCleanerClean = mDirectBufferCleaner.getReturnType().getMethod(&quot;clean&quot;);</span>
+<span class="fc" id="L95">            mhCleanerClean = MethodHandles.lookup().unreflect(mCleanerClean);</span>
+
+<span class="fc" id="L97">            ByteBuffer buf = ByteBuffer.allocateDirect(1);</span>
+<span class="fc" id="L98">            clean(buf);</span>
+        }
+<span class="nc" id="L100">        catch (IllegalAccessException e)</span>
+        {
+<span class="nc" id="L102">            logger.error(&quot;FATAL: Cassandra is unable to access required classes. This usually means it has been &quot; +</span>
+                &quot;run without the aid of the standard startup scripts or the scripts have been edited. If this was &quot; +
+                &quot;intentional, and you are attempting to use Java 11+ you may need to add the --add-exports and &quot; +
+                &quot;--add-opens jvm options from either jvm11-server.options or jvm11-client.options&quot;, e);
+<span class="nc" id="L106">            throw new RuntimeException(e);  // causes ExceptionInInitializerError, will prevent startup</span>
+        }
+<span class="nc" id="L108">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L110">            logger.error(&quot;FATAL: Cannot initialize optimized memory deallocator.&quot;, t);</span>
+<span class="nc" id="L111">            JVMStabilityInspector.inspectThrowable(t);</span>
+<span class="nc" id="L112">            throw new RuntimeException(t); // causes ExceptionInInitializerError, will prevent startup</span>
+<span class="fc" id="L113">        }</span>
+    }
+
+<span class="fc" id="L116">    private static final File tempDir = new File(JAVA_IO_TMPDIR.getString());</span>
+<span class="fc" id="L117">    private static final AtomicLong tempFileNum = new AtomicLong();</span>
+
+    public static File getTempDir()
+    {
+<span class="nc" id="L121">        return tempDir;</span>
+    }
+
+    /**
+     * Pretty much like {@link java.io.File#createTempFile(String, String, java.io.File)}, but with
+     * the guarantee that the &quot;random&quot; part of the generated file name between
+     * {@code prefix} and {@code suffix} is a positive, increasing {@code long} value.
+     */
+    public static File createTempFile(String prefix, String suffix, File directory)
+    {
+        // Do not use java.io.File.createTempFile(), because some tests rely on the
+        // behavior that the &quot;random&quot; part in the temp file name is a positive 'long'.
+        // However, at least since Java 9 the code to generate the &quot;random&quot; part
+        // uses an _unsigned_ random long generated like this:
+        // Long.toUnsignedString(new java.util.Random.nextLong())
+
+        while (true)
+        {
+            // The contract of File.createTempFile() says, that it must not return
+            // the same file name again. We do that here in a very simple way,
+            // that probably doesn't cover all edge cases. Just rely on system
+            // wall clock and return strictly increasing values from that.
+<span class="nc" id="L143">            long num = tempFileNum.getAndIncrement();</span>
+
+            // We have a positive long here, which is safe to use for example
+            // for CommitLogTest.
+<span class="nc" id="L147">            String fileName = prefix + num + suffix;</span>
+<span class="nc" id="L148">            File candidate = new File(directory, fileName);</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (candidate.createFileIfNotExists())</span>
+<span class="nc" id="L150">                return candidate;</span>
+<span class="nc" id="L151">        }</span>
+    }
+
+    public static File createTempFile(String prefix, String suffix)
+    {
+<span class="nc" id="L156">        return createTempFile(prefix, suffix, tempDir);</span>
+    }
+
+    public static File createDeletableTempFile(String prefix, String suffix)
+    {
+<span class="nc" id="L161">        File f = createTempFile(prefix, suffix, getTempDir());</span>
+<span class="nc" id="L162">        f.deleteOnExit();</span>
+<span class="nc" id="L163">        return f;</span>
+    }
+
+    public static void createHardLink(String from, String to)
+    {
+<span class="nc" id="L168">        createHardLink(new File(from), new File(to));</span>
+<span class="nc" id="L169">    }</span>
+
+    public static void createHardLink(File from, File to)
+    {
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (to.exists())</span>
+<span class="nc" id="L174">            throw new RuntimeException(&quot;Tried to create duplicate hard link to &quot; + to);</span>
+<span class="pc bpc" id="L175" title="1 of 2 branches missed.">        if (!from.exists())</span>
+<span class="nc" id="L176">            throw new RuntimeException(&quot;Tried to hard link to file that does not exist &quot; + from);</span>
+
+        try
+        {
+<span class="fc" id="L180">            Files.createLink(to.toPath(), from.toPath());</span>
+        }
+<span class="nc" id="L182">        catch (IOException e)</span>
+        {
+<span class="nc" id="L184">            throw new FSWriteError(e, to);</span>
+<span class="fc" id="L185">        }</span>
+<span class="fc" id="L186">    }</span>
+
+    public static void createHardLinkWithConfirm(String from, String to)
+    {
+<span class="nc" id="L190">        createHardLinkWithConfirm(new File(from), new File(to));</span>
+<span class="nc" id="L191">    }</span>
+
+    public static void createHardLinkWithConfirm(File from, File to)
+    {
+        try
+        {
+<span class="fc" id="L197">            createHardLink(from, to);</span>
+        }
+<span class="nc" id="L199">        catch (FSWriteError ex)</span>
+        {
+<span class="nc" id="L201">            throw ex;</span>
+        }
+<span class="nc" id="L203">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L205">            throw new RuntimeException(String.format(&quot;Unable to hardlink from %s to %s&quot;, from, to), t);</span>
+<span class="fc" id="L206">        }</span>
+<span class="fc" id="L207">    }</span>
+
+    public static void createHardLinkWithoutConfirm(String from, String to)
+    {
+<span class="nc" id="L211">        createHardLinkWithoutConfirm(new File(from), new File(to));</span>
+<span class="nc" id="L212">    }</span>
+
+    public static void createHardLinkWithoutConfirm(File from, File to)
+    {
+        try
+        {
+<span class="fc" id="L218">            createHardLink(from, to);</span>
+        }
+<span class="nc" id="L220">        catch (FSWriteError fse)</span>
+        {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L223">                logger.trace(&quot;Could not hardlink file &quot; + from + &quot; to &quot; + to, fse);</span>
+<span class="fc" id="L224">        }</span>
+<span class="fc" id="L225">    }</span>
+
+    public static void copyWithOutConfirm(String from, String to)
+    {
+<span class="nc" id="L229">        copyWithOutConfirm(new File(from), new File(to));</span>
+<span class="nc" id="L230">    }</span>
+
+    public static void copyWithOutConfirm(File from, File to)
+    {
+        try
+        {
+<span class="nc" id="L236">            Files.copy(from.toPath(), to.toPath());</span>
+        }
+<span class="nc" id="L238">        catch (IOException e)</span>
+        {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L241">                logger.trace(&quot;Could not copy file&quot; + from + &quot; to &quot; + to, e);</span>
+<span class="nc" id="L242">        }</span>
+<span class="nc" id="L243">    }</span>
+
+    public static void copyWithConfirm(String from, String to)
+    {
+<span class="nc" id="L247">        copyWithConfirm(new File(from), new File(to));</span>
+<span class="nc" id="L248">    }</span>
+
+    public static void copyWithConfirm(File from, File to)
+    {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        assert from.exists();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L254">            logger.trace(&quot;Copying {} to {}&quot;, from.path(), to.path());</span>
+
+        try
+        {
+<span class="nc" id="L258">            Files.copy(from.toPath(), to.toPath());</span>
+        }
+<span class="nc" id="L260">        catch (IOException e)</span>
+        {
+<span class="nc" id="L262">            throw new FSWriteError(e, &quot;Could not copy file&quot; + from + &quot; to &quot; + to);</span>
+<span class="nc" id="L263">        }</span>
+<span class="nc" id="L264">    }</span>
+
+    public static void truncate(String path, long size)
+    {
+<span class="fc" id="L268">        File file = new File(path);</span>
+<span class="fc" id="L269">        try (FileChannel channel = file.newReadWriteChannel())</span>
+        {
+<span class="fc" id="L271">            channel.truncate(size);</span>
+        }
+<span class="nc" id="L273">        catch (IOException e)</span>
+        {
+<span class="nc" id="L275">            throw PathUtils.propagateUnchecked(e, file.toPath(), true);</span>
+<span class="fc" id="L276">        }</span>
+<span class="fc" id="L277">    }</span>
+
+    public static void closeQuietly(Closeable c)
+    {
+        try
+        {
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">            if (c != null)</span>
+<span class="fc" id="L284">                c.close();</span>
+        }
+<span class="nc" id="L286">        catch (Exception e)</span>
+        {
+<span class="nc" id="L288">            logger.warn(&quot;Failed closing {}&quot;, c, e);</span>
+<span class="fc" id="L289">        }</span>
+<span class="fc" id="L290">    }</span>
+
+    public static void closeQuietly(AutoCloseable c)
+    {
+        try
+        {
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            if (c != null)</span>
+<span class="fc" id="L297">                c.close();</span>
+        }
+<span class="nc" id="L299">        catch (Exception e)</span>
+        {
+<span class="nc" id="L301">            logger.warn(&quot;Failed closing {}&quot;, c, e);</span>
+<span class="fc" id="L302">        }</span>
+<span class="fc" id="L303">    }</span>
+
+    public static void close(Closeable... cs) throws IOException
+    {
+<span class="fc" id="L307">        close(Arrays.asList(cs));</span>
+<span class="fc" id="L308">    }</span>
+
+    public static void close(Iterable&lt;? extends Closeable&gt; cs) throws IOException
+    {
+<span class="fc" id="L312">        Throwable e = null;</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">        for (Closeable c : cs)</span>
+        {
+            try
+            {
+<span class="fc bfc" id="L317" title="All 2 branches covered.">                if (c != null)</span>
+<span class="fc" id="L318">                    c.close();</span>
+            }
+<span class="nc" id="L320">            catch (Throwable ex)</span>
+            {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                if (e == null) e = ex;</span>
+<span class="nc" id="L323">                else e.addSuppressed(ex);</span>
+<span class="nc" id="L324">                logger.warn(&quot;Failed closing stream {}&quot;, c, ex);</span>
+<span class="fc" id="L325">            }</span>
+<span class="fc" id="L326">        }</span>
+<span class="fc" id="L327">        maybeFail(e, IOException.class);</span>
+<span class="fc" id="L328">    }</span>
+
+    public static void closeQuietly(Iterable&lt;? extends AutoCloseable&gt; cs)
+    {
+<span class="fc bfc" id="L332" title="All 2 branches covered.">        for (AutoCloseable c : cs)</span>
+        {
+            try
+            {
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">                if (c != null)</span>
+<span class="fc" id="L337">                    c.close();</span>
+            }
+<span class="nc" id="L339">            catch (Exception ex)</span>
+            {
+<span class="nc" id="L341">                logger.warn(&quot;Failed closing {}&quot;, c, ex);</span>
+<span class="fc" id="L342">            }</span>
+<span class="fc" id="L343">        }</span>
+<span class="fc" id="L344">    }</span>
+
+    public static String getCanonicalPath(String filename)
+    {
+<span class="fc" id="L348">        return new File(filename).canonicalPath();</span>
+    }
+
+    public static String getCanonicalPath(File file)
+    {
+<span class="fc" id="L353">        return file.canonicalPath();</span>
+    }
+
+    /** Return true if file is contained in folder */
+    public static boolean isContained(File folder, File file)
+    {
+<span class="nc" id="L359">        return folder.isAncestorOf(file);</span>
+    }
+
+    public static void clean(ByteBuffer buffer)
+    {
+<span class="pc bpc" id="L364" title="1 of 4 branches missed.">        if (buffer == null || !buffer.isDirect())</span>
+<span class="fc" id="L365">            return;</span>
+
+        // TODO Once we can get rid of Java 8, it's simpler to call sun.misc.Unsafe.invokeCleaner(ByteBuffer),
+        // but need to take care of the attachment handling (i.e. whether 'buf' is a duplicate or slice) - that
+        // is different in sun.misc.Unsafe.invokeCleaner and this implementation.
+
+        try
+        {
+<span class="fc" id="L373">            Object cleaner = mhDirectBufferCleaner.bindTo(buffer).invoke();</span>
+<span class="fc bfc" id="L374" title="All 2 branches covered.">            if (cleaner != null)</span>
+            {
+                // ((DirectBuffer) buf).cleaner().clean();
+<span class="fc" id="L377">                mhCleanerClean.bindTo(cleaner).invoke();</span>
+            }
+        }
+<span class="nc" id="L380">        catch (RuntimeException e)</span>
+        {
+<span class="nc" id="L382">            throw e;</span>
+        }
+<span class="nc" id="L384">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L386">            throw new RuntimeException(e);</span>
+<span class="fc" id="L387">        }</span>
+<span class="fc" id="L388">    }</span>
+
+    public static long parseFileSize(String value)
+    {
+        long result;
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        if (!value.matches(&quot;\\d+(\\.\\d+)? (GiB|KiB|MiB|TiB|bytes)&quot;))</span>
+        {
+<span class="nc" id="L395">            throw new IllegalArgumentException(</span>
+<span class="nc" id="L396">                String.format(&quot;value %s is not a valid human-readable file size&quot;, value));</span>
+        }
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (value.endsWith(&quot; TiB&quot;))</span>
+        {
+<span class="nc" id="L400">            result = Math.round(Double.valueOf(value.replace(&quot; TiB&quot;, &quot;&quot;)) * ONE_TIB);</span>
+<span class="nc" id="L401">            return result;</span>
+        }
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        else if (value.endsWith(&quot; GiB&quot;))</span>
+        {
+<span class="nc" id="L405">            result = Math.round(Double.valueOf(value.replace(&quot; GiB&quot;, &quot;&quot;)) * ONE_GIB);</span>
+<span class="nc" id="L406">            return result;</span>
+        }
+<span class="nc bnc" id="L408" title="All 2 branches missed.">        else if (value.endsWith(&quot; KiB&quot;))</span>
+        {
+<span class="nc" id="L410">            result = Math.round(Double.valueOf(value.replace(&quot; KiB&quot;, &quot;&quot;)) * ONE_KIB);</span>
+<span class="nc" id="L411">            return result;</span>
+        }
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        else if (value.endsWith(&quot; MiB&quot;))</span>
+        {
+<span class="nc" id="L415">            result = Math.round(Double.valueOf(value.replace(&quot; MiB&quot;, &quot;&quot;)) * ONE_MIB);</span>
+<span class="nc" id="L416">            return result;</span>
+        }
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        else if (value.endsWith(&quot; bytes&quot;))</span>
+        {
+<span class="nc" id="L420">            result = Math.round(Double.valueOf(value.replace(&quot; bytes&quot;, &quot;&quot;)));</span>
+<span class="nc" id="L421">            return result;</span>
+        }
+        else
+        {
+<span class="nc" id="L425">            throw new IllegalStateException(String.format(&quot;FileUtils.parseFileSize() reached an illegal state parsing %s&quot;, value));</span>
+        }
+    }
+
+    public static String stringifyFileSize(double value)
+    {
+        double d;
+<span class="fc bfc" id="L432" title="All 2 branches covered.">        if (value &gt;= ONE_TIB)</span>
+        {
+<span class="fc" id="L434">            d = value / ONE_TIB;</span>
+<span class="fc" id="L435">            String val = df.format(d);</span>
+<span class="fc" id="L436">            return val + &quot; TiB&quot;;</span>
+        }
+<span class="fc bfc" id="L438" title="All 2 branches covered.">        else if (value &gt;= ONE_GIB)</span>
+        {
+<span class="fc" id="L440">            d = value / ONE_GIB;</span>
+<span class="fc" id="L441">            String val = df.format(d);</span>
+<span class="fc" id="L442">            return val + &quot; GiB&quot;;</span>
+        }
+<span class="fc bfc" id="L444" title="All 2 branches covered.">        else if (value &gt;= ONE_MIB)</span>
+        {
+<span class="fc" id="L446">            d = value / ONE_MIB;</span>
+<span class="fc" id="L447">            String val = df.format(d);</span>
+<span class="fc" id="L448">            return val + &quot; MiB&quot;;</span>
+        }
+<span class="fc bfc" id="L450" title="All 2 branches covered.">        else if (value &gt;= ONE_KIB)</span>
+        {
+<span class="fc" id="L452">            d = value / ONE_KIB;</span>
+<span class="fc" id="L453">            String val = df.format(d);</span>
+<span class="fc" id="L454">            return val + &quot; KiB&quot;;</span>
+        }
+        else
+        {
+<span class="fc" id="L458">            String val = df.format(value);</span>
+<span class="fc" id="L459">            return val + &quot; bytes&quot;;</span>
+        }
+    }
+
+    public static void handleCorruptSSTable(CorruptSSTableException e)
+    {
+<span class="fc" id="L465">        fsErrorHandler.get().ifPresent(handler -&gt; handler.handleCorruptSSTable(e));</span>
+<span class="fc" id="L466">    }</span>
+
+    public static void handleFSError(FSError e)
+    {
+<span class="fc" id="L470">        fsErrorHandler.get().ifPresent(handler -&gt; handler.handleFSError(e));</span>
+<span class="fc" id="L471">    }</span>
+
+    public static void handleStartupFSError(Throwable t)
+    {
+<span class="nc" id="L475">        fsErrorHandler.get().ifPresent(handler -&gt; handler.handleStartupFSError(t));</span>
+<span class="nc" id="L476">    }</span>
+
+    /**
+     * handleFSErrorAndPropagate will invoke the disk failure policy error handler,
+     * which may or may not stop the daemon or transports. However, if we don't exit,
+     * we still want to propagate the exception to the caller in case they have custom
+     * exception handling
+     *
+     * @param e A filesystem error
+     */
+    public static void handleFSErrorAndPropagate(FSError e)
+    {
+<span class="nc" id="L488">        JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="nc" id="L489">        throw e;</span>
+    }
+
+    /**
+     * Get the size of a directory in bytes
+     * @param folder The directory for which we need size.
+     * @return The size of the directory
+     */
+    public static long folderSize(File folder)
+    {
+<span class="pc bpc" id="L499" title="1 of 2 branches missed.">        if (!folder.exists())</span>
+<span class="nc" id="L500">            return 0;</span>
+
+<span class="fc" id="L502">        final long [] sizeArr = {0L};</span>
+        try
+        {
+<span class="fc" id="L505">            Files.walkFileTree(folder.toPath(), new SimpleFileVisitor&lt;Path&gt;()</span>
+<span class="fc" id="L506">            {</span>
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                {
+<span class="fc" id="L510">                    sizeArr[0] += attrs.size();</span>
+<span class="fc" id="L511">                    return FileVisitResult.CONTINUE;</span>
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path path, IOException e) throws IOException
+                {
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">                    if (e instanceof NoSuchFileException)</span>
+<span class="fc" id="L518">                        return FileVisitResult.CONTINUE;</span>
+                    else
+<span class="nc" id="L520">                        throw e;</span>
+                }
+            });
+        }
+<span class="nc" id="L524">        catch (IOException e)</span>
+        {
+<span class="nc" id="L526">            logger.error(&quot;Error while getting {} folder size. {}&quot;, folder, e.getMessage());</span>
+<span class="fc" id="L527">        }</span>
+<span class="fc" id="L528">        return sizeArr[0];</span>
+    }
+
+    public static void append(File file, String ... lines)
+    {
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        if (file.exists())</span>
+<span class="nc" id="L534">            write(file, Arrays.asList(lines), StandardOpenOption.APPEND);</span>
+        else
+<span class="nc" id="L536">            write(file, Arrays.asList(lines), StandardOpenOption.CREATE);</span>
+<span class="nc" id="L537">    }</span>
+
+    public static void appendAndSync(File file, String ... lines)
+    {
+<span class="fc bfc" id="L541" title="All 2 branches covered.">        if (file.exists())</span>
+<span class="fc" id="L542">            write(file, Arrays.asList(lines), StandardOpenOption.APPEND, StandardOpenOption.SYNC);</span>
+        else
+<span class="fc" id="L544">            write(file, Arrays.asList(lines), StandardOpenOption.CREATE, StandardOpenOption.SYNC);</span>
+<span class="fc" id="L545">    }</span>
+
+    public static void replace(File file, String ... lines)
+    {
+<span class="nc" id="L549">        write(file, Arrays.asList(lines), StandardOpenOption.TRUNCATE_EXISTING);</span>
+<span class="nc" id="L550">    }</span>
+
+    /**
+     * Write lines to a file adding a newline to the end of each supplied line using the provided open options.
+     *
+     * If open option sync or dsync is provided this will not open the file with sync or dsync since it might end up syncing
+     * many times for a lot of lines. Instead it will write all the lines and sync once at the end. Since the file is
+     * never returned there is not much difference from the perspective of the caller.
+     * @param file
+     * @param lines
+     * @param options
+     */
+    public static void write(File file, List&lt;String&gt; lines, StandardOpenOption ... options)
+    {
+<span class="fc" id="L564">        Set&lt;StandardOpenOption&gt; optionsSet = EnumSet.noneOf(StandardOpenOption.class);</span>
+<span class="fc bfc" id="L565" title="All 2 branches covered.">        for (StandardOpenOption option : options)</span>
+<span class="fc" id="L566">            optionsSet.add(option);</span>
+
+        //Emulate the old FileSystemProvider.newOutputStream behavior for open options.
+<span class="pc bpc" id="L569" title="1 of 2 branches missed.">        if (optionsSet.isEmpty())</span>
+        {
+<span class="nc" id="L571">            optionsSet.add(StandardOpenOption.CREATE);</span>
+<span class="nc" id="L572">            optionsSet.add(StandardOpenOption.TRUNCATE_EXISTING);</span>
+        }
+<span class="fc" id="L574">        boolean sync = optionsSet.remove(StandardOpenOption.SYNC);</span>
+<span class="fc" id="L575">        boolean dsync = optionsSet.remove(StandardOpenOption.DSYNC);</span>
+<span class="fc" id="L576">        optionsSet.add(StandardOpenOption.WRITE);</span>
+
+<span class="fc" id="L578">        Path filePath = file.toPath();</span>
+<span class="fc" id="L579">        try (FileChannel fc = filePath.getFileSystem().provider().newFileChannel(filePath, optionsSet);</span>
+<span class="fc" id="L580">             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(Channels.newOutputStream(fc), CHARSET.newEncoder())))</span>
+        {
+<span class="fc bfc" id="L582" title="All 2 branches covered.">            for (CharSequence line: lines) {</span>
+<span class="fc" id="L583">                writer.append(line);</span>
+<span class="fc" id="L584">                writer.newLine();</span>
+<span class="fc" id="L585">            }</span>
+
+<span class="pc bpc" id="L587" title="1 of 2 branches missed.">            if (sync)</span>
+            {
+<span class="fc" id="L589">                SyncUtil.force(fc, true);</span>
+            }
+<span class="nc bnc" id="L591" title="All 2 branches missed.">            else if (dsync)</span>
+            {
+<span class="nc" id="L593">                SyncUtil.force(fc, false);</span>
+            }
+        }
+<span class="nc" id="L596">        catch (ClosedChannelException cce)</span>
+        {
+<span class="nc" id="L598">            throw new RuntimeException(cce);</span>
+        }
+<span class="nc" id="L600">        catch (IOException ex)</span>
+        {
+<span class="nc" id="L602">            throw new FSWriteError(ex, file);</span>
+<span class="fc" id="L603">        }</span>
+<span class="fc" id="L604">    }</span>
+
+    public static List&lt;String&gt; readLines(File file)
+    {
+        try
+        {
+<span class="fc" id="L610">            return Files.readAllLines(file.toPath(), CHARSET);</span>
+        }
+<span class="nc" id="L612">        catch (IOException ex)</span>
+        {
+<span class="nc bnc" id="L614" title="All 2 branches missed.">            if (ex instanceof NoSuchFileException)</span>
+<span class="nc" id="L615">                return Collections.emptyList();</span>
+
+<span class="nc" id="L617">            throw new RuntimeException(ex);</span>
+        }
+    }
+
+    public static void setFSErrorHandler(FSErrorHandler handler)
+    {
+<span class="fc" id="L623">        fsErrorHandler.getAndSet(Optional.ofNullable(handler));</span>
+<span class="fc" id="L624">    }</span>
+
+    @Deprecated
+    public static void createDirectory(String directory)
+    {
+<span class="fc" id="L629">        createDirectory(new File(directory));</span>
+<span class="fc" id="L630">    }</span>
+
+    @Deprecated
+    public static void createDirectory(File directory)
+    {
+<span class="fc" id="L635">        PathUtils.createDirectoriesIfNotExists(directory.toPath());</span>
+<span class="fc" id="L636">    }</span>
+
+    @Deprecated
+    public static boolean delete(String file)
+    {
+<span class="nc" id="L641">        return new File(file).tryDelete();</span>
+    }
+
+    @Deprecated
+    public static void delete(File... files)
+    {
+<span class="nc bnc" id="L647" title="All 2 branches missed.">        for (File file : files)</span>
+<span class="nc" id="L648">            file.tryDelete();</span>
+<span class="nc" id="L649">    }</span>
+
+    /**
+     * Deletes all files and subdirectories under &quot;dir&quot;.
+     * @param dir Directory to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     */
+    @Deprecated
+    public static void deleteRecursiveWithThrottle(File dir, RateLimiter rateLimiter)
+    {
+<span class="fc" id="L659">        dir.deleteRecursive(rateLimiter);</span>
+<span class="fc" id="L660">    }</span>
+
+    /**
+     * Deletes all files and subdirectories under &quot;dir&quot;.
+     * @param dir Directory to be deleted
+     * @throws FSWriteError if any part of the tree cannot be deleted
+     */
+    @Deprecated
+    public static void deleteRecursive(File dir)
+    {
+<span class="fc" id="L670">        dir.deleteRecursive();</span>
+<span class="fc" id="L671">    }</span>
+
+    /**
+     * Schedules deletion of all file and subdirectories under &quot;dir&quot; on JVM shutdown.
+     * @param dir Directory to be deleted
+     */
+    @Deprecated
+    public static void deleteRecursiveOnExit(File dir)
+    {
+<span class="nc" id="L680">        dir.deleteRecursiveOnExit();</span>
+<span class="nc" id="L681">    }</span>
+
+    @Deprecated
+    public static boolean isSubDirectory(File parent, File child)
+    {
+<span class="nc" id="L686">        return parent.isAncestorOf(child);</span>
+    }
+
+    @Deprecated
+    public static Throwable deleteWithConfirm(File file, Throwable accumulate)
+    {
+<span class="fc" id="L692">        return file.delete(accumulate, null);</span>
+    }
+
+    @Deprecated
+    public static Throwable deleteWithConfirm(File file, Throwable accumulate, RateLimiter rateLimiter)
+    {
+<span class="nc" id="L698">        return file.delete(accumulate, rateLimiter);</span>
+    }
+
+    @Deprecated
+    public static void deleteWithConfirm(String file)
+    {
+<span class="nc" id="L704">        deleteWithConfirm(new File(file));</span>
+<span class="nc" id="L705">    }</span>
+
+    @Deprecated
+    public static void deleteWithConfirm(File file)
+    {
+<span class="fc" id="L710">        file.delete();</span>
+<span class="fc" id="L711">    }</span>
+
+    @Deprecated
+    public static void renameWithOutConfirm(String from, String to)
+    {
+<span class="nc" id="L716">        new File(from).tryMove(new File(to));</span>
+<span class="nc" id="L717">    }</span>
+
+    @Deprecated
+    public static void renameWithConfirm(String from, String to)
+    {
+<span class="nc" id="L722">        renameWithConfirm(new File(from), new File(to));</span>
+<span class="nc" id="L723">    }</span>
+
+    @Deprecated
+    public static void renameWithConfirm(File from, File to)
+    {
+<span class="nc" id="L728">        from.move(to);</span>
+<span class="nc" id="L729">    }</span>
+
+    /**
+     * Private constructor as the class contains only static methods.
+     */
+    private FileUtils()
+    {
+    }
+
+    /**
+     * Moves the contents of a directory to another directory.
+     * &lt;p&gt;Once a file has been copied to the target directory it will be deleted from the source directory.
+     * If a file already exists in the target directory a warning will be logged and the file will not
+     * be deleted.&lt;/p&gt;
+     *
+     * @param source the directory containing the files to move
+     * @param target the directory where the files must be moved
+     */
+    public static void moveRecursively(Path source, Path target) throws IOException
+    {
+<span class="fc" id="L749">        logger.info(&quot;Moving {} to {}&quot; , source, target);</span>
+
+<span class="fc bfc" id="L751" title="All 2 branches covered.">        if (Files.isDirectory(source))</span>
+        {
+<span class="fc" id="L753">            Files.createDirectories(target);</span>
+
+<span class="fc bfc" id="L755" title="All 2 branches covered.">            for (File f : new File(source).tryList())</span>
+            {
+<span class="fc" id="L757">                String fileName = f.name();</span>
+<span class="fc" id="L758">                moveRecursively(source.resolve(fileName), target.resolve(fileName));</span>
+            }
+
+<span class="fc" id="L761">            deleteDirectoryIfEmpty(source);</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L765" title="1 of 2 branches missed.">            if (Files.exists(target))</span>
+            {
+<span class="nc" id="L767">                logger.warn(&quot;Cannot move the file {} to {} as the target file already exists.&quot; , source, target);</span>
+            }
+            else
+            {
+<span class="fc" id="L771">                Files.copy(source, target, StandardCopyOption.COPY_ATTRIBUTES);</span>
+<span class="fc" id="L772">                Files.delete(source);</span>
+            }
+        }
+<span class="fc" id="L775">    }</span>
+
+    /**
+     * Deletes the specified directory if it is empty
+     *
+     * @param path the path to the directory
+     */
+    public static void deleteDirectoryIfEmpty(Path path) throws IOException
+    {
+<span class="fc" id="L784">        Preconditions.checkArgument(Files.isDirectory(path), String.format(&quot;%s is not a directory&quot;, path));</span>
+
+        try
+        {
+<span class="fc" id="L788">            logger.info(&quot;Deleting directory {}&quot;, path);</span>
+<span class="fc" id="L789">            Files.delete(path);</span>
+        }
+<span class="nc" id="L791">        catch (DirectoryNotEmptyException e)</span>
+        {
+<span class="nc" id="L793">            try (Stream&lt;Path&gt; paths = Files.list(path))</span>
+            {
+<span class="nc" id="L795">                String content = paths.map(p -&gt; p.getFileName().toString()).collect(Collectors.joining(&quot;, &quot;));</span>
+
+<span class="nc" id="L797">                logger.warn(&quot;Cannot delete the directory {} as it is not empty. (Content: {})&quot;, path, content);</span>
+            }
+<span class="fc" id="L799">        }</span>
+<span class="fc" id="L800">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

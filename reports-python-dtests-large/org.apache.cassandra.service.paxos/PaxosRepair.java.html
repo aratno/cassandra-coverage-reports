@@ -1,0 +1,708 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosRepair.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosRepair.java</span></div><h1>PaxosRepair.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos;
+
+
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.RequestCallbackWithFailure;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.MonotonicClock;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.config.CassandraRelevantProperties.PAXOS_REPAIR_RETRY_TIMEOUT_IN_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SKIP_PAXOS_REPAIR_VERSION_VALIDATION;
+import static org.apache.cassandra.exceptions.RequestFailureReason.UNKNOWN;
+import static org.apache.cassandra.net.Verb.PAXOS2_REPAIR_REQ;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static org.apache.cassandra.service.paxos.Commit.*;
+import static org.apache.cassandra.service.paxos.ContentionStrategy.Type.REPAIR;
+import static org.apache.cassandra.service.paxos.ContentionStrategy.waitUntilForContention;
+import static org.apache.cassandra.service.paxos.Paxos.*;
+import static org.apache.cassandra.service.paxos.PaxosPrepare.*;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.NullableSerializer.deserializeNullable;
+import static org.apache.cassandra.utils.NullableSerializer.serializeNullable;
+import static org.apache.cassandra.utils.NullableSerializer.serializedSizeNullable;
+
+/**
+ * Facility to finish any in-progress paxos transaction, and ensure that a quorum of nodes agree on the most recent operation.
+ * Semantically, we simply ensure that any side effects that were &quot;decided&quot; before repair was initiated have been committed
+ * to a quorum of nodes.
+ * This means:
+ *   - any prepare that has _possibly_ reached a quorum of nodes will be invalidated
+ *   - any proposal that has been accepted by at least one node, but not known to be committed to any, will be proposed again
+ *   - any proposal that has been committed to at least one node, but not committed to all, will be committed to a quorum
+ *
+ * Note that once started, this continues to try to repair any ongoing operations for the partition up to 4 times.
+ * In a functioning cluster this should always be possible, but during a network partition this might cause the repair
+ * to fail.
+ *
+ * Requirements for correction:
+ * - If performed during a range movement, we depend on a quorum (of the new topology) have been informed of the new
+ *   topology _prior_ to initiating this repair, and this node to have been a member of a quorum of nodes verifying
+ *    - If a quorum of nodes is unaware of the new topology prior to initiating repair, an operation could simply occur
+ *      after repair completes that permits a linearization failure, such as with CASSANDRA-15745.
+ *   their topology is up-to-date.
+ * - Paxos prepare rounds must also verify the topology being used with their peers
+ *    - If prepare rounds do not verify their topology, a node that is not a member of the quorum who have agreed
+ *      the latest topology could still perform an operation without being aware of the topology change, and permit a
+ *      linearization failure, such as with CASSANDRA-15745.
+ *
+ * With these issues addressed elsewhere, our algorithm is fairly simple.
+ * In brief:
+ *   1) Query all replicas for any promises or proposals they have witnessed that have not been committed,
+ *      and their most recent commit. Wait for a quorum of responses.
+ *   2) If this is the first time we have queried other nodes, we take a note of the most recent ballot we see;
+ *      If this is not the first time we have queried other nodes, and we have committed a newer ballot than the one
+ *      we previously recorded, we terminate (somebody else has done the work for us).
+ *   3) If we see an in-progress operation that is very recent, we wait for it to complete and try again
+ *   4) If we see a previously accepted operation, we attempt to complete it, or
+ *      if we see a prepare with no proposal, we propose an empty update to invalidate it;
+ *      otherwise we have nothing to do, as there is no operation that can have produced a side-effect before we began.
+ *   5) We prepare a paxos round to agree the new commit using a higher ballot than the one witnessed,
+ *      but a lower than one we would propose a new operation with. This permits newer operations to &quot;beat&quot; us so
+ *      that we do not interfere with normal paxos operations.
+ *   6) If we are &quot;beaten&quot; we start again (without delay, as (2) manages delays where necessary)
+ */
+public class PaxosRepair extends AbstractPaxosRepair
+{
+<span class="nc" id="L124">    private static final Logger logger = LoggerFactory.getLogger(PaxosRepair.class);</span>
+
+<span class="nc" id="L126">    public static final RequestSerializer requestSerializer = new RequestSerializer();</span>
+<span class="nc" id="L127">    public static final ResponseSerializer responseSerializer = new ResponseSerializer();</span>
+<span class="nc" id="L128">    public static final RequestHandler requestHandler = new RequestHandler();</span>
+<span class="nc" id="L129">    private static final long RETRY_TIMEOUT_NANOS = getRetryTimeoutNanos();</span>
+
+<span class="nc" id="L131">    private static final ScheduledExecutorPlus RETRIES = executorFactory().scheduled(&quot;PaxosRepairRetries&quot;);</span>
+
+    private static long getRetryTimeoutNanos()
+    {
+<span class="nc" id="L135">        long retryMillis = PAXOS_REPAIR_RETRY_TIMEOUT_IN_MS.getLong();</span>
+<span class="nc" id="L136">        return TimeUnit.MILLISECONDS.toNanos(retryMillis);</span>
+    }
+
+    private final TableMetadata table;
+    private final ConsistencyLevel paxosConsistency;
+    private Participants participants;
+
+    private Ballot successCriteria;
+    private Ballot prevSupersededBy;
+    private int attempts;
+
+    public String toString()
+    {
+<span class="nc" id="L149">        return &quot;PaxosRepair{&quot; +</span>
+<span class="nc" id="L150">               &quot;key=&quot; + partitionKey() +</span>
+<span class="nc" id="L151">               &quot;, table=&quot; + table.toString() +</span>
+               &quot;, consistency=&quot; + paxosConsistency +
+               &quot;, participants=&quot; + participants.electorate +
+<span class="nc" id="L154">               &quot;, state=&quot; + state() +</span>
+<span class="nc" id="L155">               &quot;, startedMillis=&quot; + MonotonicClock.Global.approxTime.translate().toMillisSinceEpoch(startedNanos()) +</span>
+<span class="nc" id="L156">               &quot;, started=&quot; + isStarted() +</span>
+               '}';
+    }
+
+    /**
+     * Waiting for responses to PAXOS_REPAIR messages.
+     *
+     * This state may be entered multiple times; every time we fail for any reason, we restart from this state
+     */
+<span class="nc" id="L165">    private class Querying extends State implements RequestCallbackWithFailure&lt;Response&gt;, Runnable</span>
+    {
+        private int successes;
+        private int failures;
+
+        private Ballot latestWitnessed;
+        private @Nullable Accepted latestAccepted;
+        private Committed latestCommitted;
+        private Ballot oldestCommitted;
+        private Ballot clashingPromise;
+
+        @Override
+        public void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+        {
+<span class="nc" id="L179">            updateState(this, null, (i1, i2) -&gt; i1.onFailure());</span>
+<span class="nc" id="L180">        }</span>
+
+        @Override
+        public void onResponse(Message&lt;Response&gt; msg)
+        {
+<span class="nc" id="L185">            logger.trace(&quot;PaxosRepair {} from {}&quot;, msg.payload, msg.from());</span>
+<span class="nc" id="L186">            updateState(this, msg, Querying::onResponseInternal);</span>
+<span class="nc" id="L187">        }</span>
+
+        private State onFailure()
+        {
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            if (++failures + participants.sizeOfConsensusQuorum &gt; participants.sizeOfPoll())</span>
+<span class="nc" id="L192">                return retry(this);</span>
+<span class="nc" id="L193">            return this;</span>
+        }
+
+        private State onResponseInternal(Message&lt;Response&gt; msg)
+        {
+<span class="nc" id="L198">            latestWitnessed = latest(latestWitnessed, msg.payload.latestWitnessedOrLowBound);</span>
+<span class="nc" id="L199">            latestAccepted = latest(latestAccepted, msg.payload.acceptedButNotCommitted);</span>
+<span class="nc" id="L200">            latestCommitted = latest(latestCommitted, msg.payload.committed);</span>
+<span class="nc bnc" id="L201" title="All 4 branches missed.">            if (oldestCommitted == null || isAfter(oldestCommitted, msg.payload.committed))</span>
+<span class="nc" id="L202">                oldestCommitted = msg.payload.committed.ballot;</span>
+
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            if (isAfter(latestWitnessed, clashingPromise))</span>
+<span class="nc" id="L205">                clashingPromise = null;</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (timestampsClash(latestAccepted, msg.payload.latestWitnessedOrLowBound))</span>
+<span class="nc" id="L207">                clashingPromise = msg.payload.latestWitnessedOrLowBound;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (timestampsClash(latestAccepted, latestWitnessed))</span>
+<span class="nc" id="L209">                clashingPromise = latestWitnessed;</span>
+
+            // once we receive the requisite number, we can simply proceed, and ignore future responses
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (++successes == participants.sizeOfConsensusQuorum)</span>
+<span class="nc" id="L213">                return execute();</span>
+
+<span class="nc" id="L215">            return this;</span>
+        }
+
+        private State execute()
+        {
+            // if we have a timestamp clash, always prefer the accepted ballot
+<span class="nc" id="L221">            latestWitnessed = latest(latestAccepted, latestWitnessed);</span>
+<span class="nc" id="L222">            Ballot latestPreviouslyWitnessed = latest(successCriteria, prevSupersededBy);</span>
+
+            // Save as success criteria the latest promise seen by our first round; if we ever see anything
+            // newer committed, we know at least one paxos round has been completed since we started, which is all we need
+            // or newer than this committed we know we're done, so to avoid looping indefinitely in competition
+            // with others, we store this ballot for future retries so we can terminate based on other proposers' work
+<span class="nc bnc" id="L228" title="All 4 branches missed.">            if (successCriteria == null || timestampsClash(successCriteria, latestWitnessed))</span>
+            {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L231">                    logger.trace(&quot;PaxosRepair of {} setting success criteria to {}&quot;, partitionKey(), Ballot.toString(latestWitnessed));</span>
+
+<span class="nc" id="L233">                successCriteria = latestWitnessed;</span>
+            }
+
+<span class="nc bnc" id="L236" title="All 4 branches missed.">            boolean hasCommittedSuccessCriteria = isAfter(latestCommitted, successCriteria) || latestCommitted.hasBallot(successCriteria);</span>
+<span class="nc" id="L237">            boolean isPromisedButNotAccepted    = isAfter(latestWitnessed, latestAccepted); // not necessarily promised - may be lowBound</span>
+<span class="nc" id="L238">            boolean isAcceptedButNotCommitted   = isAfter(latestAccepted, latestCommitted);</span>
+<span class="nc bnc" id="L239" title="All 4 branches missed.">            boolean reproposalMayBeRejected     = clashingPromise != null || !isAfter(latestWitnessed, latestPreviouslyWitnessed);</span>
+
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if (hasCommittedSuccessCriteria)</span>
+            {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L244">                    logger.trace(&quot;PaxosRepair witnessed {} newer than success criteria {} (oldest: {})&quot;, latestCommitted, Ballot.toString(successCriteria), Ballot.toString(oldestCommitted));</span>
+
+                // we have a new enough commit, but it might not have reached enough participants; make sure it has before terminating
+                // note: we could send to only those we know haven't witnessed it, but this is a rare operation so a small amount of redundant work is fine
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                return oldestCommitted.equals(latestCommitted.ballot)</span>
+<span class="nc" id="L249">                        ? DONE</span>
+<span class="nc" id="L250">                        : PaxosCommit.commit(latestCommitted, participants, paxosConsistency, commitConsistency(), true,</span>
+                                             new CommittingRepair());
+            }
+<span class="nc bnc" id="L253" title="All 6 branches missed.">            else if (isAcceptedButNotCommitted &amp;&amp; !isPromisedButNotAccepted &amp;&amp; !reproposalMayBeRejected)</span>
+            {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L256">                    logger.trace(&quot;PaxosRepair of {} completing {}&quot;, partitionKey(), latestAccepted);</span>
+                // We need to complete this in-progress accepted proposal, which may not have been seen by a majority
+                // However, since we have not sought any promises, we can simply complete the existing proposal
+                // since this is an idempotent operation - both us and the original proposer (and others) can
+                // all do it at the same time without incident
+
+                // If ballots with same timestamp have been both accepted and rejected by different nodes,
+                // to avoid a livelock we simply try to poison, knowing we will fail but use a new ballot
+                // (note there are alternative approaches but this is conservative)
+
+<span class="nc" id="L266">                return PaxosPropose.propose(latestAccepted, participants, false,</span>
+                        new ProposingRepair(latestAccepted));
+            }
+<span class="nc bnc" id="L269" title="All 6 branches missed.">            else if (isAcceptedButNotCommitted || isPromisedButNotAccepted || latestWitnessed.compareTo(latestPreviouslyWitnessed) &lt; 0)</span>
+            {
+<span class="nc" id="L271">                Ballot ballot = staleBallotNewerThan(latest(latestWitnessed, latestPreviouslyWitnessed), paxosConsistency);</span>
+                // We need to propose a no-op &gt; latestPromised, to ensure we don't later discover
+                // that latestPromised had already been accepted (by a minority) and repair it
+                // This means starting a new ballot, but we choose to use one that is likely to lose a contention battle
+                // Since this operation is not urgent, and we can piggy-back on other paxos operations
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if (logger.isTraceEnabled())</span>
+<span class="nc" id="L277">                    logger.trace(&quot;PaxosRepair of {} found incomplete promise or proposal; preparing stale ballot {}&quot;, partitionKey(), Ballot.toString(ballot));</span>
+
+<span class="nc" id="L279">                return prepareWithBallot(ballot, participants, partitionKey(), table, false, false,</span>
+                        new PoisonProposals());
+            }
+            else
+            {
+<span class="nc" id="L284">                logger.error(&quot;PaxosRepair illegal state latestWitnessed={}, latestAcceptedButNotCommitted={}, latestCommitted={}, oldestCommitted={}&quot;, latestWitnessed, latestAccepted, latestCommitted, oldestCommitted);</span>
+<span class="nc" id="L285">                throw new IllegalStateException(); // should be logically impossible</span>
+            }
+        }
+
+        public void run()
+        {
+<span class="nc" id="L291">            Message&lt;Request&gt; message = Message.out(PAXOS2_REPAIR_REQ, new Request(partitionKey(), table));</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            for (int i = 0, size = participants.sizeOfPoll(); i &lt; size ; ++i)</span>
+<span class="nc" id="L293">                MessagingService.instance().sendWithCallback(message, participants.voter(i), this);</span>
+<span class="nc" id="L294">        }</span>
+    }
+
+    /**
+     * We found either an incomplete promise or proposal, so we need to start a new paxos round to complete them
+     */
+<span class="nc" id="L300">    private class PoisonProposals extends ConsumerState&lt;Status&gt;</span>
+    {
+        @Override
+        public State execute(Status input) throws Throwable
+        {
+<span class="nc bnc" id="L305" title="All 6 branches missed.">            switch (input.outcome)</span>
+            {
+                case MAYBE_FAILURE:
+<span class="nc" id="L308">                    return retry(this);</span>
+
+                case READ_PERMITTED:
+                case SUPERSEDED:
+<span class="nc" id="L312">                    prevSupersededBy = latest(prevSupersededBy, input.retryWithAtLeast());</span>
+<span class="nc" id="L313">                    return retry(this);</span>
+
+                case FOUND_INCOMPLETE_ACCEPTED:
+                {
+                    // finish the in-progress proposal
+                    // cannot simply restart, as our latest promise is newer than the proposal
+                    // so we require a promise before we decide which proposal to complete
+                    // (else an &quot;earlier&quot; operation can sneak in and invalidate us while we're proposing
+                    // with a newer ballot)
+<span class="nc" id="L322">                    FoundIncompleteAccepted incomplete = input.incompleteAccepted();</span>
+<span class="nc" id="L323">                    Proposal propose = new Proposal(incomplete.ballot, incomplete.accepted.update);</span>
+<span class="nc" id="L324">                    logger.trace(&quot;PaxosRepair of {} found incomplete {}&quot;, partitionKey(), incomplete.accepted);</span>
+<span class="nc" id="L325">                    return PaxosPropose.propose(propose, participants, false,</span>
+                            new ProposingRepair(propose)); // we don't know if we're done, so we must restart
+                }
+
+                case FOUND_INCOMPLETE_COMMITTED:
+                {
+                    // finish the in-progress commit
+<span class="nc" id="L332">                    FoundIncompleteCommitted incomplete = input.incompleteCommitted();</span>
+<span class="nc" id="L333">                    logger.trace(&quot;PaxosRepair of {} found in progress {}&quot;, partitionKey(), incomplete.committed);</span>
+<span class="nc" id="L334">                    return PaxosCommit.commit(incomplete.committed, participants, paxosConsistency, commitConsistency(), true,</span>
+                                              new CommitAndRestart()); // we don't know if we're done, so we must restart
+                }
+
+                case PROMISED:
+                {
+                    // propose the empty ballot
+<span class="nc" id="L341">                    logger.trace(&quot;PaxosRepair of {} submitting empty proposal&quot;, partitionKey());</span>
+<span class="nc" id="L342">                    Proposal proposal = Proposal.empty(input.success().ballot, partitionKey(), table);</span>
+<span class="nc" id="L343">                    return PaxosPropose.propose(proposal, participants, false,</span>
+                            new ProposingRepair(proposal));
+                }
+
+                default:
+<span class="nc" id="L348">                    throw new IllegalStateException();</span>
+            }
+        }
+    }
+
+    private class ProposingRepair extends ConsumerState&lt;PaxosPropose.Status&gt;
+    {
+        final Proposal proposal;
+        private ProposingRepair(Proposal proposal)
+<span class="nc" id="L357">        {</span>
+<span class="nc" id="L358">            this.proposal = proposal;</span>
+<span class="nc" id="L359">        }</span>
+
+        @Override
+        public State execute(PaxosPropose.Status input)
+        {
+<span class="nc bnc" id="L364" title="All 4 branches missed.">            switch (input.outcome)</span>
+            {
+                case MAYBE_FAILURE:
+<span class="nc" id="L367">                    return retry(this);</span>
+
+                case SUPERSEDED:
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                    if (isAfter(input.superseded().by, prevSupersededBy))</span>
+<span class="nc" id="L371">                        prevSupersededBy = input.superseded().by;</span>
+<span class="nc" id="L372">                    return retry(this);</span>
+
+                case SUCCESS:
+<span class="nc bnc" id="L375" title="All 2 branches missed.">                    if (proposal.update.isEmpty())</span>
+                    {
+<span class="nc" id="L377">                        logger.trace(&quot;PaxosRepair of {} complete after successful empty proposal&quot;, partitionKey());</span>
+<span class="nc" id="L378">                        return DONE;</span>
+                    }
+
+<span class="nc" id="L381">                    logger.trace(&quot;PaxosRepair of {} committing successful proposal {}&quot;, partitionKey(), proposal);</span>
+<span class="nc" id="L382">                    return PaxosCommit.commit(proposal.agreed(), participants, paxosConsistency, commitConsistency(), true,</span>
+                                              new CommittingRepair());
+
+                default:
+<span class="nc" id="L386">                    throw new IllegalStateException();</span>
+            }
+        }
+    }
+
+<span class="nc" id="L391">    private class CommittingRepair extends ConsumerState&lt;PaxosCommit.Status&gt;</span>
+    {
+        @Override
+        public State execute(PaxosCommit.Status input)
+        {
+<span class="nc" id="L396">            logger.trace(&quot;PaxosRepair of {} {}&quot;, partitionKey(), input);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            return input.isSuccess() ? DONE : retry(this);</span>
+        }
+    }
+
+<span class="nc" id="L401">    private class CommitAndRestart extends ConsumerState&lt;PaxosCommit.Status&gt;</span>
+    {
+        @Override
+        public State execute(PaxosCommit.Status input)
+        {
+<span class="nc" id="L406">            return restart(this);</span>
+        }
+    }
+
+    private PaxosRepair(DecoratedKey partitionKey, Ballot incompleteBallot, TableMetadata table, ConsistencyLevel paxosConsistency)
+    {
+<span class="nc" id="L412">        super(partitionKey, incompleteBallot);</span>
+        // TODO: move precondition into super ctor
+<span class="nc" id="L414">        Preconditions.checkArgument(paxosConsistency.isSerialConsistency());</span>
+<span class="nc" id="L415">        this.table = table;</span>
+<span class="nc" id="L416">        this.paxosConsistency = paxosConsistency;</span>
+<span class="nc" id="L417">        this.successCriteria = incompleteBallot;</span>
+<span class="nc" id="L418">    }</span>
+
+    public static PaxosRepair create(ConsistencyLevel consistency, DecoratedKey partitionKey, Ballot incompleteBallot, TableMetadata table)
+    {
+<span class="nc" id="L422">        return new PaxosRepair(partitionKey, incompleteBallot, table, consistency);</span>
+    }
+
+    private State retry(State state)
+    {
+<span class="nc" id="L427">        Preconditions.checkState(isStarted());</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (isResult(state))</span>
+<span class="nc" id="L429">            return state;</span>
+
+<span class="nc" id="L431">        return restart(state, waitUntilForContention(++attempts, table, partitionKey(), paxosConsistency, REPAIR));</span>
+    }
+
+    @Override
+    public State restart(State state, long waitUntil)
+    {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (isResult(state))</span>
+<span class="nc" id="L438">            return state;</span>
+
+<span class="nc" id="L440">        participants = Participants.get(table, partitionKey(), paxosConsistency);</span>
+
+<span class="nc bnc" id="L442" title="All 4 branches missed.">        if (waitUntil &gt; Long.MIN_VALUE &amp;&amp; waitUntil - startedNanos() &gt; RETRY_TIMEOUT_NANOS)</span>
+<span class="nc" id="L443">            return new Failure(null);</span>
+
+        try
+        {
+<span class="nc" id="L447">            participants.assureSufficientLiveNodesForRepair();</span>
+        }
+<span class="nc" id="L449">        catch (UnavailableException e)</span>
+        {
+<span class="nc" id="L451">            return new Failure(e);</span>
+<span class="nc" id="L452">        }</span>
+
+<span class="nc" id="L454">        Querying querying = new Querying();</span>
+        long now;
+<span class="nc bnc" id="L456" title="All 4 branches missed.">        if (waitUntil == Long.MIN_VALUE || waitUntil - (now = nanoTime()) &lt; 0) querying.run();</span>
+<span class="nc" id="L457">        else RETRIES.schedule(querying, waitUntil - now, NANOSECONDS);</span>
+
+<span class="nc" id="L459">        return querying;</span>
+    }
+
+    private ConsistencyLevel commitConsistency()
+    {
+<span class="nc" id="L464">        Preconditions.checkState(paxosConsistency.isSerialConsistency());</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        return paxosConsistency.isDatacenterLocal() ? ConsistencyLevel.LOCAL_QUORUM : ConsistencyLevel.QUORUM;</span>
+    }
+
+    static class Request
+    {
+        final DecoratedKey partitionKey;
+        final TableMetadata table;
+        Request(DecoratedKey partitionKey, TableMetadata table)
+<span class="nc" id="L473">        {</span>
+<span class="nc" id="L474">            this.partitionKey = partitionKey;</span>
+<span class="nc" id="L475">            this.table = table;</span>
+<span class="nc" id="L476">        }</span>
+    }
+
+    /**
+     * The response to a proposal, indicating success (if {@code supersededBy == null},
+     * or failure, alongside the ballot that beat us
+     */
+    static class Response
+    {
+        @Nonnull final Ballot latestWitnessedOrLowBound;
+        @Nullable final Accepted acceptedButNotCommitted;
+        @Nonnull final Committed committed;
+
+        Response(Ballot latestWitnessedOrLowBound, @Nullable Accepted acceptedButNotCommitted, Committed committed)
+<span class="nc" id="L490">        {</span>
+<span class="nc" id="L491">            this.latestWitnessedOrLowBound = latestWitnessedOrLowBound;</span>
+<span class="nc" id="L492">            this.acceptedButNotCommitted = acceptedButNotCommitted;</span>
+<span class="nc" id="L493">            this.committed = committed;</span>
+<span class="nc" id="L494">        }</span>
+
+        public String toString()
+        {
+<span class="nc" id="L498">            return String.format(&quot;Response(%s, %s, %s&quot;, latestWitnessedOrLowBound, acceptedButNotCommitted, committed);</span>
+        }
+    }
+
+    private static Map&lt;String, Set&lt;InetAddressAndPort&gt;&gt; mapToDc(Collection&lt;InetAddressAndPort&gt; endpoints, Function&lt;InetAddressAndPort, String&gt; dcFunc)
+    {
+<span class="nc" id="L504">        Map&lt;String, Set&lt;InetAddressAndPort&gt;&gt; map = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L505">        endpoints.forEach(e -&gt; map.computeIfAbsent(dcFunc.apply(e), k -&gt; new HashSet&lt;&gt;()).add(e));</span>
+<span class="nc" id="L506">        return map;</span>
+    }
+
+    private static boolean hasQuorumOrSingleDead(Collection&lt;InetAddressAndPort&gt; all, Collection&lt;InetAddressAndPort&gt; live, boolean requireQuorum)
+    {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        Preconditions.checkArgument(all.size() &gt;= live.size());</span>
+<span class="nc bnc" id="L512" title="All 6 branches missed.">        return live.size() &gt;= (all.size() / 2) + 1 || (!requireQuorum &amp;&amp; live.size() &gt;= all.size() - 1);</span>
+    }
+
+    @VisibleForTesting
+    static boolean hasSufficientLiveNodesForTopologyChange(Collection&lt;InetAddressAndPort&gt; allEndpoints, Collection&lt;InetAddressAndPort&gt; liveEndpoints, Function&lt;InetAddressAndPort, String&gt; dcFunc, boolean onlyQuorumRequired, boolean strictQuorum)
+    {
+
+<span class="nc" id="L519">        Map&lt;String, Set&lt;InetAddressAndPort&gt;&gt; allDcMap = mapToDc(allEndpoints, dcFunc);</span>
+<span class="nc" id="L520">        Map&lt;String, Set&lt;InetAddressAndPort&gt;&gt; liveDcMap = mapToDc(liveEndpoints, dcFunc);</span>
+
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (!hasQuorumOrSingleDead(allEndpoints, liveEndpoints, strictQuorum))</span>
+<span class="nc" id="L523">            return false;</span>
+
+<span class="nc bnc" id="L525" title="All 2 branches missed.">        if (onlyQuorumRequired)</span>
+<span class="nc" id="L526">            return true;</span>
+
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        for (Map.Entry&lt;String, Set&lt;InetAddressAndPort&gt;&gt; entry : allDcMap.entrySet())</span>
+        {
+<span class="nc" id="L530">            Set&lt;InetAddressAndPort&gt; all = entry.getValue();</span>
+<span class="nc" id="L531">            Set&lt;InetAddressAndPort&gt; live = liveDcMap.getOrDefault(entry.getKey(), Collections.emptySet());</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (!hasQuorumOrSingleDead(all, live, strictQuorum))</span>
+<span class="nc" id="L533">                return false;</span>
+<span class="nc" id="L534">        }</span>
+<span class="nc" id="L535">        return true;</span>
+    }
+
+    /**
+     * checks if we have enough live nodes to perform a paxos repair for topology repair. Generally, this means that we need enough
+     * live participants to reach EACH_QUORUM, with a few exceptions. The EACH_QUORUM requirement is meant to support workload using either
+     * SERIAL or LOCAL_SERIAL
+     *
+     * if paxos_topology_repair_strict_each_quorum is set to false (the default), we will accept either a quorum or n-1 live nodes
+     * in the cluster and per dc. If paxos_topology_repair_no_dc_checks is true, we only check the live nodes in the cluster,
+     * and do not do any per-dc checks.
+     */
+    public static boolean hasSufficientLiveNodesForTopologyChange(Keyspace keyspace, Range&lt;Token&gt; range, Collection&lt;InetAddressAndPort&gt; liveEndpoints)
+    {
+<span class="nc" id="L549">        return hasSufficientLiveNodesForTopologyChange(keyspace.getReplicationStrategy().getNaturalReplicasForToken(range.right).endpoints(),</span>
+                                                       liveEndpoints,
+<span class="nc" id="L551">                                                       DatabaseDescriptor.getEndpointSnitch()::getDatacenter,</span>
+<span class="nc" id="L552">                                                       DatabaseDescriptor.paxoTopologyRepairNoDcChecks(),</span>
+<span class="nc" id="L553">                                                       DatabaseDescriptor.paxoTopologyRepairStrictEachQuorum());</span>
+    }
+
+    /**
+     * The proposal request handler, i.e. receives a proposal from a peer and responds with either acccept/reject
+     */
+<span class="nc" id="L559">    public static class RequestHandler implements IVerbHandler&lt;PaxosRepair.Request&gt;</span>
+    {
+        @Override
+        public void doVerb(Message&lt;PaxosRepair.Request&gt; message)
+        {
+<span class="nc" id="L564">            PaxosRepair.Request request = message.payload;</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">            if (!isInRangeAndShouldProcess(message.from(), request.partitionKey, request.table, false))</span>
+            {
+<span class="nc" id="L567">                MessagingService.instance().respondWithFailure(UNKNOWN, message);</span>
+<span class="nc" id="L568">                return;</span>
+            }
+
+            Ballot latestWitnessed;
+            Accepted acceptedButNotCommited;
+            Committed committed;
+<span class="nc" id="L574">            long nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L575">            try (PaxosState state = PaxosState.get(request.partitionKey, request.table))</span>
+            {
+<span class="nc" id="L577">                PaxosState.Snapshot snapshot = state.current(nowInSec);</span>
+<span class="nc" id="L578">                latestWitnessed = snapshot.latestWitnessedOrLowBound();</span>
+<span class="nc" id="L579">                acceptedButNotCommited = snapshot.accepted;</span>
+<span class="nc" id="L580">                committed = snapshot.committed;</span>
+            }
+
+<span class="nc" id="L583">            Response response = new Response(latestWitnessed, acceptedButNotCommited, committed);</span>
+<span class="nc" id="L584">            MessagingService.instance().respond(response, message);</span>
+<span class="nc" id="L585">        }</span>
+    }
+
+<span class="nc" id="L588">    public static class RequestSerializer implements IVersionedSerializer&lt;Request&gt;</span>
+    {
+        @Override
+        public void serialize(Request request, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L593">            request.table.id.serialize(out);</span>
+<span class="nc" id="L594">            DecoratedKey.serializer.serialize(request.partitionKey, out, version);</span>
+<span class="nc" id="L595">        }</span>
+
+        @Override
+        public Request deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L600">            TableMetadata table = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));</span>
+<span class="nc" id="L601">            DecoratedKey partitionKey = (DecoratedKey) DecoratedKey.serializer.deserialize(in, table.partitioner, version);</span>
+<span class="nc" id="L602">            return new Request(partitionKey, table);</span>
+        }
+
+        @Override
+        public long serializedSize(Request request, int version)
+        {
+<span class="nc" id="L608">            return request.table.id.serializedSize()</span>
+<span class="nc" id="L609">                   + DecoratedKey.serializer.serializedSize(request.partitionKey, version);</span>
+        }
+    }
+
+<span class="nc" id="L613">    public static class ResponseSerializer implements IVersionedSerializer&lt;Response&gt;</span>
+    {
+        public void serialize(Response response, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L617">            response.latestWitnessedOrLowBound.serialize(out);</span>
+<span class="nc" id="L618">            serializeNullable(Accepted.serializer, response.acceptedButNotCommitted, out, version);</span>
+<span class="nc" id="L619">            Committed.serializer.serialize(response.committed, out, version);</span>
+<span class="nc" id="L620">        }</span>
+
+        public Response deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L624">            Ballot latestWitnessed = Ballot.deserialize(in);</span>
+<span class="nc" id="L625">            Accepted acceptedButNotCommitted = deserializeNullable(Accepted.serializer, in, version);</span>
+<span class="nc" id="L626">            Committed committed = Committed.serializer.deserialize(in, version);</span>
+<span class="nc" id="L627">            return new Response(latestWitnessed, acceptedButNotCommitted, committed);</span>
+        }
+
+        public long serializedSize(Response response, int version)
+        {
+<span class="nc" id="L632">            return Ballot.sizeInBytes()</span>
+<span class="nc" id="L633">                   + serializedSizeNullable(Accepted.serializer, response.acceptedButNotCommitted, version)</span>
+<span class="nc" id="L634">                   + Committed.serializer.serializedSize(response.committed, version);</span>
+        }
+    }
+
+<span class="nc" id="L638">    private static volatile boolean SKIP_VERSION_VALIDATION = SKIP_PAXOS_REPAIR_VERSION_VALIDATION.getBoolean();</span>
+
+    public static void setSkipPaxosRepairCompatibilityCheck(boolean v)
+    {
+<span class="nc" id="L642">        SKIP_VERSION_VALIDATION = v;</span>
+<span class="nc" id="L643">    }</span>
+
+    public static boolean getSkipPaxosRepairCompatibilityCheck()
+    {
+<span class="nc" id="L647">        return SKIP_VERSION_VALIDATION;</span>
+    }
+
+    static boolean validateVersionCompatibility(CassandraVersion version)
+    {
+<span class="nc bnc" id="L652" title="All 2 branches missed.">        if (SKIP_VERSION_VALIDATION)</span>
+<span class="nc" id="L653">            return true;</span>
+
+<span class="nc bnc" id="L655" title="All 2 branches missed.">        if (version == null)</span>
+<span class="nc" id="L656">            return false;</span>
+
+        // assume 4.0 is ok
+<span class="nc bnc" id="L659" title="All 6 branches missed.">        return (version.major == 4 &amp;&amp; version.minor &gt; 0) || version.major &gt; 4;</span>
+    }
+
+    static String getPeerVersion(InetAddressAndPort peer)
+    {
+<span class="nc" id="L664">        EndpointState epState = Gossiper.instance.getEndpointStateForEndpoint(peer);</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        if (epState == null)</span>
+<span class="nc" id="L666">            return null;</span>
+
+<span class="nc" id="L668">        VersionedValue value = epState.getApplicationState(ApplicationState.RELEASE_VERSION);</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (value == null)</span>
+<span class="nc" id="L670">            return null;</span>
+
+        try
+        {
+<span class="nc" id="L674">            return value.value;</span>
+        }
+<span class="nc" id="L676">        catch (IllegalArgumentException e)</span>
+        {
+<span class="nc" id="L678">            return null;</span>
+        }
+    }
+
+    static boolean validatePeerCompatibility(Replica peer)
+    {
+<span class="nc" id="L684">        String versionString = getPeerVersion(peer.endpoint());</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">        CassandraVersion version = versionString != null ? new CassandraVersion(versionString) : null;</span>
+<span class="nc" id="L686">        boolean result = validateVersionCompatibility(version);</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">        if (!result)</span>
+<span class="nc" id="L688">            logger.info(&quot;PaxosRepair isn't supported by {} on version {}&quot;, peer, versionString);</span>
+<span class="nc" id="L689">        return result;</span>
+    }
+
+    static boolean validatePeerCompatibility(TableMetadata table, Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L694">        Participants participants = Participants.get(table, range.right, ConsistencyLevel.SERIAL);</span>
+<span class="nc" id="L695">        return Iterables.all(participants.all, PaxosRepair::validatePeerCompatibility);</span>
+    }
+
+    public static boolean validatePeerCompatibility(TableMetadata table, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L700">        return Iterables.all(ranges, range -&gt; validatePeerCompatibility(table, range));</span>
+    }
+
+    public static void shutdownAndWait(long timeout, TimeUnit units) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L705">        ExecutorUtils.shutdownAndWait(timeout, units, RETRIES);</span>
+<span class="nc" id="L706">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

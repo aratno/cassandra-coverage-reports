@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StorageAttachedIndexBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.index.sai</a> &gt; <span class="el_source">StorageAttachedIndexBuilder.java</span></div><h1>StorageAttachedIndexBuilder.java</h1><pre class="source lang-java linenums">/*
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ */
+
+package org.apache.cassandra.index.sai;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.compaction.CompactionInfo;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.KeyIterator;
+import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+import org.apache.cassandra.io.sstable.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import org.apache.cassandra.utils.concurrent.Ref;
+
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+/**
+ * Multiple storage-attached indexes can start building concurrently. We need to make sure:
+ * 1. Per-SSTable index files are built only once
+ *      a. Per-SSTable index files already built, do nothing
+ *      b. Per-SSTable index files are currently building, we need to wait until it's built in order to consider index built.
+ * 2. Per-column index files are built for each column index
+ */
+public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
+{
+<span class="nc" id="L68">    protected static final Logger logger = LoggerFactory.getLogger(StorageAttachedIndexBuilder.class);</span>
+
+    // make sure only one builder can write to per sstable files when multiple storage-attached indexes are created simultaneously.
+<span class="nc" id="L71">    private static final Map&lt;SSTableReader, CountDownLatch&gt; inProgress = Maps.newConcurrentMap();</span>
+
+    private final StorageAttachedIndexGroup group;
+    private final TableMetadata metadata;
+    private final Tracker tracker;
+<span class="nc" id="L76">    private final TimeUUID compactionId = nextTimeUUID();</span>
+    private final boolean isFullRebuild;
+    private final boolean isInitialBuild;
+
+    private final SortedMap&lt;SSTableReader, Set&lt;StorageAttachedIndex&gt;&gt; sstables;
+
+<span class="nc" id="L82">    private long bytesProcessed = 0;</span>
+    private final long totalSizeInBytes;
+
+    StorageAttachedIndexBuilder(StorageAttachedIndexGroup group,
+                                SortedMap&lt;SSTableReader, Set&lt;StorageAttachedIndex&gt;&gt; sstables,
+                                boolean isFullRebuild,
+                                boolean isInitialBuild)
+<span class="nc" id="L89">    {</span>
+<span class="nc" id="L90">        this.group = group;</span>
+<span class="nc" id="L91">        this.metadata = group.metadata();</span>
+<span class="nc" id="L92">        this.sstables = sstables;</span>
+<span class="nc" id="L93">        this.tracker = group.table().getTracker();</span>
+<span class="nc" id="L94">        this.isFullRebuild = isFullRebuild;</span>
+<span class="nc" id="L95">        this.isInitialBuild = isInitialBuild;</span>
+<span class="nc" id="L96">        this.totalSizeInBytes = sstables.keySet().stream().mapToLong(SSTableReader::uncompressedLength).sum();</span>
+<span class="nc" id="L97">    }</span>
+
+    @Override
+    public void build()
+    {
+<span class="nc" id="L102">        logger.debug(logMessage(String.format(&quot;Starting %s %s index build...&quot;,</span>
+<span class="nc bnc" id="L103" title="All 2 branches missed.">                                              isInitialBuild ? &quot;initial&quot; : &quot;non-initial&quot;,</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">                                              isFullRebuild ? &quot;full&quot; : &quot;partial&quot;)));</span>
+
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        for (Map.Entry&lt;SSTableReader, Set&lt;StorageAttachedIndex&gt;&gt; e : sstables.entrySet())</span>
+        {
+<span class="nc" id="L108">            SSTableReader sstable = e.getKey();</span>
+<span class="nc" id="L109">            Set&lt;StorageAttachedIndex&gt; indexes = e.getValue();</span>
+
+<span class="nc" id="L111">            Set&lt;StorageAttachedIndex&gt; existing = validateIndexes(indexes, sstable.descriptor);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            if (existing.isEmpty())</span>
+            {
+<span class="nc" id="L114">                logger.debug(logMessage(&quot;{} dropped during index build&quot;), indexes);</span>
+<span class="nc" id="L115">                continue;</span>
+            }
+
+<span class="nc bnc" id="L118" title="All 2 branches missed.">            if (indexSSTable(sstable, existing))</span>
+<span class="nc" id="L119">                return;</span>
+<span class="nc" id="L120">        }</span>
+<span class="nc" id="L121">    }</span>
+
+    private String logMessage(String message)
+    {
+<span class="nc" id="L125">        return String.format(&quot;[%s.%s.*] %s&quot;, metadata.keyspace, metadata.name, message);</span>
+    }
+
+    /**
+     * @return true if index build should be stopped
+     */
+    private boolean indexSSTable(SSTableReader sstable, Set&lt;StorageAttachedIndex&gt; indexes)
+    {
+<span class="nc" id="L133">        logger.debug(logMessage(&quot;Starting index build on {}&quot;), sstable.descriptor);</span>
+
+<span class="nc" id="L135">        CountDownLatch perSSTableFileLock = null;</span>
+<span class="nc" id="L136">        StorageAttachedIndexWriter indexWriter = null;</span>
+
+<span class="nc" id="L138">        Ref&lt;? extends SSTableReader&gt; ref = sstable.tryRef();</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (ref == null)</span>
+        {
+<span class="nc" id="L141">            logger.warn(logMessage(&quot;Couldn't acquire reference to the SSTable {}. It may have been removed.&quot;), sstable.descriptor);</span>
+<span class="nc" id="L142">            return false;</span>
+        }
+
+<span class="nc" id="L145">        try (RandomAccessReader dataFile = sstable.openDataReader();</span>
+<span class="nc" id="L146">             LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.INDEX_BUILD, sstable))</span>
+        {
+<span class="nc" id="L148">            perSSTableFileLock = shouldWritePerSSTableFiles(sstable);</span>
+            // If we were unable to get the per-SSTable file lock it means that the
+            // per-SSTable components are already being built, so we only want to
+            // build the per-index components
+<span class="nc bnc" id="L152" title="All 2 branches missed.">            boolean perIndexComponentsOnly = perSSTableFileLock == null;</span>
+            // remove existing per column index files instead of overwriting
+<span class="nc" id="L154">            IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);</span>
+<span class="nc" id="L155">            indexes.forEach(index -&gt; indexDescriptor.deleteColumnIndex(index.getIndexContext()));</span>
+
+<span class="nc" id="L157">            indexWriter = StorageAttachedIndexWriter.createBuilderWriter(indexDescriptor, indexes, txn, perIndexComponentsOnly);</span>
+
+<span class="nc" id="L159">            indexWriter.begin();</span>
+
+<span class="nc" id="L161">            long previousBytesRead = 0;</span>
+
+<span class="nc" id="L163">            try (KeyIterator keys = sstable.keyIterator())</span>
+            {
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                while (keys.hasNext())</span>
+                {
+<span class="nc bnc" id="L167" title="All 2 branches missed.">                    if (isStopRequested())</span>
+                    {
+<span class="nc" id="L169">                        logger.debug(indexDescriptor.logMessage(&quot;Index build has been stopped&quot;));</span>
+<span class="nc" id="L170">                        throw new CompactionInterruptedException(getCompactionInfo());</span>
+                    }
+
+<span class="nc" id="L173">                    DecoratedKey key = keys.next();</span>
+
+<span class="nc" id="L175">                    indexWriter.startPartition(key, -1, -1);</span>
+
+<span class="nc" id="L177">                    long position = sstable.getPosition(key, SSTableReader.Operator.EQ);</span>
+<span class="nc" id="L178">                    dataFile.seek(position);</span>
+<span class="nc" id="L179">                    ByteBufferUtil.readWithShortLength(dataFile); // key</span>
+
+<span class="nc" id="L181">                    try (SSTableIdentityIterator partition = SSTableIdentityIterator.create(sstable, dataFile, key))</span>
+                    {
+                        // if the row has statics attached, it has to be indexed separately
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                        if (metadata.hasStaticColumns())</span>
+<span class="nc" id="L185">                            indexWriter.nextUnfilteredCluster(partition.staticRow());</span>
+
+<span class="nc bnc" id="L187" title="All 2 branches missed.">                        while (partition.hasNext())</span>
+<span class="nc" id="L188">                            indexWriter.nextUnfilteredCluster(partition.next());</span>
+                    }
+<span class="nc" id="L190">                    long bytesRead = keys.getBytesRead();</span>
+<span class="nc" id="L191">                    bytesProcessed += bytesRead - previousBytesRead;</span>
+<span class="nc" id="L192">                    previousBytesRead = bytesRead;</span>
+<span class="nc" id="L193">                }</span>
+
+<span class="nc" id="L195">                completeSSTable(indexWriter, sstable, indexes, perSSTableFileLock);</span>
+            }
+
+<span class="nc" id="L198">            return false;</span>
+        }
+<span class="nc" id="L200">        catch (Throwable t)</span>
+        {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (indexWriter != null)</span>
+            {
+<span class="nc" id="L204">                indexWriter.abort(t, true);</span>
+            }
+
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if (t instanceof InterruptedException)</span>
+            {
+<span class="nc" id="L209">                logger.warn(logMessage(&quot;Interrupted while building indexes {} on SSTable {}&quot;), indexes, sstable.descriptor);</span>
+<span class="nc" id="L210">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L211">                return true;</span>
+            }
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            else if (t instanceof CompactionInterruptedException)</span>
+            {
+                //TODO Shouldn't do this if the stop was interrupted by a truncate
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                if (isInitialBuild)</span>
+                {
+<span class="nc" id="L218">                    logger.error(logMessage(&quot;Stop requested while building initial indexes {} on SSTable {}.&quot;), indexes, sstable.descriptor);</span>
+<span class="nc" id="L219">                    throw Throwables.unchecked(t);</span>
+                }
+                else
+                {
+<span class="nc" id="L223">                    logger.info(logMessage(&quot;Stop requested while building indexes {} on SSTable {}.&quot;), indexes, sstable.descriptor);</span>
+<span class="nc" id="L224">                    return true;</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L229">                logger.error(logMessage(&quot;Unable to build indexes {} on SSTable {}. Cause: {}.&quot;), indexes, sstable, t.getMessage());</span>
+<span class="nc" id="L230">                throw Throwables.unchecked(t);</span>
+            }
+        }
+        finally
+        {
+<span class="nc" id="L235">            ref.release();</span>
+            // release current lock in case of error
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (perSSTableFileLock != null)</span>
+            {
+<span class="nc" id="L239">                inProgress.remove(sstable);</span>
+<span class="nc" id="L240">                perSSTableFileLock.decrement();</span>
+            }
+        }
+    }
+
+    @Override
+    public CompactionInfo getCompactionInfo()
+    {
+<span class="nc" id="L248">        return new CompactionInfo(metadata,</span>
+                                  OperationType.INDEX_BUILD,
+                                  bytesProcessed,
+                                  totalSizeInBytes,
+                                  compactionId,
+<span class="nc" id="L253">                                  sstables.keySet());</span>
+    }
+
+    /**
+     * if the per sstable index files are already created, no need to write them again, unless found corrupted on rebuild
+     * if not created, try to acquire a lock, so only one builder will generate per sstable index files
+     */
+    private CountDownLatch shouldWritePerSSTableFiles(SSTableReader sstable)
+    {
+<span class="nc" id="L262">        IndexDescriptor indexDescriptor = IndexDescriptor.create(sstable);</span>
+
+        // if per-table files are incomplete, full rebuild is requested, or checksum fails
+<span class="nc bnc" id="L265" title="All 4 branches missed.">        if (!indexDescriptor.isPerSSTableIndexBuildComplete()</span>
+            || isFullRebuild
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            || !indexDescriptor.validatePerSSTableComponents(IndexValidation.CHECKSUM))</span>
+        {
+<span class="nc" id="L269">            CountDownLatch latch = CountDownLatch.newCountDownLatch(1);</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            if (inProgress.putIfAbsent(sstable, latch) == null)</span>
+            {
+                // lock owner should clean up existing per-SSTable files
+<span class="nc" id="L273">                group.deletePerSSTableFiles(Collections.singleton(sstable));</span>
+<span class="nc" id="L274">                return latch;</span>
+            }
+        }
+<span class="nc" id="L277">        return null;</span>
+    }
+
+    private void completeSSTable(SSTableFlushObserver indexWriter,
+                                 SSTableReader sstable,
+                                 Set&lt;StorageAttachedIndex&gt; indexes,
+                                 CountDownLatch latch) throws InterruptedException
+    {
+<span class="nc" id="L285">        indexWriter.complete();</span>
+
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (latch != null)</span>
+        {
+            // current builder owns the lock
+<span class="nc" id="L290">            latch.decrement();</span>
+        }
+        else
+        {
+            /*
+             * When there is no lock, it means the per sstable index files are already created, just proceed to finish.
+             * When there is a lock held by another builder, wait for it to finish before finishing marking current index built.
+             */
+<span class="nc" id="L298">            latch = inProgress.get(sstable);</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (latch != null)</span>
+<span class="nc" id="L300">                latch.await();</span>
+        }
+
+<span class="nc" id="L303">        Set&lt;StorageAttachedIndex&gt; existing = validateIndexes(indexes, sstable.descriptor);</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if (existing.isEmpty())</span>
+        {
+<span class="nc" id="L306">            logger.debug(logMessage(&quot;{} dropped during index build&quot;), indexes);</span>
+<span class="nc" id="L307">            return;</span>
+        }
+
+        // register custom index components into existing sstables
+<span class="nc" id="L311">        sstable.registerComponents(StorageAttachedIndexGroup.getLiveComponents(sstable, existing), tracker);</span>
+<span class="nc" id="L312">        Set&lt;StorageAttachedIndex&gt; incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, IndexValidation.NONE);</span>
+
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if (!incomplete.isEmpty())</span>
+        {
+            // If this occurs during an initial index build, there is only one index in play, and
+            // throwing here to terminate makes sense. (This allows the initialization task to fail
+            // correctly and be marked as failed by the SIM.) In other cases, such as rebuilding a
+            // set of indexes for a new added/streamed SSTables, we terminate pessimistically. In
+            // other words, we abort the SSTable index write across all column indexes and mark
+            // then non-queryable until a restart or other incremental rebuild occurs.
+<span class="nc" id="L322">            throw new RuntimeException(logMessage(&quot;Failed to update views on column indexes &quot; + incomplete + &quot; on indexes &quot; + indexes + '.'));</span>
+        }
+<span class="nc" id="L324">    }</span>
+
+    /**
+     *  In case of full rebuild, stop the index build if any index is dropped.
+     *  Otherwise, skip dropped indexes to avoid exception during repair/streaming.
+     */
+    private Set&lt;StorageAttachedIndex&gt; validateIndexes(Set&lt;StorageAttachedIndex&gt; indexes, Descriptor descriptor)
+    {
+<span class="nc" id="L332">        Set&lt;StorageAttachedIndex&gt; existing = new HashSet&lt;&gt;();</span>
+<span class="nc" id="L333">        Set&lt;StorageAttachedIndex&gt; dropped = new HashSet&lt;&gt;();</span>
+
+<span class="nc bnc" id="L335" title="All 2 branches missed.">        for (StorageAttachedIndex index : indexes)</span>
+        {
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            if (group.containsIndex(index))</span>
+<span class="nc" id="L338">                existing.add(index);</span>
+            else
+<span class="nc" id="L340">                dropped.add(index);</span>
+<span class="nc" id="L341">        }</span>
+
+<span class="nc bnc" id="L343" title="All 2 branches missed.">        if (!dropped.isEmpty())</span>
+        {
+<span class="nc" id="L345">            String droppedIndexes = dropped.stream().map(sai -&gt; sai.getIndexContext().getIndexName()).collect(Collectors.toList()).toString();</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            if (isFullRebuild)</span>
+<span class="nc" id="L347">                throw new RuntimeException(logMessage(String.format(&quot;%s are dropped, will stop index build.&quot;, droppedIndexes)));</span>
+            else
+<span class="nc" id="L349">                logger.debug(logMessage(&quot;Skip building dropped index {} on sstable {}&quot;), droppedIndexes, descriptor.baseFile());</span>
+        }
+
+<span class="nc" id="L352">        return existing;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

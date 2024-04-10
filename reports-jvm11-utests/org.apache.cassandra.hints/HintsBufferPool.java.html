@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>HintsBufferPool.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.hints</a> &gt; <span class="el_source">HintsBufferPool.java</span></div><h1>HintsBufferPool.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.hints;
+
+import java.io.Closeable;
+import java.util.Iterator;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.MAX_HINT_BUFFERS;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
+
+/**
+ * A primitive pool of {@link HintsBuffer} buffers. Under normal conditions should only hold two buffers - the currently
+ * written to one, and a reserve buffer to switch to when the first one is beyond capacity.
+ */
+final class HintsBufferPool implements Closeable
+{
+    interface FlushCallback
+    {
+        void flush(HintsBuffer buffer, HintsBufferPool pool);
+    }
+
+<span class="fc" id="L42">    static final int MAX_ALLOCATED_BUFFERS = MAX_HINT_BUFFERS.getInt();</span>
+    private volatile HintsBuffer currentBuffer;
+    private final BlockingQueue&lt;HintsBuffer&gt; reserveBuffers;
+    private final int bufferSize;
+    private final FlushCallback flushCallback;
+<span class="fc" id="L47">    private int allocatedBuffers = 0;</span>
+
+    HintsBufferPool(int bufferSize, FlushCallback flushCallback)
+<span class="fc" id="L50">    {</span>
+<span class="fc" id="L51">        reserveBuffers = newBlockingQueue();</span>
+<span class="fc" id="L52">        this.bufferSize = bufferSize;</span>
+<span class="fc" id="L53">        this.flushCallback = flushCallback;</span>
+<span class="fc" id="L54">    }</span>
+
+    /**
+     * @param hostIds host ids of the hint's target nodes
+     * @param hint the hint to store
+     */
+    void write(Iterable&lt;UUID&gt; hostIds, Hint hint)
+    {
+<span class="fc" id="L62">        int hintSize = (int) Hint.serializer.serializedSize(hint, MessagingService.current_version);</span>
+<span class="fc" id="L63">        try (HintsBuffer.Allocation allocation = allocate(hintSize))</span>
+        {
+<span class="fc" id="L65">            allocation.write(hostIds, hint);</span>
+        }
+<span class="fc" id="L67">    }</span>
+
+    /**
+     * Get the earliest hint for a specific node from all buffers
+     * @param hostId UUID of the node
+     * @return timestamp for the earliest hint
+     */
+    long getEarliestHintForHost(UUID hostId)
+    {
+<span class="fc" id="L76">        long min = currentBuffer().getEarliestHintTime(hostId);</span>
+<span class="fc" id="L77">        Iterator&lt;HintsBuffer&gt; it = reserveBuffers.iterator();</span>
+
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">        while (it.hasNext())</span>
+<span class="nc" id="L80">            min = Math.min(min, it.next().getEarliestHintTime(hostId));</span>
+
+<span class="fc" id="L82">        return min;</span>
+    }
+
+    private HintsBuffer.Allocation allocate(int hintSize)
+    {
+<span class="fc" id="L87">        HintsBuffer current = currentBuffer();</span>
+
+        while (true)
+        {
+<span class="fc" id="L91">            HintsBuffer.Allocation allocation = current.allocate(hintSize);</span>
+<span class="fc bfc" id="L92" title="All 2 branches covered.">            if (allocation != null)</span>
+<span class="fc" id="L93">                return allocation;</span>
+
+            // allocation failed due to insufficient size remaining in the buffer
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">            if (switchCurrentBuffer(current))</span>
+<span class="fc" id="L97">                flushCallback.flush(current, this);</span>
+
+<span class="fc" id="L99">            current = currentBuffer;</span>
+<span class="fc" id="L100">        }</span>
+    }
+
+    void offer(HintsBuffer buffer)
+    {
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">        if (!reserveBuffers.offer(buffer))</span>
+<span class="nc" id="L106">            throw new RuntimeException(&quot;Failed to store buffer&quot;);</span>
+<span class="fc" id="L107">    }</span>
+
+    // A wrapper to ensure a non-null currentBuffer value on the first call.
+    HintsBuffer currentBuffer()
+    {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        if (currentBuffer == null)</span>
+<span class="fc" id="L113">            initializeCurrentBuffer();</span>
+
+<span class="fc" id="L115">        return currentBuffer;</span>
+    }
+
+    private synchronized void initializeCurrentBuffer()
+    {
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">        if (currentBuffer == null)</span>
+<span class="fc" id="L121">            currentBuffer = createBuffer();</span>
+<span class="fc" id="L122">    }</span>
+
+    private synchronized boolean switchCurrentBuffer(HintsBuffer previous)
+    {
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        if (currentBuffer != previous)</span>
+<span class="nc" id="L127">            return false;</span>
+
+<span class="fc" id="L129">        HintsBuffer buffer = reserveBuffers.poll();</span>
+<span class="fc bfc" id="L130" title="All 4 branches covered.">        if (buffer == null &amp;&amp; allocatedBuffers &gt;= MAX_ALLOCATED_BUFFERS)</span>
+        {
+            try
+            {
+                //This BlockingQueue.take is a target for byteman in HintsBufferPoolTest
+<span class="fc" id="L135">                buffer = reserveBuffers.take();</span>
+            }
+<span class="nc" id="L137">            catch (InterruptedException e)</span>
+            {
+<span class="nc" id="L139">                throw new UncheckedInterruptedException(e);</span>
+<span class="fc" id="L140">            }</span>
+        }
+<span class="fc bfc" id="L142" title="All 2 branches covered.">        currentBuffer = buffer == null ? createBuffer() : buffer;</span>
+
+<span class="fc" id="L144">        return true;</span>
+    }
+
+    private HintsBuffer createBuffer()
+    {
+<span class="fc" id="L149">        allocatedBuffers++;</span>
+<span class="fc" id="L150">        return HintsBuffer.create(bufferSize);</span>
+    }
+
+    public void close()
+    {
+<span class="fc" id="L155">        currentBuffer.free();</span>
+<span class="fc" id="L156">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

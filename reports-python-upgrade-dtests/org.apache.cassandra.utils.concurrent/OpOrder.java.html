@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>OpOrder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.concurrent</a> &gt; <span class="el_source">OpOrder.java</span></div><h1>OpOrder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cassandra.utils.concurrent;
+
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+
+import static org.apache.cassandra.utils.concurrent.WaitQueue.newWaitQueue;
+
+/**
+ * &lt;p&gt;A class for providing synchronization between producers and consumers that do not
+ * communicate directly with each other, but where the consumers need to process their
+ * work in contiguous batches. In particular this is useful for both CommitLog and Memtable
+ * where the producers (writing threads) are modifying a structure that the consumer
+ * (flush executor) only batch syncs, but needs to know what 'position' the work is at
+ * for co-ordination with other processes,
+ *
+ * &lt;p&gt;The typical usage is something like:
+ * &lt;pre&gt;
+ * {@code
+     public final class ExampleShared
+     {
+        final OpOrder order = new OpOrder();
+        volatile SharedState state;
+
+        static class SharedState
+        {
+            volatile Barrier barrier;
+
+            // ...
+        }
+
+        public void consume()
+        {
+            SharedState state = this.state;
+            state.setReplacement(new State())
+            state.doSomethingToPrepareForBarrier();
+
+            state.barrier = order.newBarrier();
+            // seal() MUST be called after newBarrier() else barrier.isAfter()
+            // will always return true, and barrier.await() will fail
+            state.barrier.issue();
+
+            // wait for all producer work started prior to the barrier to complete
+            state.barrier.await();
+
+            // change the shared state to its replacement, as the current state will no longer be used by producers
+            this.state = state.getReplacement();
+
+            state.doSomethingWithExclusiveAccess();
+        }
+
+        public void produce()
+        {
+            try (Group opGroup = order.start())
+            {
+                SharedState s = state;
+                while (s.barrier != null &amp;&amp; !s.barrier.isAfter(opGroup))
+                    s = s.getReplacement();
+                s.doProduceWork();
+            }
+        }
+    }
+ * }
+ * &lt;/pre&gt;
+ */
+<span class="fc" id="L84">public class OpOrder</span>
+{
+    /**
+     * Constant that when an Ordered.running is equal to, indicates the Ordered is complete
+     */
+    private static final int FINISHED = -1;
+
+    /**
+     * A linked list starting with the most recent Ordered object, i.e. the one we should start new operations from,
+     * with (prev) links to any incomplete Ordered instances, and (next) links to any potential future Ordered instances.
+     * Once all operations started against an Ordered instance and its ancestors have been finished the next instance
+     * will unlink this one
+     */
+<span class="fc" id="L97">    private volatile Group current = new Group();</span>
+
+    /**
+     * Start an operation against this OpOrder.
+     * Once the operation is completed Ordered.close() MUST be called EXACTLY once for this operation.
+     *
+     * @return the Ordered instance that manages this OpOrder
+     */
+    public Group start()
+    {
+        while (true)
+        {
+<span class="fc" id="L109">            Group current = this.current;</span>
+<span class="fc bfc" id="L110" title="All 2 branches covered.">            if (current.register())</span>
+<span class="fc" id="L111">                return current;</span>
+<span class="fc" id="L112">        }</span>
+    }
+
+    /**
+     * Creates a new barrier. The barrier is only a placeholder until barrier.issue() is called on it,
+     * after which all new operations will start against a new Group that will not be accepted
+     * by barrier.isAfter(), and barrier.await() will return only once all operations started prior to the issue
+     * have completed.
+     */
+    public Barrier newBarrier()
+    {
+<span class="fc" id="L123">        return new Barrier();</span>
+    }
+
+    public Group getCurrent()
+    {
+<span class="nc" id="L128">        return current;</span>
+    }
+
+    public void awaitNewBarrier()
+    {
+<span class="fc" id="L133">        Barrier barrier = newBarrier();</span>
+<span class="fc" id="L134">        barrier.issue();</span>
+<span class="fc" id="L135">        barrier.await();</span>
+<span class="fc" id="L136">    }</span>
+
+    /**
+     * Represents a group of identically ordered operations, i.e. all operations started in the interval between
+     * two barrier issuances. For each register() call this is returned, close() must be called exactly once.
+     * It should be treated like taking a lock().
+     */
+    public static final class Group implements Comparable&lt;Group&gt;, AutoCloseable
+    {
+        /**
+         * In general this class goes through the following stages:
+         * 1) LIVE:      many calls to register() and close()
+         * 2) FINISHING: a call to expire() (after a barrier issue), means calls to register() will now fail,
+         *               and we are now 'in the past' (new operations will be started against a new Ordered)
+         * 3) FINISHED:  once the last close() is called, this Ordered is done. We call unlink().
+         * 4) ZOMBIE:    all our operations are finished, but some operations against an earlier Ordered are still
+         *               running, or tidying up, so unlink() fails to remove us
+         * 5) COMPLETE:  all operations started on or before us are FINISHED (and COMPLETE), so we are unlinked
+         * &lt;p/&gt;
+         * Another parallel states is ISBLOCKING:
+         * &lt;p/&gt;
+         * isBlocking =&gt; a barrier that is waiting on us (either directly, or via a future Ordered) is blocking general
+         * progress. This state is entered by calling Barrier.markBlocking(). If the running operations are blocked
+         * on a Signal that is also registered with the isBlockingSignal (probably through isSafeBlockingSignal)
+         * then they will be notified that they are blocking forward progress, and may take action to avoid that.
+         */
+
+        private volatile Group prev, next;
+        private final long id; // monotonically increasing id for compareTo()
+<span class="fc" id="L165">        private volatile int running = 0; // number of operations currently running.  &lt; 0 means we're expired, and the count of tasks still running is -(running + 1)</span>
+        private volatile boolean isBlocking; // indicates running operations are blocking future barriers
+        private volatile ConcurrentLinkedQueue&lt;WaitQueue.Signal&gt; blocking; // signal to wait on to indicate isBlocking is true
+<span class="fc" id="L168">        private final WaitQueue waiting = newWaitQueue(); // signal to wait on for completion</span>
+
+<span class="fc" id="L170">        static final AtomicIntegerFieldUpdater&lt;Group&gt; runningUpdater = AtomicIntegerFieldUpdater.newUpdater(Group.class, &quot;running&quot;);</span>
+<span class="fc" id="L171">        static final AtomicReferenceFieldUpdater&lt;Group, ConcurrentLinkedQueue&gt; blockingUpdater = AtomicReferenceFieldUpdater.newUpdater(Group.class, ConcurrentLinkedQueue.class, &quot;blocking&quot;);</span>
+
+        // constructs first instance only
+        private Group()
+<span class="fc" id="L175">        {</span>
+<span class="fc" id="L176">            this.id = 0;</span>
+<span class="fc" id="L177">        }</span>
+
+        private Group(Group prev)
+<span class="fc" id="L180">        {</span>
+<span class="fc" id="L181">            this.id = prev.id + 1;</span>
+<span class="fc" id="L182">            this.prev = prev;</span>
+<span class="fc" id="L183">        }</span>
+
+        // prevents any further operations starting against this Ordered instance
+        // if there are no running operations, calls unlink; otherwise, we let the last op to close call it.
+        // this means issue() won't have to block for ops to finish.
+        private void expire()
+        {
+            while (true)
+            {
+<span class="fc" id="L192">                int current = running;</span>
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">                if (current &lt; 0)</span>
+<span class="nc" id="L194">                    throw new IllegalStateException();</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">                if (runningUpdater.compareAndSet(this, current, -1 - current))</span>
+                {
+                    // if we're already finished (no running ops), unlink ourselves
+<span class="fc bfc" id="L198" title="All 2 branches covered.">                    if (current == 0)</span>
+<span class="fc" id="L199">                        unlink();</span>
+<span class="fc" id="L200">                    return;</span>
+                }
+<span class="fc" id="L202">            }</span>
+        }
+
+        // attempts to start an operation against this Ordered instance, and returns true if successful.
+        private boolean register()
+        {
+            while (true)
+            {
+<span class="fc" id="L210">                int current = running;</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                if (current &lt; 0)</span>
+<span class="fc" id="L212">                    return false;</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">                if (runningUpdater.compareAndSet(this, current, current + 1))</span>
+<span class="fc" id="L214">                    return true;</span>
+<span class="fc" id="L215">            }</span>
+        }
+
+        /**
+         * To be called exactly once for each register() call this object is returned for, indicating the operation
+         * is complete
+         */
+        public void close()
+        {
+            while (true)
+            {
+<span class="fc" id="L226">                int current = running;</span>
+<span class="fc bfc" id="L227" title="All 2 branches covered.">                if (current &lt; 0)</span>
+                {
+<span class="fc bfc" id="L229" title="All 2 branches covered.">                    if (runningUpdater.compareAndSet(this, current, current + 1))</span>
+                    {
+<span class="fc bfc" id="L231" title="All 2 branches covered.">                        if (current + 1 == FINISHED)</span>
+                        {
+                            // if we're now finished, unlink ourselves
+<span class="fc" id="L234">                            unlink();</span>
+                        }
+<span class="fc" id="L236">                        return;</span>
+                    }
+                }
+<span class="fc bfc" id="L239" title="All 2 branches covered.">                else if (runningUpdater.compareAndSet(this, current, current - 1))</span>
+                {
+<span class="fc" id="L241">                    return;</span>
+                }
+<span class="fc" id="L243">            }</span>
+        }
+
+        public boolean isFinished()
+        {
+<span class="fc bfc" id="L248" title="All 2 branches covered.">            return next.prev == null;</span>
+        }
+
+        public boolean isOldestLiveGroup()
+        {
+<span class="pc bpc" id="L253" title="1 of 2 branches missed.">            return prev == null;</span>
+        }
+
+        public void await()
+        {
+<span class="fc bfc" id="L258" title="All 2 branches covered.">            while (!isFinished())</span>
+            {
+<span class="fc" id="L260">                WaitQueue.Signal signal = waiting.register();</span>
+<span class="fc bfc" id="L261" title="All 2 branches covered.">                if (isFinished())</span>
+                {
+<span class="fc" id="L263">                    signal.cancel();</span>
+<span class="fc" id="L264">                    return;</span>
+                }
+                else
+<span class="fc" id="L267">                    signal.awaitUninterruptibly();</span>
+<span class="fc" id="L268">            }</span>
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">            assert running == FINISHED;</span>
+<span class="fc" id="L270">        }</span>
+
+        public OpOrder.Group prev()
+        {
+<span class="nc" id="L274">            return prev;</span>
+        }
+
+        /**
+         * called once we know all operations started against this Ordered have completed,
+         * however we do not know if operations against its ancestors have completed, or
+         * if its descendants have completed ahead of it, so we attempt to create the longest
+         * chain from the oldest still linked Ordered. If we can't reach the oldest through
+         * an unbroken chain of completed Ordered, we abort, and leave the still completing
+         * ancestor to tidy up.
+         */
+        private void unlink()
+        {
+            // walk back in time to find the start of the list
+<span class="fc" id="L288">            Group start = this;</span>
+            while (true)
+            {
+<span class="fc" id="L291">                Group prev = start.prev;</span>
+<span class="fc bfc" id="L292" title="All 2 branches covered.">                if (prev == null)</span>
+<span class="fc" id="L293">                    break;</span>
+                // if we haven't finished this Ordered yet abort and let it clean up when it's done
+<span class="fc bfc" id="L295" title="All 2 branches covered.">                if (prev.running != FINISHED)</span>
+<span class="fc" id="L296">                    return;</span>
+<span class="fc" id="L297">                start = prev;</span>
+<span class="fc" id="L298">            }</span>
+
+            // now walk forwards in time, in case we finished up late
+<span class="fc" id="L301">            Group end = this.next;</span>
+<span class="fc bfc" id="L302" title="All 2 branches covered.">            while (end.running == FINISHED)</span>
+<span class="fc" id="L303">                end = end.next;</span>
+
+            // now walk from first to last, unlinking the prev pointer and waking up any blocking threads
+<span class="fc bfc" id="L306" title="All 2 branches covered.">            while (start != end)</span>
+            {
+<span class="fc" id="L308">                Group next = start.next;</span>
+<span class="fc" id="L309">                next.prev = null;</span>
+<span class="fc" id="L310">                start.waiting.signalAll();</span>
+<span class="fc" id="L311">                start = next;</span>
+<span class="fc" id="L312">            }</span>
+<span class="fc" id="L313">        }</span>
+
+        /**
+         * @return true if a barrier we are behind is, or may be, blocking general progress,
+         * so we should try more aggressively to progress
+         */
+        public boolean isBlocking()
+        {
+<span class="nc" id="L321">            return isBlocking;</span>
+        }
+
+        public void notifyIfBlocking(WaitQueue.Signal signal)
+        {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (blocking == null)</span>
+<span class="nc" id="L327">                blockingUpdater.compareAndSet(this, null, new ConcurrentLinkedQueue&lt;&gt;());</span>
+<span class="nc" id="L328">            blocking.add(signal);</span>
+<span class="nc bnc" id="L329" title="All 4 branches missed.">            if (isBlocking() &amp;&amp; blocking.remove(signal))</span>
+<span class="nc" id="L330">                signal.signal();</span>
+<span class="nc" id="L331">        }</span>
+
+        private void markBlocking()
+        {
+<span class="fc" id="L335">            isBlocking = true;</span>
+<span class="fc" id="L336">            ConcurrentLinkedQueue&lt;WaitQueue.Signal&gt; blocking = this.blocking;</span>
+<span class="pc bpc" id="L337" title="1 of 2 branches missed.">            if (blocking != null)</span>
+<span class="nc" id="L338">                blocking.forEach(WaitQueue.Signal::signal);</span>
+<span class="fc" id="L339">        }</span>
+
+        public int compareTo(Group that)
+        {
+            // we deliberately use subtraction, as opposed to Long.compareTo() as we care about ordering
+            // not which is the smaller value, so this permits wrapping in the unlikely event we exhaust the long space
+<span class="nc" id="L345">            long c = this.id - that.id;</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">            if (c &gt; 0)</span>
+<span class="nc" id="L347">                return 1;</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            else if (c &lt; 0)</span>
+<span class="nc" id="L349">                return -1;</span>
+            else
+<span class="nc" id="L351">                return 0;</span>
+        }
+    }
+
+    /**
+     * This class represents a synchronisation point providing ordering guarantees on operations started
+     * against the enclosing OpOrder.  When issue() is called upon it (may only happen once per Barrier), the
+     * Barrier atomically partitions new operations from those already running (by expiring the current Group),
+     * and activates its isAfter() method
+     * which indicates if an operation was started before or after this partition. It offers methods to
+     * determine, or block until, all prior operations have finished, and a means to indicate to those operations
+     * that they are blocking forward progress. See {@link OpOrder} for idiomatic usage.
+     */
+<span class="fc" id="L364">    public final class Barrier</span>
+    {
+        // this Barrier was issued after all Group operations started against orderOnOrBefore
+        private volatile Group orderOnOrBefore;
+
+        /**
+         * @return true if @param group was started prior to the issuing of the barrier.
+         *
+         * (Until issue is called, always returns true, but if you rely on this behavior you are probably
+         * Doing It Wrong.)
+         */
+        public boolean isAfter(Group group)
+        {
+<span class="fc bfc" id="L377" title="All 2 branches covered.">            if (orderOnOrBefore == null)</span>
+<span class="fc" id="L378">                return true;</span>
+            // we subtract to permit wrapping round the full range of Long - so we only need to ensure
+            // there are never Long.MAX_VALUE * 2 total Group objects in existence at any one timem which will
+            // take care of itself
+<span class="fc bfc" id="L382" title="All 2 branches covered.">            return orderOnOrBefore.id - group.id &gt;= 0;</span>
+        }
+
+        /**
+         * Issues (seals) the barrier, meaning no new operations may be issued against it, and expires the current
+         * Group.  Must be called before await() for isAfter() to be properly synchronised.
+         */
+        public void issue()
+        {
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">            if (orderOnOrBefore != null)</span>
+<span class="nc" id="L392">                throw new IllegalStateException(&quot;Can only call issue() once on each Barrier&quot;);</span>
+
+            final Group current;
+<span class="fc" id="L395">            synchronized (OpOrder.this)</span>
+            {
+<span class="fc" id="L397">                current = OpOrder.this.current;</span>
+<span class="fc" id="L398">                orderOnOrBefore = current;</span>
+<span class="fc" id="L399">                OpOrder.this.current = current.next = new Group(current);</span>
+<span class="fc" id="L400">            }</span>
+<span class="fc" id="L401">            current.expire();</span>
+<span class="fc" id="L402">        }</span>
+
+        /**
+         * Mark all prior operations as blocking, potentially signalling them to more aggressively make progress
+         */
+        public void markBlocking()
+        {
+<span class="fc" id="L409">            Group current = orderOnOrBefore;</span>
+<span class="fc bfc" id="L410" title="All 2 branches covered.">            while (current != null)</span>
+            {
+<span class="fc" id="L412">                current.markBlocking();</span>
+<span class="fc" id="L413">                current = current.prev;</span>
+            }
+<span class="fc" id="L415">        }</span>
+
+        /**
+         * wait for all operations started prior to issuing the barrier to complete
+         */
+        public void await()
+        {
+<span class="fc" id="L422">            Group current = orderOnOrBefore;</span>
+<span class="pc bpc" id="L423" title="1 of 2 branches missed.">            if (current == null)</span>
+<span class="nc" id="L424">                throw new IllegalStateException(&quot;This barrier needs to have issue() called on it before prior operations can complete&quot;);</span>
+<span class="fc" id="L425">            current.await();</span>
+<span class="fc" id="L426">        }</span>
+
+        /**
+         * returns the Group we are waiting on - any Group with {@code .compareTo(getSyncPoint()) &lt;= 0}
+         * must complete before await() returns
+         */
+        public Group getSyncPoint()
+        {
+<span class="nc" id="L434">            return orderOnOrBefore;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

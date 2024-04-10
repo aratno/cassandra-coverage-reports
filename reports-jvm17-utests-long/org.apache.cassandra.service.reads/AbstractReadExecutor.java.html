@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AbstractReadExecutor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads</a> &gt; <span class="el_source">AbstractReadExecutor.java</span></div><h1>AbstractReadExecutor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service.reads;
+
+import com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.transform.DuplicateRowChecker;
+import org.apache.cassandra.exceptions.ReadFailureException;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.locator.ReplicaPlans;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageProxy.LocalReadRunnable;
+import org.apache.cassandra.service.reads.repair.ReadRepair;
+import org.apache.cassandra.tracing.TraceState;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static com.google.common.collect.Iterables.all;
+import static java.util.concurrent.TimeUnit.MICROSECONDS;
+
+/**
+ * Sends a read request to the replicas needed to satisfy a given ConsistencyLevel.
+ *
+ * Optionally, may perform additional requests to provide redundancy against replica failure:
+ * AlwaysSpeculatingReadExecutor will always send a request to one extra replica, while
+ * SpeculatingReadExecutor will wait until it looks like the original request is in danger
+ * of timing out before performing extra reads.
+ */
+public abstract class AbstractReadExecutor
+{
+<span class="fc" id="L63">    private static final Logger logger = LoggerFactory.getLogger(AbstractReadExecutor.class);</span>
+
+    protected final ReadCommand command;
+    private   final ReplicaPlan.SharedForTokenRead replicaPlan;
+    protected final ReadRepair&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; readRepair;
+    protected final DigestResolver&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; digestResolver;
+    protected final ReadCallback&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; handler;
+    protected final TraceState traceState;
+    protected final ColumnFamilyStore cfs;
+    protected final long queryStartNanoTime;
+    private   final int initialDataRequestCount;
+<span class="fc" id="L74">    protected volatile PartitionIterator result = null;</span>
+
+    AbstractReadExecutor(ColumnFamilyStore cfs, ReadCommand command, ReplicaPlan.ForTokenRead replicaPlan, int initialDataRequestCount, long queryStartNanoTime)
+<span class="fc" id="L77">    {</span>
+<span class="fc" id="L78">        this.command = command;</span>
+<span class="fc" id="L79">        this.replicaPlan = ReplicaPlan.shared(replicaPlan);</span>
+<span class="fc" id="L80">        this.initialDataRequestCount = initialDataRequestCount;</span>
+        // the ReadRepair and DigestResolver both need to see our updated
+<span class="fc" id="L82">        this.readRepair = ReadRepair.create(command, this.replicaPlan, queryStartNanoTime);</span>
+<span class="fc" id="L83">        this.digestResolver = new DigestResolver&lt;&gt;(command, this.replicaPlan, queryStartNanoTime);</span>
+<span class="fc" id="L84">        this.handler = new ReadCallback&lt;&gt;(digestResolver, command, this.replicaPlan, queryStartNanoTime);</span>
+<span class="fc" id="L85">        this.cfs = cfs;</span>
+<span class="fc" id="L86">        this.traceState = Tracing.instance.get();</span>
+<span class="fc" id="L87">        this.queryStartNanoTime = queryStartNanoTime;</span>
+
+
+        // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
+        // knows how to produce older digest but the reverse is not true.
+        // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
+        // we stop being compatible with pre-3.0 nodes.
+<span class="fc" id="L94">        int digestVersion = MessagingService.current_version;</span>
+<span class="fc bfc" id="L95" title="All 2 branches covered.">        for (Replica replica : replicaPlan.contacts())</span>
+<span class="fc" id="L96">            digestVersion = Math.min(digestVersion, MessagingService.instance().versions.get(replica.endpoint()));</span>
+<span class="fc" id="L97">        command.setDigestVersion(digestVersion);</span>
+<span class="fc" id="L98">    }</span>
+
+    public DecoratedKey getKey()
+    {
+<span class="nc" id="L102">        Preconditions.checkState(command instanceof SinglePartitionReadCommand,</span>
+                                 &quot;Can only get keys for SinglePartitionReadCommand&quot;);
+<span class="nc" id="L104">        return ((SinglePartitionReadCommand) command).partitionKey();</span>
+    }
+
+    public ReadRepair&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; getReadRepair()
+    {
+<span class="fc" id="L109">        return readRepair;</span>
+    }
+
+    protected void makeFullDataRequests(ReplicaCollection&lt;?&gt; replicas)
+    {
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        assert all(replicas, Replica::isFull);</span>
+<span class="fc" id="L115">        makeRequests(command, replicas);</span>
+<span class="fc" id="L116">    }</span>
+
+    protected void makeTransientDataRequests(Iterable&lt;Replica&gt; replicas)
+    {
+<span class="fc" id="L120">        makeRequests(command.copyAsTransientQuery(replicas), replicas);</span>
+<span class="fc" id="L121">    }</span>
+
+    protected void makeDigestRequests(Iterable&lt;Replica&gt; replicas)
+    {
+<span class="pc bpc" id="L125" title="1 of 2 branches missed.">        assert all(replicas, Replica::isFull);</span>
+        // only send digest requests to full replicas, send data requests instead to the transient replicas
+<span class="fc" id="L127">        makeRequests(command.copyAsDigestQuery(replicas), replicas);</span>
+<span class="fc" id="L128">    }</span>
+
+    private void makeRequests(ReadCommand readCommand, Iterable&lt;Replica&gt; replicas)
+    {
+<span class="fc" id="L132">        boolean hasLocalEndpoint = false;</span>
+<span class="fc" id="L133">        Message&lt;ReadCommand&gt; message = null;</span>
+
+<span class="fc bfc" id="L135" title="All 2 branches covered.">        for (Replica replica: replicas)</span>
+        {
+<span class="pc bpc" id="L137" title="3 of 4 branches missed.">            assert replica.isFull() || readCommand.acceptsTransient();</span>
+
+<span class="fc" id="L139">            InetAddressAndPort endpoint = replica.endpoint();</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">            if (replica.isSelf())</span>
+            {
+<span class="fc" id="L142">                hasLocalEndpoint = true;</span>
+<span class="fc" id="L143">                continue;</span>
+            }
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if (traceState != null)</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">                traceState.trace(&quot;reading {} from {}&quot;, readCommand.isDigestQuery() ? &quot;digest&quot; : &quot;data&quot;, endpoint);</span>
+
+<span class="nc bnc" id="L149" title="All 2 branches missed.">            if (null == message)</span>
+<span class="nc" id="L150">                message = readCommand.createMessage(false);</span>
+
+<span class="nc" id="L152">            MessagingService.instance().sendWithCallback(message, endpoint, handler);</span>
+<span class="nc" id="L153">        }</span>
+
+        // We delay the local (potentially blocking) read till the end to avoid stalling remote requests.
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        if (hasLocalEndpoint)</span>
+        {
+<span class="pc bpc" id="L158" title="1 of 2 branches missed.">            logger.trace(&quot;reading {} locally&quot;, readCommand.isDigestQuery() ? &quot;digest&quot; : &quot;data&quot;);</span>
+<span class="fc" id="L159">            Stage.READ.maybeExecuteImmediately(new LocalReadRunnable(readCommand, handler));</span>
+        }
+<span class="fc" id="L161">    }</span>
+
+    /**
+     * Perform additional requests if it looks like the original will time out.  May block while it waits
+     * to see if the original requests are answered first.
+     */
+    public abstract void maybeTryAdditionalReplicas();
+
+    /**
+     * send the initial set of requests
+     */
+    public void executeAsync()
+    {
+<span class="fc" id="L174">        EndpointsForToken selected = replicaPlan().contacts();</span>
+<span class="fc" id="L175">        EndpointsForToken fullDataRequests = selected.filter(Replica::isFull, initialDataRequestCount);</span>
+<span class="fc" id="L176">        makeFullDataRequests(fullDataRequests);</span>
+<span class="fc" id="L177">        makeTransientDataRequests(selected.filterLazily(Replica::isTransient));</span>
+<span class="pc bpc" id="L178" title="2 of 4 branches missed.">        makeDigestRequests(selected.filterLazily(r -&gt; r.isFull() &amp;&amp; !fullDataRequests.contains(r)));</span>
+<span class="fc" id="L179">    }</span>
+
+    /**
+     * @return an executor appropriate for the configured speculative read policy
+     */
+    public static AbstractReadExecutor getReadExecutor(SinglePartitionReadCommand command,
+                                                       ConsistencyLevel consistencyLevel,
+                                                       long queryStartNanoTime) throws UnavailableException
+    {
+<span class="fc" id="L188">        Keyspace keyspace = Keyspace.open(command.metadata().keyspace);</span>
+<span class="fc" id="L189">        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(command.metadata().id);</span>
+<span class="fc" id="L190">        SpeculativeRetryPolicy retry = cfs.metadata().params.speculativeRetry;</span>
+
+<span class="fc" id="L192">        ReplicaPlan.ForTokenRead replicaPlan = ReplicaPlans.forRead(keyspace,</span>
+<span class="fc" id="L193">                                                                    command.partitionKey().getToken(),</span>
+<span class="fc" id="L194">                                                                    command.indexQueryPlan(),</span>
+                                                                    consistencyLevel,
+                                                                    retry);
+
+        // Speculative retry is disabled *OR*
+        // 11980: Disable speculative retry if using EACH_QUORUM in order to prevent miscounting DC responses
+<span class="pc bpc" id="L200" title="2 of 4 branches missed.">        if (retry.equals(NeverSpeculativeRetryPolicy.INSTANCE) || consistencyLevel == ConsistencyLevel.EACH_QUORUM)</span>
+<span class="nc" id="L201">            return new NeverSpeculatingReadExecutor(cfs, command, replicaPlan, queryStartNanoTime, false);</span>
+
+        // There are simply no extra replicas to speculate.
+        // Handle this separately so it can record failed attempts to speculate due to lack of replicas
+<span class="pc bpc" id="L205" title="1 of 2 branches missed.">        if (replicaPlan.contacts().size() == replicaPlan.readCandidates().size())</span>
+        {
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">            boolean recordFailedSpeculation = consistencyLevel != ConsistencyLevel.ALL;</span>
+<span class="fc" id="L208">            return new NeverSpeculatingReadExecutor(cfs, command, replicaPlan, queryStartNanoTime, recordFailedSpeculation);</span>
+        }
+
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        if (retry.equals(AlwaysSpeculativeRetryPolicy.INSTANCE))</span>
+<span class="nc" id="L212">            return new AlwaysSpeculatingReadExecutor(cfs, command, replicaPlan, queryStartNanoTime);</span>
+        else // PERCENTILE or CUSTOM.
+<span class="nc" id="L214">            return new SpeculatingReadExecutor(cfs, command, replicaPlan, queryStartNanoTime);</span>
+    }
+
+    public boolean hasLocalRead()
+    {
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">        return replicaPlan().lookup(FBUtilities.getBroadcastAddressAndPort()) != null;</span>
+    }
+
+    /**
+     *  Returns true if speculation should occur and if it should then block until it is time to
+     *  send the speculative reads
+     */
+    boolean shouldSpeculateAndMaybeWait()
+    {
+        // no latency information, or we're overloaded
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        if (cfs.sampleReadLatencyMicros &gt; command.getTimeout(MICROSECONDS))</span>
+        {
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L232">                logger.trace(&quot;Decided not to speculate as {} &gt; {}&quot;, cfs.sampleReadLatencyMicros, command.getTimeout(MICROSECONDS));</span>
+<span class="nc" id="L233">            return false;</span>
+        }
+
+<span class="pc bpc" id="L236" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L237">            logger.trace(&quot;Awaiting {} microseconds before speculating&quot;, cfs.sampleReadLatencyMicros);</span>
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">        return !handler.await(cfs.sampleReadLatencyMicros, MICROSECONDS);</span>
+    }
+
+    ReplicaPlan.ForTokenRead replicaPlan()
+    {
+<span class="fc" id="L243">        return replicaPlan.get();</span>
+    }
+
+<span class="nc" id="L246">    void onReadTimeout() {}</span>
+
+    public static class NeverSpeculatingReadExecutor extends AbstractReadExecutor
+    {
+        /**
+         * If never speculating due to lack of replicas
+         * log it is as a failure if it should have happened
+         * but couldn't due to lack of replicas
+         */
+        private final boolean logFailedSpeculation;
+
+        public NeverSpeculatingReadExecutor(ColumnFamilyStore cfs, ReadCommand command, ReplicaPlan.ForTokenRead replicaPlan, long queryStartNanoTime, boolean logFailedSpeculation)
+        {
+<span class="fc" id="L259">            super(cfs, command, replicaPlan, 1, queryStartNanoTime);</span>
+<span class="fc" id="L260">            this.logFailedSpeculation = logFailedSpeculation;</span>
+<span class="fc" id="L261">        }</span>
+
+        public void maybeTryAdditionalReplicas()
+        {
+<span class="pc bpc" id="L265" title="3 of 4 branches missed.">            if (shouldSpeculateAndMaybeWait() &amp;&amp; logFailedSpeculation)</span>
+            {
+<span class="nc" id="L267">                cfs.metric.speculativeInsufficientReplicas.inc();</span>
+            }
+<span class="fc" id="L269">        }</span>
+    }
+
+<span class="nc" id="L272">    static class SpeculatingReadExecutor extends AbstractReadExecutor</span>
+    {
+<span class="nc" id="L274">        private volatile boolean speculated = false;</span>
+
+        public SpeculatingReadExecutor(ColumnFamilyStore cfs,
+                                       ReadCommand command,
+                                       ReplicaPlan.ForTokenRead replicaPlan,
+                                       long queryStartNanoTime)
+        {
+            // We're hitting additional targets for read repair (??).  Since our &quot;extra&quot; replica is the least-
+            // preferred by the snitch, we do an extra data read to start with against a replica more
+            // likely to respond; better to let RR fail than the entire query.
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            super(cfs, command, replicaPlan, replicaPlan.readQuorum() &lt; replicaPlan.contacts().size() ? 2 : 1, queryStartNanoTime);</span>
+<span class="nc" id="L285">        }</span>
+
+        public void maybeTryAdditionalReplicas()
+        {
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if (shouldSpeculateAndMaybeWait())</span>
+            {
+                //Handle speculation stats first in case the callback fires immediately
+<span class="nc" id="L292">                cfs.metric.speculativeRetries.inc();</span>
+<span class="nc" id="L293">                speculated = true;</span>
+
+<span class="nc" id="L295">                ReplicaPlan.ForTokenRead replicaPlan = replicaPlan();</span>
+                ReadCommand retryCommand;
+                Replica extraReplica;
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                if (handler.resolver.isDataPresent())</span>
+                {
+<span class="nc" id="L300">                    extraReplica = replicaPlan.firstUncontactedCandidate(replica -&gt; true);</span>
+
+                    // we should only use a SpeculatingReadExecutor if we have an extra replica to speculate against
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                    assert extraReplica != null;</span>
+
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                    retryCommand = extraReplica.isTransient()</span>
+<span class="nc" id="L306">                            ? command.copyAsTransientQuery(extraReplica)</span>
+<span class="nc" id="L307">                            : command.copyAsDigestQuery(extraReplica);</span>
+                }
+                else
+                {
+<span class="nc" id="L311">                    extraReplica = replicaPlan.firstUncontactedCandidate(Replica::isFull);</span>
+<span class="nc" id="L312">                    retryCommand = command;</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                    if (extraReplica == null)</span>
+                    {
+<span class="nc" id="L315">                        cfs.metric.speculativeInsufficientReplicas.inc();</span>
+                        // cannot safely speculate a new data request, without more work - requests assumed to be
+                        // unique per endpoint, and we have no full nodes left to speculate against
+<span class="nc" id="L318">                        return;</span>
+                    }
+                }
+
+                // we must update the plan to include this new node, else when we come to read-repair, we may not include this
+                // speculated response in the data requests we make again, and we will not be able to 'speculate' an extra repair read,
+                // nor would we be able to speculate a new 'write' if the repair writes are insufficient
+<span class="nc" id="L325">                super.replicaPlan.addToContacts(extraReplica);</span>
+
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                if (traceState != null)</span>
+<span class="nc" id="L328">                    traceState.trace(&quot;speculating read retry on {}&quot;, extraReplica);</span>
+<span class="nc" id="L329">                logger.trace(&quot;speculating read retry on {}&quot;, extraReplica);</span>
+<span class="nc" id="L330">                MessagingService.instance().sendWithCallback(retryCommand.createMessage(false), extraReplica.endpoint(), handler);</span>
+            }
+<span class="nc" id="L332">        }</span>
+
+        @Override
+        void onReadTimeout()
+        {
+            //Shouldn't be possible to get here without first attempting to speculate even if the
+            //timing is bad
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            assert speculated;</span>
+<span class="nc" id="L340">            cfs.metric.speculativeFailedRetries.inc();</span>
+<span class="nc" id="L341">        }</span>
+    }
+
+    private static class AlwaysSpeculatingReadExecutor extends AbstractReadExecutor
+    {
+        public AlwaysSpeculatingReadExecutor(ColumnFamilyStore cfs,
+                                             ReadCommand command,
+                                             ReplicaPlan.ForTokenRead replicaPlan,
+                                             long queryStartNanoTime)
+        {
+            // presumably, we speculate an extra data request here in case it is our data request that fails to respond,
+            // and there are no more nodes to consult
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            super(cfs, command, replicaPlan, replicaPlan.contacts().size() &gt; 1 ? 2 : 1, queryStartNanoTime);</span>
+<span class="nc" id="L354">        }</span>
+
+        public void maybeTryAdditionalReplicas()
+        {
+            // no-op
+<span class="nc" id="L359">        }</span>
+
+        @Override
+        public void executeAsync()
+        {
+<span class="nc" id="L364">            super.executeAsync();</span>
+<span class="nc" id="L365">            cfs.metric.speculativeRetries.inc();</span>
+<span class="nc" id="L366">        }</span>
+
+        @Override
+        void onReadTimeout()
+        {
+<span class="nc" id="L371">            cfs.metric.speculativeFailedRetries.inc();</span>
+<span class="nc" id="L372">        }</span>
+    }
+
+    public void setResult(PartitionIterator result)
+    {
+<span class="pc bpc" id="L377" title="1 of 2 branches missed.">        Preconditions.checkState(this.result == null, &quot;Result can only be set once&quot;);</span>
+<span class="fc" id="L378">        this.result = DuplicateRowChecker.duringRead(result, this.replicaPlan.get().readCandidates().endpointList());</span>
+<span class="fc" id="L379">    }</span>
+
+    public void awaitResponses() throws ReadTimeoutException
+    {
+<span class="nc" id="L383">        awaitResponses(false);</span>
+<span class="nc" id="L384">    }</span>
+
+    /**
+     * Wait for the CL to be satisfied by responses
+     */
+    public void awaitResponses(boolean logBlockingReadRepairAttempt) throws ReadTimeoutException
+    {
+        try
+        {
+<span class="fc" id="L393">            handler.awaitResults();</span>
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">            assert digestResolver.isDataPresent() : &quot;awaitResults returned with no data present.&quot;;</span>
+        }
+<span class="nc" id="L396">        catch (ReadTimeoutException e)</span>
+        {
+            try
+            {
+<span class="nc" id="L400">                onReadTimeout();</span>
+            }
+            finally
+            {
+<span class="nc" id="L404">                throw e;</span>
+            }
+<span class="fc" id="L406">        }</span>
+
+        // return immediately, or begin a read repair
+<span class="pc bpc" id="L409" title="1 of 2 branches missed.">        if (digestResolver.responsesMatch())</span>
+        {
+<span class="fc" id="L411">            setResult(digestResolver.getData());</span>
+        }
+        else
+        {
+<span class="nc" id="L415">            Tracing.trace(&quot;Digest mismatch: Mismatch for key {}&quot;, getKey());</span>
+<span class="nc" id="L416">            readRepair.startRepair(digestResolver, this::setResult);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">            if (logBlockingReadRepairAttempt)</span>
+            {
+<span class="nc" id="L419">                logger.info(&quot;Blocking Read Repair triggered for query [{}] at CL.{} with endpoints {}&quot;,</span>
+<span class="nc" id="L420">                            command.toCQLString(),</span>
+<span class="nc" id="L421">                            replicaPlan().consistencyLevel(),</span>
+<span class="nc" id="L422">                            replicaPlan().contacts());</span>
+            }
+        }
+<span class="fc" id="L425">    }</span>
+
+    public void awaitReadRepair() throws ReadTimeoutException
+    {
+        try
+        {
+<span class="fc" id="L431">            readRepair.awaitReads();</span>
+        }
+<span class="nc" id="L433">        catch (ReadTimeoutException e)</span>
+        {
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            if (Tracing.isTracing())</span>
+<span class="nc" id="L436">                Tracing.trace(&quot;Timed out waiting on digest mismatch repair requests&quot;);</span>
+            else
+<span class="nc" id="L438">                logger.trace(&quot;Timed out waiting on digest mismatch repair requests&quot;);</span>
+            // the caught exception here will have CL.ALL from the repair command,
+            // not whatever CL the initial command was at (CASSANDRA-7947)
+<span class="nc" id="L441">            throw new ReadTimeoutException(replicaPlan().consistencyLevel(), handler.blockFor - 1, handler.blockFor, true);</span>
+<span class="fc" id="L442">        }</span>
+<span class="fc" id="L443">    }</span>
+
+    boolean isDone()
+    {
+<span class="pc bpc" id="L447" title="1 of 2 branches missed.">        return result != null;</span>
+    }
+
+    public void maybeSendAdditionalDataRequests()
+    {
+<span class="pc bpc" id="L452" title="1 of 2 branches missed.">        if (isDone())</span>
+<span class="fc" id="L453">            return;</span>
+
+<span class="nc" id="L455">        readRepair.maybeSendAdditionalReads();</span>
+<span class="nc" id="L456">    }</span>
+
+    public PartitionIterator getResult() throws ReadFailureException, ReadTimeoutException
+    {
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">        Preconditions.checkState(result != null, &quot;Result must be set first&quot;);</span>
+<span class="fc" id="L461">        return result;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

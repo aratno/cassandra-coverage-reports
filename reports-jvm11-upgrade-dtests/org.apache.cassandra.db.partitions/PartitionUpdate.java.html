@@ -1,0 +1,1033 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PartitionUpdate.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.partitions</a> &gt; <span class="el_source">PartitionUpdate.java</span></div><h1>PartitionUpdate.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.partitions;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.btree.BTree;
+import org.apache.cassandra.utils.btree.UpdateFunction;
+import org.apache.cassandra.utils.vint.VIntCoding;
+
+import static org.apache.cassandra.db.rows.UnfilteredRowIteratorSerializer.IS_EMPTY;
+
+/**
+ * Stores updates made on a partition.
+ * &lt;p&gt;
+ * A PartitionUpdate object requires that all writes/additions are performed before we
+ * try to read the updates (attempts to write to the PartitionUpdate after a read method
+ * has been called will result in an exception being thrown). In other words, a Partition
+ * is mutable while it's written but becomes immutable as soon as it is read.
+ * &lt;p&gt;
+ * A typical usage is to create a new update ({@code new PartitionUpdate(metadata, key, columns, capacity)})
+ * and then add rows and range tombstones through the {@code add()} methods (the partition
+ * level deletion time can also be set with {@code addPartitionDeletion()}). However, there
+ * is also a few static helper constructor methods for special cases ({@code emptyUpdate()},
+ * {@code fullPartitionDelete} and {@code singleRowUpdate}).
+ */
+public class PartitionUpdate extends AbstractBTreePartition
+{
+<span class="fc" id="L69">    protected static final Logger logger = LoggerFactory.getLogger(PartitionUpdate.class);</span>
+
+<span class="fc" id="L71">    public static final PartitionUpdateSerializer serializer = new PartitionUpdateSerializer();</span>
+
+    private final BTreePartitionData holder;
+    private final DeletionInfo deletionInfo;
+    private final TableMetadata metadata;
+
+    private final boolean canHaveShadowedData;
+
+    private PartitionUpdate(TableMetadata metadata,
+                            DecoratedKey key,
+                            BTreePartitionData holder,
+                            MutableDeletionInfo deletionInfo,
+                            boolean canHaveShadowedData)
+    {
+<span class="fc" id="L85">        super(key);</span>
+<span class="fc" id="L86">        this.metadata = metadata;</span>
+<span class="fc" id="L87">        this.holder = holder;</span>
+<span class="fc" id="L88">        this.deletionInfo = deletionInfo;</span>
+<span class="fc" id="L89">        this.canHaveShadowedData = canHaveShadowedData;</span>
+<span class="fc" id="L90">    }</span>
+
+    /**
+     * Creates a empty immutable partition update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the created update.
+     *
+     * @return the newly created empty (and immutable) update.
+     */
+    public static PartitionUpdate emptyUpdate(TableMetadata metadata, DecoratedKey key)
+    {
+<span class="fc" id="L102">        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();</span>
+<span class="fc" id="L103">        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);</span>
+<span class="fc" id="L104">        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);</span>
+    }
+
+    /**
+     * Creates an immutable partition update that entirely deletes a given partition.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition that the created update should delete.
+     * @param timestamp the timestamp for the deletion.
+     * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+     *
+     * @return the newly created partition deletion update.
+     */
+    public static PartitionUpdate fullPartitionDelete(TableMetadata metadata, DecoratedKey key, long timestamp, long nowInSec)
+    {
+<span class="fc" id="L119">        MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);</span>
+<span class="fc" id="L120">        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);</span>
+<span class="fc" id="L121">        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);</span>
+    }
+
+    /**
+     * Creates an immutable partition update that contains a single row update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition to update.
+     * @param row the row for the update (may be null).
+     * @param row the static row for the update (may be null).
+     *
+     * @return the newly created partition update containing only {@code row}.
+     */
+    public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row, Row staticRow)
+    {
+<span class="fc" id="L136">        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();</span>
+<span class="fc" id="L137">        BTreePartitionData holder = new BTreePartitionData(</span>
+            new RegularAndStaticColumns(
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">                staticRow == null ? Columns.NONE : Columns.from(staticRow),</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                row == null ? Columns.NONE : Columns.from(row)</span>
+            ),
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">            row == null ? BTree.empty() : BTree.singleton(row),</span>
+            deletionInfo,
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow,</span>
+            EncodingStats.NO_STATS
+        );
+<span class="fc" id="L147">        return new PartitionUpdate(metadata, key, holder, deletionInfo, false);</span>
+    }
+
+    /**
+     * Creates an immutable partition update that contains a single row update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition to update.
+     * @param row the row for the update (may be static).
+     *
+     * @return the newly created partition update containing only {@code row}.
+     */
+    public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row)
+    {
+<span class="pc bpc" id="L161" title="2 of 4 branches missed.">        return singleRowUpdate(metadata, key, row.isStatic() ? null : row, row.isStatic() ? row : null);</span>
+    }
+
+    /**
+     * Creates an immutable partition update that contains a single row update.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition to update.
+     * @param row the row for the update.
+     *
+     * @return the newly created partition update containing only {@code row}.
+     */
+    public static PartitionUpdate singleRowUpdate(TableMetadata metadata, ByteBuffer key, Row row)
+    {
+<span class="nc" id="L175">        return singleRowUpdate(metadata, metadata.partitioner.decorateKey(key), row);</span>
+    }
+
+    /**
+     * Turns the given iterator into an update.
+     *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
+     * Warning: this method does not close the provided iterator, it is up to
+     * the caller to close it.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public static PartitionUpdate fromIterator(UnfilteredRowIterator iterator, ColumnFilter filter)
+    {
+<span class="fc" id="L192">        iterator = UnfilteredRowIterators.withOnlyQueriedData(iterator, filter);</span>
+<span class="fc" id="L193">        BTreePartitionData holder = build(iterator, 16);</span>
+<span class="fc" id="L194">        MutableDeletionInfo deletionInfo = (MutableDeletionInfo) holder.deletionInfo;</span>
+<span class="fc" id="L195">        return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);</span>
+    }
+
+    /**
+     * Turns the given iterator into an update.
+     *
+     * @param iterator the iterator to turn into updates.
+     * @param filter the column filter used when querying {@code iterator}. This is used to make
+     * sure we don't include data for which the value has been skipped while reading (as we would
+     * then be writing something incorrect).
+     *
+     * Warning: this method does not close the provided iterator, it is up to
+     * the caller to close it.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public static PartitionUpdate fromIterator(RowIterator iterator, ColumnFilter filter)
+    {
+<span class="nc" id="L212">        iterator = RowIterators.withOnlyQueriedData(iterator, filter);</span>
+<span class="nc" id="L213">        MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();</span>
+<span class="nc" id="L214">        BTreePartitionData holder = build(iterator, deletionInfo, true);</span>
+<span class="nc" id="L215">        return new PartitionUpdate(iterator.metadata(), iterator.partitionKey(), holder, deletionInfo, false);</span>
+    }
+
+
+    public PartitionUpdate withOnlyPresentColumns()
+    {
+<span class="fc" id="L221">        Set&lt;ColumnMetadata&gt; columnSet = new HashSet&lt;&gt;();</span>
+
+<span class="fc bfc" id="L223" title="All 2 branches covered.">        for (Row row : this)</span>
+<span class="fc bfc" id="L224" title="All 2 branches covered.">            for (ColumnData column : row)</span>
+<span class="fc" id="L225">                columnSet.add(column.column());</span>
+
+<span class="fc" id="L227">        RegularAndStaticColumns columns = RegularAndStaticColumns.builder().addAll(columnSet).build();</span>
+<span class="fc" id="L228">        return new PartitionUpdate(this.metadata, this.partitionKey, this.holder.withColumns(columns), this.deletionInfo.mutableCopy(), false);</span>
+    }
+
+
+    protected boolean canHaveShadowedData()
+    {
+<span class="fc" id="L234">        return canHaveShadowedData;</span>
+    }
+
+    /**
+     * Deserialize a partition update from a provided byte buffer.
+     *
+     * @param bytes the byte buffer that contains the serialized update.
+     * @param version the version with which the update is serialized.
+     *
+     * @return the deserialized update or {@code null} if {@code bytes == null}.
+     */
+    @SuppressWarnings(&quot;resource&quot;)
+    public static PartitionUpdate fromBytes(ByteBuffer bytes, int version)
+    {
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">        if (bytes == null)</span>
+<span class="nc" id="L249">            return null;</span>
+
+        try
+        {
+<span class="fc" id="L253">            return serializer.deserialize(new DataInputBuffer(bytes, true),</span>
+                                          version,
+                                          DeserializationHelper.Flag.LOCAL);
+        }
+<span class="nc" id="L257">        catch (IOException e)</span>
+        {
+<span class="nc" id="L259">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /**
+     * Serialize a partition update as a byte buffer.
+     *
+     * @param update the partition update to serialize.
+     * @param version the version to serialize the update into.
+     *
+     * @return a newly allocated byte buffer containing the serialized update.
+     */
+    public static ByteBuffer toBytes(PartitionUpdate update, int version)
+    {
+<span class="fc" id="L273">        try (DataOutputBuffer out = new DataOutputBuffer())</span>
+        {
+<span class="fc" id="L275">            serializer.serialize(update, out, version);</span>
+<span class="fc" id="L276">            return out.buffer();</span>
+        }
+<span class="nc" id="L278">        catch (IOException e)</span>
+        {
+<span class="nc" id="L280">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    /**
+     * Creates a partition update that entirely deletes a given partition.
+     *
+     * @param metadata the metadata for the created update.
+     * @param key the partition key for the partition that the created update should delete.
+     * @param timestamp the timestamp for the deletion.
+     * @param nowInSec the current time in seconds to use as local deletion time for the partition deletion.
+     *
+     * @return the newly created partition deletion update.
+     */
+    public static PartitionUpdate fullPartitionDelete(TableMetadata metadata, ByteBuffer key, long timestamp, long nowInSec)
+    {
+<span class="fc" id="L296">        return fullPartitionDelete(metadata, metadata.partitioner.decorateKey(key), timestamp, nowInSec);</span>
+    }
+
+    /**
+     * Merges the provided updates, yielding a new update that incorporates all those updates.
+     *
+     * @param updates the collection of updates to merge. This shouldn't be empty.
+     *
+     * @return a partition update that include (merge) all the updates from {@code updates}.
+     */
+    public static PartitionUpdate merge(List&lt;PartitionUpdate&gt; updates)
+    {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">        assert !updates.isEmpty();</span>
+<span class="nc" id="L309">        final int size = updates.size();</span>
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        if (size == 1)</span>
+<span class="nc" id="L312">            return Iterables.getOnlyElement(updates);</span>
+
+<span class="nc" id="L314">        List&lt;UnfilteredRowIterator&gt; asIterators = Lists.transform(updates, AbstractBTreePartition::unfilteredIterator);</span>
+<span class="nc" id="L315">        return fromIterator(UnfilteredRowIterators.merge(asIterators), ColumnFilter.all(updates.get(0).metadata()));</span>
+    }
+
+    // We override this, because the version in the super-class calls holder(), which build the update preventing
+    // further updates, but that's not necessary here and being able to check at least the partition deletion without
+    // &quot;locking&quot; the update is nice (and used in DataResolver.RepairMergeListener.MergeListener).
+    @Override
+    public DeletionInfo deletionInfo()
+    {
+<span class="fc" id="L324">        return deletionInfo;</span>
+    }
+
+    /**
+     * The number of &quot;operations&quot; contained in the update.
+     * &lt;p&gt;
+     * This is used by {@code Memtable} to approximate how much work this update does. In practice, this
+     * count how many rows are updated and how many ranges are deleted by the partition update.
+     *
+     * @return the number of &quot;operations&quot; performed by the update.
+     */
+    public int operationCount()
+    {
+<span class="fc" id="L337">        return rowCount()</span>
+<span class="fc bfc" id="L338" title="All 2 branches covered.">             + (staticRow().isEmpty() ? 0 : 1)</span>
+<span class="fc" id="L339">             + deletionInfo.rangeCount()</span>
+<span class="fc bfc" id="L340" title="All 2 branches covered.">             + (deletionInfo.getPartitionDeletion().isLive() ? 0 : 1);</span>
+    }
+
+    /**
+     * The size of the data contained in this update.
+     *
+     * @return the size of the data contained in this update.
+     */
+    public int dataSize()
+    {
+<span class="fc" id="L350">        return Ints.saturatedCast(BTree.&lt;Row&gt;accumulate(holder.tree, (row, value) -&gt; row.dataSize() + value, 0L)</span>
+<span class="fc" id="L351">                + holder.staticRow.dataSize() + holder.deletionInfo.dataSize());</span>
+    }
+
+    /**
+     * The size of the data contained in this update.
+     *
+     * @return the size of the data contained in this update.
+     */
+    public long unsharedHeapSize()
+    {
+<span class="fc" id="L361">        return BTree.&lt;Row&gt;accumulate(holder.tree, (row, value) -&gt; row.unsharedHeapSize() + value, 0L)</span>
+<span class="fc" id="L362">                + holder.staticRow.unsharedHeapSize() + holder.deletionInfo.unsharedHeapSize();</span>
+    }
+
+    public TableMetadata metadata()
+    {
+<span class="fc" id="L367">        return metadata;</span>
+    }
+
+    @Override
+    public RegularAndStaticColumns columns()
+    {
+        // The superclass implementation calls holder(), but that triggers a build of the PartitionUpdate. But since
+        // the columns are passed to the ctor, we know the holder always has the proper columns even if it doesn't have
+        // the built rows yet, so just bypass the holder() method.
+<span class="fc" id="L376">        return holder.columns;</span>
+    }
+
+    protected BTreePartitionData holder()
+    {
+<span class="fc" id="L381">        return holder;</span>
+    }
+
+    public EncodingStats stats()
+    {
+<span class="fc" id="L386">        return holder().stats;</span>
+    }
+
+    /**
+     * Validates the data contained in this update.
+     *
+     * @throws org.apache.cassandra.serializers.MarshalException if some of the data contained in this update is corrupted.
+     */
+    public void validate()
+    {
+<span class="fc bfc" id="L396" title="All 2 branches covered.">        for (Row row : this)</span>
+        {
+<span class="fc" id="L398">            metadata().comparator.validate(row.clustering());</span>
+<span class="fc bfc" id="L399" title="All 2 branches covered.">            for (ColumnData cd : row)</span>
+<span class="fc" id="L400">                cd.validate();</span>
+<span class="fc" id="L401">        }</span>
+<span class="fc" id="L402">    }</span>
+
+    /**
+     * The maximum timestamp used in this update.
+     *
+     * @return the maximum timestamp used in this update.
+     */
+    public long maxTimestamp()
+    {
+<span class="fc" id="L411">        long maxTimestamp = deletionInfo.maxTimestamp();</span>
+<span class="fc bfc" id="L412" title="All 2 branches covered.">        for (Row row : this)</span>
+        {
+<span class="fc" id="L414">            maxTimestamp = Math.max(maxTimestamp, row.primaryKeyLivenessInfo().timestamp());</span>
+<span class="fc bfc" id="L415" title="All 2 branches covered.">            for (ColumnData cd : row)</span>
+            {
+<span class="fc bfc" id="L417" title="All 2 branches covered.">                if (cd.column().isSimple())</span>
+                {
+<span class="fc" id="L419">                    maxTimestamp = Math.max(maxTimestamp, ((Cell&lt;?&gt;)cd).timestamp());</span>
+                }
+                else
+                {
+<span class="fc" id="L423">                    ComplexColumnData complexData = (ComplexColumnData)cd;</span>
+<span class="fc" id="L424">                    maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());</span>
+<span class="fc bfc" id="L425" title="All 2 branches covered.">                    for (Cell&lt;?&gt; cell : complexData)</span>
+<span class="fc" id="L426">                        maxTimestamp = Math.max(maxTimestamp, cell.timestamp());</span>
+                }
+<span class="fc" id="L428">            }</span>
+<span class="fc" id="L429">        }</span>
+
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">        if (this.holder.staticRow != null)</span>
+        {
+<span class="fc bfc" id="L433" title="All 2 branches covered.">            for (ColumnData cd : this.holder.staticRow.columnData())</span>
+            {
+<span class="pc bpc" id="L435" title="1 of 2 branches missed.">                if (cd.column().isSimple())</span>
+                {
+<span class="fc" id="L437">                    maxTimestamp = Math.max(maxTimestamp, ((Cell&lt;?&gt;) cd).timestamp());</span>
+                }
+                else
+                {
+<span class="nc" id="L441">                    ComplexColumnData complexData = (ComplexColumnData) cd;</span>
+<span class="nc" id="L442">                    maxTimestamp = Math.max(maxTimestamp, complexData.complexDeletion().markedForDeleteAt());</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                    for (Cell&lt;?&gt; cell : complexData)</span>
+<span class="nc" id="L444">                        maxTimestamp = Math.max(maxTimestamp, cell.timestamp());</span>
+                }
+<span class="fc" id="L446">            }</span>
+        }
+<span class="fc" id="L448">        return maxTimestamp;</span>
+    }
+
+    /**
+     * For an update on a counter table, returns a list containing a {@code CounterMark} for
+     * every counter contained in the update.
+     *
+     * @return a list with counter marks for every counter in this update.
+     */
+    public List&lt;CounterMark&gt; collectCounterMarks()
+    {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        assert metadata().isCounter();</span>
+        // We will take aliases on the rows of this update, and update them in-place. So we should be sure the
+        // update is now immutable for all intent and purposes.
+<span class="nc" id="L462">        List&lt;CounterMark&gt; marks = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L463">        addMarksForRow(staticRow(), marks);</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        for (Row row : this)</span>
+<span class="nc" id="L465">            addMarksForRow(row, marks);</span>
+<span class="nc" id="L466">        return marks;</span>
+    }
+
+    /**
+     *
+     * @return the estimated number of rows affected by this mutation 
+     */
+    public int affectedRowCount()
+    {
+        // If there is a partition-level deletion, we intend to delete at least one row.
+<span class="pc bpc" id="L476" title="1 of 2 branches missed.">        if (!partitionLevelDeletion().isLive())</span>
+<span class="nc" id="L477">            return 1;</span>
+
+<span class="fc" id="L479">        int count = 0;</span>
+
+        // Each range delete should correspond to at least one intended row deletion.
+<span class="pc bpc" id="L482" title="1 of 2 branches missed.">        if (deletionInfo().hasRanges())</span>
+<span class="nc" id="L483">            count += deletionInfo().rangeCount();</span>
+
+<span class="fc" id="L485">        count += rowCount();</span>
+
+<span class="fc bfc" id="L487" title="All 2 branches covered.">        if (!staticRow().isEmpty())</span>
+<span class="fc" id="L488">            count++;</span>
+
+<span class="fc" id="L490">        return count;</span>
+    }
+
+    /**
+     *
+     * @return the estimated total number of columns that either have live data or are covered by a delete
+     */
+    public int affectedColumnCount()
+    {
+        // If there is a partition-level deletion, we intend to delete at least the columns of one row.
+<span class="pc bpc" id="L500" title="1 of 2 branches missed.">        if (!partitionLevelDeletion().isLive())</span>
+<span class="nc" id="L501">            return metadata().regularAndStaticColumns().size();</span>
+
+<span class="fc" id="L503">        int count = 0;</span>
+
+        // Each range delete should correspond to at least one intended row deletion, and with it, its regular columns.
+<span class="pc bpc" id="L506" title="1 of 2 branches missed.">        if (deletionInfo().hasRanges())</span>
+<span class="nc" id="L507">            count += deletionInfo().rangeCount() * metadata().regularColumns().size();</span>
+
+<span class="fc bfc" id="L509" title="All 2 branches covered.">        for (Row row : this)</span>
+        {
+<span class="pc bpc" id="L511" title="1 of 2 branches missed.">            if (row.deletion().isLive())</span>
+                // If the row is live, this will include simple tombstones as well as cells w/ actual data. 
+<span class="fc" id="L513">                count += row.columnCount();</span>
+            else
+                // We have a row deletion, so account for the columns that might be deleted.
+<span class="nc" id="L516">                count += metadata().regularColumns().size();</span>
+<span class="fc" id="L517">        }</span>
+
+<span class="fc bfc" id="L519" title="All 2 branches covered.">        if (!staticRow().isEmpty())</span>
+<span class="fc" id="L520">            count += staticRow().columnCount();</span>
+
+<span class="fc" id="L522">        return count;</span>
+    }
+
+    private static void addMarksForRow(Row row, List&lt;CounterMark&gt; marks)
+    {
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        for (Cell&lt;?&gt; cell : row.cells())</span>
+        {
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (cell.isCounterCell())</span>
+<span class="nc" id="L530">                marks.add(new CounterMark(row, cell.column(), cell.path()));</span>
+<span class="nc" id="L531">        }</span>
+<span class="nc" id="L532">    }</span>
+
+    /**
+     * Creates a new simple partition update builder.
+     *
+     * @param metadata the metadata for the table this is a partition of.
+     * @param partitionKeyValues the values for partition key columns identifying this partition. The values for each
+     * partition key column can be passed either directly as {@code ByteBuffer} or using a &quot;native&quot; value (int for
+     * Int32Type, string for UTF8Type, ...). It is also allowed to pass a single {@code DecoratedKey} value directly.
+     * @return a newly created builder.
+     */
+    public static SimpleBuilder simpleBuilder(TableMetadata metadata, Object... partitionKeyValues)
+    {
+<span class="fc" id="L545">        return new SimpleBuilders.PartitionUpdateBuilder(metadata, partitionKeyValues);</span>
+    }
+
+    public void validateIndexedColumns()
+    {
+<span class="fc" id="L550">        IndexRegistry.obtain(metadata()).validate(this);</span>
+<span class="fc" id="L551">    }</span>
+
+    @VisibleForTesting
+    public static PartitionUpdate unsafeConstruct(TableMetadata metadata,
+                                                  DecoratedKey key,
+                                                  BTreePartitionData holder,
+                                                  MutableDeletionInfo deletionInfo,
+                                                  boolean canHaveShadowedData)
+    {
+<span class="nc" id="L560">        return new PartitionUpdate(metadata, key, holder, deletionInfo, canHaveShadowedData);</span>
+    }
+
+    /**
+     * Interface for building partition updates geared towards human.
+     * &lt;p&gt;
+     * This should generally not be used when performance matters too much, but provides a more convenient interface to
+     * build an update than using the class constructor when performance is not of the utmost importance.
+     */
+    public interface SimpleBuilder
+    {
+        /**
+         * The metadata of the table this is a builder on.
+         */
+        public TableMetadata metadata();
+
+        /**
+         * Sets the timestamp to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param timestamp the timestamp to use for following additions. If that timestamp hasn't been set, the current
+         * time in microseconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder timestamp(long timestamp);
+
+        /**
+         * Sets the ttl to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param ttl the ttl to use for following additions. If that ttl hasn't been set, no ttl will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder ttl(int ttl);
+
+        /**
+         * Sets the current time to use for the following additions to this builder or any derived (row) builder.
+         *
+         * @param nowInSec the current time to use for following additions. If the current time hasn't been set, the current
+         * time in seconds will be used.
+         * @return this builder.
+         */
+        public SimpleBuilder nowInSec(long nowInSec);
+
+        /**
+         * Adds the row identifier by the provided clustering and return a builder for that row.
+         *
+         * @param clusteringValues the value for the clustering columns of the row to add to this build. There may be no
+         * values if either the table has no clustering column, or if you want to edit the static row. Note that as a
+         * shortcut it is also allowed to pass a {@code Clustering} object directly, in which case that should be the
+         * only argument.
+         * @return a builder for the row identified by {@code clusteringValues}.
+         */
+        public Row.SimpleBuilder row(Object... clusteringValues);
+
+        /**
+         * Deletes the partition identified by this builder (using a partition level deletion).
+         *
+         * @return this builder.
+         */
+        public SimpleBuilder delete();
+
+        /**
+         * Adds a new range tombstone to this update, returning a builder for that range.
+         *
+         * @return the range tombstone builder for the newly added range.
+         */
+        public RangeTombstoneBuilder addRangeTombstone();
+
+        /**
+         * Adds a new range tombstone to this update
+         *
+         * @return this builder
+         */
+        public SimpleBuilder addRangeTombstone(RangeTombstone rt);
+
+        /**
+         * Build the update represented by this builder.
+         *
+         * @return the built update.
+         */
+        public PartitionUpdate build();
+
+        /**
+         * As shortcut for {@code new Mutation(build())}.
+         *
+         * @return the built update, wrapped in a {@code Mutation}.
+         */
+        public Mutation buildAsMutation();
+
+        /**
+         * Interface to build range tombstone.
+         *
+         * By default, if no other methods are called, the represented range is inclusive of both start and end and
+         * includes everything (its start is {@code BOTTOM} and it's end is {@code TOP}).
+         */
+        public interface RangeTombstoneBuilder
+        {
+            /**
+             * Sets the start for the built range using the provided values.
+             *
+             * @param values the value for the start of the range. They act like the {@code clusteringValues} argument
+             * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+             * clustering, it can only be a prefix.
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder start(Object... values);
+
+            /**
+             * Sets the end for the built range using the provided values.
+             *
+             * @param values the value for the end of the range. They act like the {@code clusteringValues} argument
+             * of the {@link SimpleBuilder#row(Object...)} method, except that it doesn't have to be a full
+             * clustering, it can only be a prefix.
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder end(Object... values);
+
+            /**
+             * Sets the start of this range as inclusive.
+             * &lt;p&gt;
+             * This is the default and don't need to be called, but can for explicitness.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder inclStart();
+
+            /**
+             * Sets the start of this range as exclusive.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder exclStart();
+
+            /**
+             * Sets the end of this range as inclusive.
+             * &lt;p&gt;
+             * This is the default and don't need to be called, but can for explicitness.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder inclEnd();
+
+            /**
+             * Sets the end of this range as exclusive.
+             *
+             * @return this builder.
+             */
+            public RangeTombstoneBuilder exclEnd();
+        }
+    }
+
+<span class="fc" id="L710">    public static class PartitionUpdateSerializer</span>
+    {
+        public void serialize(PartitionUpdate update, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L714">            try (UnfilteredRowIterator iter = update.unfilteredIterator())</span>
+            {
+<span class="pc bpc" id="L716" title="1 of 2 branches missed.">                assert !iter.isReverseOrder();</span>
+
+<span class="fc" id="L718">                update.metadata.id.serialize(out);</span>
+<span class="fc" id="L719">                UnfilteredRowIteratorSerializer.serializer.serialize(iter, null, out, version, update.rowCount());</span>
+            }
+<span class="fc" id="L721">        }</span>
+
+        public PartitionUpdate deserialize(DataInputPlus in, int version, DeserializationHelper.Flag flag) throws IOException
+        {
+<span class="fc" id="L725">            TableMetadata metadata = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));</span>
+<span class="fc" id="L726">            UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, flag);</span>
+<span class="fc bfc" id="L727" title="All 2 branches covered.">            if (header.isEmpty)</span>
+<span class="fc" id="L728">                return emptyUpdate(metadata, header.key);</span>
+
+<span class="pc bpc" id="L730" title="1 of 2 branches missed.">            assert !header.isReversed;</span>
+<span class="pc bpc" id="L731" title="1 of 2 branches missed.">            assert header.rowEstimate &gt;= 0;</span>
+
+<span class="fc" id="L733">            MutableDeletionInfo.Builder deletionBuilder = MutableDeletionInfo.builder(header.partitionDeletion, metadata.comparator, false);</span>
+            Object[] rows;
+<span class="fc" id="L735">            try (BTree.FastBuilder&lt;Row&gt; builder = BTree.fastBuilder();</span>
+<span class="fc" id="L736">                 UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, flag, header))</span>
+            {
+<span class="fc bfc" id="L738" title="All 2 branches covered.">                while (partition.hasNext())</span>
+                {
+<span class="fc" id="L740">                    Unfiltered unfiltered = partition.next();</span>
+<span class="pc bpc" id="L741" title="1 of 2 branches missed.">                    if (unfiltered.kind() == Unfiltered.Kind.ROW)</span>
+<span class="fc" id="L742">                        builder.add((Row)unfiltered);</span>
+                    else
+<span class="nc" id="L744">                        deletionBuilder.add((RangeTombstoneMarker)unfiltered);</span>
+<span class="fc" id="L745">                }</span>
+<span class="fc" id="L746">                rows = builder.build();</span>
+            }
+
+<span class="fc" id="L749">            MutableDeletionInfo deletionInfo = deletionBuilder.build();</span>
+<span class="fc" id="L750">            return new PartitionUpdate(metadata,</span>
+                                       header.key,
+<span class="fc" id="L752">                                       new BTreePartitionData(header.sHeader.columns(), rows, deletionInfo, header.staticRow, header.sHeader.stats()),</span>
+                                       deletionInfo,
+                                       false);
+        }
+
+        public static boolean isEmpty(ByteBuffer in, DeserializationHelper.Flag flag, DecoratedKey key) throws IOException
+        {
+<span class="nc" id="L759">            int position = in.position();</span>
+<span class="nc" id="L760">            position += 16; // CFMetaData.serializer.deserialize(in, version);</span>
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            if (position &gt;= in.limit())</span>
+<span class="nc" id="L762">                throw new EOFException();</span>
+            // DecoratedKey key = metadata.decorateKey(ByteBufferUtil.readWithVIntLength(in));
+<span class="nc" id="L764">            int keyLength = VIntCoding.getUnsignedVInt32(in, position);</span>
+<span class="nc" id="L765">            position += keyLength + VIntCoding.computeUnsignedVIntSize(keyLength);</span>
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            if (position &gt;= in.limit())</span>
+<span class="nc" id="L767">                throw new EOFException();</span>
+<span class="nc" id="L768">            int flags = in.get(position) &amp; 0xff;</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">            return (flags &amp; IS_EMPTY) != 0;</span>
+        }
+
+        public long serializedSize(PartitionUpdate update, int version)
+        {
+<span class="fc" id="L774">            try (UnfilteredRowIterator iter = update.unfilteredIterator())</span>
+            {
+<span class="fc" id="L776">                return update.metadata.id.serializedSize()</span>
+<span class="fc" id="L777">                     + UnfilteredRowIteratorSerializer.serializer.serializedSize(iter, null, version, update.rowCount());</span>
+            }
+        }
+    }
+
+    /**
+     * A counter mark is basically a pointer to a counter update inside this partition update. That pointer allows
+     * us to update the counter value based on the pre-existing value read during the read-before-write that counters
+     * do. See {@link CounterMutation} to understand how this is used.
+     */
+    public static class CounterMark
+    {
+        private final Row row;
+        private final ColumnMetadata column;
+        private final CellPath path;
+
+        private CounterMark(Row row, ColumnMetadata column, CellPath path)
+        {
+            this.row = row;
+            this.column = column;
+            this.path = path;
+        }
+
+        public Clustering&lt;?&gt; clustering()
+        {
+            return row.clustering();
+        }
+
+        public ColumnMetadata column()
+        {
+            return column;
+        }
+
+        public CellPath path()
+        {
+            return path;
+        }
+
+        public ByteBuffer value()
+        {
+            return path == null
+                 ? row.getCell(column).buffer()
+                 : row.getCell(column, path).buffer();
+        }
+
+        public void setValue(ByteBuffer value)
+        {
+            // This is a bit of a giant hack as this is the only place where we mutate a Row object. This makes it more efficient
+            // for counters however and this won't be needed post-#6506 so that's probably fine.
+            assert row instanceof BTreeRow;
+            ((BTreeRow)row).setValue(column, path, value);
+        }
+    }
+
+    /**
+     * Builder for PartitionUpdates
+     *
+     * This class is not thread safe, but the PartitionUpdate it produces is (since it is immutable).
+     */
+<span class="fc" id="L836">    public static class Builder</span>
+    {
+        private final TableMetadata metadata;
+        private final DecoratedKey key;
+        private final MutableDeletionInfo deletionInfo;
+        private final boolean canHaveShadowedData;
+<span class="fc" id="L842">        private Object[] tree = BTree.empty();</span>
+        private final BTree.Builder&lt;Row&gt; rowBuilder;
+<span class="fc" id="L844">        private Row staticRow = Rows.EMPTY_STATIC_ROW;</span>
+        private final RegularAndStaticColumns columns;
+<span class="fc" id="L846">        private boolean isBuilt = false;</span>
+
+        public Builder(TableMetadata metadata,
+                       DecoratedKey key,
+                       RegularAndStaticColumns columns,
+                       int initialRowCapacity,
+                       boolean canHaveShadowedData)
+        {
+<span class="fc" id="L854">            this(metadata, key, columns, initialRowCapacity, canHaveShadowedData, Rows.EMPTY_STATIC_ROW, MutableDeletionInfo.live(), BTree.empty());</span>
+<span class="fc" id="L855">        }</span>
+
+        private Builder(TableMetadata metadata,
+                       DecoratedKey key,
+                       RegularAndStaticColumns columns,
+                       int initialRowCapacity,
+                       boolean canHaveShadowedData,
+                       BTreePartitionData holder)
+        {
+<span class="fc" id="L864">            this(metadata, key, columns, initialRowCapacity, canHaveShadowedData, holder.staticRow, holder.deletionInfo, holder.tree);</span>
+<span class="fc" id="L865">        }</span>
+
+        private Builder(TableMetadata metadata,
+                        DecoratedKey key,
+                        RegularAndStaticColumns columns,
+                        int initialRowCapacity,
+                        boolean canHaveShadowedData,
+                        Row staticRow,
+                        DeletionInfo deletionInfo,
+                        Object[] tree)
+<span class="fc" id="L875">        {</span>
+<span class="fc" id="L876">            this.metadata = metadata;</span>
+<span class="fc" id="L877">            this.key = key;</span>
+<span class="fc" id="L878">            this.columns = columns;</span>
+<span class="fc" id="L879">            this.rowBuilder = rowBuilder(initialRowCapacity);</span>
+<span class="fc" id="L880">            this.canHaveShadowedData = canHaveShadowedData;</span>
+<span class="fc" id="L881">            this.deletionInfo = deletionInfo.mutableCopy();</span>
+<span class="fc" id="L882">            this.staticRow = staticRow;</span>
+<span class="fc" id="L883">            this.tree = tree;</span>
+<span class="fc" id="L884">        }</span>
+
+        public Builder(TableMetadata metadata, DecoratedKey key, RegularAndStaticColumns columnDefinitions, int size)
+        {
+<span class="fc" id="L888">            this(metadata, key, columnDefinitions, size, true);</span>
+<span class="fc" id="L889">        }</span>
+
+        public Builder(PartitionUpdate base, int initialRowCapacity)
+        {
+<span class="fc" id="L893">            this(base.metadata, base.partitionKey, base.columns(), initialRowCapacity, base.canHaveShadowedData, base.holder);</span>
+<span class="fc" id="L894">        }</span>
+
+        public Builder(TableMetadata metadata,
+                        ByteBuffer key,
+                        RegularAndStaticColumns columns,
+                        int initialRowCapacity)
+        {
+<span class="nc" id="L901">            this(metadata, metadata.partitioner.decorateKey(key), columns, initialRowCapacity, true);</span>
+<span class="nc" id="L902">        }</span>
+
+        /**
+         * Adds a row to this update.
+         *
+         * There is no particular assumption made on the order of row added to a partition update. It is further
+         * allowed to add the same row (more precisely, multiple row objects for the same clustering).
+         *
+         * Note however that the columns contained in the added row must be a subset of the columns used when
+         * creating this update.
+         *
+         * @param row the row to add.
+         */
+        public void add(Row row)
+        {
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">            if (row.isEmpty())</span>
+<span class="nc" id="L918">                return;</span>
+
+<span class="fc bfc" id="L920" title="All 2 branches covered.">            if (row.isStatic())</span>
+            {
+                // this assert is expensive, and possibly of limited value; we should consider removing it
+                // or introducing a new class of assertions for test purposes
+<span class="pc bpc" id="L924" title="1 of 2 branches missed.">                assert columns().statics.containsAll(row.columns()) : columns().statics + &quot; is not superset of &quot; + row.columns();</span>
+<span class="pc bpc" id="L925" title="1 of 2 branches missed.">                staticRow = staticRow.isEmpty()</span>
+<span class="fc" id="L926">                            ? row</span>
+<span class="pc" id="L927">                            : Rows.merge(staticRow, row);</span>
+            }
+            else
+            {
+                // this assert is expensive, and possibly of limited value; we should consider removing it
+                // or introducing a new class of assertions for test purposes
+<span class="pc bpc" id="L933" title="1 of 2 branches missed.">                assert columns().regulars.containsAll(row.columns()) : columns().regulars + &quot; is not superset of &quot; + row.columns();</span>
+<span class="fc" id="L934">                rowBuilder.add(row);</span>
+            }
+<span class="fc" id="L936">        }</span>
+
+        public void addPartitionDeletion(DeletionTime deletionTime)
+        {
+<span class="fc" id="L940">            deletionInfo.add(deletionTime);</span>
+<span class="fc" id="L941">        }</span>
+
+        public void add(RangeTombstone range)
+        {
+<span class="nc" id="L945">            deletionInfo.add(range, metadata.comparator);</span>
+<span class="nc" id="L946">        }</span>
+
+        public DecoratedKey partitionKey()
+        {
+<span class="fc" id="L950">            return key;</span>
+        }
+
+        public TableMetadata metadata()
+        {
+<span class="nc" id="L955">            return metadata;</span>
+        }
+
+        public PartitionUpdate build()
+        {
+            // assert that we are not calling build() several times
+<span class="pc bpc" id="L961" title="1 of 2 branches missed.">            assert !isBuilt : &quot;A PartitionUpdate.Builder should only get built once&quot;;</span>
+<span class="fc" id="L962">            Object[] add = rowBuilder.build();</span>
+<span class="fc" id="L963">            Object[] merged = BTree.&lt;Row, Row, Row&gt;update(tree, add, metadata.comparator,</span>
+<span class="fc" id="L964">                                                          UpdateFunction.Simple.of(Rows::merge));</span>
+
+<span class="fc" id="L966">            EncodingStats newStats = EncodingStats.Collector.collect(staticRow, BTree.iterator(merged), deletionInfo);</span>
+
+<span class="fc" id="L968">            isBuilt = true;</span>
+<span class="fc" id="L969">            return new PartitionUpdate(metadata,</span>
+<span class="fc" id="L970">                                       partitionKey(),</span>
+                                       new BTreePartitionData(columns,
+                                                              merged,
+                                                              deletionInfo,
+                                                              staticRow,
+                                                              newStats),
+                                       deletionInfo,
+                                       canHaveShadowedData);
+        }
+
+        public RegularAndStaticColumns columns()
+        {
+<span class="fc" id="L982">            return columns;</span>
+        }
+
+        public DeletionTime partitionLevelDeletion()
+        {
+<span class="nc" id="L987">            return deletionInfo.getPartitionDeletion();</span>
+        }
+
+        private BTree.Builder&lt;Row&gt; rowBuilder(int initialCapacity)
+        {
+<span class="fc" id="L992">            return BTree.&lt;Row&gt;builder(metadata.comparator, initialCapacity)</span>
+<span class="fc" id="L993">                   .setQuickResolver(Rows::merge);</span>
+        }
+        /**
+         * Modify this update to set every timestamp for live data to {@code newTimestamp} and
+         * every deletion timestamp to {@code newTimestamp - 1}.
+         *
+         * There is no reason to use that expect on the Paxos code path, where we need ensure that
+         * anything inserted use the ballot timestamp (to respect the order of update decided by
+         * the Paxos algorithm). We use {@code newTimestamp - 1} for deletions because tombstones
+         * always win on timestamp equality and we don't want to delete our own insertions
+         * (typically, when we overwrite a collection, we first set a complex deletion to delete the
+         * previous collection before adding new elements. If we were to set that complex deletion
+         * to the same timestamp that the new elements, it would delete those elements). And since
+         * tombstones always wins on timestamp equality, using -1 guarantees our deletion will still
+         * delete anything from a previous update.
+         */
+        public Builder updateAllTimestamp(long newTimestamp)
+        {
+<span class="fc" id="L1011">            deletionInfo.updateAllTimestamp(newTimestamp - 1);</span>
+<span class="fc" id="L1012">            tree = BTree.&lt;Row, Row&gt;transformAndFilter(tree, (x) -&gt; x.updateAllTimestamp(newTimestamp));</span>
+<span class="fc" id="L1013">            staticRow = this.staticRow.updateAllTimestamp(newTimestamp);</span>
+<span class="fc" id="L1014">            return this;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1020">            return &quot;Builder{&quot; +</span>
+                   &quot;metadata=&quot; + metadata +
+                   &quot;, key=&quot; + key +
+                   &quot;, deletionInfo=&quot; + deletionInfo +
+                   &quot;, canHaveShadowedData=&quot; + canHaveShadowedData +
+                   &quot;, staticRow=&quot; + staticRow +
+                   &quot;, columns=&quot; + columns +
+                   &quot;, isBuilt=&quot; + isBuilt +
+                   '}';
+        }
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

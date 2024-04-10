@@ -1,0 +1,1081 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>QueryProcessor.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3</a> &gt; <span class="el_source">QueryProcessor.java</span></div><h1>QueryProcessor.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import com.google.common.collect.*;
+import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.antlr.runtime.*;
+import org.apache.cassandra.concurrent.ImmediateExecutor;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.metrics.ClientRequestMetrics;
+import org.apache.cassandra.metrics.ClientRequestsMetricsHolder;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaChangeListener;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.selection.ResultSetBuilder;
+import org.apache.cassandra.cql3.statements.*;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionIterators;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.metrics.CQLMetrics;
+import org.apache.cassandra.service.*;
+import org.apache.cassandra.service.pager.QueryPager;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.*;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.FutureCombiner;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.ENABLE_NODELOCAL_QUERIES;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+public class QueryProcessor implements QueryHandler
+{
+<span class="fc" id="L82">    public static final CassandraVersion CQL_VERSION = new CassandraVersion(&quot;3.4.7&quot;);</span>
+
+    // See comments on QueryProcessor #prepare
+<span class="fc" id="L85">    public static final CassandraVersion NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_40 = new CassandraVersion(&quot;4.0.2&quot;);</span>
+
+<span class="fc" id="L87">    public static final QueryProcessor instance = new QueryProcessor();</span>
+
+<span class="fc" id="L89">    private static final Logger logger = LoggerFactory.getLogger(QueryProcessor.class);</span>
+
+    private static final Cache&lt;MD5Digest, Prepared&gt; preparedStatements;
+
+    // A map for prepared statements used internally (which we don't want to mix with user statement, in particular we don't
+    // bother with expiration on those.
+<span class="fc" id="L95">    private static final ConcurrentMap&lt;String, Prepared&gt; internalStatements = new ConcurrentHashMap&lt;&gt;();</span>
+
+    // Direct calls to processStatement do not increment the preparedStatementsExecuted/regularStatementsExecuted
+    // counters. Callers of processStatement are responsible for correctly notifying metrics
+<span class="fc" id="L99">    public static final CQLMetrics metrics = new CQLMetrics();</span>
+
+<span class="fc" id="L101">    private static final AtomicInteger lastMinuteEvictionsCount = new AtomicInteger(0);</span>
+
+    static
+    {
+<span class="fc" id="L105">        preparedStatements = Caffeine.newBuilder()</span>
+<span class="fc" id="L106">                             .executor(ImmediateExecutor.INSTANCE)</span>
+<span class="fc" id="L107">                             .maximumWeight(capacityToBytes(DatabaseDescriptor.getPreparedStatementsCacheSizeMiB()))</span>
+<span class="fc" id="L108">                             .weigher(QueryProcessor::measure)</span>
+<span class="fc" id="L109">                             .removalListener((key, prepared, cause) -&gt; {</span>
+<span class="nc" id="L110">                                 MD5Digest md5Digest = (MD5Digest) key;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                                 if (cause.wasEvicted())</span>
+                                 {
+<span class="nc" id="L113">                                     metrics.preparedStatementsEvicted.inc();</span>
+<span class="nc" id="L114">                                     lastMinuteEvictionsCount.incrementAndGet();</span>
+<span class="nc" id="L115">                                     SystemKeyspace.removePreparedStatement(md5Digest);</span>
+                                 }
+<span class="pc" id="L117">                             }).build();</span>
+
+<span class="fc" id="L119">        ScheduledExecutors.scheduledTasks.scheduleAtFixedRate(() -&gt; {</span>
+<span class="fc" id="L120">            long count = lastMinuteEvictionsCount.getAndSet(0);</span>
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">            if (count &gt; 0)</span>
+<span class="nc" id="L122">                logger.warn(&quot;{} prepared statements discarded in the last minute because cache limit reached ({} MiB)&quot;,</span>
+<span class="nc" id="L123">                            count,</span>
+<span class="nc" id="L124">                            DatabaseDescriptor.getPreparedStatementsCacheSizeMiB());</span>
+<span class="fc" id="L125">        }, 1, 1, TimeUnit.MINUTES);</span>
+
+<span class="fc" id="L127">        logger.info(&quot;Initialized prepared statement caches with {} MiB&quot;,</span>
+<span class="fc" id="L128">                    DatabaseDescriptor.getPreparedStatementsCacheSizeMiB());</span>
+<span class="fc" id="L129">    }</span>
+
+    private static long capacityToBytes(long cacheSizeMB)
+    {
+<span class="fc" id="L133">        return cacheSizeMB * 1024 * 1024;</span>
+    }
+
+    public static int preparedStatementsCount()
+    {
+<span class="nc" id="L138">        return preparedStatements.asMap().size();</span>
+    }
+
+    // Work around initialization dependency
+<span class="fc" id="L142">    private enum InternalStateInstance</span>
+    {
+<span class="fc" id="L144">        INSTANCE;</span>
+
+        private final ClientState clientState;
+
+        InternalStateInstance()
+<span class="fc" id="L149">        {</span>
+<span class="fc" id="L150">            clientState = ClientState.forInternalCalls(SchemaConstants.SYSTEM_KEYSPACE_NAME);</span>
+<span class="fc" id="L151">        }</span>
+    }
+
+    public void preloadPreparedStatements()
+    {
+<span class="fc" id="L156">        int count = SystemKeyspace.loadPreparedStatements((id, query, keyspace) -&gt; {</span>
+            try
+            {
+<span class="fc" id="L159">                ClientState clientState = ClientState.forInternalCalls();</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">                if (keyspace != null)</span>
+<span class="fc" id="L161">                    clientState.setKeyspace(keyspace);</span>
+
+<span class="fc" id="L163">                Prepared prepared = parseAndPrepare(query, clientState, false);</span>
+<span class="fc" id="L164">                preparedStatements.put(id, prepared);</span>
+
+                // Preload `null` statement for non-fully qualified statements, since it can't be parsed if loaded from cache and will be dropped
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">                if (!prepared.fullyQualified)</span>
+<span class="fc" id="L168">                    preparedStatements.get(computeId(query, null), (ignored_) -&gt; prepared);</span>
+<span class="fc" id="L169">                return true;</span>
+            }
+<span class="fc" id="L171">            catch (RequestValidationException e)</span>
+            {
+<span class="fc" id="L173">                JVMStabilityInspector.inspectThrowable(e);</span>
+<span class="fc" id="L174">                logger.warn(String.format(&quot;Prepared statement recreation error, removing statement: %s %s %s&quot;, id, query, keyspace));</span>
+<span class="fc" id="L175">                SystemKeyspace.removePreparedStatement(id);</span>
+<span class="fc" id="L176">                return false;</span>
+            }
+        });
+<span class="fc" id="L179">        logger.info(&quot;Preloaded {} prepared statements&quot;, count);</span>
+<span class="fc" id="L180">    }</span>
+
+
+    /**
+     * Clears the prepared statement cache.
+     * @param memoryOnly {@code true} if only the in memory caches must be cleared, {@code false} otherwise.
+     */
+    @VisibleForTesting
+    public static void clearPreparedStatements(boolean memoryOnly)
+    {
+<span class="nc" id="L190">        preparedStatements.invalidateAll();</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (!memoryOnly)</span>
+<span class="nc" id="L192">            SystemKeyspace.resetPreparedStatements();</span>
+<span class="nc" id="L193">    }</span>
+
+    @VisibleForTesting
+    public static ConcurrentMap&lt;String, Prepared&gt; getInternalStatements()
+    {
+<span class="nc" id="L198">        return internalStatements;</span>
+    }
+
+    @VisibleForTesting
+    public static QueryState internalQueryState()
+    {
+<span class="fc" id="L204">        return new QueryState(InternalStateInstance.INSTANCE.clientState);</span>
+    }
+
+    private QueryProcessor()
+<span class="fc" id="L208">    {</span>
+<span class="fc" id="L209">        Schema.instance.registerListener(new StatementInvalidatingListener());</span>
+<span class="fc" id="L210">    }</span>
+
+    @VisibleForTesting
+    public void evictPrepared(MD5Digest id)
+    {
+<span class="fc" id="L215">        preparedStatements.invalidate(id);</span>
+<span class="fc" id="L216">        SystemKeyspace.removePreparedStatement(id);</span>
+<span class="fc" id="L217">    }</span>
+
+    public HashMap&lt;MD5Digest, Prepared&gt; getPreparedStatements()
+    {
+<span class="nc" id="L221">        return new HashMap&lt;&gt;(preparedStatements.asMap());</span>
+    }
+
+    public Prepared getPrepared(MD5Digest id)
+    {
+<span class="fc" id="L226">        return preparedStatements.getIfPresent(id);</span>
+    }
+
+    public static void validateKey(ByteBuffer key) throws InvalidRequestException
+    {
+<span class="pc bpc" id="L231" title="2 of 4 branches missed.">        if (key == null || key.remaining() == 0)</span>
+        {
+<span class="nc" id="L233">            throw new InvalidRequestException(&quot;Key may not be empty&quot;);</span>
+        }
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">        if (key == ByteBufferUtil.UNSET_BYTE_BUFFER)</span>
+<span class="nc" id="L236">            throw new InvalidRequestException(&quot;Key may not be unset&quot;);</span>
+
+        // check that key can be handled by ByteArrayUtil.writeWithShortLength and ByteBufferUtil.writeWithShortLength
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">        if (key.remaining() &gt; FBUtilities.MAX_UNSIGNED_SHORT)</span>
+        {
+<span class="nc" id="L241">            throw new InvalidRequestException(&quot;Key length of &quot; + key.remaining() +</span>
+                                              &quot; is longer than maximum of &quot; + FBUtilities.MAX_UNSIGNED_SHORT);
+        }
+<span class="fc" id="L244">    }</span>
+
+    public ResultMessage processStatement(CQLStatement statement, QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L249">        logger.trace(&quot;Process {} @CL.{}&quot;, statement, options.getConsistency());</span>
+<span class="fc" id="L250">        ClientState clientState = queryState.getClientState();</span>
+<span class="fc" id="L251">        statement.authorize(clientState);</span>
+<span class="fc" id="L252">        statement.validate(clientState);</span>
+
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">        ResultMessage result = options.getConsistency() == ConsistencyLevel.NODE_LOCAL</span>
+<span class="nc" id="L255">                             ? processNodeLocalStatement(statement, queryState, options)</span>
+<span class="fc" id="L256">                             : statement.execute(queryState, options, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L258" title="All 2 branches covered.">        return result == null ? new ResultMessage.Void() : result;</span>
+    }
+
+    private ResultMessage processNodeLocalStatement(CQLStatement statement, QueryState queryState, QueryOptions options)
+    {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        if (!ENABLE_NODELOCAL_QUERIES.getBoolean())</span>
+<span class="nc" id="L264">            throw new InvalidRequestException(&quot;NODE_LOCAL consistency level is highly dangerous and should be used only for debugging purposes&quot;);</span>
+
+<span class="nc bnc" id="L266" title="All 4 branches missed.">        if (statement instanceof BatchStatement || statement instanceof ModificationStatement)</span>
+<span class="nc" id="L267">            return processNodeLocalWrite(statement, queryState, options);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        else if (statement instanceof SelectStatement)</span>
+<span class="nc" id="L269">            return processNodeLocalSelect((SelectStatement) statement, queryState, options);</span>
+        else
+<span class="nc" id="L271">            throw new InvalidRequestException(&quot;NODE_LOCAL consistency level can only be used with BATCH, UPDATE, INSERT, DELETE, and SELECT statements&quot;);</span>
+    }
+
+    private ResultMessage processNodeLocalWrite(CQLStatement statement, QueryState queryState, QueryOptions options)
+    {
+<span class="nc" id="L276">        ClientRequestMetrics  levelMetrics = ClientRequestsMetricsHolder.writeMetricsForLevel(ConsistencyLevel.NODE_LOCAL);</span>
+<span class="nc" id="L277">        ClientRequestMetrics globalMetrics = ClientRequestsMetricsHolder.writeMetrics;</span>
+
+<span class="nc" id="L279">        long startTime = nanoTime();</span>
+        try
+        {
+<span class="nc" id="L282">            return statement.executeLocally(queryState, options);</span>
+        }
+        finally
+        {
+<span class="nc" id="L286">            long latency = nanoTime() - startTime;</span>
+<span class="nc" id="L287">             levelMetrics.addNano(latency);</span>
+<span class="nc" id="L288">            globalMetrics.addNano(latency);</span>
+        }
+    }
+
+    private ResultMessage processNodeLocalSelect(SelectStatement statement, QueryState queryState, QueryOptions options)
+    {
+<span class="nc" id="L294">        ClientRequestMetrics  levelMetrics = ClientRequestsMetricsHolder.readMetricsForLevel(ConsistencyLevel.NODE_LOCAL);</span>
+<span class="nc" id="L295">        ClientRequestMetrics globalMetrics = ClientRequestsMetricsHolder.readMetrics;</span>
+
+<span class="nc bnc" id="L297" title="All 4 branches missed.">        if (StorageService.instance.isBootstrapMode() &amp;&amp; !SchemaConstants.isLocalSystemKeyspace(statement.keyspace()))</span>
+        {
+<span class="nc" id="L299">            levelMetrics.unavailables.mark();</span>
+<span class="nc" id="L300">            globalMetrics.unavailables.mark();</span>
+<span class="nc" id="L301">            throw new IsBootstrappingException();</span>
+        }
+
+<span class="nc" id="L304">        long startTime = nanoTime();</span>
+        try
+        {
+<span class="nc" id="L307">            return statement.executeLocally(queryState, options);</span>
+        }
+        finally
+        {
+<span class="nc" id="L311">            long latency = nanoTime() - startTime;</span>
+<span class="nc" id="L312">             levelMetrics.addNano(latency);</span>
+<span class="nc" id="L313">            globalMetrics.addNano(latency);</span>
+        }
+    }
+
+    public static ResultMessage process(String queryString, ConsistencyLevel cl, QueryState queryState, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L320">        QueryOptions options = QueryOptions.forInternalCalls(cl, Collections.&lt;ByteBuffer&gt;emptyList());</span>
+<span class="nc" id="L321">        CQLStatement statement = instance.parse(queryString, queryState, options);</span>
+<span class="nc" id="L322">        return instance.process(statement, queryState, options, queryStartNanoTime);</span>
+    }
+
+    public CQLStatement parse(String queryString, QueryState queryState, QueryOptions options)
+    {
+<span class="fc" id="L327">        return getStatement(queryString, queryState.getClientState().cloneWithKeyspaceIfSet(options.getKeyspace()));</span>
+    }
+
+    public ResultMessage process(CQLStatement statement,
+                                 QueryState state,
+                                 QueryOptions options,
+                                 Map&lt;String, ByteBuffer&gt; customPayload,
+                                 long queryStartNanoTime) throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L336">        return process(statement, state, options, queryStartNanoTime);</span>
+    }
+
+    public ResultMessage process(CQLStatement prepared, QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L342">        options.prepare(prepared.getBindVariables());</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">        if (prepared.getBindVariables().size() != options.getValues().size())</span>
+<span class="nc" id="L344">            throw new InvalidRequestException(&quot;Invalid amount of bind variables&quot;);</span>
+
+<span class="fc bfc" id="L346" title="All 2 branches covered.">        if (!queryState.getClientState().isInternal)</span>
+<span class="fc" id="L347">            metrics.regularStatementsExecuted.inc();</span>
+
+<span class="fc" id="L349">        return processStatement(prepared, queryState, options, queryStartNanoTime);</span>
+    }
+
+    public static CQLStatement parseStatement(String queryStr, ClientState clientState) throws RequestValidationException
+    {
+<span class="fc" id="L354">        return getStatement(queryStr, clientState);</span>
+    }
+
+    public static UntypedResultSet process(String query, ConsistencyLevel cl) throws RequestExecutionException
+    {
+<span class="fc" id="L359">        return process(query, cl, Collections.&lt;ByteBuffer&gt;emptyList());</span>
+    }
+
+    public static UntypedResultSet process(String query, ConsistencyLevel cl, List&lt;ByteBuffer&gt; values) throws RequestExecutionException
+    {
+<span class="fc" id="L364">        QueryState queryState = QueryState.forInternalCalls();</span>
+<span class="fc" id="L365">        QueryOptions options = QueryOptions.forInternalCalls(cl, values);</span>
+<span class="fc" id="L366">        CQLStatement statement = instance.parse(query, queryState, options);</span>
+<span class="fc" id="L367">        ResultMessage result = instance.process(statement, queryState, options, nanoTime());</span>
+<span class="fc bfc" id="L368" title="All 2 branches covered.">        if (result instanceof ResultMessage.Rows)</span>
+<span class="fc" id="L369">            return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+        else
+<span class="fc" id="L371">            return null;</span>
+    }
+
+    @VisibleForTesting
+    public static QueryOptions makeInternalOptions(CQLStatement prepared, Object[] values)
+    {
+<span class="fc" id="L377">        return makeInternalOptions(prepared, values, ConsistencyLevel.ONE);</span>
+    }
+
+    private static QueryOptions makeInternalOptions(CQLStatement prepared, Object[] values, ConsistencyLevel cl)
+    {
+<span class="fc" id="L382">        return makeInternalOptionsWithNowInSec(prepared, FBUtilities.nowInSeconds(), values, cl);</span>
+    }
+
+    public static QueryOptions makeInternalOptionsWithNowInSec(CQLStatement prepared, long nowInSec, Object[] values)
+    {
+<span class="fc" id="L387">        return makeInternalOptionsWithNowInSec(prepared, nowInSec, values, ConsistencyLevel.ONE);</span>
+    }
+
+    private static QueryOptions makeInternalOptionsWithNowInSec(CQLStatement prepared, long nowInSec, Object[] values, ConsistencyLevel cl)
+    {
+<span class="pc bpc" id="L392" title="1 of 2 branches missed.">        if (prepared.getBindVariables().size() != values.length)</span>
+<span class="nc" id="L393">            throw new IllegalArgumentException(String.format(&quot;Invalid number of values. Expecting %d but got %d&quot;, prepared.getBindVariables().size(), values.length));</span>
+
+<span class="fc" id="L395">        List&lt;ByteBuffer&gt; boundValues = new ArrayList&lt;&gt;(values.length);</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">        for (int i = 0; i &lt; values.length; i++)</span>
+        {
+<span class="fc" id="L398">            Object value = values[i];</span>
+<span class="fc" id="L399">            AbstractType&lt;?&gt; type = prepared.getBindVariables().get(i).type;</span>
+<span class="fc bfc" id="L400" title="All 4 branches covered.">            boundValues.add(value instanceof ByteBuffer || value == null ? (ByteBuffer)value : type.decomposeUntyped(value));</span>
+        }
+<span class="fc" id="L402">        return QueryOptions.forInternalCallsWithNowInSec(nowInSec, cl, boundValues);</span>
+    }
+
+    public static Prepared prepareInternal(String query) throws RequestValidationException
+    {
+<span class="fc" id="L407">        Prepared prepared = internalStatements.get(query);</span>
+<span class="fc bfc" id="L408" title="All 2 branches covered.">        if (prepared != null)</span>
+<span class="fc" id="L409">            return prepared;</span>
+
+<span class="fc" id="L411">        prepared = parseAndPrepare(query, internalQueryState().getClientState(), true);</span>
+<span class="fc" id="L412">        internalStatements.put(query, prepared);</span>
+<span class="fc" id="L413">        return prepared;</span>
+    }
+
+    public static Prepared parseAndPrepare(String query, ClientState clientState, boolean isInternal) throws RequestValidationException
+    {
+<span class="fc" id="L418">        CQLStatement.Raw raw = parseStatement(query);</span>
+
+<span class="fc" id="L420">        boolean fullyQualified = false;</span>
+<span class="fc" id="L421">        String keyspace = null;</span>
+
+        // Set keyspace for statement that require login
+<span class="pc bpc" id="L424" title="1 of 2 branches missed.">        if (raw instanceof QualifiedStatement)</span>
+        {
+<span class="fc" id="L426">            QualifiedStatement qualifiedStatement = ((QualifiedStatement) raw);</span>
+<span class="fc" id="L427">            fullyQualified = qualifiedStatement.isFullyQualified();</span>
+<span class="fc" id="L428">            qualifiedStatement.setKeyspace(clientState);</span>
+<span class="fc" id="L429">            keyspace = qualifiedStatement.keyspace();</span>
+        }
+
+        // Note: if 2 threads prepare the same query, we'll live so don't bother synchronizing
+<span class="fc" id="L433">        CQLStatement statement = raw.prepare(clientState);</span>
+<span class="fc" id="L434">        statement.validate(clientState);</span>
+
+<span class="fc bfc" id="L436" title="All 2 branches covered.">        if (isInternal)</span>
+<span class="fc" id="L437">            return new Prepared(statement, &quot;&quot;, fullyQualified, keyspace);</span>
+        else
+<span class="fc" id="L439">            return new Prepared(statement, query, fullyQualified, keyspace);</span>
+    }
+
+    public static UntypedResultSet executeInternal(String query, Object... values)
+    {
+<span class="fc" id="L444">        Prepared prepared = prepareInternal(query);</span>
+<span class="fc" id="L445">        ResultMessage result = prepared.statement.executeLocally(internalQueryState(), makeInternalOptions(prepared.statement, values));</span>
+<span class="fc bfc" id="L446" title="All 2 branches covered.">        if (result instanceof ResultMessage.Rows)</span>
+<span class="fc" id="L447">            return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+        else
+<span class="fc" id="L449">            return null;</span>
+    }
+
+    public static Future&lt;UntypedResultSet&gt; executeAsync(InetAddressAndPort address, String query, Object... values)
+    {
+<span class="nc" id="L454">        Prepared prepared = prepareInternal(query);</span>
+<span class="nc" id="L455">        long nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="nc" id="L456">        QueryOptions options = makeInternalOptionsWithNowInSec(prepared.statement, nowInSec, values);</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (prepared.statement instanceof SelectStatement)</span>
+        {
+<span class="nc" id="L459">            SelectStatement select = (SelectStatement) prepared.statement;</span>
+<span class="nc" id="L460">            ReadQuery readQuery = select.getQuery(options, nowInSec);</span>
+            List&lt;ReadCommand&gt; commands;
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            if (readQuery instanceof ReadCommand)</span>
+            {
+<span class="nc" id="L464">                commands = Collections.singletonList((ReadCommand) readQuery);</span>
+            }
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            else if (readQuery instanceof SinglePartitionReadQuery.Group)</span>
+            {
+<span class="nc" id="L468">                List&lt;? extends SinglePartitionReadQuery&gt; queries = ((SinglePartitionReadQuery.Group&lt;? extends SinglePartitionReadQuery&gt;) readQuery).queries;</span>
+<span class="nc" id="L469">                queries.forEach(a -&gt; {</span>
+<span class="nc bnc" id="L470" title="All 2 branches missed.">                    if (!(a instanceof ReadCommand))</span>
+<span class="nc" id="L471">                        throw new IllegalArgumentException(&quot;Queries found which are not ReadCommand: &quot; + a.getClass());</span>
+<span class="nc" id="L472">                });</span>
+<span class="nc" id="L473">                commands = (List&lt;ReadCommand&gt;) (List&lt;?&gt;) queries;</span>
+<span class="nc" id="L474">            }</span>
+            else
+            {
+<span class="nc" id="L477">                throw new IllegalArgumentException(&quot;Unable to handle; only expected ReadCommands but given &quot; + readQuery.getClass());</span>
+            }
+<span class="nc" id="L479">            Future&lt;List&lt;Message&lt;ReadResponse&gt;&gt;&gt; future = FutureCombiner.allOf(commands.stream()</span>
+<span class="nc" id="L480">                                                                                      .map(rc -&gt; Message.out(rc.verb(), rc))</span>
+<span class="nc" id="L481">                                                                                      .map(m -&gt; MessagingService.instance().&lt;ReadCommand, ReadResponse&gt;sendWithResult(m, address))</span>
+<span class="nc" id="L482">                                                                                      .collect(Collectors.toList()));</span>
+
+<span class="nc" id="L484">            ResultSetBuilder result = new ResultSetBuilder(select.getResultMetadata(), select.getSelection().newSelectors(options), false);</span>
+<span class="nc" id="L485">            return future.map(list -&gt; {</span>
+<span class="nc" id="L486">                int i = 0;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">                for (Message&lt;ReadResponse&gt; m : list)</span>
+                {
+<span class="nc" id="L489">                    ReadResponse rsp = m.payload;</span>
+<span class="nc" id="L490">                    try (PartitionIterator it = UnfilteredPartitionIterators.filter(rsp.makeIterator(commands.get(i++)), nowInSec))</span>
+                    {
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                        while (it.hasNext())</span>
+                        {
+<span class="nc" id="L494">                            try (RowIterator partition = it.next())</span>
+                            {
+<span class="nc" id="L496">                                select.processPartition(partition, options, result, nowInSec);</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L500">                }</span>
+<span class="nc" id="L501">                return result.build();</span>
+<span class="nc" id="L502">            }).map(UntypedResultSet::create);</span>
+        }
+<span class="nc" id="L504">        throw new IllegalArgumentException(&quot;Unable to execute query; only SELECT supported but given: &quot; + query);</span>
+    }
+
+    public static UntypedResultSet execute(String query, ConsistencyLevel cl, Object... values)
+    throws RequestExecutionException
+    {
+<span class="nc" id="L510">        return execute(query, cl, internalQueryState(), values);</span>
+    }
+
+    public static UntypedResultSet executeInternalWithNowInSec(String query, long nowInSec, Object... values)
+    {
+<span class="nc" id="L515">        Prepared prepared = prepareInternal(query);</span>
+<span class="nc" id="L516">        ResultMessage result = prepared.statement.executeLocally(internalQueryState(), makeInternalOptionsWithNowInSec(prepared.statement, nowInSec, values));</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (result instanceof ResultMessage.Rows)</span>
+<span class="nc" id="L518">            return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+        else
+<span class="nc" id="L520">            return null;</span>
+    }
+
+    public static UntypedResultSet execute(String query, ConsistencyLevel cl, QueryState state, Object... values)
+    throws RequestExecutionException
+    {
+        try
+        {
+<span class="nc" id="L528">            Prepared prepared = prepareInternal(query);</span>
+<span class="nc" id="L529">            ResultMessage result = prepared.statement.execute(state, makeInternalOptionsWithNowInSec(prepared.statement, state.getNowInSeconds(), values, cl), nanoTime());</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">            if (result instanceof ResultMessage.Rows)</span>
+<span class="nc" id="L531">                return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+            else
+<span class="nc" id="L533">                return null;</span>
+        }
+<span class="nc" id="L535">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L537">            throw new RuntimeException(&quot;Error validating &quot; + query, e);</span>
+        }
+    }
+
+    public static UntypedResultSet executeInternalWithPaging(String query, int pageSize, Object... values)
+    {
+<span class="fc" id="L543">        Prepared prepared = prepareInternal(query);</span>
+<span class="pc bpc" id="L544" title="1 of 2 branches missed.">        if (!(prepared.statement instanceof SelectStatement))</span>
+<span class="nc" id="L545">            throw new IllegalArgumentException(&quot;Only SELECTs can be paged&quot;);</span>
+
+<span class="fc" id="L547">        SelectStatement select = (SelectStatement)prepared.statement;</span>
+<span class="fc" id="L548">        long nowInSec = FBUtilities.nowInSeconds();</span>
+<span class="fc" id="L549">        QueryPager pager = select.getQuery(makeInternalOptionsWithNowInSec(prepared.statement, nowInSec, values), nowInSec).getPager(null, ProtocolVersion.CURRENT);</span>
+<span class="fc" id="L550">        return UntypedResultSet.create(select, pager, pageSize);</span>
+    }
+
+    /**
+     * Same than executeLocally, but to use for queries we know are only executed once so that the
+     * created statement object is not cached.
+     */
+    public static UntypedResultSet executeOnceInternal(String query, Object... values)
+    {
+<span class="fc" id="L559">        return executeOnceInternal(internalQueryState(), query, values);</span>
+    }
+
+    /**
+     * Execute an internal query with the provided {@code nowInSec} and {@code timestamp} for the {@code QueryState}.
+     * &lt;p&gt;This method ensure that the statement will not be cached in the prepared statement cache.&lt;/p&gt;
+     */
+    @VisibleForTesting
+    public static UntypedResultSet executeOnceInternalWithNowAndTimestamp(long nowInSec, long timestamp, String query, Object... values)
+    {
+<span class="nc" id="L569">        QueryState queryState = new QueryState(InternalStateInstance.INSTANCE.clientState, timestamp, nowInSec);</span>
+<span class="nc" id="L570">        return executeOnceInternal(queryState, query, values);</span>
+    }
+
+    private static UntypedResultSet executeOnceInternal(QueryState queryState, String query, Object... values)
+    {
+<span class="fc" id="L575">        CQLStatement statement = parseStatement(query, queryState.getClientState());</span>
+<span class="fc" id="L576">        statement.validate(queryState.getClientState());</span>
+<span class="fc" id="L577">        ResultMessage result = statement.executeLocally(queryState, makeInternalOptionsWithNowInSec(statement, queryState.getNowInSeconds(), values));</span>
+<span class="fc bfc" id="L578" title="All 2 branches covered.">        if (result instanceof ResultMessage.Rows)</span>
+<span class="fc" id="L579">            return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+        else
+<span class="fc" id="L581">            return null;</span>
+    }
+
+    /**
+     * A special version of executeLocally that takes the time used as &quot;now&quot; for the query in argument.
+     * Note that this only make sense for Selects so this only accept SELECT statements and is only useful in rare
+     * cases.
+     */
+    public static UntypedResultSet executeInternalWithNow(long nowInSec, long queryStartNanoTime, String query, Object... values)
+    {
+<span class="nc" id="L591">        Prepared prepared = prepareInternal(query);</span>
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        assert prepared.statement instanceof SelectStatement;</span>
+<span class="nc" id="L593">        SelectStatement select = (SelectStatement)prepared.statement;</span>
+<span class="nc" id="L594">        ResultMessage result = select.executeInternal(internalQueryState(), makeInternalOptionsWithNowInSec(prepared.statement, nowInSec, values), nowInSec, queryStartNanoTime);</span>
+<span class="nc bnc" id="L595" title="All 2 branches missed.">        assert result instanceof ResultMessage.Rows;</span>
+<span class="nc" id="L596">        return UntypedResultSet.create(((ResultMessage.Rows)result).result);</span>
+    }
+
+    /**
+     * A special version of executeInternal that takes the time used as &quot;now&quot; for the query in argument.
+     * Note that this only make sense for Selects so this only accept SELECT statements and is only useful in rare
+     * cases.
+     */
+    public static Map&lt;DecoratedKey, List&lt;Row&gt;&gt; executeInternalRawWithNow(long nowInSec, String query, Object... values)
+    {
+<span class="nc" id="L606">        Prepared prepared = prepareInternal(query);</span>
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        assert prepared.statement instanceof SelectStatement;</span>
+<span class="nc" id="L608">        SelectStatement select = (SelectStatement) prepared.statement;</span>
+<span class="nc" id="L609">        return select.executeRawInternal(makeInternalOptionsWithNowInSec(prepared.statement, nowInSec, values), internalQueryState().getClientState(), nowInSec);</span>
+    }
+
+    @VisibleForTesting
+    public static UntypedResultSet resultify(String query, RowIterator partition)
+    {
+<span class="nc" id="L615">        return resultify(query, PartitionIterators.singletonIterator(partition));</span>
+    }
+
+    @VisibleForTesting
+    public static UntypedResultSet resultify(String query, PartitionIterator partitions)
+    {
+<span class="nc" id="L621">        try (PartitionIterator iter = partitions)</span>
+        {
+<span class="nc" id="L623">            SelectStatement ss = (SelectStatement) getStatement(query, null);</span>
+<span class="nc" id="L624">            ResultSet cqlRows = ss.process(iter, FBUtilities.nowInSeconds(), true);</span>
+<span class="nc" id="L625">            return UntypedResultSet.create(cqlRows);</span>
+        }
+    }
+
+    public ResultMessage.Prepared prepare(String query,
+                                          ClientState clientState,
+                                          Map&lt;String, ByteBuffer&gt; customPayload) throws RequestValidationException
+    {
+<span class="fc" id="L633">        return prepare(query, clientState);</span>
+    }
+
+<span class="fc" id="L636">    private volatile boolean newPreparedStatementBehaviour = false;</span>
+    public boolean useNewPreparedStatementBehaviour()
+    {
+<span class="pc bpc" id="L639" title="1 of 4 branches missed.">        if (newPreparedStatementBehaviour || DatabaseDescriptor.getForceNewPreparedStatementBehaviour())</span>
+<span class="fc" id="L640">            return true;</span>
+
+<span class="fc" id="L642">        synchronized (this)</span>
+        {
+<span class="fc" id="L644">            CassandraVersion minVersion = Gossiper.instance.getMinVersion(DatabaseDescriptor.getWriteRpcTimeout(TimeUnit.MILLISECONDS), TimeUnit.MILLISECONDS);</span>
+<span class="pc bpc" id="L645" title="2 of 4 branches missed.">            if (minVersion != null &amp;&amp; minVersion.compareTo(NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_40, true) &gt;= 0)</span>
+            {
+<span class="fc" id="L647">                logger.info(&quot;Fully upgraded to at least {}&quot;, minVersion);</span>
+<span class="fc" id="L648">                newPreparedStatementBehaviour = true;</span>
+            }
+
+<span class="fc" id="L651">            return newPreparedStatementBehaviour;</span>
+        }
+    }
+
+    /**
+     * This method got slightly out of hand, but this is with best intentions: to allow users to be upgraded from any
+     * prior version, and help implementers avoid previous mistakes by clearly separating fully qualified and non-fully
+     * qualified statement behaviour.
+     * &lt;p&gt;
+     * Basically we need to handle 4 different hashes here;
+     * 1. fully qualified query with keyspace
+     * 2. fully qualified query without keyspace
+     * 3. unqualified query with keyspace
+     * 4. unqualified query without keyspace
+     * &lt;p&gt;
+     * The correct combination to return is 2/3 - the problem is during upgrades (assuming upgrading from &lt; 4.0.2)
+     * - Existing clients have hash 1 or 3
+     * - Query prepared on a post-4.0.2 instance needs to return hash 1/3 to be able to execute it on a pre-4.0.2 instance
+     * - This is handled by the useNewPreparedStatementBehaviour flag - while there still are pre-4.0.2 instances in
+     *   the cluster we always return hash 1/3
+     * - Once fully upgraded we start returning hash 2/3, this will cause a prepared statement id mismatch for existing
+     *   clients, but they will be able to continue using the old prepared statement id after that exception since we
+     *   store the query both with and without keyspace.
+     */
+    public ResultMessage.Prepared prepare(String queryString, ClientState clientState)
+    {
+<span class="fc" id="L677">        boolean useNewPreparedStatementBehaviour = useNewPreparedStatementBehaviour();</span>
+<span class="fc" id="L678">        MD5Digest hashWithoutKeyspace = computeId(queryString, null);</span>
+<span class="fc" id="L679">        MD5Digest hashWithKeyspace = computeId(queryString, clientState.getRawKeyspace());</span>
+<span class="fc" id="L680">        Prepared cachedWithoutKeyspace = preparedStatements.getIfPresent(hashWithoutKeyspace);</span>
+<span class="fc" id="L681">        Prepared cachedWithKeyspace = preparedStatements.getIfPresent(hashWithKeyspace);</span>
+        // We assume it is only safe to return cached prepare if we have both instances
+<span class="pc bpc" id="L683" title="1 of 4 branches missed.">        boolean safeToReturnCached = cachedWithoutKeyspace != null &amp;&amp; cachedWithKeyspace != null;</span>
+
+<span class="fc bfc" id="L685" title="All 2 branches covered.">        if (safeToReturnCached)</span>
+        {
+<span class="pc bpc" id="L687" title="1 of 2 branches missed.">            if (useNewPreparedStatementBehaviour)</span>
+            {
+<span class="pc bpc" id="L689" title="1 of 2 branches missed.">                if (cachedWithoutKeyspace.fullyQualified) // For fully qualified statements, we always skip keyspace to avoid digest switching</span>
+<span class="nc" id="L690">                    return createResultMessage(hashWithoutKeyspace, cachedWithoutKeyspace);</span>
+
+<span class="pc bpc" id="L692" title="3 of 4 branches missed.">                if (clientState.getRawKeyspace() != null &amp;&amp; !cachedWithKeyspace.fullyQualified) // For non-fully qualified statements, we always include keyspace to avoid ambiguity</span>
+<span class="nc" id="L693">                    return createResultMessage(hashWithKeyspace, cachedWithKeyspace);</span>
+
+            }
+            else // legacy caches, pre-CASSANDRA-15252 behaviour
+            {
+<span class="nc" id="L698">                return createResultMessage(hashWithKeyspace, cachedWithKeyspace);</span>
+            }
+        }
+        else
+        {
+            // Make sure the missing one is going to be eventually re-prepared
+<span class="fc" id="L704">            evictPrepared(hashWithKeyspace);</span>
+<span class="fc" id="L705">            evictPrepared(hashWithoutKeyspace);</span>
+        }
+
+<span class="fc" id="L708">        Prepared prepared = parseAndPrepare(queryString, clientState, false);</span>
+<span class="fc" id="L709">        CQLStatement statement = prepared.statement;</span>
+
+<span class="fc" id="L711">        int boundTerms = statement.getBindVariables().size();</span>
+<span class="pc bpc" id="L712" title="1 of 2 branches missed.">        if (boundTerms &gt; FBUtilities.MAX_UNSIGNED_SHORT)</span>
+<span class="nc" id="L713">            throw new InvalidRequestException(String.format(&quot;Too many markers(?). %d markers exceed the allowed maximum of %d&quot;, boundTerms, FBUtilities.MAX_UNSIGNED_SHORT));</span>
+
+<span class="pc bpc" id="L715" title="1 of 2 branches missed.">        if (prepared.fullyQualified)</span>
+        {
+<span class="nc" id="L717">            ResultMessage.Prepared qualifiedWithoutKeyspace = storePreparedStatement(queryString, null, prepared);</span>
+<span class="nc" id="L718">            ResultMessage.Prepared qualifiedWithKeyspace = null;</span>
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (clientState.getRawKeyspace() != null)</span>
+<span class="nc" id="L720">                qualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared);</span>
+
+<span class="nc bnc" id="L722" title="All 4 branches missed.">            if (!useNewPreparedStatementBehaviour &amp;&amp; qualifiedWithKeyspace != null)</span>
+<span class="nc" id="L723">                return qualifiedWithKeyspace;</span>
+
+<span class="nc" id="L725">            return qualifiedWithoutKeyspace;</span>
+        }
+        else
+        {
+<span class="fc" id="L729">            clientState.warnAboutUseWithPreparedStatements(hashWithKeyspace, clientState.getRawKeyspace());</span>
+
+<span class="fc" id="L731">            ResultMessage.Prepared nonQualifiedWithKeyspace = storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared);</span>
+<span class="fc" id="L732">            ResultMessage.Prepared nonQualifiedWithNullKeyspace = storePreparedStatement(queryString, null, prepared);</span>
+<span class="pc bpc" id="L733" title="1 of 2 branches missed.">            if (!useNewPreparedStatementBehaviour)</span>
+<span class="nc" id="L734">                return nonQualifiedWithNullKeyspace;</span>
+
+<span class="fc" id="L736">            return nonQualifiedWithKeyspace;</span>
+        }
+    }
+
+    private static MD5Digest computeId(String queryString, String keyspace)
+    {
+<span class="fc bfc" id="L742" title="All 2 branches covered.">        String toHash = keyspace == null ? queryString : keyspace + queryString;</span>
+<span class="fc" id="L743">        return MD5Digest.compute(toHash);</span>
+    }
+
+    @VisibleForTesting
+    public static ResultMessage.Prepared getStoredPreparedStatement(String queryString, String clientKeyspace)
+    throws InvalidRequestException
+    {
+<span class="nc" id="L750">        MD5Digest statementId = computeId(queryString, clientKeyspace);</span>
+<span class="nc" id="L751">        Prepared existing = preparedStatements.getIfPresent(statementId);</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">        if (existing == null)</span>
+<span class="nc" id="L753">            return null;</span>
+
+<span class="nc" id="L755">        checkTrue(queryString.equals(existing.rawCQLStatement),</span>
+                  &quot;MD5 hash collision: query with the same MD5 hash was already prepared. \n Existing: '%s'&quot;,
+                  existing.rawCQLStatement);
+
+<span class="nc" id="L759">        return createResultMessage(statementId, existing);</span>
+    }
+
+    @VisibleForTesting
+    private static ResultMessage.Prepared createResultMessage(MD5Digest statementId, Prepared existing)
+    throws InvalidRequestException
+    {
+<span class="nc" id="L766">        ResultSet.PreparedMetadata preparedMetadata = ResultSet.PreparedMetadata.fromPrepared(existing.statement);</span>
+<span class="nc" id="L767">        ResultSet.ResultMetadata resultMetadata = ResultSet.ResultMetadata.fromPrepared(existing.statement);</span>
+<span class="nc" id="L768">        return new ResultMessage.Prepared(statementId, resultMetadata.getResultMetadataId(), preparedMetadata, resultMetadata);</span>
+    }
+
+    @VisibleForTesting
+    public static ResultMessage.Prepared storePreparedStatement(String queryString, String keyspace, Prepared prepared)
+    throws InvalidRequestException
+    {
+        // Concatenate the current keyspace so we don't mix prepared statements between keyspace (#5352).
+        // (if the keyspace is null, queryString has to have a fully-qualified keyspace so it's fine.
+<span class="fc" id="L777">        long statementSize = ObjectSizes.measureDeep(prepared.statement);</span>
+        // don't execute the statement if it's bigger than the allowed threshold
+<span class="pc bpc" id="L779" title="1 of 2 branches missed.">        if (statementSize &gt; capacityToBytes(DatabaseDescriptor.getPreparedStatementsCacheSizeMiB()))</span>
+<span class="nc" id="L780">            throw new InvalidRequestException(String.format(&quot;Prepared statement of size %d bytes is larger than allowed maximum of %d MB: %s...&quot;,</span>
+<span class="nc" id="L781">                                                            statementSize,</span>
+<span class="nc" id="L782">                                                            DatabaseDescriptor.getPreparedStatementsCacheSizeMiB(),</span>
+<span class="nc" id="L783">                                                            queryString.substring(0, 200)));</span>
+<span class="fc" id="L784">        MD5Digest statementId = computeId(queryString, keyspace);</span>
+<span class="fc" id="L785">        Prepared previous = preparedStatements.get(statementId, (ignored_) -&gt; prepared);</span>
+<span class="pc bpc" id="L786" title="1 of 2 branches missed.">        if (previous == prepared)</span>
+<span class="fc" id="L787">            SystemKeyspace.writePreparedStatement(keyspace, statementId, queryString);</span>
+
+<span class="fc" id="L789">        ResultSet.PreparedMetadata preparedMetadata = ResultSet.PreparedMetadata.fromPrepared(prepared.statement);</span>
+<span class="fc" id="L790">        ResultSet.ResultMetadata resultMetadata = ResultSet.ResultMetadata.fromPrepared(prepared.statement);</span>
+<span class="fc" id="L791">        return new ResultMessage.Prepared(statementId, resultMetadata.getResultMetadataId(), preparedMetadata, resultMetadata);</span>
+    }
+
+    public ResultMessage processPrepared(CQLStatement statement,
+                                         QueryState state,
+                                         QueryOptions options,
+                                         Map&lt;String, ByteBuffer&gt; customPayload,
+                                         long queryStartNanoTime)
+                                                 throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L801">        return processPrepared(statement, state, options, queryStartNanoTime);</span>
+    }
+
+    public ResultMessage processPrepared(CQLStatement statement, QueryState queryState, QueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="fc" id="L807">        List&lt;ByteBuffer&gt; variables = options.getValues();</span>
+        // Check to see if there are any bound variables to verify
+<span class="pc bpc" id="L809" title="3 of 4 branches missed.">        if (!(variables.isEmpty() &amp;&amp; statement.getBindVariables().isEmpty()))</span>
+        {
+<span class="pc bpc" id="L811" title="1 of 2 branches missed.">            if (variables.size() != statement.getBindVariables().size())</span>
+<span class="nc" id="L812">                throw new InvalidRequestException(String.format(&quot;there were %d markers(?) in CQL but %d bound variables&quot;,</span>
+<span class="nc" id="L813">                                                                statement.getBindVariables().size(),</span>
+<span class="nc" id="L814">                                                                variables.size()));</span>
+
+            // at this point there is a match in count between markers and variables that is non-zero
+<span class="pc bpc" id="L817" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">                for (int i = 0; i &lt; variables.size(); i++)</span>
+<span class="nc" id="L819">                    logger.trace(&quot;[{}] '{}'&quot;, i+1, variables.get(i));</span>
+        }
+
+<span class="fc" id="L822">        metrics.preparedStatementsExecuted.inc();</span>
+<span class="fc" id="L823">        return processStatement(statement, queryState, options, queryStartNanoTime);</span>
+    }
+
+    public ResultMessage processBatch(BatchStatement statement,
+                                      QueryState state,
+                                      BatchQueryOptions options,
+                                      Map&lt;String, ByteBuffer&gt; customPayload,
+                                      long queryStartNanoTime)
+                                              throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L833">        return processBatch(statement, state, options, queryStartNanoTime);</span>
+    }
+
+    public ResultMessage processBatch(BatchStatement batch, QueryState queryState, BatchQueryOptions options, long queryStartNanoTime)
+    throws RequestExecutionException, RequestValidationException
+    {
+<span class="nc" id="L839">        ClientState clientState = queryState.getClientState().cloneWithKeyspaceIfSet(options.getKeyspace());</span>
+<span class="nc" id="L840">        batch.authorize(clientState);</span>
+<span class="nc" id="L841">        batch.validate();</span>
+<span class="nc" id="L842">        batch.validate(clientState);</span>
+<span class="nc" id="L843">        return batch.execute(queryState, options, queryStartNanoTime);</span>
+    }
+
+    public static CQLStatement getStatement(String queryStr, ClientState clientState)
+    throws RequestValidationException
+    {
+<span class="fc" id="L849">        Tracing.trace(&quot;Parsing {}&quot;, queryStr);</span>
+<span class="fc" id="L850">        CQLStatement.Raw statement = parseStatement(queryStr);</span>
+
+        // Set keyspace for statement that require login
+<span class="fc bfc" id="L853" title="All 2 branches covered.">        if (statement instanceof QualifiedStatement)</span>
+<span class="fc" id="L854">            ((QualifiedStatement) statement).setKeyspace(clientState);</span>
+
+<span class="fc" id="L856">        Tracing.trace(&quot;Preparing statement&quot;);</span>
+<span class="fc" id="L857">        return statement.prepare(clientState);</span>
+    }
+
+    public static &lt;T extends CQLStatement.Raw&gt; T parseStatement(String queryStr, Class&lt;T&gt; klass, String type) throws SyntaxException
+    {
+        try
+        {
+<span class="nc" id="L864">            CQLStatement.Raw stmt = parseStatement(queryStr);</span>
+
+<span class="nc bnc" id="L866" title="All 2 branches missed.">            if (!klass.isAssignableFrom(stmt.getClass()))</span>
+<span class="nc" id="L867">                throw new IllegalArgumentException(&quot;Invalid query, must be a &quot; + type + &quot; statement but was: &quot; + stmt.getClass());</span>
+
+<span class="nc" id="L869">            return klass.cast(stmt);</span>
+        }
+<span class="nc" id="L871">        catch (RequestValidationException e)</span>
+        {
+<span class="nc" id="L873">            throw new IllegalArgumentException(e.getMessage(), e);</span>
+        }
+    }
+    public static CQLStatement.Raw parseStatement(String queryStr) throws SyntaxException
+    {
+        try
+        {
+<span class="fc" id="L880">            return CQLFragmentParser.parseAnyUnhandled(CqlParser::query, queryStr);</span>
+        }
+<span class="nc" id="L882">        catch (CassandraException ce)</span>
+        {
+<span class="nc" id="L884">            throw ce;</span>
+        }
+<span class="nc" id="L886">        catch (RuntimeException re)</span>
+        {
+<span class="nc" id="L888">            logger.error(String.format(&quot;The statement: [%s] could not be parsed.&quot;, queryStr), re);</span>
+<span class="nc" id="L889">            throw new SyntaxException(String.format(&quot;Failed parsing statement: [%s] reason: %s %s&quot;,</span>
+                                                    queryStr,
+<span class="nc" id="L891">                                                    re.getClass().getSimpleName(),</span>
+<span class="nc" id="L892">                                                    re.getMessage()));</span>
+        }
+<span class="nc" id="L894">        catch (RecognitionException e)</span>
+        {
+<span class="nc" id="L896">            throw new SyntaxException(&quot;Invalid or malformed CQL query string: &quot; + e.getMessage());</span>
+        }
+    }
+
+    private static int measure(Object key, Prepared value)
+    {
+<span class="fc" id="L902">        return Ints.checkedCast(ObjectSizes.measureDeep(key) + ObjectSizes.measureDeep(value));</span>
+    }
+
+    /**
+     * Clear our internal statmeent cache for test purposes.
+     */
+    @VisibleForTesting
+    public static void clearInternalStatementsCache()
+    {
+<span class="nc" id="L911">        internalStatements.clear();</span>
+<span class="nc" id="L912">    }</span>
+
+    @VisibleForTesting
+    public static void clearPreparedStatementsCache()
+    {
+<span class="nc" id="L917">        preparedStatements.asMap().clear();</span>
+<span class="nc" id="L918">    }</span>
+
+    private static class StatementInvalidatingListener implements SchemaChangeListener
+    {
+        private static void removeInvalidPreparedStatements(String ksName, String cfName)
+        {
+<span class="fc" id="L924">            removeInvalidPreparedStatements(internalStatements.values().iterator(), ksName, cfName);</span>
+<span class="fc" id="L925">            removeInvalidPersistentPreparedStatements(preparedStatements.asMap().entrySet().iterator(), ksName, cfName);</span>
+<span class="fc" id="L926">        }</span>
+
+        private static void removeInvalidPreparedStatementsForFunction(String ksName, String functionName)
+        {
+<span class="nc bnc" id="L930" title="All 4 branches missed.">            Predicate&lt;Function&gt; matchesFunction = f -&gt; ksName.equals(f.name().keyspace) &amp;&amp; functionName.equals(f.name().name);</span>
+
+<span class="nc" id="L932">            for (Iterator&lt;Map.Entry&lt;MD5Digest, Prepared&gt;&gt; iter = preparedStatements.asMap().entrySet().iterator();</span>
+<span class="nc bnc" id="L933" title="All 2 branches missed.">                 iter.hasNext();)</span>
+            {
+<span class="nc" id="L935">                Map.Entry&lt;MD5Digest, Prepared&gt; pstmt = iter.next();</span>
+<span class="nc bnc" id="L936" title="All 2 branches missed.">                if (Iterables.any(pstmt.getValue().statement.getFunctions(), matchesFunction))</span>
+                {
+<span class="nc" id="L938">                    SystemKeyspace.removePreparedStatement(pstmt.getKey());</span>
+<span class="nc" id="L939">                    iter.remove();</span>
+                }
+<span class="nc" id="L941">            }</span>
+
+
+<span class="nc" id="L944">            Iterators.removeIf(internalStatements.values().iterator(),</span>
+<span class="nc" id="L945">                               statement -&gt; Iterables.any(statement.statement.getFunctions(), matchesFunction));</span>
+<span class="nc" id="L946">        }</span>
+
+        private static void removeInvalidPersistentPreparedStatements(Iterator&lt;Map.Entry&lt;MD5Digest, Prepared&gt;&gt; iterator,
+                                                                      String ksName, String cfName)
+        {
+<span class="pc bpc" id="L951" title="1 of 2 branches missed.">            while (iterator.hasNext())</span>
+            {
+<span class="nc" id="L953">                Map.Entry&lt;MD5Digest, Prepared&gt; entry = iterator.next();</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">                if (shouldInvalidate(ksName, cfName, entry.getValue().statement))</span>
+                {
+<span class="nc" id="L956">                    SystemKeyspace.removePreparedStatement(entry.getKey());</span>
+<span class="nc" id="L957">                    iterator.remove();</span>
+                }
+<span class="nc" id="L959">            }</span>
+<span class="fc" id="L960">        }</span>
+
+        private static void removeInvalidPreparedStatements(Iterator&lt;Prepared&gt; iterator, String ksName, String cfName)
+        {
+<span class="fc bfc" id="L964" title="All 2 branches covered.">            while (iterator.hasNext())</span>
+            {
+<span class="pc bpc" id="L966" title="1 of 2 branches missed.">                if (shouldInvalidate(ksName, cfName, iterator.next().statement))</span>
+<span class="nc" id="L967">                    iterator.remove();</span>
+            }
+<span class="fc" id="L969">        }</span>
+
+        private static boolean shouldInvalidate(String ksName, String cfName, CQLStatement statement)
+        {
+            String statementKsName;
+            String statementCfName;
+
+<span class="fc bfc" id="L976" title="All 2 branches covered.">            if (statement instanceof ModificationStatement)</span>
+            {
+<span class="fc" id="L978">                ModificationStatement modificationStatement = ((ModificationStatement) statement);</span>
+<span class="fc" id="L979">                statementKsName = modificationStatement.keyspace();</span>
+<span class="fc" id="L980">                statementCfName = modificationStatement.table();</span>
+<span class="fc" id="L981">            }</span>
+<span class="pc bpc" id="L982" title="1 of 2 branches missed.">            else if (statement instanceof SelectStatement)</span>
+            {
+<span class="fc" id="L984">                SelectStatement selectStatement = ((SelectStatement) statement);</span>
+<span class="fc" id="L985">                statementKsName = selectStatement.keyspace();</span>
+<span class="fc" id="L986">                statementCfName = selectStatement.table();</span>
+<span class="fc" id="L987">            }</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">            else if (statement instanceof BatchStatement)</span>
+            {
+<span class="nc" id="L990">                BatchStatement batchStatement = ((BatchStatement) statement);</span>
+<span class="nc bnc" id="L991" title="All 2 branches missed.">                for (ModificationStatement stmt : batchStatement.getStatements())</span>
+                {
+<span class="nc bnc" id="L993" title="All 2 branches missed.">                    if (shouldInvalidate(ksName, cfName, stmt))</span>
+<span class="nc" id="L994">                        return true;</span>
+<span class="nc" id="L995">                }</span>
+<span class="nc" id="L996">                return false;</span>
+            }
+            else
+            {
+<span class="nc" id="L1000">                return false;</span>
+            }
+
+<span class="pc bpc" id="L1003" title="5 of 6 branches missed.">            return ksName.equals(statementKsName) &amp;&amp; (cfName == null || cfName.equals(statementCfName));</span>
+        }
+
+        @Override
+        public void onCreateFunction(UDFunction function)
+        {
+<span class="nc" id="L1009">            onCreateFunctionInternal(function.name().keyspace, function.name().name, function.argTypes());</span>
+<span class="nc" id="L1010">        }</span>
+
+        @Override
+        public void onCreateAggregate(UDAggregate aggregate)
+        {
+<span class="nc" id="L1015">            onCreateFunctionInternal(aggregate.name().keyspace, aggregate.name().name, aggregate.argTypes());</span>
+<span class="nc" id="L1016">        }</span>
+
+        private static void onCreateFunctionInternal(String ksName, String functionName, List&lt;AbstractType&lt;?&gt;&gt; argTypes)
+        {
+            // in case there are other overloads, we have to remove all overloads since argument type
+            // matching may change (due to type casting)
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">            if (Schema.instance.getKeyspaceMetadata(ksName).userFunctions.get(new FunctionName(ksName, functionName)).size() &gt; 1)</span>
+<span class="nc" id="L1023">                removeInvalidPreparedStatementsForFunction(ksName, functionName);</span>
+<span class="nc" id="L1024">        }</span>
+
+        @Override
+        public void onAlterTable(TableMetadata before, TableMetadata after, boolean affectsStatements)
+        {
+<span class="fc" id="L1029">            logger.trace(&quot;Column definitions for {}.{} changed, invalidating related prepared statements&quot;, before.keyspace, before.name);</span>
+<span class="pc bpc" id="L1030" title="1 of 2 branches missed.">            if (affectsStatements)</span>
+<span class="fc" id="L1031">                removeInvalidPreparedStatements(before.keyspace, before.name);</span>
+<span class="fc" id="L1032">        }</span>
+
+        @Override
+        public void onAlterFunction(UDFunction before, UDFunction after)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+<span class="nc" id="L1041">            removeInvalidPreparedStatementsForFunction(before.name().keyspace, before.name().name);</span>
+<span class="nc" id="L1042">        }</span>
+
+        @Override
+        public void onAlterAggregate(UDAggregate before, UDAggregate after)
+        {
+            // Updating a function may imply we've changed the body of the function, so we need to invalid statements so that
+            // the new definition is picked (the function is resolved at preparation time).
+            // TODO: if the function has multiple overload, we could invalidate only the statement refering to the overload
+            // that was updated. This requires a few changes however and probably doesn't matter much in practice.
+<span class="nc" id="L1051">            removeInvalidPreparedStatementsForFunction(before.name().keyspace, before.name().name);</span>
+<span class="nc" id="L1052">        }</span>
+
+        @Override
+        public void onDropKeyspace(KeyspaceMetadata keyspace, boolean dropData)
+        {
+<span class="nc" id="L1057">            logger.trace(&quot;Keyspace {} was dropped, invalidating related prepared statements&quot;, keyspace.name);</span>
+<span class="nc" id="L1058">            removeInvalidPreparedStatements(keyspace.name, null);</span>
+<span class="nc" id="L1059">        }</span>
+
+        @Override
+        public void onDropTable(TableMetadata table, boolean dropData)
+        {
+<span class="nc" id="L1064">            logger.trace(&quot;Table {}.{} was dropped, invalidating related prepared statements&quot;, table.keyspace, table.name);</span>
+<span class="nc" id="L1065">            removeInvalidPreparedStatements(table.keyspace, table.name);</span>
+<span class="nc" id="L1066">        }</span>
+
+        @Override
+        public void onDropFunction(UDFunction function)
+        {
+<span class="nc" id="L1071">            removeInvalidPreparedStatementsForFunction(function.name().keyspace, function.name().name);</span>
+<span class="nc" id="L1072">        }</span>
+
+        @Override
+        public void onDropAggregate(UDAggregate aggregate)
+        {
+<span class="nc" id="L1077">            removeInvalidPreparedStatementsForFunction(aggregate.name().keyspace, aggregate.name().name);</span>
+<span class="nc" id="L1078">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

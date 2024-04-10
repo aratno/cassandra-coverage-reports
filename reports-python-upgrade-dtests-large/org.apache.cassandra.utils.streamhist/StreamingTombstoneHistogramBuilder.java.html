@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>StreamingTombstoneHistogramBuilder.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils.streamhist</a> &gt; <span class="el_source">StreamingTombstoneHistogramBuilder.java</span></div><h1>StreamingTombstoneHistogramBuilder.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.utils.streamhist;
+
+import java.math.RoundingMode;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.math.IntMath;
+
+import org.apache.commons.lang3.StringUtils;
+
+import org.apache.cassandra.db.rows.Cell;
+
+/**
+ * Histogram that can be constructed from streaming of data.
+ *
+ * Histogram used to retrieve the number of droppable tombstones for example via
+ * {@link org.apache.cassandra.io.sstable.format.SSTableReader#getDroppableTombstonesBefore(long)}.
+ * &lt;p&gt;
+ * When an sstable is written (or streamed), this histogram-builder receives the &quot;local deletion timestamp&quot;
+ * as an {@code long} via {@link #update(long)}. Negative values are not supported.
+ * &lt;p&gt;
+ * Algorithm: Histogram is represented as collection of {point, weight} pairs. When new point &lt;i&gt;p&lt;/i&gt; with weight &lt;i&gt;m&lt;/i&gt; is added:
+ * &lt;ol&gt;
+ *     &lt;li&gt;If point &lt;i&gt;p&lt;/i&gt; is already exists in collection, add &lt;i&gt;m&lt;/i&gt; to recorded value of point &lt;i&gt;p&lt;/i&gt; &lt;/li&gt;
+ *     &lt;li&gt;If there is no point &lt;i&gt;p&lt;/i&gt; in the collection, add point &lt;i&gt;p&lt;/i&gt; with weight &lt;i&gt;m&lt;/i&gt; &lt;/li&gt;
+ *     &lt;li&gt;If point was added and collection size became larger than maxBinSize:&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * &lt;ol type=&quot;a&quot;&gt;
+ *     &lt;li&gt;Find nearest points &lt;i&gt;p1&lt;/i&gt; and &lt;i&gt;p2&lt;/i&gt; in the collection &lt;/li&gt;
+ *     &lt;li&gt;Replace these two points with one weighted point &lt;i&gt;p3 = (p1*m1+p2*m2)/(p1+p2)&lt;/i&gt;&lt;/li&gt;
+ * &lt;/ol&gt;
+ *
+ * &lt;p&gt;
+ * There are some optimization to make histogram builder faster:
+ * &lt;ol&gt;
+ *     &lt;li&gt;Spool: big map that saves from excessively merging of small bin. This map can contains up to maxSpoolSize points and accumulate weight from same points.
+ *     For example, if spoolSize=100, binSize=10 and there are only 50 different points. it will be only 40 merges regardless how many points will be added.&lt;/li&gt;
+ *     &lt;li&gt;Spool is organized as open-addressing primitive hash map where odd elements are points and event elements are values.
+ *     Spool can not resize =&gt; when number of collisions became bigger than threshold or size became large that &lt;i&gt;array_size/2&lt;/i&gt; Spool is drained to bin&lt;/li&gt;
+ *     &lt;li&gt;Bin is organized as sorted arrays. It reduces garbage collection pressure and allows to find elements in log(binSize) time via binary search&lt;/li&gt;
+ *     &lt;li&gt;To use existing Arrays.binarySearch &lt;i&gt;&lt;/&gt;{point, values}&lt;/i&gt; in bin pairs is packed in one long&lt;/li&gt;
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ * The original algorithm is taken from following paper:
+ * Yael Ben-Haim and Elad Tom-Tov, &quot;A Streaming Parallel Decision Tree Algorithm&quot; (2010)
+ * http://jmlr.csail.mit.edu/papers/volume11/ben-haim10a/ben-haim10a.pdf
+ */
+<span class="fc" id="L69">public class StreamingTombstoneHistogramBuilder</span>
+{
+    // Buffer with point-value pair
+    private final DataHolder bin;
+
+    // Keep a second, larger buffer to spool data in, before finalizing it into `bin`
+    private Spool spool;
+
+    // voluntarily give up resolution for speed
+    private final int roundSeconds;
+
+    public StreamingTombstoneHistogramBuilder(int maxBinSize, int maxSpoolSize, int roundSeconds)
+<span class="fc" id="L81">    {</span>
+<span class="pc bpc" id="L82" title="3 of 6 branches missed.">        assert maxBinSize &gt; 0 &amp;&amp; maxSpoolSize &gt;= 0 &amp;&amp; roundSeconds &gt; 0: &quot;Invalid arguments: maxBinSize:&quot; + maxBinSize + &quot; maxSpoolSize:&quot; + maxSpoolSize + &quot; delta:&quot; + roundSeconds;</span>
+
+<span class="fc" id="L84">        this.roundSeconds = roundSeconds;</span>
+<span class="fc" id="L85">        this.bin = new DataHolder(maxBinSize + 1, roundSeconds);</span>
+<span class="fc" id="L86">        this.spool = new Spool(maxSpoolSize);</span>
+<span class="fc" id="L87">    }</span>
+
+    /**
+     * Adds new point to this histogram with a default value of 1.
+     *
+     * @param point the point to be added
+     */
+    public void update(long point)
+    {
+<span class="fc" id="L96">        update(point, 1);</span>
+<span class="fc" id="L97">    }</span>
+
+    /**
+     * Adds new point {@param point} with value {@param value} to this histogram.
+     */
+    public void update(long point, int value)
+    {
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        assert spool != null: &quot;update is being called after releaseBuffers. This could be functionally okay, but this assertion is a canary to alert about unintended use before it is necessary.&quot;;</span>
+<span class="fc" id="L105">        point = ceilKey(point, roundSeconds);</span>
+
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if (spool.capacity &gt; 0)</span>
+        {
+<span class="pc bpc" id="L109" title="1 of 2 branches missed.">            if (!spool.tryAddOrAccumulate(point, value))</span>
+            {
+<span class="nc" id="L111">                flushHistogram();</span>
+<span class="nc" id="L112">                final boolean success = spool.tryAddOrAccumulate(point, value);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">                assert success : &quot;Can not add value to spool&quot;; // after spool flushing we should always be able to insert new value</span>
+<span class="nc" id="L114">            }</span>
+        }
+        else
+        {
+<span class="nc" id="L118">            flushValue(point, value);</span>
+        }
+<span class="fc" id="L120">    }</span>
+
+    /**
+     * Drain the temporary spool into the final bins
+     */
+    public void flushHistogram()
+    {
+<span class="fc" id="L127">        Spool spool = this.spool;</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">        if (spool != null)</span>
+        {
+<span class="fc" id="L130">            spool.forEach(this::flushValue);</span>
+<span class="fc" id="L131">            spool.clear();</span>
+        }
+<span class="fc" id="L133">    }</span>
+
+    /**
+     * Release inner spool buffers. Histogram remains readable and writable, but with lesser performance.
+     * Not intended for use before finalization.
+     */
+    public void releaseBuffers()
+    {
+<span class="fc" id="L141">       flushHistogram();</span>
+<span class="fc" id="L142">       spool = null;</span>
+<span class="fc" id="L143">    }</span>
+
+    private void flushValue(long key, int spoolValue)
+    {
+<span class="fc" id="L147">        bin.addValue(key, spoolValue);</span>
+
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">        if (bin.isFull())</span>
+        {
+<span class="nc" id="L151">            bin.mergeNearestPoints();</span>
+        }
+<span class="fc" id="L153">    }</span>
+
+    /**
+     * Creates a 'finished' snapshot of the current state of the histogram, but leaves this builder instance
+     * open for subsequent additions to the histograms. Basically, this allows us to have some degree of sanity
+     * wrt sstable early open.
+     */
+    public TombstoneHistogram build()
+    {
+<span class="fc" id="L162">        flushHistogram();</span>
+<span class="fc" id="L163">        return new TombstoneHistogram(bin);</span>
+    }
+
+    /**
+     * An ordered collection of histogram buckets, each entry in the collection represents a pair (bucket, count).
+     * Once the collection is full it merges the closest buckets using a weighted approach see {@link #mergeNearestPoints()}.
+     */
+<span class="fc" id="L170">    static class DataHolder</span>
+    {
+        private static final long EMPTY = Long.MAX_VALUE;
+        private final long[] points;
+        private final int[] values;
+        private final int roundSeconds;
+
+        DataHolder(int maxCapacity, int roundSeconds)
+<span class="fc" id="L178">        {</span>
+<span class="fc" id="L179">            points = new long[maxCapacity];</span>
+<span class="fc" id="L180">            values = new int[maxCapacity];</span>
+<span class="fc" id="L181">            Arrays.fill(points, EMPTY);</span>
+<span class="fc" id="L182">            Arrays.fill(values, 0);</span>
+<span class="fc" id="L183">            this.roundSeconds = roundSeconds;</span>
+<span class="fc" id="L184">        }</span>
+
+        DataHolder(DataHolder holder)
+<span class="fc" id="L187">        {</span>
+<span class="fc" id="L188">            points = Arrays.copyOf(holder.points, holder.points.length);</span>
+<span class="fc" id="L189">            values = Arrays.copyOf(holder.values, holder.values.length);</span>
+<span class="fc" id="L190">            roundSeconds = holder.roundSeconds;</span>
+<span class="fc" id="L191">        }</span>
+
+        @VisibleForTesting
+        int getValue(long point)
+        {
+<span class="nc" id="L196">            int index = Arrays.binarySearch(points, point);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (index &lt; 0)</span>
+<span class="nc" id="L198">                index = -index - 1;</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            if (index &gt;= points.length)</span>
+<span class="nc" id="L200">                return -1; // not-found sentinel</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (points[index] != point)</span>
+<span class="nc" id="L202">                return -2; // not-found sentinel</span>
+<span class="nc" id="L203">            return values[index];</span>
+        }
+
+        /**
+         * Adds value {@code delta} to the point {@code point}.
+         *
+         * @return {@code true} if inserted, {@code false} if accumulated
+         */
+        boolean addValue(long point, int delta)
+        {
+<span class="fc" id="L213">            int index = Arrays.binarySearch(points, point);</span>
+<span class="pc bpc" id="L214" title="1 of 2 branches missed.">            if (index &lt; 0)</span>
+            {
+<span class="fc" id="L216">                index = -index - 1;</span>
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">                assert (index &lt; points.length) : &quot;No more space in array&quot;;</span>
+
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">                if (points[index] != point) //ok, someone else at this point, let's shift array and insert</span>
+                {
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">                    assert (points[points.length - 1] == EMPTY) : &quot;No more space in array&quot;;</span>
+
+<span class="fc" id="L223">                    System.arraycopy(points, index, points, index + 1, points.length - index - 1);</span>
+<span class="fc" id="L224">                    System.arraycopy(values, index, values, index + 1, values.length - index - 1);</span>
+
+<span class="fc" id="L226">                    points[index] = point;</span>
+<span class="fc" id="L227">                    values[index] = saturatingCastToInt(delta);</span>
+<span class="fc" id="L228">                    return true;</span>
+                }
+                else
+                {
+<span class="nc" id="L232">                    values[index] = saturatingCastToInt((long)values[index] + (long)delta);</span>
+                }
+            }
+            else
+            {
+<span class="nc" id="L237">                values[index] = saturatingCastToInt((long)values[index] + (long)delta);</span>
+            }
+
+<span class="nc" id="L240">            return false;</span>
+        }
+
+        /**
+         *  Finds nearest points &lt;i&gt;p1&lt;/i&gt; and &lt;i&gt;p2&lt;/i&gt; in the collection
+         *  Replaces these two points with one weighted point &lt;i&gt;p3 = (p1*m1+p2*m2)/(p1+p2)
+         */
+        @VisibleForTesting
+        void mergeNearestPoints()
+        {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            assert isFull() : &quot;DataHolder must be full in order to merge two points&quot;;</span>
+
+<span class="nc" id="L252">            final long[] smallestDifference = findPointPairWithSmallestDistance();</span>
+
+<span class="nc" id="L254">            final long point1 = smallestDifference[0];</span>
+<span class="nc" id="L255">            final long point2 = smallestDifference[1];</span>
+
+<span class="nc" id="L257">            int index = Arrays.binarySearch(points, point1);</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (index &lt; 0)</span>
+            {
+<span class="nc" id="L260">                index = -index - 1;</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">                assert (index &lt; points.length) : &quot;Not found in array&quot;;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                assert (points[index] == point1) : &quot;Not found in array&quot;;</span>
+            }
+
+<span class="nc" id="L265">            long value1 = values[index];</span>
+<span class="nc" id="L266">            long value2 = values[index + 1];</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            assert (points[index + 1] == point2) : &quot;point2 should follow point1&quot;;</span>
+
+<span class="nc" id="L270">            long a = saturatingCastToLong(point1 * value1);</span>
+<span class="nc" id="L271">            long b = saturatingCastToLong(point2 * value2);</span>
+<span class="nc" id="L272">            long sum = saturatingCastToLong(value1 + value2);</span>
+<span class="nc" id="L273">            long newPoint = saturatingCastToMaxDeletionTime(saturatingCastToLong(a + b) / sum);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            newPoint = newPoint &lt;= point1 ? saturatingCastToMaxDeletionTime(point1 + 1) : newPoint;</span>
+<span class="nc" id="L275">            newPoint = Math.min(newPoint, point2);</span>
+<span class="nc" id="L276">            newPoint = ceilKey(newPoint, roundSeconds);</span>
+<span class="nc" id="L277">            points[index] = newPoint;</span>
+<span class="nc" id="L278">            values[index] = saturatingCastToInt(sum);</span>
+
+<span class="nc" id="L280">            System.arraycopy(points, index + 2, points, index + 1, points.length - index - 2);</span>
+<span class="nc" id="L281">            System.arraycopy(values, index + 2, values, index + 1, values.length - index - 2);</span>
+<span class="nc" id="L282">            points[points.length - 1] = EMPTY;</span>
+<span class="nc" id="L283">            values[values.length - 1] = 0;</span>
+<span class="nc" id="L284">        }</span>
+
+        private long[] findPointPairWithSmallestDistance()
+        {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            assert isFull(): &quot;The DataHolder must be full in order to find the closest pair of points&quot;;</span>
+
+<span class="nc" id="L290">            long point1 = 0;</span>
+<span class="nc" id="L291">            long point2 = Long.MAX_VALUE;</span>
+
+<span class="nc bnc" id="L293" title="All 2 branches missed.">            for (int i = 0; i &lt; points.length - 1; i++)</span>
+            {
+<span class="nc" id="L295">                long pointA = points[i];</span>
+<span class="nc" id="L296">                long pointB = points[i + 1];</span>
+
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                assert pointB &gt; pointA : &quot;DataHolder not sorted, p2(&quot; + pointB +&quot;) &lt; p1(&quot; + pointA + &quot;) for &quot; + this;</span>
+
+<span class="nc bnc" id="L300" title="All 2 branches missed.">                if (point2 - point1 &gt; pointB - pointA)</span>
+                {
+<span class="nc" id="L302">                    point1 = pointA;</span>
+<span class="nc" id="L303">                    point2 = pointB;</span>
+                }
+            }
+
+<span class="nc" id="L307">            return new long[]{point1, point2};</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L312">            List&lt;String&gt; entries = new ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            for (int i = 0; i &lt; points.length; i++)</span>
+            {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                if (points[i] == EMPTY)</span>
+<span class="nc" id="L316">                    break;</span>
+
+<span class="nc" id="L318">                entries.add(&quot;[&quot; + points[i] + &quot;], [&quot; + values[i] + &quot;]&quot;);</span>
+            }
+<span class="nc" id="L320">            return StringUtils.join(entries, &quot;,&quot;);</span>
+        }
+
+        public boolean isFull()
+        {
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">            return points[points.length - 1] != EMPTY;</span>
+        }
+
+        public &lt;E extends Exception&gt; void forEach(HistogramDataConsumer&lt;E&gt; histogramDataConsumer) throws E
+        {
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">            for (int i = 0; i &lt; points.length; i++)</span>
+            {
+<span class="fc bfc" id="L332" title="All 2 branches covered.">                if (points[i] == EMPTY)</span>
+<span class="fc" id="L333">                    break;</span>
+
+<span class="fc" id="L335">                histogramDataConsumer.consume(points[i], values[i]);</span>
+            }
+<span class="fc" id="L337">        }</span>
+
+        public int size()
+        {
+<span class="fc" id="L341">            int[] accumulator = new int[1];</span>
+<span class="fc" id="L342">            forEach((point, value) -&gt; accumulator[0]++);</span>
+<span class="fc" id="L343">            return accumulator[0];</span>
+        }
+
+        public double sum(int b)
+        {
+<span class="nc" id="L348">            double sum = 0;</span>
+
+<span class="nc bnc" id="L350" title="All 2 branches missed.">            for (int i = 0; i &lt; points.length; i++)</span>
+            {
+<span class="nc" id="L352">                final long point = points[i];</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                if (point == EMPTY)</span>
+<span class="nc" id="L354">                    break;</span>
+<span class="nc" id="L355">                final int value = values[i];</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                if (point &gt; b)</span>
+                {
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                    if (i == 0)</span>
+                    { // no prev point
+<span class="nc" id="L360">                        return 0;</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L364">                        final long prevPoint = points[i - 1];</span>
+<span class="nc" id="L365">                        final int prevValue = values[i - 1];</span>
+                        // calculate estimated count mb for point b
+<span class="nc" id="L367">                        double weight = (b - prevPoint) / (double) (point - prevPoint);</span>
+<span class="nc" id="L368">                        double mb = prevValue + (value - prevValue) * weight;</span>
+<span class="nc" id="L369">                        sum -= prevValue;</span>
+<span class="nc" id="L370">                        sum += (prevValue + mb) * weight / 2;</span>
+<span class="nc" id="L371">                        sum += prevValue / 2.0;</span>
+<span class="nc" id="L372">                        return sum;</span>
+                    }
+                }
+                else
+                {
+<span class="nc" id="L377">                    sum += value;</span>
+                }
+            }
+<span class="nc" id="L380">            return sum;</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="nc" id="L386">            return Arrays.hashCode(points);</span>
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (!(o instanceof DataHolder))</span>
+<span class="nc" id="L393">                return false;</span>
+
+<span class="nc" id="L395">            final DataHolder other = ((DataHolder) o);</span>
+
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (this.size()!=other.size())</span>
+<span class="nc" id="L398">                return false;</span>
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            for (int i=0; i&lt;size(); i++)</span>
+            {
+<span class="nc bnc" id="L402" title="All 4 branches missed.">                if (points[i]!=other.points[i] || values[i]!=other.values[i])</span>
+                {
+<span class="nc" id="L404">                    return false;</span>
+                }
+            }
+<span class="nc" id="L407">            return true;</span>
+        }
+    }
+
+    /**
+     * This class is a specialized open addressing HashMap that uses int as keys and int as values.
+     * This is an optimization to avoid allocating objects.
+     * In order for this class to work correctly it should have a power of 2 capacity.
+     * This last invariant is taken care of during construction.
+     */
+<span class="fc" id="L417">    static class Spool</span>
+    {
+        final long[] points;
+        final int[] values;
+
+        final int capacity;
+        int size;
+
+        Spool(int requestedCapacity)
+<span class="fc" id="L426">        {</span>
+<span class="pc bpc" id="L427" title="1 of 2 branches missed.">            if (requestedCapacity &lt; 0)</span>
+<span class="nc" id="L428">                throw new IllegalArgumentException(&quot;Illegal capacity &quot; + requestedCapacity);</span>
+
+<span class="fc" id="L430">            this.capacity = getPowerOfTwoCapacity(requestedCapacity);</span>
+
+            // x2 because we want no more than two reprobes on average when _capacity_ entries will be written
+<span class="fc" id="L433">            points = new long[capacity * 2];</span>
+<span class="fc" id="L434">            values = new int[capacity * 2];</span>
+<span class="fc" id="L435">            clear();</span>
+<span class="fc" id="L436">        }</span>
+
+        private int getPowerOfTwoCapacity(int requestedCapacity)
+        {
+            //for spool we need power-of-two cells
+<span class="pc bpc" id="L441" title="1 of 2 branches missed.">            return requestedCapacity == 0 ? 0 : IntMath.pow(2, IntMath.log2(requestedCapacity, RoundingMode.CEILING));</span>
+        }
+
+        void clear()
+        {
+<span class="fc" id="L446">            Arrays.fill(points, -1);</span>
+<span class="fc" id="L447">            size = 0;</span>
+<span class="fc" id="L448">        }</span>
+
+        boolean tryAddOrAccumulate(long point, int delta)
+        {
+<span class="pc bpc" id="L452" title="1 of 2 branches missed.">            if (size &gt; capacity)</span>
+            {
+<span class="nc" id="L454">                return false;</span>
+            }
+
+<span class="fc" id="L457">            final int cell = (capacity - 1) &amp; hash(point);</span>
+
+            // We use linear scanning. I think cluster of 100 elements is large enough to give up.
+<span class="pc bpc" id="L460" title="1 of 2 branches missed.">            for (int attempt = 0; attempt &lt; 100; attempt++)</span>
+            {
+<span class="pc bpc" id="L462" title="1 of 2 branches missed.">                if (tryCell(cell + attempt, point, delta))</span>
+<span class="fc" id="L463">                    return true;</span>
+            }
+<span class="nc" id="L465">            return false;</span>
+        }
+
+        private int hash(long i)
+        {
+<span class="fc" id="L470">            long largePrime = 948701839L;</span>
+<span class="fc" id="L471">            return (int) (i * largePrime);</span>
+        }
+
+        &lt;E extends Exception&gt; void forEach(HistogramDataConsumer&lt;E&gt; consumer) throws E
+        {
+<span class="fc bfc" id="L476" title="All 2 branches covered.">            for (int i = 0; i &lt; points.length; i++)</span>
+            {
+<span class="fc bfc" id="L478" title="All 2 branches covered.">                if (points[i] != -1)</span>
+                {
+<span class="fc" id="L480">                    consumer.consume(points[i], values[i]);</span>
+                }
+            }
+<span class="fc" id="L483">        }</span>
+
+        private boolean tryCell(int cell, long point, int delta)
+        {
+<span class="pc bpc" id="L487" title="3 of 6 branches missed.">            assert cell &gt;= 0 &amp;&amp; point &gt;= 0 &amp;&amp; delta &gt;= 0 : &quot;Invalid arguments: cell:&quot; + cell + &quot; point:&quot; + point + &quot; delta:&quot; + delta;</span>
+
+<span class="fc" id="L489">            cell = cell % points.length;</span>
+<span class="fc bfc" id="L490" title="All 2 branches covered.">            if (points[cell] == -1)</span>
+            {
+<span class="fc" id="L492">                points[cell] = point;</span>
+<span class="fc" id="L493">                values[cell] = delta;</span>
+<span class="fc" id="L494">                size++;</span>
+<span class="fc" id="L495">                return true;</span>
+            }
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">            if (points[cell] == point)</span>
+            {
+<span class="fc" id="L499">                values[cell] = (int) saturatingCastToInt((long) values[cell] + (long) delta);</span>
+<span class="fc" id="L500">                return true;</span>
+            }
+<span class="nc" id="L502">            return false;</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L507">            StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L508">            sb.append('[');</span>
+<span class="nc bnc" id="L509" title="All 2 branches missed.">            for (int i = 0; i &lt; points.length; i++)</span>
+            {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">                if (points[i] == -1)</span>
+<span class="nc" id="L512">                    continue;</span>
+<span class="nc bnc" id="L513" title="All 2 branches missed.">                if (sb.length() &gt; 1)</span>
+<span class="nc" id="L514">                    sb.append(&quot;, &quot;);</span>
+<span class="nc" id="L515">                sb.append('[').append(points[i]).append(',').append(values[i]).append(']');</span>
+            }
+<span class="nc" id="L517">            sb.append(']');</span>
+<span class="nc" id="L518">            return sb.toString();</span>
+        }
+    }
+
+    private static long ceilKey(long point, int bucketSize)
+    {
+<span class="fc" id="L524">        long delta = point % bucketSize;</span>
+
+<span class="fc bfc" id="L526" title="All 2 branches covered.">        if (delta == 0)</span>
+<span class="fc" id="L527">            return point;</span>
+
+<span class="fc" id="L529">        return saturatingCastToMaxDeletionTime((long) point + (long) bucketSize - (long) delta);</span>
+    }
+
+    public static int saturatingCastToInt(long value)
+    {
+<span class="pc bpc" id="L534" title="1 of 2 branches missed.">        return (int) (value &gt; Integer.MAX_VALUE ? Integer.MAX_VALUE : value);</span>
+    }
+    
+    public static long saturatingCastToLong(long value)
+    {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        return value &lt; 0L ? Long.MAX_VALUE : value;</span>
+    }
+
+    /**
+     * Cast to an long with maximum value of {@code Cell.MAX_DELETION_TIME} to avoid representing values that
+     * aren't a tombstone
+     */
+    public static long saturatingCastToMaxDeletionTime(long value)
+    {
+<span class="pc bpc" id="L548" title="2 of 4 branches missed.">        return (value &lt; 0L || value &gt; Cell.MAX_DELETION_TIME)</span>
+<span class="nc" id="L549">               ? Cell.MAX_DELETION_TIME</span>
+<span class="fc" id="L550">               : value;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

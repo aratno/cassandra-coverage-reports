@@ -1,0 +1,354 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionController.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionController.java</span></div><h1>CompactionController.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.compaction;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.LongPredicate;
+
+import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
+import com.google.common.util.concurrent.RateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.AbstractCompactionController;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileDataInput;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
+import org.apache.cassandra.utils.OverlapIterator;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.NEVER_PURGE_TOMBSTONES;
+import static org.apache.cassandra.db.lifecycle.SSTableIntervalTree.buildIntervals;
+
+/**
+ * Manage compaction options.
+ */
+public class CompactionController extends AbstractCompactionController
+{
+<span class="fc" id="L57">    private static final Logger logger = LoggerFactory.getLogger(CompactionController.class);</span>
+<span class="fc" id="L58">    static final boolean NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE = NEVER_PURGE_TOMBSTONES.getBoolean();</span>
+
+    private final boolean compactingRepaired;
+    // note that overlapIterator and overlappingSSTables will be null if NEVER_PURGE_TOMBSTONES is set - this is a
+    // good thing so that noone starts using them and thinks that if overlappingSSTables is empty, there
+    // is no overlap.
+    private Refs&lt;SSTableReader&gt; overlappingSSTables;
+    private OverlapIterator&lt;PartitionPosition, SSTableReader&gt; overlapIterator;
+    private final Iterable&lt;SSTableReader&gt; compacting;
+    private final RateLimiter limiter;
+    private final long minTimestamp;
+<span class="fc" id="L69">    final Map&lt;SSTableReader, FileDataInput&gt; openDataFiles = new HashMap&lt;&gt;();</span>
+
+    protected CompactionController(ColumnFamilyStore cfs, long maxValue)
+    {
+<span class="fc" id="L73">        this(cfs, null, maxValue);</span>
+<span class="fc" id="L74">    }</span>
+
+    public CompactionController(ColumnFamilyStore cfs, Set&lt;SSTableReader&gt; compacting, long gcBefore)
+    {
+<span class="fc" id="L78">        this(cfs, compacting, gcBefore, null,</span>
+<span class="fc" id="L79">             cfs.getCompactionStrategyManager().getCompactionParams().tombstoneOption());</span>
+<span class="fc" id="L80">    }</span>
+
+    public CompactionController(ColumnFamilyStore cfs, Set&lt;SSTableReader&gt; compacting, long gcBefore, RateLimiter limiter, TombstoneOption tombstoneOption)
+    {
+        //When making changes to the method, be aware that some of the state of the controller may still be uninitialized
+        //(e.g. TWCS sets up the value of ignoreOverlaps() after this completes)
+<span class="fc" id="L86">        super(cfs, gcBefore, tombstoneOption);</span>
+<span class="fc" id="L87">        this.compacting = compacting;</span>
+<span class="fc" id="L88">        this.limiter = limiter;</span>
+<span class="fc bfc" id="L89" title="All 4 branches covered.">        compactingRepaired = compacting != null &amp;&amp; compacting.stream().allMatch(SSTableReader::isRepaired);</span>
+<span class="pc bpc" id="L90" title="1 of 4 branches missed.">        this.minTimestamp = compacting != null &amp;&amp; !compacting.isEmpty()       // check needed for test</span>
+<span class="fc" id="L91">                          ? compacting.stream().mapToLong(SSTableReader::getMinTimestamp).min().getAsLong()</span>
+<span class="fc" id="L92">                          : 0;</span>
+<span class="fc" id="L93">        refreshOverlaps();</span>
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">        if (NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE)</span>
+<span class="nc" id="L95">            logger.warn(&quot;You are running with -D{}=true, this is dangerous!&quot;, NEVER_PURGE_TOMBSTONES.getKey());</span>
+<span class="fc" id="L96">    }</span>
+
+    public void maybeRefreshOverlaps()
+    {
+<span class="pc bpc" id="L100" title="1 of 2 branches missed.">        if (NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE)</span>
+        {
+<span class="nc" id="L102">            logger.debug(&quot;not refreshing overlaps - running with -D{}=true&quot;, NEVER_PURGE_TOMBSTONES.getKey());</span>
+<span class="nc" id="L103">            return;</span>
+        }
+
+<span class="pc bpc" id="L106" title="1 of 2 branches missed.">        if (cfs.getNeverPurgeTombstones())</span>
+        {
+<span class="nc" id="L108">            logger.debug(&quot;not refreshing overlaps for {}.{} - neverPurgeTombstones is enabled&quot;, cfs.getKeyspaceName(), cfs.getTableName());</span>
+<span class="nc" id="L109">            return;</span>
+        }
+
+<span class="pc bpc" id="L112" title="2 of 4 branches missed.">        if (overlappingSSTables == null || overlappingSSTables.stream().anyMatch(SSTableReader::isMarkedCompacted))</span>
+<span class="nc" id="L113">            refreshOverlaps();</span>
+<span class="fc" id="L114">    }</span>
+
+    void refreshOverlaps()
+    {
+<span class="pc bpc" id="L118" title="2 of 4 branches missed.">        if (NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE || cfs.getNeverPurgeTombstones())</span>
+<span class="nc" id="L119">            return;</span>
+
+<span class="pc bpc" id="L121" title="1 of 2 branches missed.">        if (this.overlappingSSTables != null)</span>
+<span class="nc" id="L122">            close();</span>
+
+<span class="fc bfc" id="L124" title="All 2 branches covered.">        if (compacting == null)</span>
+<span class="fc" id="L125">            overlappingSSTables = Refs.tryRef(Collections.&lt;SSTableReader&gt;emptyList());</span>
+        else
+<span class="fc" id="L127">            overlappingSSTables = cfs.getAndReferenceOverlappingLiveSSTables(compacting);</span>
+<span class="fc" id="L128">        this.overlapIterator = new OverlapIterator&lt;&gt;(buildIntervals(overlappingSSTables));</span>
+<span class="fc" id="L129">    }</span>
+
+    public Set&lt;SSTableReader&gt; getFullyExpiredSSTables()
+    {
+<span class="fc" id="L133">        return getFullyExpiredSSTables(cfs, compacting, overlappingSSTables, gcBefore, ignoreOverlaps());</span>
+    }
+
+    /**
+     * Finds expired sstables
+     *
+     * works something like this;
+     * 1. find &quot;global&quot; minTimestamp of overlapping sstables, compacting sstables and memtables containing any non-expired data
+     * 2. build a list of fully expired candidates
+     * 3. check if the candidates to be dropped actually can be dropped {@code (maxTimestamp &lt; global minTimestamp)}
+     *    - if not droppable, remove from candidates
+     * 4. return candidates.
+     *
+     * @param cfStore
+     * @param compacting we take the drop-candidates from this set, it is usually the sstables included in the compaction
+     * @param overlapping the sstables that overlap the ones in compacting.
+     * @param gcBefore
+     * @param ignoreOverlaps don't check if data shadows/overlaps any data in other sstables
+     * @return
+     */
+    public static Set&lt;SSTableReader&gt; getFullyExpiredSSTables(ColumnFamilyStore cfStore,
+                                                             Iterable&lt;SSTableReader&gt; compacting,
+                                                             Iterable&lt;SSTableReader&gt; overlapping,
+                                                             long gcBefore,
+                                                             boolean ignoreOverlaps)
+    {
+<span class="fc" id="L159">        logger.trace(&quot;Checking droppable sstables in {}&quot;, cfStore);</span>
+
+<span class="pc bpc" id="L161" title="3 of 8 branches missed.">        if (NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE || compacting == null || cfStore.getNeverPurgeTombstones() || overlapping == null)</span>
+<span class="fc" id="L162">            return Collections.emptySet();</span>
+
+<span class="pc bpc" id="L164" title="3 of 4 branches missed.">        if (cfStore.getCompactionStrategyManager().onlyPurgeRepairedTombstones() &amp;&amp; !Iterables.all(compacting, SSTableReader::isRepaired))</span>
+<span class="nc" id="L165">            return Collections.emptySet();</span>
+
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (ignoreOverlaps)</span>
+        {
+<span class="nc" id="L169">            Set&lt;SSTableReader&gt; fullyExpired = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            for (SSTableReader candidate : compacting)</span>
+            {
+<span class="nc bnc" id="L172" title="All 2 branches missed.">                if (candidate.getMaxLocalDeletionTime() &lt; gcBefore)</span>
+                {
+<span class="nc" id="L174">                    fullyExpired.add(candidate);</span>
+<span class="nc" id="L175">                    logger.trace(&quot;Dropping overlap ignored expired SSTable {} (maxLocalDeletionTime={}, gcBefore={})&quot;,</span>
+<span class="nc" id="L176">                                 candidate, candidate.getMaxLocalDeletionTime(), gcBefore);</span>
+                }
+<span class="nc" id="L178">            }</span>
+<span class="nc" id="L179">            return fullyExpired;</span>
+        }
+
+<span class="fc" id="L182">        List&lt;SSTableReader&gt; candidates = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L183">        long minTimestamp = Long.MAX_VALUE;</span>
+
+<span class="fc bfc" id="L185" title="All 2 branches covered.">        for (SSTableReader sstable : overlapping)</span>
+        {
+            // Overlapping might include fully expired sstables. What we care about here is
+            // the min timestamp of the overlapping sstables that actually contain live data.
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">            if (sstable.getMaxLocalDeletionTime() &gt;= gcBefore)</span>
+<span class="fc" id="L190">                minTimestamp = Math.min(minTimestamp, sstable.getMinTimestamp());</span>
+<span class="fc" id="L191">        }</span>
+
+<span class="fc bfc" id="L193" title="All 2 branches covered.">        for (SSTableReader candidate : compacting)</span>
+        {
+<span class="fc bfc" id="L195" title="All 2 branches covered.">            if (candidate.getMaxLocalDeletionTime() &lt; gcBefore)</span>
+<span class="fc" id="L196">                candidates.add(candidate);</span>
+            else
+<span class="fc" id="L198">                minTimestamp = Math.min(minTimestamp, candidate.getMinTimestamp());</span>
+<span class="fc" id="L199">        }</span>
+
+<span class="fc bfc" id="L201" title="All 2 branches covered.">        for (Memtable memtable : cfStore.getTracker().getView().getAllMemtables())</span>
+        {
+<span class="pc bpc" id="L203" title="1 of 2 branches missed.">            if (memtable.getMinTimestamp() != Memtable.NO_MIN_TIMESTAMP)</span>
+<span class="fc" id="L204">                minTimestamp = Math.min(minTimestamp, memtable.getMinTimestamp());</span>
+<span class="fc" id="L205">        }</span>
+
+        // At this point, minTimestamp denotes the lowest timestamp of any relevant
+        // SSTable or Memtable that contains a constructive value. candidates contains all the
+        // candidates with no constructive values. The ones out of these that have
+        // (getMaxTimestamp() &lt; minTimestamp) serve no purpose anymore.
+
+<span class="fc" id="L212">        Iterator&lt;SSTableReader&gt; iterator = candidates.iterator();</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        while (iterator.hasNext())</span>
+        {
+<span class="fc" id="L215">            SSTableReader candidate = iterator.next();</span>
+<span class="fc bfc" id="L216" title="All 2 branches covered.">            if (candidate.getMaxTimestamp() &gt;= minTimestamp)</span>
+            {
+<span class="fc" id="L218">                iterator.remove();</span>
+            }
+            else
+            {
+<span class="fc" id="L222">               logger.trace(&quot;Dropping expired SSTable {} (maxLocalDeletionTime={}, gcBefore={})&quot;,</span>
+<span class="fc" id="L223">                        candidate, candidate.getMaxLocalDeletionTime(), gcBefore);</span>
+            }
+<span class="fc" id="L225">        }</span>
+<span class="fc" id="L226">        return new HashSet&lt;&gt;(candidates);</span>
+    }
+
+    public static Set&lt;SSTableReader&gt; getFullyExpiredSSTables(ColumnFamilyStore cfStore,
+                                                             Iterable&lt;SSTableReader&gt; compacting,
+                                                             Iterable&lt;SSTableReader&gt; overlapping,
+                                                             long gcBefore)
+    {
+<span class="nc" id="L234">        return getFullyExpiredSSTables(cfStore, compacting, overlapping, gcBefore, false);</span>
+    }
+
+    /**
+     * @param key
+     * @return a predicate for whether tombstones marked for deletion at the given time for the given partition are
+     * purgeable; we calculate this by checking whether the deletion time is less than the min timestamp of all SSTables
+     * containing his partition and not participating in the compaction. This means there isn't any data in those
+     * sstables that might still need to be suppressed by a tombstone at this timestamp.
+     */
+    @Override
+    public LongPredicate getPurgeEvaluator(DecoratedKey key)
+    {
+<span class="pc bpc" id="L247" title="4 of 8 branches missed.">        if (NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE || !compactingRepaired() || cfs.getNeverPurgeTombstones() || overlapIterator == null)</span>
+<span class="nc" id="L248">            return time -&gt; false;</span>
+
+<span class="fc" id="L250">        overlapIterator.update(key);</span>
+<span class="fc" id="L251">        Set&lt;SSTableReader&gt; filteredSSTables = overlapIterator.overlaps();</span>
+<span class="fc" id="L252">        Iterable&lt;Memtable&gt; memtables = cfs.getTracker().getView().getAllMemtables();</span>
+<span class="fc" id="L253">        long minTimestampSeen = Long.MAX_VALUE;</span>
+<span class="fc" id="L254">        boolean hasTimestamp = false;</span>
+
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">        for (SSTableReader sstable: filteredSSTables)</span>
+        {
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (sstable.mayContainAssumingKeyIsInRange(key))</span>
+            {
+<span class="nc" id="L260">                minTimestampSeen = Math.min(minTimestampSeen, sstable.getMinTimestamp());</span>
+<span class="nc" id="L261">                hasTimestamp = true;</span>
+            }
+<span class="nc" id="L263">        }</span>
+
+<span class="fc bfc" id="L265" title="All 2 branches covered.">        for (Memtable memtable : memtables)</span>
+        {
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">            if (memtable.getMinTimestamp() != Memtable.NO_MIN_TIMESTAMP)</span>
+            {
+<span class="fc bfc" id="L269" title="All 2 branches covered.">                if (memtable.rowIterator(key) != null)</span>
+                {
+<span class="fc" id="L271">                    minTimestampSeen = Math.min(minTimestampSeen, memtable.getMinTimestamp());</span>
+<span class="fc" id="L272">                    hasTimestamp = true;</span>
+                }
+            }
+<span class="fc" id="L275">        }</span>
+
+<span class="fc bfc" id="L277" title="All 2 branches covered.">        if (!hasTimestamp)</span>
+<span class="fc" id="L278">            return time -&gt; true;</span>
+        else
+        {
+<span class="fc" id="L281">            final long finalTimestamp = minTimestampSeen;</span>
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">            return time -&gt; time &lt; finalTimestamp;</span>
+        }
+    }
+
+    public void close()
+    {
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">        if (overlappingSSTables != null)</span>
+<span class="fc" id="L289">            overlappingSSTables.release();</span>
+
+<span class="fc" id="L291">        FileUtils.closeQuietly(openDataFiles.values());</span>
+<span class="fc" id="L292">        openDataFiles.clear();</span>
+<span class="fc" id="L293">    }</span>
+
+    public boolean compactingRepaired()
+    {
+<span class="pc bpc" id="L297" title="3 of 4 branches missed.">        return !cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones() || compactingRepaired;</span>
+    }
+
+    boolean provideTombstoneSources()
+    {
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">        return tombstoneOption != TombstoneOption.NONE;</span>
+    }
+
+    // caller must close iterators
+    public Iterable&lt;UnfilteredRowIterator&gt; shadowSources(DecoratedKey key, boolean tombstoneOnly)
+    {
+<span class="pc bpc" id="L308" title="7 of 8 branches missed.">        if (!provideTombstoneSources() || !compactingRepaired() || NEVER_PURGE_TOMBSTONES_PROPERTY_VALUE || cfs.getNeverPurgeTombstones())</span>
+<span class="fc" id="L309">            return null;</span>
+<span class="nc" id="L310">        overlapIterator.update(key);</span>
+<span class="nc" id="L311">        return Iterables.filter(Iterables.transform(overlapIterator.overlaps(),</span>
+<span class="nc" id="L312">                                                    reader -&gt; getShadowIterator(reader, key, tombstoneOnly)),</span>
+<span class="nc" id="L313">                                Predicates.notNull());</span>
+    }
+
+    @SuppressWarnings(&quot;resource&quot;) // caller to close
+    private UnfilteredRowIterator getShadowIterator(SSTableReader reader, DecoratedKey key, boolean tombstoneOnly)
+    {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (reader.isMarkedSuspect() ||</span>
+<span class="nc bnc" id="L320" title="All 4 branches missed.">            reader.getMaxTimestamp() &lt;= minTimestamp ||</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            tombstoneOnly &amp;&amp; !reader.mayHaveTombstones())</span>
+<span class="nc" id="L322">            return null;</span>
+<span class="nc" id="L323">        long position = reader.getPosition(key, SSTableReader.Operator.EQ);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">        if (position &lt; 0)</span>
+<span class="nc" id="L325">            return null;</span>
+<span class="nc" id="L326">        FileDataInput dfile = openDataFiles.computeIfAbsent(reader, this::openDataFile);</span>
+<span class="nc" id="L327">        return reader.simpleIterator(dfile, key, position, tombstoneOnly);</span>
+    }
+
+    /**
+     * Is overlapped sstables ignored
+     *
+     * Control whether or not we are taking into account overlapping sstables when looking for fully expired sstables.
+     * In order to reduce the amount of work needed, we look for sstables that can be dropped instead of compacted.
+     * As a safeguard mechanism, for each time range of data in a sstable, we are checking globally to see if all data
+     * of this time range is fully expired before considering to drop the sstable.
+     * This strategy can retain for a long time a lot of sstables on disk (see CASSANDRA-13418) so this option
+     * control whether or not this check should be ignored.
+     *
+     * Do NOT call this method in the CompactionController constructor
+     *
+     * @return false by default
+     */
+    protected boolean ignoreOverlaps()
+    {
+<span class="fc" id="L346">        return false;</span>
+    }
+
+    private FileDataInput openDataFile(SSTableReader reader)
+    {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        return limiter != null ? reader.openDataReader(limiter) : reader.openDataReader();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

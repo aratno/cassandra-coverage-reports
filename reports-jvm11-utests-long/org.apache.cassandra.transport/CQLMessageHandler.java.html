@@ -1,0 +1,710 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CQLMessageHandler.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">CQLMessageHandler.java</span></div><h1>CQLMessageHandler.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.transport;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.primitives.Ints;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
+import org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.metrics.ClientMessageSizeMetrics;
+import org.apache.cassandra.net.AbstractMessageHandler;
+import org.apache.cassandra.net.FrameDecoder;
+import org.apache.cassandra.net.FrameDecoder.IntactFrame;
+import org.apache.cassandra.net.FrameEncoder;
+import org.apache.cassandra.net.ResourceLimits;
+import org.apache.cassandra.net.ResourceLimits.Limit;
+import org.apache.cassandra.net.ShareableBytes;
+import org.apache.cassandra.transport.Flusher.FlushItem.Framed;
+import org.apache.cassandra.transport.messages.ErrorMessage;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+
+/**
+ * Implementation of {@link AbstractMessageHandler} for processing CQL messages which comprise a {@link Message} wrapped
+ * in an {@link Envelope}. This class is parameterized by a {@link Message} subtype, expected to be either
+ * {@link Message.Request} or {@link Message.Response}. Most commonly, an instance for handling {@link Message.Request}
+ * is created for each inbound CQL client connection.
+ *
+ * # Small vs large messages
+ * Small messages are deserialized in place, and then handed off to a consumer for processing.
+ * Large messages accumulate frames until all bytes for the envelope are received, then concatenate and deserialize the
+ * frames on the event loop thread and pass them on to the same consumer.
+ *
+ * # Flow control (backpressure)
+ * The size of an incoming message is explicit in the {@link Envelope.Header}.
+ *
+ * By default, every connection has 1MiB of exlusive permits available before needing to access the per-endpoint
+ * and global reserves. By default, those reserves are sized proportionally to the heap - 2.5% of heap per-endpoint
+ * and a 10% for the global reserve.
+ *
+ * Permits are held while CQL messages are processed and released after the response has been encoded into the
+ * buffers of the response frame.
+ *
+ * A connection level option (THROW_ON_OVERLOAD) allows clients to choose the backpressure strategy when a connection
+ * has exceeded the maximum number of allowed permits. The choices are to either pause reads from the incoming socket
+ * and allow TCP backpressure to do the work, or to throw an explict exception and rely on the client to back off.
+ */
+public class CQLMessageHandler&lt;M extends Message&gt; extends AbstractMessageHandler
+{
+<span class="fc" id="L78">    private static final Logger logger = LoggerFactory.getLogger(CQLMessageHandler.class);</span>
+<span class="fc" id="L79">    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1L, TimeUnit.SECONDS);</span>
+
+    public static final int LARGE_MESSAGE_THRESHOLD = FrameEncoder.Payload.MAX_SIZE - 1;
+<span class="fc" id="L82">    public static final TimeUnit RATE_LIMITER_DELAY_UNIT = TimeUnit.NANOSECONDS;</span>
+
+    private final Envelope.Decoder envelopeDecoder;
+    private final Message.Decoder&lt;M&gt; messageDecoder;
+    private final FrameEncoder.PayloadAllocator payloadAllocator;
+    private final MessageConsumer&lt;M&gt; dispatcher;
+    private final ErrorHandler errorHandler;
+    private final boolean throwOnOverload;
+    private final ProtocolVersion version;
+    private final NonBlockingRateLimiter requestRateLimiter;
+
+    long channelPayloadBytesInFlight;
+<span class="fc" id="L94">    private int consecutiveMessageErrors = 0;</span>
+
+    interface MessageConsumer&lt;M extends Message&gt;
+    {
+        void accept(Channel channel, M message, Dispatcher.FlushItemConverter toFlushItem, Overload backpressure);
+    }
+
+    interface ErrorHandler
+    {
+        void accept(Throwable error);
+    }
+
+    CQLMessageHandler(Channel channel,
+                      ProtocolVersion version,
+                      FrameDecoder decoder,
+                      Envelope.Decoder envelopeDecoder,
+                      Message.Decoder&lt;M&gt; messageDecoder,
+                      MessageConsumer&lt;M&gt; dispatcher,
+                      FrameEncoder.PayloadAllocator payloadAllocator,
+                      int queueCapacity,
+                      ClientResourceLimits.ResourceProvider resources,
+                      OnHandlerClosed onClosed,
+                      ErrorHandler errorHandler,
+                      boolean throwOnOverload)
+    {
+<span class="fc" id="L119">        super(decoder,</span>
+              channel,
+              LARGE_MESSAGE_THRESHOLD,
+              queueCapacity,
+<span class="fc" id="L123">              resources.endpointLimit(),</span>
+<span class="fc" id="L124">              resources.globalLimit(),</span>
+<span class="fc" id="L125">              resources.endpointWaitQueue(),</span>
+<span class="fc" id="L126">              resources.globalWaitQueue(),</span>
+              onClosed);
+<span class="fc" id="L128">        this.envelopeDecoder    = envelopeDecoder;</span>
+<span class="fc" id="L129">        this.messageDecoder     = messageDecoder;</span>
+<span class="fc" id="L130">        this.payloadAllocator   = payloadAllocator;</span>
+<span class="fc" id="L131">        this.dispatcher         = dispatcher;</span>
+<span class="fc" id="L132">        this.errorHandler       = errorHandler;</span>
+<span class="fc" id="L133">        this.throwOnOverload    = throwOnOverload;</span>
+<span class="fc" id="L134">        this.version            = version;</span>
+<span class="fc" id="L135">        this.requestRateLimiter = resources.requestRateLimiter();</span>
+<span class="fc" id="L136">    }</span>
+
+    @Override
+    public boolean process(FrameDecoder.Frame frame) throws IOException
+    {
+        // new frame, clean slate for processing errors
+<span class="fc" id="L142">        consecutiveMessageErrors = 0;</span>
+<span class="fc" id="L143">        return super.process(frame);</span>
+    }
+
+    /**
+     * Checks limits on bytes in flight and the request rate limiter (if enabled), then takes one of three actions:
+     * 
+     * 1.) If no limits are breached, process the request.
+     * 2.) If a limit is breached, and the connection is configured to throw on overload, throw {@link OverloadedException}.
+     * 3.) If a limit is breached, and the connection is not configurd to throw, process the request, and return false
+     *     to let the {@link FrameDecoder} know it should stop processing frames.
+     *     
+     * If the connection is configured to throw {@link OverloadedException}, requests that breach the rate limit are
+     * not counted against that limit.
+     * 
+     * @return true if the {@link FrameDecoder} should continue to process incoming frames, and false if it should stop
+     *         processing them, effectively applying backpressure to clients
+     * 
+     * @throws ErrorMessage.WrappedException with an {@link OverloadedException} if overload occurs and the 
+     *         connection is configured to throw on overload
+     */
+    protected boolean processOneContainedMessage(ShareableBytes bytes, Limit endpointReserve, Limit globalReserve)
+    {
+<span class="fc" id="L165">        ByteBuffer buf = bytes.get();</span>
+<span class="fc" id="L166">        Envelope.Decoder.HeaderExtractionResult extracted = envelopeDecoder.extractHeader(buf);</span>
+<span class="pc bpc" id="L167" title="1 of 2 branches missed.">        if (!extracted.isSuccess())</span>
+<span class="nc" id="L168">            return handleProtocolException(extracted.error(), buf, extracted.streamId(), extracted.bodyLength());</span>
+
+<span class="fc" id="L170">        Envelope.Header header = extracted.header();</span>
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">        if (header.version != version)</span>
+        {
+<span class="nc" id="L173">            ProtocolException error = new ProtocolException(String.format(&quot;Invalid message version. Got %s but previous&quot; +</span>
+                                                                          &quot;messages on this connection had version %s&quot;,
+                                                                          header.version, version));
+<span class="nc" id="L176">            return handleProtocolException(error, buf, header.streamId, header.bodySizeInBytes);</span>
+        }
+
+        // max CQL message size defaults to 256mb, so should be safe to downcast
+<span class="fc" id="L180">        int messageSize = Ints.checkedCast(header.bodySizeInBytes);</span>
+        
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">        if (throwOnOverload)</span>
+        {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (!acquireCapacity(header, endpointReserve, globalReserve))</span>
+            {
+<span class="nc" id="L186">                discardAndThrow(endpointReserve, globalReserve, buf, header, messageSize, Overload.BYTES_IN_FLIGHT);</span>
+<span class="nc" id="L187">                return true;</span>
+            }
+
+<span class="nc bnc" id="L190" title="All 4 branches missed.">            if (DatabaseDescriptor.getNativeTransportRateLimitingEnabled() &amp;&amp; !requestRateLimiter.tryReserve())</span>
+            {
+                // We've already allocated against the bytes-in-flight limits, so release those resources.
+<span class="nc" id="L193">                release(header);</span>
+<span class="nc" id="L194">                discardAndThrow(endpointReserve, globalReserve, buf, header, messageSize, Overload.REQUESTS);</span>
+<span class="nc" id="L195">                return true;</span>
+            }
+        }
+        else
+        {
+<span class="fc" id="L200">            Overload backpressure = Overload.NONE;</span>
+
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">            if (!acquireCapacityAndQueueOnFailure(header, endpointReserve, globalReserve))</span>
+            {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (processRequestAndUpdateMetrics(bytes, header, messageSize, Overload.BYTES_IN_FLIGHT))</span>
+                {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                    if (decoder.isActive())</span>
+<span class="nc" id="L207">                        ClientMetrics.instance.pauseConnection();</span>
+                }
+
+<span class="nc" id="L210">                backpressure = Overload.BYTES_IN_FLIGHT;</span>
+            }
+            
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">            if (DatabaseDescriptor.getNativeTransportRateLimitingEnabled())</span>
+            {
+                // Reserve a permit even if we've already triggered backpressure on bytes in flight.
+<span class="nc" id="L216">                long delay = requestRateLimiter.reserveAndGetDelay(RATE_LIMITER_DELAY_UNIT);</span>
+                
+<span class="nc bnc" id="L218" title="All 4 branches missed.">                if (backpressure == Overload.NONE &amp;&amp; delay &gt; 0)</span>
+                {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                    if (processRequestAndUpdateMetrics(bytes, header, messageSize, Overload.REQUESTS))</span>
+                    {
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                        if (decoder.isActive())</span>
+<span class="nc" id="L223">                            ClientMetrics.instance.pauseConnection();</span>
+
+                        // Schedule a wakup here if we process successfully. The connection should be closing otherwise.  
+<span class="nc" id="L226">                        scheduleConnectionWakeupTask(delay, RATE_LIMITER_DELAY_UNIT);</span>
+                    }
+                    
+<span class="nc" id="L229">                    backpressure = Overload.REQUESTS;</span>
+                }
+            }
+            
+            // If we triggered backpressure, make sure the caller stops processing frames after the request completes.
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">            if (backpressure != Overload.NONE)</span>
+<span class="nc" id="L235">                return false;</span>
+        }
+
+<span class="fc" id="L238">        return processRequestAndUpdateMetrics(bytes, header, messageSize, Overload.NONE);</span>
+    }
+
+    private boolean processRequestAndUpdateMetrics(ShareableBytes bytes, Envelope.Header header, int messageSize, Overload backpressure)
+    {
+<span class="fc" id="L243">        channelPayloadBytesInFlight += messageSize;</span>
+<span class="fc" id="L244">        incrementReceivedMessageMetrics(messageSize);</span>
+<span class="fc" id="L245">        return processRequest(composeRequest(header, bytes), backpressure);</span>
+    }
+
+    private void discardAndThrow(Limit endpointReserve, Limit globalReserve, 
+                                 ByteBuffer buf, Envelope.Header header, int messageSize,
+                                 Overload overload)
+    {
+<span class="nc" id="L252">        ClientMetrics.instance.markRequestDiscarded();</span>
+<span class="nc" id="L253">        logOverload(endpointReserve, globalReserve, header, messageSize);</span>
+
+<span class="nc" id="L255">        OverloadedException exception = buildOverloadedException(endpointReserve, globalReserve, overload);</span>
+<span class="nc" id="L256">        handleError(exception, header);</span>
+
+        // Don't stop processing incoming messages, as we rely on the client to apply
+        // backpressure when it receives OverloadedException, but discard this message 
+        // as we're responding with the overloaded error.
+<span class="nc" id="L261">        incrementReceivedMessageMetrics(messageSize);</span>
+<span class="nc" id="L262">        buf.position(buf.position() + Envelope.Header.LENGTH + messageSize);</span>
+<span class="nc" id="L263">    }</span>
+
+    private OverloadedException buildOverloadedException(Limit endpointReserve, Limit globalReserve, Overload overload) {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        return overload == Overload.REQUESTS</span>
+<span class="nc" id="L267">                ? new OverloadedException(String.format(&quot;Request breached global limit of %d requests/second. Server is &quot; +</span>
+                                                        &quot;currently in an overloaded state and cannot accept more requests.&quot;, 
+<span class="nc" id="L269">                                                        requestRateLimiter.getRate()))</span>
+<span class="nc" id="L270">                : new OverloadedException(String.format(&quot;Request breached limit on bytes in flight. (Endpoint: %d/%d bytes, Global: %d/%d bytes.) &quot; +</span>
+                                                        &quot;Server is currently in an overloaded state and cannot accept more requests.&quot;,
+<span class="nc" id="L272">                                                        endpointReserve.using(), endpointReserve.limit(), globalReserve.using(), globalReserve.limit()));</span>
+    }
+
+    private void logOverload(Limit endpointReserve, Limit globalReserve, Envelope.Header header, int messageSize)
+    {
+<span class="nc" id="L277">        logger.trace(&quot;Discarded request of size {} with {} bytes in flight on channel. &quot; + </span>
+                     &quot;Using {}/{} bytes of endpoint limit and {}/{} bytes of global limit. &quot; + 
+                     &quot;Global rate limiter: {} Header: {}&quot;,
+<span class="nc" id="L280">                     messageSize, channelPayloadBytesInFlight,</span>
+<span class="nc" id="L281">                     endpointReserve.using(), endpointReserve.limit(), globalReserve.using(), globalReserve.limit(),</span>
+                     requestRateLimiter, header);
+<span class="nc" id="L283">    }</span>
+
+    private boolean handleProtocolException(ProtocolException exception,
+                                            ByteBuffer buf,
+                                            int streamId,
+                                            long expectedMessageLength)
+    {
+        // hard fail if either :
+        //  * the expectedMessageLength is &lt; 0 as we're unable to  skip the remainder
+        //    of the Envelope and attempt to read the next one
+        //  * we hit a run of errors in the same frame. Some errors are recoverable
+        //    as they have no effect on subsequent Envelopes, in which case we attempt
+        //    to continue processing. If we start seeing consecutive errors we assume
+        //    that this is not the case and that the entire remaining frame is garbage.
+        //    It's possible here that we fail hard when we could potentially not do
+        //    (e.g. every Envelope has an invalid opcode, but is otherwise semantically
+        //    intact), but this is a trade off.
+<span class="nc bnc" id="L300" title="All 4 branches missed.">        if (expectedMessageLength &lt; 0 || ++consecutiveMessageErrors &gt; DatabaseDescriptor.getConsecutiveMessageErrorsThreshold())</span>
+        {
+            // transform the exception to a fatal one so the exception handler closes the channel
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (!exception.isFatal())</span>
+<span class="nc" id="L304">                exception = ProtocolException.toFatalException(exception);</span>
+<span class="nc" id="L305">            handleError(exception, streamId);</span>
+<span class="nc" id="L306">            return false;</span>
+        }
+        else
+        {
+            // exception should not be a fatal error or the exception handler will close the channel
+<span class="nc" id="L311">            handleError(exception, streamId);</span>
+            // skip body
+<span class="nc" id="L313">            buf.position(Math.min(buf.limit(), buf.position() + Envelope.Header.LENGTH + Ints.checkedCast(expectedMessageLength)));</span>
+            // continue processing frame
+<span class="nc" id="L315">            return true;</span>
+        }
+    }
+
+    private void incrementReceivedMessageMetrics(int messageSize)
+    {
+<span class="fc" id="L321">        receivedCount++;</span>
+<span class="fc" id="L322">        receivedBytes += messageSize + Envelope.Header.LENGTH;</span>
+<span class="fc" id="L323">        ClientMessageSizeMetrics.bytesReceived.inc(messageSize + Envelope.Header.LENGTH);</span>
+<span class="fc" id="L324">        ClientMessageSizeMetrics.bytesReceivedPerRequest.update(messageSize + Envelope.Header.LENGTH);</span>
+<span class="fc" id="L325">    }</span>
+
+    private Envelope composeRequest(Envelope.Header header, ShareableBytes bytes)
+    {
+        // extract body
+<span class="fc" id="L330">        ByteBuffer buf = bytes.get();</span>
+<span class="fc" id="L331">        int idx = buf.position() + Envelope.Header.LENGTH;</span>
+<span class="fc" id="L332">        final int end = idx + Ints.checkedCast(header.bodySizeInBytes);</span>
+<span class="fc" id="L333">        ByteBuf body = Unpooled.wrappedBuffer(buf.slice());</span>
+<span class="fc" id="L334">        body.readerIndex(Envelope.Header.LENGTH);</span>
+<span class="fc" id="L335">        body.retain();</span>
+<span class="fc" id="L336">        buf.position(end);</span>
+<span class="fc" id="L337">        return new Envelope(header, body);</span>
+    }
+
+    protected boolean processRequest(Envelope request)
+    {
+<span class="nc" id="L342">        return processRequest(request, Overload.NONE);</span>
+    }
+    
+    protected boolean processRequest(Envelope request, Overload backpressure)
+    {
+<span class="fc" id="L347">        M message = null;</span>
+        try
+        {
+<span class="fc" id="L350">            message = messageDecoder.decode(channel, request);</span>
+<span class="fc" id="L351">            dispatcher.accept(channel, message, this::toFlushItem, backpressure);</span>
+            
+            // sucessfully delivered a CQL message to the execution
+            // stage, so reset the counter of consecutive errors
+<span class="fc" id="L355">            consecutiveMessageErrors = 0;</span>
+<span class="fc" id="L356">            return true;</span>
+        }
+<span class="nc" id="L358">        catch (Exception e)</span>
+        {
+<span class="nc bnc" id="L360" title="All 2 branches missed.">            if (message != null)</span>
+<span class="nc" id="L361">                request.release();</span>
+
+<span class="nc" id="L363">            boolean continueProcessing = true;</span>
+
+            // Indicate that an error was encountered. Initially, we can continue to
+            // process the current frame, but if we keep catching errors, we assume that
+            // the whole frame payload is no good, stop processing and close the connection.
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if(++consecutiveMessageErrors &gt; DatabaseDescriptor.getConsecutiveMessageErrorsThreshold())</span>
+            {
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                if (!(e instanceof ProtocolException))</span>
+                {
+<span class="nc" id="L372">                    logger.debug(&quot;Error decoding CQL message&quot;, e);</span>
+<span class="nc" id="L373">                    e = new ProtocolException(&quot;Error encountered decoding CQL message: &quot; + e.getMessage());</span>
+                }
+<span class="nc" id="L375">                e = ProtocolException.toFatalException((ProtocolException) e);</span>
+<span class="nc" id="L376">                continueProcessing = false;</span>
+            }
+<span class="nc" id="L378">            handleErrorAndRelease(e, request.header);</span>
+<span class="nc" id="L379">            return continueProcessing;</span>
+        }
+    }
+
+    /**
+     * For &quot;expected&quot; errors this ensures we pass a WrappedException,
+     * which contains a streamId, to the error handler. This makes
+     * sure that whereever possible, the streamId is propagated back
+     * to the client.
+     * This also releases the capacity acquired for processing as
+     * indicated by supplied header.
+     */
+    private void handleErrorAndRelease(Throwable t, Envelope.Header header)
+    {
+<span class="nc" id="L393">        release(header);</span>
+<span class="nc" id="L394">        handleError(t, header);</span>
+<span class="nc" id="L395">    }</span>
+
+    /**
+     * For &quot;expected&quot; errors this ensures we pass a WrappedException,
+     * which contains a streamId, to the error handler. This makes
+     * sure that whereever possible, the streamId is propagated back
+     * to the client.
+     * This variant doesn't call release as it is intended for use
+     * when an error occurs without any capacity being acquired.
+     * Typically, this would be the result of an acquisition failure
+     * if the THROW_ON_OVERLOAD option has been specified by the client.
+     */
+    private void handleError(Throwable t, Envelope.Header header)
+    {
+<span class="nc" id="L409">        handleError(t, header.streamId);</span>
+<span class="nc" id="L410">    }</span>
+
+    /**
+     * For &quot;expected&quot; errors this ensures we pass a WrappedException,
+     * which contains a streamId, to the error handler. This makes
+     * sure that whereever possible, the streamId is propagated back
+     * to the client.
+     * This variant doesn't call release as it is intended for use
+     * when an error occurs without any capacity being acquired.
+     * Typically, this would be the result of an acquisition failure
+     * if the THROW_ON_OVERLOAD option has been specified by the client.
+     */
+    private void handleError(Throwable t, int streamId)
+    {
+<span class="nc" id="L424">        errorHandler.accept(ErrorMessage.wrap(t, streamId));</span>
+<span class="nc" id="L425">    }</span>
+
+    /**
+     * For use in the case where the error can't be mapped to a specific stream id,
+     * such as a corrupted frame, or when extracting a CQL message from the frame's
+     * payload fails. This does not attempt to release any resources, as these errors
+     * should only occur before any capacity acquisition is attempted (e.g. on receipt
+     * of a corrupt frame, or failure to extract a CQL message from the envelope).
+     */
+    private void handleError(Throwable t)
+    {
+<span class="nc" id="L436">        errorHandler.accept(t);</span>
+<span class="nc" id="L437">    }</span>
+
+    // Acts as a Dispatcher.FlushItemConverter
+    private Framed toFlushItem(Channel channel, Message.Request request, Message.Response response)
+    {
+        // Returns a FlushItem.Framed instance which wraps a Consumer&lt;FlushItem&gt; that performs
+        // the work of returning the capacity allocated for processing the request.
+        // The Dispatcher will call this to obtain the FlushItem to enqueue with its Flusher once
+        // a dispatched request has been processed.
+
+<span class="fc" id="L447">        Envelope responseFrame = response.encode(request.getSource().header.version);</span>
+<span class="fc" id="L448">        int responseSize = envelopeSize(responseFrame.header);</span>
+<span class="fc" id="L449">        ClientMessageSizeMetrics.bytesSent.inc(responseSize);</span>
+<span class="fc" id="L450">        ClientMessageSizeMetrics.bytesSentPerResponse.update(responseSize);</span>
+
+<span class="fc" id="L452">        return new Framed(channel,</span>
+                          responseFrame,
+<span class="fc" id="L454">                          request.getSource(),</span>
+                          payloadAllocator,
+                          this::release);
+    }
+
+    private void release(Flusher.FlushItem&lt;Envelope&gt; flushItem)
+    {
+<span class="fc" id="L461">        release(flushItem.request.header);</span>
+<span class="fc" id="L462">        flushItem.request.release();</span>
+<span class="fc" id="L463">        flushItem.response.release();</span>
+<span class="fc" id="L464">    }</span>
+
+    private void release(Envelope.Header header)
+    {
+<span class="fc" id="L468">        releaseCapacity(Ints.checkedCast(header.bodySizeInBytes));</span>
+<span class="fc" id="L469">        channelPayloadBytesInFlight -= header.bodySizeInBytes;</span>
+<span class="fc" id="L470">    }</span>
+
+    /*
+     * Handling of multi-frame large messages
+     */
+    protected boolean processFirstFrameOfLargeMessage(IntactFrame frame, Limit endpointReserve, Limit globalReserve) throws IOException
+    {
+<span class="fc" id="L477">        ShareableBytes bytes = frame.contents;</span>
+<span class="fc" id="L478">        ByteBuffer buf = bytes.get();</span>
+        try
+        {
+<span class="fc" id="L481">            Envelope.Decoder.HeaderExtractionResult extracted = envelopeDecoder.extractHeader(buf);</span>
+<span class="pc bpc" id="L482" title="1 of 2 branches missed.">            if (!extracted.isSuccess())</span>
+            {
+                // Hard fail on any decoding error as we can't trust the subsequent frames of
+                // the large message
+<span class="nc" id="L486">                handleError(ProtocolException.toFatalException(extracted.error()));</span>
+<span class="nc" id="L487">                return false;</span>
+            }
+
+<span class="fc" id="L490">            Envelope.Header header = extracted.header();</span>
+            // max CQL message size defaults to 256mb, so should be safe to downcast
+<span class="fc" id="L492">            int messageSize = Ints.checkedCast(header.bodySizeInBytes);</span>
+<span class="fc" id="L493">            receivedBytes += buf.remaining();</span>
+            
+<span class="fc" id="L495">            LargeMessage largeMessage = new LargeMessage(header);</span>
+
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">            if (!acquireCapacity(header, endpointReserve, globalReserve))</span>
+            {
+                // In the case of large messages, never stop processing incoming frames
+                // as this will halt the client meaning no further frames will be sent,
+                // leading to starvation.
+                // If the throwOnOverload option is set, don't process the message once
+                // read, return an error response to notify the client that resource
+                // limits have been exceeded. If the option isn't set, the only thing we
+                // can do is to consume the subsequent frames and process the message.
+                // Large and small messages are never interleaved for a single client, so
+                // we know that this client will finish sending the large message before
+                // anything else. Other clients sending small messages concurrently will
+                // be backpressured by the global resource limits. The server is still
+                // vulnerable to overload by multiple clients sending large messages
+                // concurrently.
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                if (throwOnOverload)</span>
+                {
+                    // Mark as overloaded so that discard the message after consuming any subsequent frames.
+<span class="nc" id="L515">                    ClientMetrics.instance.markRequestDiscarded();</span>
+<span class="nc" id="L516">                    logOverload(endpointReserve, globalReserve, header, messageSize);</span>
+<span class="nc" id="L517">                    largeMessage.markOverloaded(Overload.BYTES_IN_FLIGHT);</span>
+                }
+            }
+<span class="pc bpc" id="L520" title="1 of 2 branches missed.">            else if (DatabaseDescriptor.getNativeTransportRateLimitingEnabled())</span>
+            {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                if (throwOnOverload)</span>
+                {
+<span class="nc bnc" id="L524" title="All 2 branches missed.">                    if (!requestRateLimiter.tryReserve())</span>
+                    {
+<span class="nc" id="L526">                        ClientMetrics.instance.markRequestDiscarded();</span>
+<span class="nc" id="L527">                        logOverload(endpointReserve, globalReserve, header, messageSize);</span>
+                        
+                        // Mark as overloaded so that we discard the message after consuming any subsequent frames.
+                        // (i.e. Request resources we may already have acquired above will be released.)
+<span class="nc" id="L531">                        largeMessage.markOverloaded(Overload.REQUESTS);</span>
+                        
+<span class="nc" id="L533">                        this.largeMessage = largeMessage;</span>
+<span class="nc" id="L534">                        largeMessage.supply(frame);</span>
+<span class="nc" id="L535">                        return true;</span>
+                    }
+                }
+                else
+                {
+<span class="nc" id="L540">                    long delay = requestRateLimiter.reserveAndGetDelay(RATE_LIMITER_DELAY_UNIT);</span>
+
+<span class="nc bnc" id="L542" title="All 2 branches missed.">                    if (delay &gt; 0)</span>
+                    {
+<span class="nc" id="L544">                        this.largeMessage = largeMessage;</span>
+<span class="nc" id="L545">                        largeMessage.markBackpressure(Overload.REQUESTS);</span>
+<span class="nc" id="L546">                        largeMessage.supply(frame);</span>
+
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                        if (decoder.isActive())</span>
+<span class="nc" id="L549">                            ClientMetrics.instance.pauseConnection();</span>
+
+<span class="nc" id="L551">                        scheduleConnectionWakeupTask(delay, RATE_LIMITER_DELAY_UNIT);</span>
+<span class="nc" id="L552">                        return false;</span>
+                    }
+                }
+            }
+            
+<span class="fc" id="L557">            this.largeMessage = largeMessage;</span>
+<span class="fc" id="L558">            largeMessage.supply(frame);</span>
+<span class="fc" id="L559">            return true;</span>
+        }
+<span class="nc" id="L561">        catch (Exception e)</span>
+        {
+<span class="nc" id="L563">            throw new IOException(&quot;Error decoding CQL Message&quot;, e);</span>
+        }
+    }
+
+    protected String id()
+    {
+<span class="nc" id="L569">        return channel.id().asShortText();</span>
+    }
+
+    private void scheduleConnectionWakeupTask(long waitLength, TimeUnit unit)
+    {
+<span class="nc" id="L574">        channel.eventLoop().schedule(() -&gt;</span>
+                                     {
+                                         try
+                                         {
+                                             // We might have already reactivated via another wake task.
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                                             if (!decoder.isActive())</span>
+                                             {
+<span class="nc" id="L581">                                                 decoder.reactivate();</span>
+
+                                                 // Only update the relevant metric if we've actually activated.
+<span class="nc bnc" id="L584" title="All 2 branches missed.">                                                 if (decoder.isActive())</span>
+<span class="nc" id="L585">                                                     ClientMetrics.instance.unpauseConnection();</span>
+                                             }
+                                         }
+<span class="nc" id="L588">                                         catch (Throwable t)</span>
+                                         {
+<span class="nc" id="L590">                                             fatalExceptionCaught(t);</span>
+<span class="nc" id="L591">                                         }</span>
+<span class="nc" id="L592">                                     },</span>
+                                     waitLength,
+                                     unit);
+<span class="nc" id="L595">    }</span>
+
+    @SuppressWarnings(&quot;BooleanMethodIsAlwaysInverted&quot;)
+    private boolean acquireCapacityAndQueueOnFailure(Envelope.Header header, Limit endpointReserve, Limit globalReserve)
+    {
+<span class="fc" id="L600">        int bytesRequired = Ints.checkedCast(header.bodySizeInBytes);</span>
+<span class="fc" id="L601">        long currentTimeNanos = approxTime.now();</span>
+<span class="fc" id="L602">        return acquireCapacity(endpointReserve, globalReserve, bytesRequired, currentTimeNanos, Long.MAX_VALUE);</span>
+    }
+
+    @SuppressWarnings(&quot;BooleanMethodIsAlwaysInverted&quot;)
+    private boolean acquireCapacity(Envelope.Header header, Limit endpointReserve, Limit globalReserve)
+    {
+<span class="fc" id="L608">        int bytesRequired = Ints.checkedCast(header.bodySizeInBytes);</span>
+<span class="pc bpc" id="L609" title="1 of 2 branches missed.">        return acquireCapacity(endpointReserve, globalReserve, bytesRequired) == ResourceLimits.Outcome.SUCCESS;</span>
+    }
+
+    /*
+     * Although it would be possible to recover when certain types of corrupt frame are encountered,
+     * this could cause problems for clients as the payload may contain CQL messages from multiple
+     * streams. Simply dropping the corrupt frame or returning an error response would not give the
+     * client enough information to map back to inflight requests, leading to timeouts.
+     * Instead, we need to fail fast, possibly dropping the connection whenever a corrupt frame is
+     * encountered. Consequently, we terminate the connection (via a ProtocolException) whenever a
+     * corrupt frame is encountered, regardless of its type.
+     */
+    protected void processCorruptFrame(FrameDecoder.CorruptFrame frame)
+    {
+<span class="nc" id="L623">        corruptFramesUnrecovered++;</span>
+<span class="nc" id="L624">        String error = String.format(&quot;%s invalid, unrecoverable CRC mismatch detected in frame %s. Read %d, Computed %d&quot;,</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                                     id(), frame.isRecoverable() ? &quot;body&quot; : &quot;header&quot;, frame.readCRC, frame.computedCRC);</span>
+
+<span class="nc" id="L627">        noSpamLogger.error(error);</span>
+
+        // If this is part of a multi-frame message, process it before passing control to the error handler.
+        // This is so we can take care of any housekeeping associated with large messages.
+<span class="nc bnc" id="L631" title="All 2 branches missed.">        if (!frame.isSelfContained)</span>
+        {
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            if (null == largeMessage) // first frame of a large message</span>
+<span class="nc" id="L634">                receivedBytes += frame.frameSize;</span>
+            else // subsequent frame of a large message
+<span class="nc" id="L636">                processSubsequentFrameOfLargeMessage(frame);</span>
+        }
+
+<span class="nc" id="L639">        handleError(ProtocolException.toFatalException(new ProtocolException(error)));</span>
+<span class="nc" id="L640">    }</span>
+
+    protected void fatalExceptionCaught(Throwable cause)
+    {
+<span class="nc" id="L644">        decoder.discard();</span>
+<span class="nc" id="L645">        logger.warn(&quot;Unrecoverable exception caught in CQL message processing pipeline, closing the connection&quot;, cause);</span>
+<span class="nc" id="L646">        channel.close();</span>
+<span class="nc" id="L647">    }</span>
+
+    static int envelopeSize(Envelope.Header header)
+    {
+<span class="fc" id="L651">        return Envelope.Header.LENGTH + Ints.checkedCast(header.bodySizeInBytes);</span>
+    }
+
+    private class LargeMessage extends AbstractMessageHandler.LargeMessage&lt;Envelope.Header&gt;
+    {
+        private static final long EXPIRES_AT = Long.MAX_VALUE;
+
+<span class="fc" id="L658">        private Overload overload = Overload.NONE;</span>
+<span class="fc" id="L659">        private Overload backpressure = Overload.NONE;</span>
+
+        private LargeMessage(Envelope.Header header)
+<span class="fc" id="L662">        {</span>
+<span class="fc" id="L663">            super(envelopeSize(header), header, EXPIRES_AT, false);</span>
+<span class="fc" id="L664">        }</span>
+
+        private Envelope assembleFrame()
+        {
+<span class="fc" id="L668">            ByteBuf body = Unpooled.wrappedBuffer(buffers.stream()</span>
+<span class="fc" id="L669">                                                          .map(ShareableBytes::get)</span>
+<span class="fc" id="L670">                                                          .toArray(ByteBuffer[]::new));</span>
+
+<span class="fc" id="L672">            body.readerIndex(Envelope.Header.LENGTH);</span>
+<span class="fc" id="L673">            body.retain();</span>
+<span class="fc" id="L674">            return new Envelope(header, body);</span>
+        }
+
+        /**
+         * Used to indicate that a message should be dropped and not processed.
+         * We do this on receipt of the first frame of a large message if sufficient capacity
+         * cannot be acquired to process it and throwOnOverload is set for the connection.
+         * In this case, the client has elected to shed load rather than apply backpressure
+         * so we must ensure that subsequent frames are consumed from the channel. At that
+         * point an error response is returned to the client, rather than processing the message.
+         */
+        private void markOverloaded(Overload overload)
+        {
+<span class="nc" id="L687">            this.overload = overload;</span>
+<span class="nc" id="L688">        }</span>
+
+        private void markBackpressure(Overload backpressure)
+        {
+<span class="nc" id="L692">            this.backpressure = backpressure;</span>
+<span class="nc" id="L693">        }</span>
+
+        protected void onComplete()
+        {
+<span class="pc bpc" id="L697" title="1 of 2 branches missed.">            if (overload != Overload.NONE)</span>
+<span class="nc" id="L698">                handleErrorAndRelease(buildOverloadedException(endpointReserveCapacity, globalReserveCapacity, overload), header);</span>
+<span class="pc bpc" id="L699" title="1 of 2 branches missed.">            else if (!isCorrupt)</span>
+<span class="fc" id="L700">                processRequest(assembleFrame(), backpressure);</span>
+<span class="fc" id="L701">        }</span>
+
+        protected void abort()
+        {
+<span class="nc bnc" id="L705" title="All 2 branches missed.">            if (!isCorrupt)</span>
+<span class="nc" id="L706">                releaseBuffersAndCapacity(); // release resources if in normal state when abort() is invoked</span>
+<span class="nc" id="L707">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

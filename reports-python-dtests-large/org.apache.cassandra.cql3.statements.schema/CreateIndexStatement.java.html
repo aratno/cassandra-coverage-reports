@@ -1,0 +1,347 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CreateIndexStatement.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3.statements.schema</a> &gt; <span class="el_source">CreateIndexStatement.java</span></div><h1>CreateIndexStatement.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3.statements.schema;
+
+import java.util.*;
+
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
+
+import org.apache.cassandra.audit.AuditLogContext;
+import org.apache.cassandra.audit.AuditLogEntryType;
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.QualifiedName;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget.Type;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.sasi.SASIIndex;
+import org.apache.cassandra.schema.*;
+import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.transport.Event.SchemaChange;
+import org.apache.cassandra.transport.Event.SchemaChange.Change;
+import org.apache.cassandra.transport.Event.SchemaChange.Target;
+
+import static com.google.common.collect.Iterables.transform;
+import static com.google.common.collect.Iterables.tryFind;
+
+public final class CreateIndexStatement extends AlterSchemaStatement
+{
+    public static final String SASI_INDEX_DISABLED = &quot;SASI indexes are disabled. Enable in cassandra.yaml to use.&quot;;
+    public static final String KEYSPACE_DOES_NOT_EXIST = &quot;Keyspace '%s' doesn't exist&quot;;
+    public static final String TABLE_DOES_NOT_EXIST = &quot;Table '%s' doesn't exist&quot;;
+    public static final String COUNTER_TABLES_NOT_SUPPORTED = &quot;Secondary indexes on counter tables aren't supported&quot;;
+    public static final String MATERIALIZED_VIEWS_NOT_SUPPORTED = &quot;Secondary indexes on materialized views aren't supported&quot;;
+    public static final String TRANSIENTLY_REPLICATED_KEYSPACE_NOT_SUPPORTED = &quot;Secondary indexes are not supported on transiently replicated keyspaces&quot;;
+    public static final String CUSTOM_CREATE_WITHOUT_COLUMN = &quot;Only CUSTOM indexes can be created without specifying a target column&quot;;
+    public static final String CUSTOM_MULTIPLE_COLUMNS = &quot;Only CUSTOM indexes support multiple columns&quot;;
+    public static final String DUPLICATE_TARGET_COLUMN = &quot;Duplicate column '%s' in index target list&quot;;
+    public static final String COLUMN_DOES_NOT_EXIST = &quot;Column '%s' doesn't exist&quot;;
+    public static final String INVALID_CUSTOM_INDEX_TARGET = &quot;Column '%s' is longer than the permissible name length of %d characters or&quot; +
+                                                             &quot; contains non-alphanumeric-underscore characters&quot;;
+    public static final String COLLECTIONS_WITH_DURATIONS_NOT_SUPPORTED = &quot;Secondary indexes are not supported on collections containing durations&quot;;
+    public static final String TUPLES_WITH_DURATIONS_NOT_SUPPORTED = &quot;Secondary indexes are not supported on tuples containing durations&quot;;
+    public static final String DURATIONS_NOT_SUPPORTED = &quot;Secondary indexes are not supported on duration columns&quot;;
+    public static final String UDTS_WITH_DURATIONS_NOT_SUPPORTED = &quot;Secondary indexes are not supported on UDTs containing durations&quot;;
+    public static final String PRIMARY_KEY_IN_COMPACT_STORAGE = &quot;Secondary indexes are not supported on PRIMARY KEY columns in COMPACT STORAGE tables&quot;;
+    public static final String COMPACT_COLUMN_IN_COMPACT_STORAGE = &quot;Secondary indexes are not supported on compact value column of COMPACT STORAGE tables&quot;;
+    public static final String ONLY_PARTITION_KEY = &quot;Cannot create secondary index on the only partition key column %s&quot;;
+    public static final String CREATE_ON_FROZEN_COLUMN = &quot;Cannot create %s() index on frozen column %s. Frozen collections are immutable and must be fully &quot; +
+                                                         &quot;indexed by using the 'full(%s)' modifier&quot;;
+    public static final String FULL_ON_FROZEN_COLLECTIONS = &quot;full() indexes can only be created on frozen collections&quot;;
+    public static final String NON_COLLECTION_SIMPLE_INDEX = &quot;Cannot create %s() index on %s. Non-collection columns only support simple indexes&quot;;
+    public static final String CREATE_WITH_NON_MAP_TYPE = &quot;Cannot create index on %s of column %s with non-map type&quot;;
+    public static final String CREATE_ON_NON_FROZEN_UDT = &quot;Cannot create index on non-frozen UDT column %s&quot;;
+    public static final String INDEX_ALREADY_EXISTS = &quot;Index '%s' already exists&quot;;
+    public static final String INDEX_DUPLICATE_OF_EXISTING = &quot;Index %s is a duplicate of existing index %s&quot;;
+    public static final String KEYSPACE_DOES_NOT_MATCH_TABLE = &quot;Keyspace name '%s' doesn't match table name '%s'&quot;;
+    public static final String KEYSPACE_DOES_NOT_MATCH_INDEX = &quot;Keyspace name '%s' doesn't match index name '%s'&quot;;
+    public static final String MUST_SPECIFY_INDEX_IMPLEMENTATION = &quot;Must specify index implementation via USING&quot;;
+
+    private final String indexName;
+    private final String tableName;
+    private final List&lt;IndexTarget.Raw&gt; rawIndexTargets;
+    private final IndexAttributes attrs;
+    private final boolean ifNotExists;
+
+    private ClientState state;
+
+    public CreateIndexStatement(String keyspaceName,
+                                String tableName,
+                                String indexName,
+                                List&lt;IndexTarget.Raw&gt; rawIndexTargets,
+                                IndexAttributes attrs,
+                                boolean ifNotExists)
+    {
+<span class="nc" id="L98">        super(keyspaceName);</span>
+<span class="nc" id="L99">        this.tableName = tableName;</span>
+<span class="nc" id="L100">        this.indexName = indexName;</span>
+<span class="nc" id="L101">        this.rawIndexTargets = rawIndexTargets;</span>
+<span class="nc" id="L102">        this.attrs = attrs;</span>
+<span class="nc" id="L103">        this.ifNotExists = ifNotExists;</span>
+<span class="nc" id="L104">    }</span>
+
+    @Override
+    public void validate(ClientState state)
+    {
+<span class="nc" id="L109">        super.validate(state);</span>
+
+        // save the query state to use it for guardrails validation in #apply
+<span class="nc" id="L112">        this.state = state;</span>
+<span class="nc" id="L113">    }</span>
+
+    public Keyspaces apply(Keyspaces schema)
+    {
+<span class="nc" id="L117">        attrs.validate();</span>
+
+<span class="nc" id="L119">        Guardrails.createSecondaryIndexesEnabled.ensureEnabled(&quot;Creating secondary indexes&quot;, state);</span>
+
+<span class="nc bnc" id="L121" title="All 6 branches missed.">        if (attrs.isCustom &amp;&amp; attrs.customClass.equals(SASIIndex.class.getName()) &amp;&amp; !DatabaseDescriptor.getSASIIndexesEnabled())</span>
+<span class="nc" id="L122">            throw new InvalidRequestException(SASI_INDEX_DISABLED);</span>
+
+<span class="nc" id="L124">        KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        if (null == keyspace)</span>
+<span class="nc" id="L126">            throw ire(KEYSPACE_DOES_NOT_EXIST, keyspaceName);</span>
+
+<span class="nc" id="L128">        TableMetadata table = keyspace.getTableOrViewNullable(tableName);</span>
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (null == table)</span>
+<span class="nc" id="L130">            throw ire(TABLE_DOES_NOT_EXIST, tableName);</span>
+
+<span class="nc bnc" id="L132" title="All 4 branches missed.">        if (null != indexName &amp;&amp; keyspace.hasIndex(indexName))</span>
+        {
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (ifNotExists)</span>
+<span class="nc" id="L135">                return schema;</span>
+
+<span class="nc" id="L137">            throw ire(INDEX_ALREADY_EXISTS, indexName);</span>
+        }
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (table.isCounter())</span>
+<span class="nc" id="L141">            throw ire(COUNTER_TABLES_NOT_SUPPORTED);</span>
+
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (table.isView())</span>
+<span class="nc" id="L144">            throw ire(MATERIALIZED_VIEWS_NOT_SUPPORTED);</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (Keyspace.open(table.keyspace).getReplicationStrategy().hasTransientReplicas())</span>
+<span class="nc" id="L147">            throw new InvalidRequestException(TRANSIENTLY_REPLICATED_KEYSPACE_NOT_SUPPORTED);</span>
+
+        // guardrails to limit number of secondary indexes per table.
+<span class="nc" id="L150">        Guardrails.secondaryIndexesPerTable.guard(table.indexes.size() + 1,</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">                                                  Strings.isNullOrEmpty(indexName)</span>
+<span class="nc" id="L152">                                                  ? String.format(&quot;on table %s&quot;, table.name)</span>
+<span class="nc" id="L153">                                                  : String.format(&quot;%s on table %s&quot;, indexName, table.name),</span>
+                                                  false,
+                                                  state);
+
+<span class="nc" id="L157">        List&lt;IndexTarget&gt; indexTargets = Lists.newArrayList(transform(rawIndexTargets, t -&gt; t.prepare(table)));</span>
+
+<span class="nc bnc" id="L159" title="All 4 branches missed.">        if (indexTargets.isEmpty() &amp;&amp; !attrs.isCustom)</span>
+<span class="nc" id="L160">            throw ire(CUSTOM_CREATE_WITHOUT_COLUMN);</span>
+
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if (indexTargets.size() &gt; 1)</span>
+        {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (!attrs.isCustom)</span>
+<span class="nc" id="L165">                throw ire(CUSTOM_MULTIPLE_COLUMNS);</span>
+
+<span class="nc" id="L167">            Set&lt;ColumnIdentifier&gt; columns = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">            for (IndexTarget target : indexTargets)</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">                if (!columns.add(target.column))</span>
+<span class="nc" id="L170">                    throw ire(DUPLICATE_TARGET_COLUMN, target.column);</span>
+        }
+
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        IndexMetadata.Kind kind = attrs.isCustom ? IndexMetadata.Kind.CUSTOM : IndexMetadata.Kind.COMPOSITES;</span>
+
+<span class="nc" id="L175">        indexTargets.forEach(t -&gt; validateIndexTarget(table, kind, t));</span>
+
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        String name = null == indexName ? generateIndexName(keyspace, indexTargets) : indexName;</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        Map&lt;String, String&gt; options = attrs.isCustom ? attrs.getOptions() : Collections.emptyMap();</span>
+
+<span class="nc" id="L181">        IndexMetadata index = IndexMetadata.fromIndexTargets(indexTargets, name, kind, options);</span>
+
+        // check to disallow creation of an index which duplicates an existing one in all but name
+<span class="nc" id="L184">        IndexMetadata equalIndex = tryFind(table.indexes, i -&gt; i.equalsWithoutName(index)).orNull();</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        if (null != equalIndex)</span>
+        {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            if (ifNotExists)</span>
+<span class="nc" id="L188">                return schema;</span>
+
+<span class="nc" id="L190">            throw ire(INDEX_DUPLICATE_OF_EXISTING, index.name, equalIndex.name);</span>
+        }
+
+<span class="nc" id="L193">        TableMetadata newTable = table.withSwapped(table.indexes.with(index));</span>
+<span class="nc" id="L194">        newTable.validate();</span>
+
+<span class="nc" id="L196">        return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.tables.withSwapped(newTable)));</span>
+    }
+
+    @Override
+    Set&lt;String&gt; clientWarnings(KeyspacesDiff diff)
+    {
+<span class="nc bnc" id="L202" title="All 4 branches missed.">        if (attrs.isCustom &amp;&amp; attrs.customClass.equals(SASIIndex.class.getName()))</span>
+<span class="nc" id="L203">            return ImmutableSet.of(SASIIndex.USAGE_WARNING);</span>
+
+<span class="nc" id="L205">        return ImmutableSet.of();</span>
+    }
+
+    private void validateIndexTarget(TableMetadata table, IndexMetadata.Kind kind, IndexTarget target)
+    {
+<span class="nc" id="L210">        ColumnMetadata column = table.getColumn(target.column);</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (null == column)</span>
+<span class="nc" id="L213">            throw ire(COLUMN_DOES_NOT_EXIST, target.column);</span>
+
+<span class="nc bnc" id="L215" title="All 4 branches missed.">        if ((kind == IndexMetadata.Kind.CUSTOM) &amp;&amp; !SchemaConstants.isValidName(target.column.toString()))</span>
+<span class="nc" id="L216">            throw ire(INVALID_CUSTOM_INDEX_TARGET, target.column, SchemaConstants.NAME_LENGTH);</span>
+
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (column.type.referencesDuration())</span>
+        {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (column.type.isCollection())</span>
+<span class="nc" id="L221">                throw ire(COLLECTIONS_WITH_DURATIONS_NOT_SUPPORTED);</span>
+
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (column.type.isTuple())</span>
+<span class="nc" id="L224">                throw ire(TUPLES_WITH_DURATIONS_NOT_SUPPORTED);</span>
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (column.type.isUDT())</span>
+<span class="nc" id="L227">                throw  ire(UDTS_WITH_DURATIONS_NOT_SUPPORTED);</span>
+
+<span class="nc" id="L229">            throw ire(DURATIONS_NOT_SUPPORTED);</span>
+        }
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">        if (table.isCompactTable())</span>
+        {
+<span class="nc" id="L234">            TableMetadata.CompactTableMetadata compactTable = (TableMetadata.CompactTableMetadata) table;</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (column.isPrimaryKeyColumn())</span>
+<span class="nc" id="L236">                throw new InvalidRequestException(PRIMARY_KEY_IN_COMPACT_STORAGE);</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (compactTable.compactValueColumn.equals(column))</span>
+<span class="nc" id="L238">                throw new InvalidRequestException(COMPACT_COLUMN_IN_COMPACT_STORAGE);</span>
+        }
+
+<span class="nc bnc" id="L241" title="All 4 branches missed.">        if (column.isPartitionKey() &amp;&amp; table.partitionKeyColumns().size() == 1)</span>
+<span class="nc" id="L242">            throw ire(ONLY_PARTITION_KEY, column);</span>
+
+<span class="nc bnc" id="L244" title="All 4 branches missed.">        if (column.type.isFrozenCollection() &amp;&amp; target.type != Type.FULL)</span>
+<span class="nc" id="L245">            throw ire(CREATE_ON_FROZEN_COLUMN, target.type, column, column);</span>
+
+<span class="nc bnc" id="L247" title="All 4 branches missed.">        if (!column.type.isFrozenCollection() &amp;&amp; target.type == Type.FULL)</span>
+<span class="nc" id="L248">            throw ire(FULL_ON_FROZEN_COLLECTIONS);</span>
+
+<span class="nc bnc" id="L250" title="All 4 branches missed.">        if (!column.type.isCollection() &amp;&amp; target.type != Type.SIMPLE)</span>
+<span class="nc" id="L251">            throw ire(NON_COLLECTION_SIMPLE_INDEX, target.type, column);</span>
+
+<span class="nc bnc" id="L253" title="All 8 branches missed.">        if (!(column.type instanceof MapType &amp;&amp; column.type.isMultiCell()) &amp;&amp; (target.type == Type.KEYS || target.type == Type.KEYS_AND_VALUES))</span>
+<span class="nc" id="L254">            throw ire(CREATE_WITH_NON_MAP_TYPE, target.type, column);</span>
+
+<span class="nc bnc" id="L256" title="All 4 branches missed.">        if (column.type.isUDT() &amp;&amp; column.type.isMultiCell())</span>
+<span class="nc" id="L257">            throw ire(CREATE_ON_NON_FROZEN_UDT, column);</span>
+<span class="nc" id="L258">    }</span>
+
+    private String generateIndexName(KeyspaceMetadata keyspace, List&lt;IndexTarget&gt; targets)
+    {
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        String baseName = targets.size() == 1</span>
+<span class="nc" id="L263">                        ? IndexMetadata.generateDefaultIndexName(tableName, targets.get(0).column)</span>
+<span class="nc" id="L264">                        : IndexMetadata.generateDefaultIndexName(tableName);</span>
+<span class="nc" id="L265">        return keyspace.findAvailableIndexName(baseName);</span>
+    }
+
+    SchemaChange schemaChangeEvent(KeyspacesDiff diff)
+    {
+<span class="nc" id="L270">        return new SchemaChange(Change.UPDATED, Target.TABLE, keyspaceName, tableName);</span>
+    }
+
+    public void authorize(ClientState client)
+    {
+<span class="nc" id="L275">        client.ensureTablePermission(keyspaceName, tableName, Permission.ALTER);</span>
+<span class="nc" id="L276">    }</span>
+
+    @Override
+    public AuditLogContext getAuditLogContext()
+    {
+<span class="nc" id="L281">        return new AuditLogContext(AuditLogEntryType.CREATE_INDEX, keyspaceName, indexName);</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L286">        return String.format(&quot;%s (%s, %s)&quot;, getClass().getSimpleName(), keyspaceName, indexName);</span>
+    }
+
+    public static final class Raw extends CQLStatement.Raw
+    {
+        private final QualifiedName tableName;
+        private final QualifiedName indexName;
+        private final List&lt;IndexTarget.Raw&gt; rawIndexTargets;
+        private final IndexAttributes attrs;
+        private final boolean ifNotExists;
+
+        public Raw(QualifiedName tableName,
+                   QualifiedName indexName,
+                   List&lt;IndexTarget.Raw&gt; rawIndexTargets,
+                   IndexAttributes attrs,
+                   boolean ifNotExists)
+<span class="nc" id="L302">        {</span>
+<span class="nc" id="L303">            this.tableName = tableName;</span>
+<span class="nc" id="L304">            this.indexName = indexName;</span>
+<span class="nc" id="L305">            this.rawIndexTargets = rawIndexTargets;</span>
+<span class="nc" id="L306">            this.attrs = attrs;</span>
+<span class="nc" id="L307">            this.ifNotExists = ifNotExists;</span>
+<span class="nc" id="L308">        }</span>
+
+        public CreateIndexStatement prepare(ClientState state)
+        {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            String keyspaceName = tableName.hasKeyspace()</span>
+<span class="nc" id="L313">                                ? tableName.getKeyspace()</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                                : indexName.hasKeyspace() ? indexName.getKeyspace() : state.getKeyspace();</span>
+
+<span class="nc bnc" id="L316" title="All 4 branches missed.">            if (tableName.hasKeyspace() &amp;&amp; !keyspaceName.equals(tableName.getKeyspace()))</span>
+<span class="nc" id="L317">                throw ire(KEYSPACE_DOES_NOT_MATCH_TABLE, keyspaceName, tableName);</span>
+
+<span class="nc bnc" id="L319" title="All 4 branches missed.">            if (indexName.hasKeyspace() &amp;&amp; !keyspaceName.equals(indexName.getKeyspace()))</span>
+<span class="nc" id="L320">                throw ire(KEYSPACE_DOES_NOT_MATCH_INDEX, keyspaceName, tableName);</span>
+            
+            // Set the configured default 2i implementation if one isn't specified with USING:
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (attrs.customClass == null)</span>
+            {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">                if (DatabaseDescriptor.getDefaultSecondaryIndexEnabled())</span>
+<span class="nc" id="L326">                    attrs.customClass = DatabaseDescriptor.getDefaultSecondaryIndex();</span>
+                else
+                    // However, operators may require an implementation be specified
+<span class="nc" id="L329">                    throw ire(MUST_SPECIFY_INDEX_IMPLEMENTATION);</span>
+            }
+            
+            // If we explicitly specify the index type &quot;legacy_local_table&quot;, we can just clear the custom class, and the
+            // non-custom 2i creation process will begin. Otherwise, if an index type has been specified with 
+            // USING, make sure the appropriate custom index is created.
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (attrs.customClass != null)</span>
+            {
+<span class="nc bnc" id="L337" title="All 4 branches missed.">                if (!attrs.isCustom &amp;&amp; attrs.customClass.equalsIgnoreCase(CassandraIndex.NAME))</span>
+<span class="nc" id="L338">                    attrs.customClass = null;</span>
+                else
+<span class="nc" id="L340">                    attrs.isCustom = true;</span>
+            }
+
+<span class="nc" id="L343">            return new CreateIndexStatement(keyspaceName, tableName.getName(), indexName.getName(), rawIndexTargets, attrs, ifNotExists);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SSTableOfflineRelevel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.tools</a> &gt; <span class="el_source">SSTableOfflineRelevel.java</span></div><h1>SSTableOfflineRelevel.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.tools;
+
+import java.io.IOException;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import com.google.common.base.Throwables;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.Multimap;
+import com.google.common.collect.SetMultimap;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.schema.Schema;
+
+/**
+ * Create a decent leveling for the given keyspace/column family
+ *
+ * Approach is to sort the sstables by their last token
+ *
+ * given an original leveling like this (note that [ ] indicates token boundaries, not sstable size on disk, all sstables are the same size)
+ *
+ * L3 [][][][][][][][][][][]
+ * L2 [    ][    ][    ][  ]
+ * L1 [          ][        ]
+ * L0 [                    ]
+ *
+ * Will look like this after being dropped to L0 and sorted by last token (and, to illustrate overlap, the overlapping ones are put on a new line):
+ *
+ * [][][]
+ * [    ][][][]
+ *       [    ]
+ * [          ]
+ *...
+ *
+ * Then, we start iterating from the smallest last-token and adding all sstables that do not cause an overlap to
+ * a level, we will reconstruct the original leveling top-down. Whenever we add an sstable to the level, we remove it from
+ * the sorted list. Once we reach the end of the sorted list, we have a full level, and can start over with the level below.
+ *
+ * If we end up with more levels than expected, we put all levels exceeding the expected in L0, for example, original L0
+ * files will most likely be put in a level of its own since they most often overlap many other sstables
+ */
+<span class="nc" id="L75">public class SSTableOfflineRelevel</span>
+{
+    /**
+     * @param args a list of sstables whose metadata we are changing
+     */
+    public static void main(String[] args) throws IOException
+    {
+<span class="fc" id="L82">        PrintStream out = System.out;</span>
+<span class="fc bfc" id="L83" title="All 2 branches covered.">        if (args.length &lt; 2)</span>
+        {
+<span class="fc" id="L85">            out.println(&quot;This command should be run with Cassandra stopped!&quot;);</span>
+<span class="fc" id="L86">            out.println(&quot;Usage: sstableofflinerelevel [--dry-run] &lt;keyspace&gt; &lt;columnfamily&gt;&quot;);</span>
+<span class="nc" id="L87">            System.exit(1);</span>
+        }
+
+<span class="fc" id="L90">        Util.initDatabaseDescriptor();</span>
+
+<span class="fc" id="L92">        boolean dryRun = args[0].equals(&quot;--dry-run&quot;);</span>
+<span class="fc" id="L93">        String keyspace = args[args.length - 2];</span>
+<span class="fc" id="L94">        String columnfamily = args[args.length - 1];</span>
+<span class="fc" id="L95">        Schema.instance.loadFromDisk();</span>
+
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        if (Schema.instance.getTableMetadataRef(keyspace, columnfamily) == null)</span>
+<span class="nc" id="L98">            throw new IllegalArgumentException(String.format(&quot;Unknown keyspace/table %s.%s&quot;,</span>
+                    keyspace,
+                    columnfamily));
+
+        // remove any leftovers in the transaction log
+<span class="fc" id="L103">        Keyspace ks = Keyspace.openWithoutSSTables(keyspace);</span>
+<span class="fc" id="L104">        ColumnFamilyStore cfs = ks.getColumnFamilyStore(columnfamily);</span>
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">        if (!LifecycleTransaction.removeUnfinishedLeftovers(cfs))</span>
+        {
+<span class="nc" id="L107">            throw new RuntimeException(String.format(&quot;Cannot remove temporary or obsoleted files for %s.%s &quot; +</span>
+                                                     &quot;due to a problem with transaction log files.&quot;,
+                                                     keyspace, columnfamily));
+        }
+
+<span class="fc" id="L112">        Directories.SSTableLister lister = cfs.getDirectories().sstableLister(Directories.OnTxnErr.THROW).skipTemporary(true);</span>
+<span class="fc" id="L113">        SetMultimap&lt;File, SSTableReader&gt; sstableMultimap = HashMultimap.create();</span>
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">        for (Map.Entry&lt;Descriptor, Set&lt;Component&gt;&gt; sstable : lister.list().entrySet())</span>
+        {
+<span class="nc bnc" id="L116" title="All 2 branches missed.">            if (sstable.getKey() != null)</span>
+            {
+                try
+                {
+<span class="nc" id="L120">                    SSTableReader reader = SSTableReader.open(cfs, sstable.getKey());</span>
+<span class="nc" id="L121">                    sstableMultimap.put(reader.descriptor.directory, reader);</span>
+                }
+<span class="nc" id="L123">                catch (Throwable t)</span>
+                {
+<span class="nc" id="L125">                    out.println(&quot;Couldn't open sstable: &quot;+sstable.getKey().fileFor(Components.DATA));</span>
+<span class="nc" id="L126">                    Throwables.throwIfUnchecked(t);</span>
+<span class="nc" id="L127">                    throw new RuntimeException(t);</span>
+<span class="nc" id="L128">                }</span>
+            }
+<span class="nc" id="L130">        }</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (sstableMultimap.isEmpty())</span>
+        {
+<span class="fc" id="L133">            out.println(&quot;No sstables to relevel for &quot;+keyspace+&quot;.&quot;+columnfamily);</span>
+<span class="nc" id="L134">            System.exit(1);</span>
+        }
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        for (File directory : sstableMultimap.keySet())</span>
+        {
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if (!sstableMultimap.get(directory).isEmpty())</span>
+            {
+<span class="nc" id="L140">                Relevel rl = new Relevel(sstableMultimap.get(directory));</span>
+<span class="nc" id="L141">                out.println(&quot;For sstables in &quot; + directory + &quot;:&quot;);</span>
+<span class="nc" id="L142">                rl.relevel(dryRun);</span>
+            }
+<span class="nc" id="L144">        }</span>
+<span class="nc" id="L145">        System.exit(0);</span>
+
+<span class="nc" id="L147">    }</span>
+
+    private static class Relevel
+    {
+        private final Set&lt;SSTableReader&gt; sstables;
+        private final int approxExpectedLevels;
+        public Relevel(Set&lt;SSTableReader&gt; sstables)
+        {
+            this.sstables = sstables;
+            approxExpectedLevels = (int) Math.ceil(Math.log10(sstables.size()));
+        }
+
+        private void printLeveling(Iterable&lt;SSTableReader&gt; sstables)
+        {
+            Multimap&lt;Integer, SSTableReader&gt; leveling = ArrayListMultimap.create();
+            int maxLevel = 0;
+            for (SSTableReader sstable : sstables)
+            {
+                leveling.put(sstable.getSSTableLevel(), sstable);
+                maxLevel = Math.max(sstable.getSSTableLevel(), maxLevel);
+            }
+            System.out.println(&quot;Current leveling:&quot;);
+            for (int i = 0; i &lt;= maxLevel; i++)
+                System.out.println(String.format(&quot;L%d=%d&quot;, i, leveling.get(i).size()));
+        }
+
+        public void relevel(boolean dryRun) throws IOException
+        {
+            printLeveling(sstables);
+            List&lt;SSTableReader&gt; sortedSSTables = new ArrayList&lt;&gt;(sstables);
+            Collections.sort(sortedSSTables, new Comparator&lt;SSTableReader&gt;()
+            {
+                @Override
+                public int compare(SSTableReader o1, SSTableReader o2)
+                {
+                    return o1.getLast().compareTo(o2.getLast());
+                }
+            });
+
+            List&lt;List&lt;SSTableReader&gt;&gt; levels = new ArrayList&lt;&gt;();
+
+            while (!sortedSSTables.isEmpty())
+            {
+                Iterator&lt;SSTableReader&gt; it = sortedSSTables.iterator();
+                List&lt;SSTableReader&gt; level = new ArrayList&lt;&gt;();
+                DecoratedKey lastLast = null;
+                while (it.hasNext())
+                {
+                    SSTableReader sstable = it.next();
+                    if (lastLast == null || lastLast.compareTo(sstable.getFirst()) &lt; 0)
+                    {
+                        level.add(sstable);
+                        lastLast = sstable.getLast();
+                        it.remove();
+                    }
+                }
+                levels.add(level);
+            }
+            List&lt;SSTableReader&gt; l0 = new ArrayList&lt;&gt;();
+            if (approxExpectedLevels &lt; levels.size())
+            {
+                for (int i = approxExpectedLevels; i &lt; levels.size(); i++)
+                    l0.addAll(levels.get(i));
+                levels = levels.subList(0, approxExpectedLevels);
+            }
+            if (dryRun)
+                System.out.println(&quot;Potential leveling: &quot;);
+            else
+                System.out.println(&quot;New leveling: &quot;);
+
+            System.out.println(&quot;L0=&quot;+l0.size());
+            // item 0 in levels is the highest level we will create, printing from L1 up here:
+            for (int i = levels.size() - 1; i &gt;= 0; i--)
+                System.out.println(String.format(&quot;L%d=%d&quot;, levels.size() - i, levels.get(i).size()));
+
+            if (!dryRun)
+            {
+                for (SSTableReader sstable : l0)
+                {
+                    if (sstable.getSSTableLevel() != 0)
+                        sstable.descriptor.getMetadataSerializer().mutateLevel(sstable.descriptor, 0);
+                }
+                for (int i = levels.size() - 1; i &gt;= 0; i--)
+                {
+                    for (SSTableReader sstable : levels.get(i))
+                    {
+                        int newLevel = levels.size() - i;
+                        if (newLevel != sstable.getSSTableLevel())
+                            sstable.descriptor.getMetadataSerializer().mutateLevel(sstable.descriptor, newLevel);
+                    }
+                }
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

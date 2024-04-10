@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CassandraStreamReceiver.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.streaming</a> &gt; <span class="el_source">CassandraStreamReceiver.java</span></div><h1>CassandraStreamReceiver.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.streaming;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.ThrottledUnfilteredIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.view.View;
+import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableMultiWriter;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.streaming.IncomingStream;
+import org.apache.cassandra.streaming.StreamReceiver;
+import org.apache.cassandra.streaming.StreamSession;
+import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.Refs;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.REPAIR_MUTATION_REPAIR_ROWS_PER_BATCH;
+
+public class CassandraStreamReceiver implements StreamReceiver
+{
+<span class="nc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(CassandraStreamReceiver.class);</span>
+
+<span class="nc" id="L62">    private static final int MAX_ROWS_PER_BATCH = REPAIR_MUTATION_REPAIR_ROWS_PER_BATCH.getInt();</span>
+
+    private final ColumnFamilyStore cfs;
+    private final StreamSession session;
+
+    // Transaction tracking new files received
+    private final LifecycleTransaction txn;
+
+    //  holds references to SSTables received
+    protected final Collection&lt;SSTableReader&gt; sstables;
+
+    protected volatile boolean receivedEntireSSTable;
+
+    private final boolean requiresWritePath;
+
+
+    public CassandraStreamReceiver(ColumnFamilyStore cfs, StreamSession session, int totalFiles)
+<span class="nc" id="L79">    {</span>
+<span class="nc" id="L80">        this.cfs = cfs;</span>
+<span class="nc" id="L81">        this.session = session;</span>
+        // this is an &quot;offline&quot; transaction, as we currently manually expose the sstables once done;
+        // this should be revisited at a later date, so that LifecycleTransaction manages all sstable state changes
+<span class="nc" id="L84">        this.txn = LifecycleTransaction.offline(OperationType.STREAM);</span>
+<span class="nc" id="L85">        this.sstables = new ArrayList&lt;&gt;(totalFiles);</span>
+<span class="nc" id="L86">        this.requiresWritePath = requiresWritePath(cfs);</span>
+<span class="nc" id="L87">    }</span>
+
+    public static CassandraStreamReceiver fromReceiver(StreamReceiver receiver)
+    {
+<span class="nc" id="L91">        Preconditions.checkArgument(receiver instanceof CassandraStreamReceiver);</span>
+<span class="nc" id="L92">        return (CassandraStreamReceiver) receiver;</span>
+    }
+
+    private static CassandraIncomingFile getFile(IncomingStream stream)
+    {
+<span class="nc" id="L97">        Preconditions.checkArgument(stream instanceof CassandraIncomingFile, &quot;Wrong stream type: {}&quot;, stream);</span>
+<span class="nc" id="L98">        return (CassandraIncomingFile) stream;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;resource&quot;)
+    public synchronized void received(IncomingStream stream)
+    {
+<span class="nc" id="L105">        CassandraIncomingFile file = getFile(stream);</span>
+
+<span class="nc" id="L107">        Collection&lt;SSTableReader&gt; finished = null;</span>
+<span class="nc" id="L108">        SSTableMultiWriter sstable = file.getSSTable();</span>
+        try
+        {
+<span class="nc" id="L111">            finished = sstable.finish(true);</span>
+        }
+<span class="nc" id="L113">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L115">            Throwables.maybeFail(sstable.abort(t));</span>
+<span class="nc" id="L116">        }</span>
+<span class="nc" id="L117">        txn.update(finished, false);</span>
+<span class="nc" id="L118">        sstables.addAll(finished);</span>
+<span class="nc" id="L119">        receivedEntireSSTable = file.isEntireSSTable();</span>
+<span class="nc" id="L120">    }</span>
+
+    @Override
+    public void discardStream(IncomingStream stream)
+    {
+<span class="nc" id="L125">        CassandraIncomingFile file = getFile(stream);</span>
+<span class="nc" id="L126">        Throwables.maybeFail(file.getSSTable().abort(null));</span>
+<span class="nc" id="L127">    }</span>
+
+    /**
+     * @return a LifecycleNewTracker whose operations are synchronised on this StreamReceiveTask.
+     */
+    public synchronized LifecycleNewTracker createLifecycleNewTracker()
+    {
+<span class="nc" id="L134">        return new LifecycleNewTracker()</span>
+<span class="nc" id="L135">        {</span>
+            @Override
+            public void trackNew(SSTable table)
+            {
+<span class="nc" id="L139">                synchronized (CassandraStreamReceiver.this)</span>
+                {
+<span class="nc" id="L141">                    txn.trackNew(table);</span>
+<span class="nc" id="L142">                }</span>
+<span class="nc" id="L143">            }</span>
+
+            @Override
+            public void untrackNew(SSTable table)
+            {
+<span class="nc" id="L148">                synchronized (CassandraStreamReceiver.this)</span>
+                {
+<span class="nc" id="L150">                    txn.untrackNew(table);</span>
+<span class="nc" id="L151">                }</span>
+<span class="nc" id="L152">            }</span>
+
+            public OperationType opType()
+            {
+<span class="nc" id="L156">                return txn.opType();</span>
+            }
+        };
+    }
+
+
+    @Override
+    public synchronized void abort()
+    {
+<span class="nc" id="L165">        sstables.clear();</span>
+<span class="nc" id="L166">        txn.abort();</span>
+<span class="nc" id="L167">    }</span>
+
+    private boolean hasViews(ColumnFamilyStore cfs)
+    {
+<span class="nc bnc" id="L171" title="All 2 branches missed.">        return !Iterables.isEmpty(View.findAll(cfs.metadata.keyspace, cfs.getTableName()));</span>
+    }
+
+    private boolean hasCDC(ColumnFamilyStore cfs)
+    {
+<span class="nc" id="L176">        return cfs.metadata().params.cdc;</span>
+    }
+
+    // returns true iif it is a cdc table and cdc on repair is enabled.
+    private boolean cdcRequiresWriteCommitLog(ColumnFamilyStore cfs)
+    {
+<span class="nc bnc" id="L182" title="All 4 branches missed.">        return DatabaseDescriptor.isCDCOnRepairEnabled() &amp;&amp; hasCDC(cfs);</span>
+    }
+
+    /*
+     * We have a special path for views and for CDC.
+     *
+     * For views, since the view requires cleaning up any pre-existing state, we must put all partitions
+     * through the same write path as normal mutations. This also ensures any 2is are also updated.
+     *
+     * For CDC-enabled tables and write path for CDC is enabled, we want to ensure that the mutations are
+     * run through the CommitLog, so they can be archived by the CDC process on discard.
+     */
+    private boolean requiresWritePath(ColumnFamilyStore cfs)
+    {
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        return cdcRequiresWriteCommitLog(cfs)</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">               || cfs.streamToMemtable()</span>
+<span class="nc bnc" id="L198" title="All 4 branches missed.">               || (session.streamOperation().requiresViewBuild() &amp;&amp; hasViews(cfs));</span>
+    }
+
+    private void sendThroughWritePath(ColumnFamilyStore cfs, Collection&lt;SSTableReader&gt; readers)
+    {
+<span class="nc" id="L203">        boolean writeCDCCommitLog = cdcRequiresWriteCommitLog(cfs);</span>
+<span class="nc" id="L204">        ColumnFilter filter = ColumnFilter.all(cfs.metadata());</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        for (SSTableReader reader : readers)</span>
+        {
+<span class="nc" id="L207">            Keyspace ks = Keyspace.open(reader.getKeyspaceName());</span>
+            // When doing mutation-based repair we split each partition into smaller batches
+            // ({@link Stream MAX_ROWS_PER_BATCH}) to avoid OOMing and generating heap pressure
+<span class="nc" id="L210">            try (ISSTableScanner scanner = reader.getScanner();</span>
+<span class="nc" id="L211">                 CloseableIterator&lt;UnfilteredRowIterator&gt; throttledPartitions = ThrottledUnfilteredIterator.throttle(scanner, MAX_ROWS_PER_BATCH))</span>
+            {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">                while (throttledPartitions.hasNext())</span>
+                {
+                    // MV *can* be applied unsafe if there's no CDC on the CFS as we flush
+                    // before transaction is done.
+                    //
+                    // If the CFS has CDC, however, these updates need to be written to the CommitLog
+                    // so they get archived into the cdc_raw folder
+<span class="nc" id="L220">                    ks.apply(new Mutation(PartitionUpdate.fromIterator(throttledPartitions.next(), filter)),</span>
+                             writeCDCCommitLog,
+                             true,
+                             false);
+                }
+            }
+<span class="nc" id="L226">        }</span>
+<span class="nc" id="L227">    }</span>
+
+    public synchronized void finishTransaction()
+    {
+<span class="nc" id="L231">        txn.finish();</span>
+<span class="nc" id="L232">    }</span>
+
+    @Override
+    public void finished()
+    {
+<span class="nc" id="L237">        boolean requiresWritePath = requiresWritePath(cfs);</span>
+<span class="nc" id="L238">        Collection&lt;SSTableReader&gt; readers = sstables;</span>
+
+<span class="nc" id="L240">        try (Refs&lt;SSTableReader&gt; refs = Refs.ref(readers))</span>
+        {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (requiresWritePath)</span>
+            {
+<span class="nc" id="L244">                sendThroughWritePath(cfs, readers);</span>
+            }
+            else
+            {
+                // Validate SSTable-attached indexes that should have streamed in an already complete state. When we
+                // don't stream the entire SSTable, validation is unnecessary, as the indexes have just been written
+                // via the SSTable flush observer, and an error there would have aborted the streaming transaction.
+<span class="nc bnc" id="L251" title="All 2 branches missed.">                if (receivedEntireSSTable)</span>
+                    // If we do validate, any exception thrown doing so will also abort the streaming transaction:
+<span class="nc" id="L253">                    cfs.indexManager.validateSSTableAttachedIndexes(readers, true);</span>
+
+<span class="nc" id="L255">                finishTransaction();</span>
+
+                // add sstables (this will build non-SSTable-attached secondary indexes too, see CASSANDRA-10130)
+<span class="nc" id="L258">                logger.debug(&quot;[Stream #{}] Received {} sstables from {} ({})&quot;, session.planId(), readers.size(), session.peer, readers);</span>
+<span class="nc" id="L259">                cfs.addSSTables(readers);</span>
+
+                //invalidate row and counter cache
+<span class="nc bnc" id="L262" title="All 4 branches missed.">                if (cfs.isRowCacheEnabled() || cfs.metadata().isCounter())</span>
+                {
+<span class="nc" id="L264">                    List&lt;Bounds&lt;Token&gt;&gt; boundsToInvalidate = new ArrayList&lt;&gt;(readers.size());</span>
+<span class="nc" id="L265">                    readers.forEach(sstable -&gt; boundsToInvalidate.add(new Bounds&lt;Token&gt;(sstable.getFirst().getToken(), sstable.getLast().getToken())));</span>
+<span class="nc" id="L266">                    Set&lt;Bounds&lt;Token&gt;&gt; nonOverlappingBounds = Bounds.getNonOverlappingBounds(boundsToInvalidate);</span>
+
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                    if (cfs.isRowCacheEnabled())</span>
+                    {
+<span class="nc" id="L270">                        int invalidatedKeys = cfs.invalidateRowCache(nonOverlappingBounds);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">                        if (invalidatedKeys &gt; 0)</span>
+<span class="nc" id="L272">                            logger.debug(&quot;[Stream #{}] Invalidated {} row cache entries on table {}.{} after stream &quot; +</span>
+<span class="nc" id="L273">                                         &quot;receive task completed.&quot;, session.planId(), invalidatedKeys,</span>
+<span class="nc" id="L274">                                         cfs.getKeyspaceName(), cfs.getTableName());</span>
+                    }
+
+<span class="nc bnc" id="L277" title="All 2 branches missed.">                    if (cfs.metadata().isCounter())</span>
+                    {
+<span class="nc" id="L279">                        int invalidatedKeys = cfs.invalidateCounterCache(nonOverlappingBounds);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                        if (invalidatedKeys &gt; 0)</span>
+<span class="nc" id="L281">                            logger.debug(&quot;[Stream #{}] Invalidated {} counter cache entries on table {}.{} after stream &quot; +</span>
+<span class="nc" id="L282">                                         &quot;receive task completed.&quot;, session.planId(), invalidatedKeys,</span>
+<span class="nc" id="L283">                                         cfs.getKeyspaceName(), cfs.getTableName());</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L288">    }</span>
+
+    @Override
+    public void cleanup()
+    {
+        // We don't keep the streamed sstables since we've applied them manually so we abort the txn and delete
+        // the streamed sstables.
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (requiresWritePath)</span>
+        {
+<span class="nc" id="L297">            cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.STREAMS_RECEIVED);</span>
+<span class="nc" id="L298">            abort();</span>
+        }
+<span class="nc" id="L300">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

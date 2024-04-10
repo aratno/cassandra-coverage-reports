@@ -1,0 +1,480 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosPropose.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos</a> &gt; <span class="el_source">PaxosPropose.java</span></div><h1>PaxosPropose.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos;
+
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.paxos.Commit.Proposal;
+import org.apache.cassandra.utils.concurrent.ConditionAsConsumer;
+
+import static java.util.Collections.emptyMap;
+import static org.apache.cassandra.exceptions.RequestFailureReason.UNKNOWN;
+import static org.apache.cassandra.net.Verb.PAXOS2_PROPOSE_REQ;
+import static org.apache.cassandra.service.paxos.PaxosPropose.Superseded.SideEffects.NO;
+import static org.apache.cassandra.service.paxos.PaxosPropose.Superseded.SideEffects.MAYBE;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.concurrent.ConditionAsConsumer.newConditionAsConsumer;
+
+/**
+ * In waitForNoSideEffect mode, we will not return failure to the caller until
+ * we have received a complete set of refusal responses, or at least one accept,
+ * indicating (respectively) that we have had no side effect, or that we cannot
+ * know if we our proposal produced a side effect.
+ */
+public class PaxosPropose&lt;OnDone extends Consumer&lt;? super PaxosPropose.Status&gt;&gt; extends PaxosRequestCallback&lt;PaxosPropose.Response&gt;
+{
+<span class="fc" id="L59">    private static final Logger logger = LoggerFactory.getLogger(PaxosPropose.class);</span>
+
+<span class="fc" id="L61">    public static final RequestHandler requestHandler = new RequestHandler();</span>
+<span class="fc" id="L62">    public static final RequestSerializer requestSerializer = new RequestSerializer();</span>
+<span class="fc" id="L63">    public static final ResponseSerializer responseSerializer = new ResponseSerializer();</span>
+
+    /**
+     * Represents the current status of a propose action: it is a status rather than a result,
+     * as the result may be unknown without sufficient responses (though in most cases it is final status).
+     */
+    static class Status
+    {
+<span class="fc" id="L71">        enum Outcome { SUCCESS, SUPERSEDED, MAYBE_FAILURE }</span>
+        final Outcome outcome;
+
+        Status(Outcome outcome)
+<span class="fc" id="L75">        {</span>
+<span class="fc" id="L76">            this.outcome = outcome;</span>
+<span class="fc" id="L77">        }</span>
+<span class="fc" id="L78">        Superseded superseded() { return (Superseded) this; }</span>
+<span class="fc" id="L79">        Paxos.MaybeFailure maybeFailure() { return ((MaybeFailure) this).info; }</span>
+<span class="nc" id="L80">        public String toString() { return &quot;Success&quot;; }</span>
+    }
+
+    static class Superseded extends Status
+    {
+<span class="fc" id="L85">        enum SideEffects { NO, MAYBE }</span>
+        final Ballot by;
+        final SideEffects hadSideEffects;
+        Superseded(Ballot by, SideEffects hadSideEffects)
+        {
+<span class="fc" id="L90">            super(Outcome.SUPERSEDED);</span>
+<span class="fc" id="L91">            this.by = by;</span>
+<span class="fc" id="L92">            this.hadSideEffects = hadSideEffects;</span>
+<span class="fc" id="L93">        }</span>
+
+<span class="nc" id="L95">        public String toString() { return &quot;Superseded(&quot; + by + ',' + hadSideEffects + ')'; }</span>
+    }
+
+    private static class MaybeFailure extends Status
+    {
+        final Paxos.MaybeFailure info;
+        MaybeFailure(Paxos.MaybeFailure info)
+        {
+<span class="fc" id="L103">            super(Outcome.MAYBE_FAILURE);</span>
+<span class="fc" id="L104">            this.info = info;</span>
+<span class="fc" id="L105">        }</span>
+
+<span class="nc" id="L107">        public String toString() { return info.toString(); }</span>
+    }
+
+<span class="fc" id="L110">    private static final Status success = new Status(Status.Outcome.SUCCESS);</span>
+
+<span class="fc" id="L112">    private static final AtomicLongFieldUpdater&lt;PaxosPropose&gt; responsesUpdater = AtomicLongFieldUpdater.newUpdater(PaxosPropose.class, &quot;responses&quot;);</span>
+<span class="fc" id="L113">    private static final AtomicReferenceFieldUpdater&lt;PaxosPropose, Ballot&gt; supersededByUpdater = AtomicReferenceFieldUpdater.newUpdater(PaxosPropose.class, Ballot.class, &quot;supersededBy&quot;);</span>
+
+    @VisibleForTesting public static final long ACCEPT_INCREMENT = 1;
+    private static final int  REFUSAL_SHIFT = 21;
+    @VisibleForTesting public static final long REFUSAL_INCREMENT = 1L &lt;&lt; REFUSAL_SHIFT;
+    private static final int  FAILURE_SHIFT = 42;
+    @VisibleForTesting public static final long FAILURE_INCREMENT = 1L &lt;&lt; FAILURE_SHIFT;
+    private static final long MASK = (1L &lt;&lt; REFUSAL_SHIFT) - 1L;
+
+    private final Proposal proposal;
+    /** Wait until we know if we may have had side effects */
+    private final boolean waitForNoSideEffect;
+    /** Number of contacted nodes */
+    final int participants;
+    /** Number of accepts required */
+    final int required;
+    /** Invoke on reaching a terminal status */
+    final OnDone onDone;
+
+    /**
+     * bit 0-20:  accepts
+     * bit 21-41: refusals/errors
+     * bit 42-62: timeouts
+     * bit 63:    ambiguous signal bit (i.e. those states that cannot be certain to signal uniquely flip this bit to take signal responsibility)
+     *
+     * {@link #accepts}
+     * {@link #refusals}
+     * {@link #failures}
+     * {@link #notAccepts} (timeouts/errors+refusals)
+     */
+    private volatile long responses;
+
+    /** The newest superseding ballot from a refusal; only returned to the caller if we fail to reach a quorum */
+    private volatile Ballot supersededBy;
+
+    private PaxosPropose(Proposal proposal, int participants, int required, boolean waitForNoSideEffect, OnDone onDone)
+<span class="fc" id="L149">    {</span>
+<span class="fc" id="L150">        this.proposal = proposal;</span>
+<span class="pc bpc" id="L151" title="1 of 2 branches missed.">        assert required &gt; 0;</span>
+<span class="fc" id="L152">        this.waitForNoSideEffect = waitForNoSideEffect;</span>
+<span class="fc" id="L153">        this.participants = participants;</span>
+<span class="fc" id="L154">        this.required = required;</span>
+<span class="fc" id="L155">        this.onDone = onDone;</span>
+<span class="fc" id="L156">    }</span>
+
+    /**
+     * Submit the proposal for commit with all replicas, and return an object that can be waited on synchronously for the result,
+     * or for the present status if the time elapses without a final result being reached.
+     * @param waitForNoSideEffect if true, on failure we will wait until we can say with certainty there are no side effects
+     *                            or until we know we will never be able to determine this with certainty
+     */
+    static Paxos.Async&lt;Status&gt; propose(Proposal proposal, Paxos.Participants participants, boolean waitForNoSideEffect)
+    {
+<span class="pc bpc" id="L166" title="1 of 4 branches missed.">        if (waitForNoSideEffect &amp;&amp; proposal.update.isEmpty())</span>
+<span class="nc" id="L167">            waitForNoSideEffect = false; // by definition this has no &quot;side effects&quot; (besides linearizing the operation)</span>
+
+        // to avoid unnecessary object allocations we extend PaxosPropose to implements Paxos.Async
+        class Async extends PaxosPropose&lt;ConditionAsConsumer&lt;Status&gt;&gt; implements Paxos.Async&lt;Status&gt;
+        {
+            private Async(Proposal proposal, int participants, int required, boolean waitForNoSideEffect)
+            {
+<span class="fc" id="L174">                super(proposal, participants, required, waitForNoSideEffect, newConditionAsConsumer());</span>
+<span class="fc" id="L175">            }</span>
+
+            public Status awaitUntil(long deadline)
+            {
+                try
+                {
+<span class="fc" id="L181">                    onDone.awaitUntil(deadline);</span>
+                }
+<span class="nc" id="L183">                catch (InterruptedException e)</span>
+                {
+<span class="nc" id="L185">                    Thread.currentThread().interrupt();</span>
+<span class="nc" id="L186">                    return new MaybeFailure(new Paxos.MaybeFailure(true, participants, required, 0, emptyMap()));</span>
+<span class="fc" id="L187">                }</span>
+
+<span class="fc" id="L189">                return status();</span>
+            }
+        }
+
+<span class="fc" id="L193">        Async propose = new Async(proposal, participants.sizeOfPoll(), participants.sizeOfConsensusQuorum, waitForNoSideEffect);</span>
+<span class="fc" id="L194">        propose.start(participants);</span>
+<span class="fc" id="L195">        return propose;</span>
+    }
+
+    static &lt;T extends Consumer&lt;Status&gt;&gt; T propose(Proposal proposal, Paxos.Participants participants, boolean waitForNoSideEffect, T onDone)
+    {
+<span class="pc bpc" id="L200" title="3 of 4 branches missed.">        if (waitForNoSideEffect &amp;&amp; proposal.update.isEmpty())</span>
+<span class="nc" id="L201">            waitForNoSideEffect = false; // by definition this has no &quot;side effects&quot; (besides linearizing the operation)</span>
+
+<span class="fc" id="L203">        PaxosPropose&lt;?&gt; propose = new PaxosPropose&lt;&gt;(proposal, participants.sizeOfPoll(), participants.sizeOfConsensusQuorum, waitForNoSideEffect, onDone);</span>
+<span class="fc" id="L204">        propose.start(participants);</span>
+<span class="fc" id="L205">        return onDone;</span>
+    }
+
+    void start(Paxos.Participants participants)
+    {
+<span class="fc" id="L210">        Message&lt;Request&gt; message = Message.out(PAXOS2_PROPOSE_REQ, new Request(proposal));</span>
+
+<span class="fc" id="L212">        boolean executeOnSelf = false;</span>
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        for (int i = 0, size = participants.sizeOfPoll(); i &lt; size ; ++i)</span>
+        {
+<span class="fc" id="L215">            InetAddressAndPort destination = participants.voter(i);</span>
+<span class="fc" id="L216">            logger.trace(&quot;{} to {}&quot;, proposal, destination);</span>
+<span class="fc bfc" id="L217" title="All 2 branches covered.">            if (shouldExecuteOnSelf(destination)) executeOnSelf = true;</span>
+<span class="fc" id="L218">            else MessagingService.instance().sendWithCallback(message, destination, this);</span>
+        }
+
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        if (executeOnSelf)</span>
+<span class="fc" id="L222">            PAXOS2_PROPOSE_REQ.stage.execute(() -&gt; executeOnSelf(proposal));</span>
+<span class="fc" id="L223">    }</span>
+
+    /**
+     * @return the result as of now; unless the result is definitive, it is only a snapshot of the present incomplete status
+     */
+    Status status()
+    {
+<span class="fc" id="L230">        long responses = this.responses;</span>
+
+<span class="fc bfc" id="L232" title="All 2 branches covered.">        if (isSuccessful(responses))</span>
+<span class="fc" id="L233">            return success;</span>
+
+<span class="fc bfc" id="L235" title="All 4 branches covered.">        if (!canSucceed(responses) &amp;&amp; supersededBy != null)</span>
+        {
+<span class="fc bfc" id="L237" title="All 2 branches covered.">            Superseded.SideEffects sideEffects = hasNoSideEffects(responses) ? NO : MAYBE;</span>
+<span class="fc" id="L238">            return new Superseded(supersededBy, sideEffects);</span>
+        }
+
+<span class="fc" id="L241">        return new MaybeFailure(new Paxos.MaybeFailure(participants, required, accepts(responses), failureReasonsAsMap()));</span>
+    }
+
+    private void executeOnSelf(Proposal proposal)
+    {
+<span class="fc" id="L246">        executeOnSelf(proposal, RequestHandler::execute);</span>
+<span class="fc" id="L247">    }</span>
+
+    public void onResponse(Response response, InetAddressAndPort from)
+    {
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L252">            logger.trace(&quot;{} for {} from {}&quot;, response, proposal, from);</span>
+
+<span class="fc" id="L254">        Ballot supersededBy = response.supersededBy;</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">        if (supersededBy != null)</span>
+<span class="fc bfc" id="L256" title="All 4 branches covered.">            supersededByUpdater.accumulateAndGet(this, supersededBy, (a, b) -&gt; a == null ? b : b.uuidTimestamp() &gt; a.uuidTimestamp() ? b : a);</span>
+
+<span class="fc bfc" id="L258" title="All 2 branches covered.">        long increment = supersededBy == null</span>
+<span class="fc" id="L259">                ? ACCEPT_INCREMENT</span>
+<span class="fc" id="L260">                : REFUSAL_INCREMENT;</span>
+
+<span class="fc" id="L262">        update(increment);</span>
+<span class="fc" id="L263">    }</span>
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L269">            logger.trace(&quot;{} {} failure from {}&quot;, proposal, reason, from);</span>
+
+<span class="fc" id="L271">        super.onFailure(from, reason);</span>
+<span class="fc" id="L272">        update(FAILURE_INCREMENT);</span>
+<span class="fc" id="L273">    }</span>
+
+    private void update(long increment)
+    {
+<span class="fc" id="L277">        long responses = responsesUpdater.addAndGet(this, increment);</span>
+<span class="fc bfc" id="L278" title="All 2 branches covered.">        if (shouldSignal(responses))</span>
+<span class="fc" id="L279">            signalDone();</span>
+<span class="fc" id="L280">    }</span>
+
+    // returns true at most once for a given PaxosPropose, so we do not propagate a signal more than once
+    private boolean shouldSignal(long responses)
+    {
+<span class="fc" id="L285">        return shouldSignal(responses, required, participants, waitForNoSideEffect, responsesUpdater, this);</span>
+    }
+
+    @VisibleForTesting
+    public static &lt;T&gt; boolean shouldSignal(long responses, int required, int participants, boolean waitForNoSideEffect, AtomicLongFieldUpdater&lt;T&gt; responsesUpdater, T update)
+    {
+<span class="fc bfc" id="L291" title="All 2 branches covered.">        if (responses &lt;= 0L) // already signalled via ambiguous signal bit</span>
+<span class="fc" id="L292">            return false;</span>
+
+<span class="fc bfc" id="L294" title="All 2 branches covered.">        if (!isSuccessful(responses, required))</span>
+        {
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            if (canSucceed(responses, required, participants))</span>
+<span class="fc" id="L297">                return false;</span>
+
+<span class="fc bfc" id="L299" title="All 4 branches covered.">            if (waitForNoSideEffect &amp;&amp; !hasPossibleSideEffects(responses))</span>
+<span class="fc" id="L300">                return hasNoSideEffects(responses, participants);</span>
+        }
+
+<span class="fc bfc" id="L303" title="All 2 branches covered.">        return responsesUpdater.getAndUpdate(update, x -&gt; x | Long.MIN_VALUE) &gt;= 0L;</span>
+    }
+
+    private void signalDone()
+    {
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">        if (onDone != null)</span>
+<span class="fc" id="L309">            onDone.accept(status());</span>
+<span class="fc" id="L310">    }</span>
+
+    private boolean isSuccessful(long responses)
+    {
+<span class="fc" id="L314">        return isSuccessful(responses, required);</span>
+    }
+
+    private static boolean isSuccessful(long responses, int required)
+    {
+<span class="fc bfc" id="L319" title="All 2 branches covered.">        return accepts(responses) &gt;= required;</span>
+    }
+
+    private boolean canSucceed(long responses)
+    {
+<span class="fc" id="L324">        return canSucceed(responses, required, participants);</span>
+    }
+
+    private static boolean canSucceed(long responses, int required, int participants)
+    {
+<span class="fc bfc" id="L329" title="All 4 branches covered.">        return refusals(responses) == 0 &amp;&amp; required &lt;= participants - failures(responses);</span>
+    }
+
+    // Note: this is only reliable if !failFast
+    private boolean hasNoSideEffects(long responses)
+    {
+<span class="fc" id="L335">        return hasNoSideEffects(responses, participants);</span>
+    }
+
+    private static boolean hasNoSideEffects(long responses, int participants)
+    {
+<span class="fc bfc" id="L340" title="All 2 branches covered.">        return refusals(responses) == participants;</span>
+    }
+
+    private static boolean hasPossibleSideEffects(long responses)
+    {
+<span class="fc bfc" id="L345" title="All 2 branches covered.">        return accepts(responses) + failures(responses) &gt; 0;</span>
+    }
+
+    /** {@link #responses} */
+    private static int accepts(long responses)
+    {
+<span class="fc" id="L351">        return (int) (responses &amp; MASK);</span>
+    }
+
+    /** {@link #responses} */
+    private static int notAccepts(long responses)
+    {
+<span class="nc" id="L357">        return failures(responses) + refusals(responses);</span>
+    }
+
+    /** {@link #responses} */
+    private static int refusals(long responses)
+    {
+<span class="fc" id="L363">        return (int) ((responses &gt;&gt;&gt; REFUSAL_SHIFT) &amp; MASK);</span>
+    }
+
+    /** {@link #responses} */
+    private static int failures(long responses)
+    {
+<span class="fc" id="L369">        return (int) ((responses &gt;&gt;&gt; FAILURE_SHIFT) &amp; MASK);</span>
+    }
+
+    /**
+     * A Proposal to submit to another node
+     */
+    static class Request
+    {
+        final Proposal proposal;
+        Request(Proposal proposal)
+<span class="fc" id="L379">        {</span>
+<span class="fc" id="L380">            this.proposal = proposal;</span>
+<span class="fc" id="L381">        }</span>
+
+        public String toString()
+        {
+<span class="nc" id="L385">            return proposal.toString(&quot;Propose&quot;);</span>
+        }
+    }
+
+    /**
+     * The response to a proposal, indicating success (if {@code supersededBy == null},
+     * or failure, alongside the ballot that beat us
+     */
+    static class Response
+    {
+        final Ballot supersededBy;
+        Response(Ballot supersededBy)
+<span class="fc" id="L397">        {</span>
+<span class="fc" id="L398">            this.supersededBy = supersededBy;</span>
+<span class="fc" id="L399">        }</span>
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        public String toString() { return supersededBy == null ? &quot;Accept&quot; : &quot;RejectProposal(supersededBy=&quot; + supersededBy + ')'; }</span>
+    }
+
+    /**
+     * The proposal request handler, i.e. receives a proposal from a peer and responds with either acccept/reject
+     */
+<span class="fc" id="L406">    public static class RequestHandler implements IVerbHandler&lt;Request&gt;</span>
+    {
+        @Override
+        public void doVerb(Message&lt;Request&gt; message)
+        {
+<span class="fc" id="L411">            Response response = execute(message.payload.proposal, message.from());</span>
+<span class="pc bpc" id="L412" title="1 of 2 branches missed.">            if (response == null)</span>
+<span class="nc" id="L413">                MessagingService.instance().respondWithFailure(UNKNOWN, message);</span>
+            else
+<span class="fc" id="L415">                MessagingService.instance().respond(response, message);</span>
+<span class="fc" id="L416">        }</span>
+
+        public static Response execute(Proposal proposal, InetAddressAndPort from)
+        {
+<span class="pc bpc" id="L420" title="1 of 2 branches missed.">            if (!Paxos.isInRangeAndShouldProcess(from, proposal.update.partitionKey(), proposal.update.metadata(), false))</span>
+<span class="nc" id="L421">                return null;</span>
+
+<span class="fc" id="L423">            long start = nanoTime();</span>
+<span class="fc" id="L424">            try (PaxosState state = PaxosState.get(proposal))</span>
+            {
+<span class="fc" id="L426">                return new Response(state.acceptIfLatest(proposal));</span>
+            }
+            finally
+            {
+<span class="fc" id="L430">                Keyspace.openAndGetStore(proposal.update.metadata()).metric.casPropose.addNano(nanoTime() - start);</span>
+            }
+        }
+    }
+
+<span class="fc" id="L435">    public static class RequestSerializer implements IVersionedSerializer&lt;Request&gt;</span>
+    {
+        @Override
+        public void serialize(Request request, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L440">            Proposal.serializer.serialize(request.proposal, out, version);</span>
+<span class="fc" id="L441">        }</span>
+
+        @Override
+        public Request deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L446">            Proposal propose = Proposal.serializer.deserialize(in, version);</span>
+<span class="fc" id="L447">            return new Request(propose);</span>
+        }
+
+        @Override
+        public long serializedSize(Request request, int version)
+        {
+<span class="fc" id="L453">            return Proposal.serializer.serializedSize(request.proposal, version);</span>
+        }
+    }
+
+<span class="fc" id="L457">    public static class ResponseSerializer implements IVersionedSerializer&lt;Response&gt;</span>
+    {
+        public void serialize(Response response, DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc bfc" id="L461" title="All 2 branches covered.">            out.writeBoolean(response.supersededBy != null);</span>
+<span class="fc bfc" id="L462" title="All 2 branches covered.">            if (response.supersededBy != null)</span>
+<span class="fc" id="L463">                response.supersededBy.serialize(out);</span>
+<span class="fc" id="L464">        }</span>
+
+        public Response deserialize(DataInputPlus in, int version) throws IOException
+        {
+<span class="fc" id="L468">            boolean isSuperseded = in.readBoolean();</span>
+<span class="fc bfc" id="L469" title="All 2 branches covered.">            return isSuperseded ? new Response(Ballot.deserialize(in)) : new Response(null);</span>
+        }
+
+        public long serializedSize(Response response, int version)
+        {
+<span class="fc bfc" id="L474" title="All 2 branches covered.">            return response.supersededBy != null</span>
+<span class="fc" id="L475">                    ? TypeSizes.sizeof(true) + Ballot.sizeInBytes()</span>
+<span class="fc" id="L476">                    : TypeSizes.sizeof(false);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

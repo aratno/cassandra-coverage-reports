@@ -1,0 +1,465 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Sets.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.cql3</a> &gt; <span class="el_source">Sets.java</span></div><h1>Sets.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.cql3;
+
+import static org.apache.cassandra.cql3.Constants.UNSET_VALUE;
+
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.serializers.CollectionSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+/**
+ * Static helper methods and classes for sets.
+ */
+public abstract class Sets
+{
+    private Sets() {}
+
+    public static ColumnSpecification valueSpecOf(ColumnSpecification column)
+    {
+        return new ColumnSpecification(column.ksName, column.cfName, new ColumnIdentifier(&quot;value(&quot; + column.name + &quot;)&quot;, true), elementsType(column.type));
+    }
+
+    private static AbstractType&lt;?&gt; unwrap(AbstractType&lt;?&gt; type)
+    {
+        return type.isReversed() ? unwrap(((ReversedType&lt;?&gt;) type).baseType) : type;
+    }
+
+    private static AbstractType&lt;?&gt; elementsType(AbstractType&lt;?&gt; type)
+    {
+        return ((SetType&lt;?&gt;) unwrap(type)).getElementsType();
+    }
+
+    /**
+     * Tests that the set with the specified elements can be assigned to the specified column.
+     *
+     * @param receiver the receiving column
+     * @param elements the set elements
+     */
+    public static AssignmentTestable.TestResult testSetAssignment(ColumnSpecification receiver,
+                                                                  List&lt;? extends AssignmentTestable&gt; elements)
+    {
+        if (!(receiver.type instanceof SetType))
+        {
+            // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
+            if (receiver.type instanceof MapType &amp;&amp; elements.isEmpty())
+                return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+        }
+
+        // If there is no elements, we can't say it's an exact match (an empty set if fundamentally polymorphic).
+        if (elements.isEmpty())
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+        ColumnSpecification valueSpec = valueSpecOf(receiver);
+        return AssignmentTestable.TestResult.testAll(receiver.ksName, valueSpec, elements);
+    }
+
+    /**
+     * Create a &lt;code&gt;String&lt;/code&gt; representation of the set containing the specified elements.
+     *
+     * @param elements the set elements
+     * @return a &lt;code&gt;String&lt;/code&gt; representation of the set
+     */
+    public static String setToString(List&lt;?&gt; elements)
+    {
+        return setToString(elements, Object::toString);
+    }
+
+    /**
+     * Create a &lt;code&gt;String&lt;/code&gt; representation of the set from the specified items associated to
+     * the set elements.
+     *
+     * @param items items associated to the set elements
+     * @param mapper the mapper used to map the items to the &lt;code&gt;String&lt;/code&gt; representation of the set elements
+     * @return a &lt;code&gt;String&lt;/code&gt; representation of the set
+     */
+    public static &lt;T&gt; String setToString(Iterable&lt;T&gt; items, java.util.function.Function&lt;T, String&gt; mapper)
+    {
+        return StreamSupport.stream(items.spliterator(), false)
+                            .map(mapper)
+                            .collect(Collectors.joining(&quot;, &quot;, &quot;{&quot;, &quot;}&quot;));
+    }
+
+    /**
+     * Returns the exact SetType from the items if it can be known.
+     *
+     * @param items the items mapped to the set elements
+     * @param mapper the mapper used to retrieve the element types from the items
+     * @return the exact SetType from the items if it can be known or &lt;code&gt;null&lt;/code&gt;
+     */
+    public static &lt;T&gt; SetType&lt;?&gt; getExactSetTypeIfKnown(List&lt;T&gt; items,
+                                                        java.util.function.Function&lt;T, AbstractType&lt;?&gt;&gt; mapper)
+    {
+        Optional&lt;AbstractType&lt;?&gt;&gt; type = items.stream().map(mapper).filter(Objects::nonNull).findFirst();
+        return type.isPresent() ? SetType.getInstance(type.get(), false) : null;
+    }
+
+    public static &lt;T&gt; SetType&lt;?&gt; getPreferredCompatibleType(List&lt;T&gt; items,
+                                                            java.util.function.Function&lt;T, AbstractType&lt;?&gt;&gt; mapper)
+    {
+        Set&lt;AbstractType&lt;?&gt;&gt; types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        AbstractType&lt;?&gt; type = AssignmentTestable.getCompatibleTypeIfKnown(types);
+        return type == null ? null : SetType.getInstance(type, false);
+    }
+
+    public static class Literal extends Term.Raw
+    {
+        private final List&lt;Term.Raw&gt; elements;
+
+        public Literal(List&lt;Term.Raw&gt; elements)
+<span class="nc" id="L154">        {</span>
+<span class="nc" id="L155">            this.elements = elements;</span>
+<span class="nc" id="L156">        }</span>
+
+        public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+<span class="nc" id="L160">            validateAssignableTo(keyspace, receiver);</span>
+
+            // We've parsed empty maps as a set literal to break the ambiguity so
+            // handle that case now
+<span class="nc bnc" id="L164" title="All 4 branches missed.">            if (receiver.type instanceof MapType &amp;&amp; elements.isEmpty())</span>
+<span class="nc" id="L165">                return new Maps.Value(Collections.emptySortedMap());</span>
+
+<span class="nc" id="L167">            ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);</span>
+<span class="nc" id="L168">            Set&lt;Term&gt; values = new HashSet&lt;&gt;(elements.size());</span>
+<span class="nc" id="L169">            boolean allTerminal = true;</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            for (Term.Raw rt : elements)</span>
+            {
+<span class="nc" id="L172">                Term t = rt.prepare(keyspace, valueSpec);</span>
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                if (t.containsBindMarker())</span>
+<span class="nc" id="L175">                    throw new InvalidRequestException(String.format(&quot;Invalid set literal for %s: bind variables are not supported inside collection literals&quot;, receiver.name));</span>
+
+<span class="nc bnc" id="L177" title="All 2 branches missed.">                if (t instanceof Term.NonTerminal)</span>
+<span class="nc" id="L178">                    allTerminal = false;</span>
+
+<span class="nc" id="L180">                values.add(t);</span>
+<span class="nc" id="L181">            }</span>
+<span class="nc" id="L182">            DelayedValue value = new DelayedValue(elementsType(receiver.type), values);</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            return allTerminal ? value.bind(QueryOptions.DEFAULT) : value;</span>
+        }
+
+        private void validateAssignableTo(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
+        {
+<span class="nc" id="L188">            AbstractType&lt;?&gt; type = unwrap(receiver.type);</span>
+
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if (!(type instanceof SetType))</span>
+            {
+                // We've parsed empty maps as a set literal to break the ambiguity so
+                // handle that case now
+<span class="nc bnc" id="L194" title="All 4 branches missed.">                if ((type instanceof MapType) &amp;&amp; elements.isEmpty())</span>
+<span class="nc" id="L195">                    return;</span>
+
+<span class="nc" id="L197">                throw new InvalidRequestException(String.format(&quot;Invalid set literal for %s of type %s&quot;, receiver.name, receiver.type.asCQL3Type()));</span>
+            }
+
+<span class="nc" id="L200">            ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            for (Term.Raw rt : elements)</span>
+            {
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                if (!rt.testAssignment(keyspace, valueSpec).isAssignable())</span>
+<span class="nc" id="L204">                    throw new InvalidRequestException(String.format(&quot;Invalid set literal for %s: value %s is not of type %s&quot;, receiver.name, rt, valueSpec.type.asCQL3Type()));</span>
+<span class="nc" id="L205">            }</span>
+<span class="nc" id="L206">        }</span>
+
+        public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+        {
+<span class="nc" id="L210">            return testSetAssignment(receiver, elements);</span>
+        }
+
+        @Override
+        public AbstractType&lt;?&gt; getExactTypeIfKnown(String keyspace)
+        {
+<span class="nc" id="L216">            return getExactSetTypeIfKnown(elements, p -&gt; p.getExactTypeIfKnown(keyspace));</span>
+        }
+
+        @Override
+        public AbstractType&lt;?&gt; getCompatibleTypeIfKnown(String keyspace)
+        {
+<span class="nc" id="L222">            return Sets.getPreferredCompatibleType(elements, p -&gt; p.getCompatibleTypeIfKnown(keyspace));</span>
+        }
+
+        public String getText()
+        {
+<span class="nc" id="L227">            return setToString(elements, Term.Raw::getText);</span>
+        }
+    }
+
+    public static class Value extends Term.Terminal
+    {
+        public final SortedSet&lt;ByteBuffer&gt; elements;
+
+        public Value(SortedSet&lt;ByteBuffer&gt; elements)
+        {
+            this.elements = elements;
+        }
+
+        public static &lt;T&gt; Value fromSerialized(ByteBuffer value, SetType&lt;T&gt; type) throws InvalidRequestException
+        {
+            try
+            {
+                // Collections have this small hack that validate cannot be called on a serialized object,
+                // but compose does the validation (so we're fine).
+                Set&lt;T&gt; s = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
+                SortedSet&lt;ByteBuffer&gt; elements = new TreeSet&lt;&gt;(type.getElementsType());
+                for (T element : s)
+                    elements.add(type.getElementsType().decomposeUntyped(element));
+                return new Value(elements);
+            }
+            catch (MarshalException e)
+            {
+                throw new InvalidRequestException(e.getMessage());
+            }
+        }
+
+        public ByteBuffer get(ProtocolVersion version)
+        {
+            return CollectionSerializer.pack(elements, elements.size());
+        }
+
+        public boolean equals(SetType&lt;?&gt; st, Value v)
+        {
+            if (elements.size() != v.elements.size())
+                return false;
+
+            Iterator&lt;ByteBuffer&gt; thisIter = elements.iterator();
+            Iterator&lt;ByteBuffer&gt; thatIter = v.elements.iterator();
+            AbstractType&lt;?&gt; elementsType = st.getElementsType();
+            while (thisIter.hasNext())
+                if (elementsType.compare(thisIter.next(), thatIter.next()) != 0)
+                    return false;
+
+            return true;
+        }
+    }
+
+    // See Lists.DelayedValue
+    public static class DelayedValue extends Term.NonTerminal
+    {
+        private final Comparator&lt;ByteBuffer&gt; comparator;
+        private final Set&lt;Term&gt; elements;
+
+        public DelayedValue(Comparator&lt;ByteBuffer&gt; comparator, Set&lt;Term&gt; elements)
+        {
+            this.comparator = comparator;
+            this.elements = elements;
+        }
+
+        public boolean containsBindMarker()
+        {
+            // False since we don't support them in collection
+            return false;
+        }
+
+        public void collectMarkerSpecification(VariableSpecifications boundNames)
+        {
+        }
+
+        public Terminal bind(QueryOptions options) throws InvalidRequestException
+        {
+            SortedSet&lt;ByteBuffer&gt; buffers = new TreeSet&lt;&gt;(comparator);
+            for (Term t : elements)
+            {
+                ByteBuffer bytes = t.bindAndGet(options);
+
+                if (bytes == null)
+                    throw new InvalidRequestException(&quot;null is not supported inside collections&quot;);
+                if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                    return UNSET_VALUE;
+
+                buffers.add(bytes);
+            }
+            return new Value(buffers);
+        }
+
+        public void addFunctionsTo(List&lt;Function&gt; functions)
+        {
+            Terms.addFunctions(elements, functions);
+        }
+    }
+
+<span class="nc" id="L324">    public static class Marker extends AbstractMarker</span>
+    {
+        protected Marker(int bindIndex, ColumnSpecification receiver)
+        {
+<span class="nc" id="L328">            super(bindIndex, receiver);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">            assert receiver.type instanceof SetType;</span>
+<span class="nc" id="L330">        }</span>
+
+        public Terminal bind(QueryOptions options) throws InvalidRequestException
+        {
+<span class="nc" id="L334">            ByteBuffer value = options.getValues().get(bindIndex);</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (value == null)</span>
+<span class="nc" id="L336">                return null;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">            if (value == ByteBufferUtil.UNSET_BYTE_BUFFER)</span>
+<span class="nc" id="L338">                return UNSET_VALUE;</span>
+<span class="nc" id="L339">            return Value.fromSerialized(value, (SetType&lt;?&gt;) receiver.type);</span>
+        }
+    }
+
+    public static class Setter extends Operation
+    {
+        public Setter(ColumnMetadata column, Term t)
+        {
+<span class="nc" id="L347">            super(column, t);</span>
+<span class="nc" id="L348">        }</span>
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+<span class="nc" id="L352">            Term.Terminal value = t.bind(params.options);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (value == UNSET_VALUE)</span>
+<span class="nc" id="L354">                return;</span>
+
+            // delete + add
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            if (column.type.isMultiCell())</span>
+<span class="nc" id="L358">                params.setComplexDeletionTimeForOverwrite(column);</span>
+<span class="nc" id="L359">            Adder.doAdd(value, column, params);</span>
+<span class="nc" id="L360">        }</span>
+    }
+
+    public static class Adder extends Operation
+    {
+        public Adder(ColumnMetadata column, Term t)
+        {
+            super(column, t);
+        }
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : &quot;Attempted to add items to a frozen set&quot;;
+            Term.Terminal value = t.bind(params.options);
+            if (value != UNSET_VALUE)
+                doAdd(value, column, params);
+        }
+
+        static void doAdd(Term.Terminal value, ColumnMetadata column, UpdateParameters params) throws InvalidRequestException
+        {
+            if (value == null)
+            {
+                // for frozen sets, we're overwriting the whole cell
+                if (!column.type.isMultiCell())
+                    params.addTombstone(column);
+
+                return;
+            }
+
+            SortedSet&lt;ByteBuffer&gt; elements = ((Value) value).elements;
+
+            if (column.type.isMultiCell())
+            {
+                if (elements.size() == 0)
+                    return;
+
+                // Guardrails about collection size are only checked for the added elements without considering
+                // already existent elements. This is done so to avoid read-before-write, having additional checks
+                // during SSTable write.
+                Guardrails.itemsPerCollection.guard(elements.size(), column.name.toString(), false, params.clientState);
+
+                int dataSize = 0;
+                for (ByteBuffer bb : elements)
+                {
+                    if (bb == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                        continue;
+
+                    Cell&lt;?&gt; cell = params.addCell(column, CellPath.create(bb), ByteBufferUtil.EMPTY_BYTE_BUFFER);
+                    dataSize += cell.dataSize();
+                }
+                Guardrails.collectionSize.guard(dataSize, column.name.toString(), false, params.clientState);
+            }
+            else
+            {
+                Guardrails.itemsPerCollection.guard(elements.size(), column.name.toString(), false, params.clientState);
+                Cell&lt;?&gt; cell = params.addCell(column, value.get(ProtocolVersion.CURRENT));
+                Guardrails.collectionSize.guard(cell.dataSize(), column.name.toString(), false, params.clientState);
+            }
+        }
+    }
+
+    // Note that this is reused for Map subtraction too (we subtract a set from a map)
+    public static class Discarder extends Operation
+    {
+        public Discarder(ColumnMetadata column, Term t)
+        {
+            super(column, t);
+        }
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : &quot;Attempted to remove items from a frozen set&quot;;
+
+            Term.Terminal value = t.bind(params.options);
+            if (value == null || value == UNSET_VALUE)
+                return;
+
+            // This can be either a set or a single element
+            Set&lt;ByteBuffer&gt; toDiscard = value instanceof Sets.Value
+                                      ? ((Sets.Value)value).elements
+                                      : Collections.singleton(value.get(params.options.getProtocolVersion()));
+
+            for (ByteBuffer bb : toDiscard)
+                params.addTombstone(column, CellPath.create(bb));
+        }
+    }
+
+    public static class ElementDiscarder extends Operation
+    {
+        public ElementDiscarder(ColumnMetadata column, Term k)
+        {
+            super(column, k);
+        }
+
+        public void execute(DecoratedKey partitionKey, UpdateParameters params) throws InvalidRequestException
+        {
+            assert column.type.isMultiCell() : &quot;Attempted to delete a single element in a frozen set&quot;;
+            Term.Terminal elt = t.bind(params.options);
+            if (elt == null)
+                throw new InvalidRequestException(&quot;Invalid null set element&quot;);
+
+            params.addTombstone(column, CellPath.create(elt.get(params.options.getProtocolVersion())));
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

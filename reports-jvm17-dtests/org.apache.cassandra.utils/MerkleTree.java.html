@@ -1,0 +1,1654 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MerkleTree.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.utils</a> &gt; <span class="el_source">MerkleTree.java</span></div><h1>MerkleTree.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.utils;
+
+import java.io.DataInput;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.PeekingIterator;
+import com.google.common.primitives.Ints;
+import com.google.common.primitives.Shorts;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.memory.MemoryUtil;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.db.TypeSizes.sizeof;
+import static org.apache.cassandra.utils.ByteBufferUtil.compare;
+import static org.apache.cassandra.utils.MerkleTree.Difference.*;
+
+/**
+ * A MerkleTree implemented as a binary tree.
+ *
+ * A MerkleTree is a full binary tree that represents a perfect binary tree of
+ * depth 'hashdepth'. In a perfect binary tree, each leaf contains a
+ * sequentially hashed range, and each inner node contains the binary hash of
+ * its two children. In the MerkleTree, many ranges will not be split to the
+ * full depth of the perfect binary tree: the leaves of this tree are Leaf objects,
+ * which contain the computed values of the nodes that would be below them if
+ * the tree were perfect.
+ *
+ * The hash values of the inner nodes of the MerkleTree are calculated lazily based
+ * on their children when the hash of a range is requested with hash(range).
+ *
+ * Inputs passed to TreeRange.validate should be calculated using a very secure hash,
+ * because all hashing internal to the tree is accomplished using XOR.
+ *
+ * If two MerkleTrees have the same hashdepth, they represent a perfect tree
+ * of the same depth, and can always be compared, regardless of size or splits.
+ */
+public class MerkleTree
+{
+<span class="fc" id="L74">    private static final Logger logger = LoggerFactory.getLogger(MerkleTree.class);</span>
+
+    private static final int HASH_SIZE = 32; // 2xMM3_128 = 32 bytes.
+<span class="fc" id="L77">    private static final byte[] EMPTY_HASH = new byte[HASH_SIZE];</span>
+
+    /*
+     * Thread-local byte array, large enough to host 32B of digest or MM3/Random partitoners' tokens
+     */
+<span class="fc" id="L82">    private static final ThreadLocal&lt;byte[]&gt; byteArray = ThreadLocal.withInitial(() -&gt; new byte[HASH_SIZE]);</span>
+
+    private static byte[] getTempArray(int minimumSize)
+    {
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">        return minimumSize &lt;= HASH_SIZE ? byteArray.get() : new byte[minimumSize];</span>
+    }
+
+    public static final byte RECOMMENDED_DEPTH = Byte.MAX_VALUE - 1;
+
+    private final int hashdepth;
+
+    /** The top level range that this MerkleTree covers. */
+    final Range&lt;Token&gt; fullRange;
+    private final IPartitioner partitioner;
+
+    private long maxsize;
+    private long size;
+    private Node root;
+
+    /**
+     * @param partitioner The partitioner in use.
+     * @param range the range this tree covers
+     * @param hashdepth The maximum depth of the tree. 100/(2^depth) is the %
+     *        of the key space covered by each subrange of a fully populated tree.
+     * @param maxsize The maximum number of subranges in the tree.
+     */
+    public MerkleTree(IPartitioner partitioner, Range&lt;Token&gt; range, int hashdepth, long maxsize)
+    {
+<span class="fc" id="L110">        this(new OnHeapLeaf(), partitioner, range, hashdepth, maxsize, 1);</span>
+<span class="fc" id="L111">    }</span>
+
+    /**
+     * @param partitioner The partitioner in use.
+     * @param range the range this tree covers
+     * @param hashdepth The maximum depth of the tree. 100/(2^depth) is the %
+     *        of the key space covered by each subrange of a fully populated tree.
+     * @param maxsize The maximum number of subranges in the tree.
+     * @param size The size of the tree. Typically 1, unless deserilized from an existing tree
+     */
+    private MerkleTree(Node root, IPartitioner partitioner, Range&lt;Token&gt; range, int hashdepth, long maxsize, long size)
+<span class="fc" id="L122">    {</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">        assert hashdepth &lt; Byte.MAX_VALUE;</span>
+
+<span class="fc" id="L125">        this.root = root;</span>
+<span class="fc" id="L126">        this.fullRange = Preconditions.checkNotNull(range);</span>
+<span class="fc" id="L127">        this.partitioner = Preconditions.checkNotNull(partitioner);</span>
+<span class="fc" id="L128">        this.hashdepth = hashdepth;</span>
+<span class="fc" id="L129">        this.maxsize = maxsize;</span>
+<span class="fc" id="L130">        this.size = size;</span>
+<span class="fc" id="L131">    }</span>
+
+    /**
+     * Initializes this tree by splitting it until hashdepth is reached,
+     * or until an additional level of splits would violate maxsize.
+     *
+     * NB: Replaces all nodes in the tree, and always builds on the heap
+     */
+    public void init()
+    {
+        // determine the depth to which we can safely split the tree
+<span class="fc" id="L142">        int sizedepth = (int) (Math.log10(maxsize) / Math.log10(2));</span>
+<span class="fc" id="L143">        int depth = Math.min(sizedepth, hashdepth);</span>
+
+<span class="fc" id="L145">        root = initHelper(fullRange.left, fullRange.right, 0, depth);</span>
+<span class="fc" id="L146">        size = (long) Math.pow(2, depth);</span>
+<span class="fc" id="L147">    }</span>
+
+    private OnHeapNode initHelper(Token left, Token right, int depth, int max)
+    {
+<span class="fc bfc" id="L151" title="All 2 branches covered.">        if (depth == max)</span>
+            // we've reached the leaves
+<span class="fc" id="L153">            return new OnHeapLeaf();</span>
+<span class="fc" id="L154">        Token midpoint = partitioner.midpoint(left, right);</span>
+
+<span class="pc bpc" id="L156" title="2 of 4 branches missed.">        if (midpoint.equals(left) || midpoint.equals(right))</span>
+<span class="nc" id="L157">            return new OnHeapLeaf();</span>
+
+<span class="fc" id="L159">        OnHeapNode leftChild = initHelper(left, midpoint, depth + 1, max);</span>
+<span class="fc" id="L160">        OnHeapNode rightChild = initHelper(midpoint, right, depth + 1, max);</span>
+<span class="fc" id="L161">        return new OnHeapInner(midpoint, leftChild, rightChild);</span>
+    }
+
+    public void release()
+    {
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">        if (root instanceof OffHeapNode)</span>
+<span class="fc" id="L167">            ((OffHeapNode) root).release();</span>
+<span class="fc" id="L168">        root = null;</span>
+<span class="fc" id="L169">    }</span>
+
+    public IPartitioner partitioner()
+    {
+<span class="fc" id="L173">        return partitioner;</span>
+    }
+
+    /**
+     * The number of distinct ranges contained in this tree. This is a reasonable
+     * measure of the memory usage of the tree (assuming 'this.order' is significant).
+     */
+    public long size()
+    {
+<span class="fc" id="L182">        return size;</span>
+    }
+
+    public long maxsize()
+    {
+<span class="nc" id="L187">        return maxsize;</span>
+    }
+
+    public void maxsize(long maxsize)
+    {
+<span class="nc" id="L192">        this.maxsize = maxsize;</span>
+<span class="nc" id="L193">    }</span>
+
+    /**
+     * @param ltree First tree.
+     * @param rtree Second tree.
+     * @return A list of the largest contiguous ranges where the given trees disagree.
+     */
+    public static List&lt;TreeRange&gt; difference(MerkleTree ltree, MerkleTree rtree)
+    {
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">        if (!ltree.fullRange.equals(rtree.fullRange))</span>
+<span class="nc" id="L203">            throw new IllegalArgumentException(&quot;Difference only make sense on tree covering the same range (but &quot; + ltree.fullRange + &quot; != &quot; + rtree.fullRange + ')');</span>
+
+        // ensure on-heap trees' inner node hashes have been computed
+<span class="fc" id="L206">        ltree.fillInnerHashes();</span>
+<span class="fc" id="L207">        rtree.fillInnerHashes();</span>
+
+<span class="fc" id="L209">        List&lt;TreeRange&gt; diff = new ArrayList&lt;&gt;();</span>
+<span class="fc" id="L210">        TreeRange active = new TreeRange(ltree.fullRange.left, ltree.fullRange.right, 0);</span>
+
+<span class="fc" id="L212">        Node lnode = ltree.root;</span>
+<span class="fc" id="L213">        Node rnode = rtree.root;</span>
+
+<span class="fc bfc" id="L215" title="All 2 branches covered.">        if (lnode.hashesDiffer(rnode))</span>
+        {
+<span class="fc bfc" id="L217" title="All 4 branches covered.">            if (lnode instanceof Leaf || rnode instanceof Leaf)</span>
+            {
+<span class="fc" id="L219">                logger.trace(&quot;Digest mismatch detected among leaf nodes {}, {}&quot;, lnode, rnode);</span>
+<span class="fc" id="L220">                diff.add(active);</span>
+            }
+            else
+            {
+<span class="fc" id="L224">                logger.trace(&quot;Digest mismatch detected, traversing trees [{}, {}]&quot;, ltree, rtree);</span>
+<span class="fc bfc" id="L225" title="All 2 branches covered.">                if (FULLY_INCONSISTENT == differenceHelper(ltree, rtree, diff, active))</span>
+                {
+<span class="fc" id="L227">                    logger.trace(&quot;Range {} fully inconsistent&quot;, active);</span>
+<span class="fc" id="L228">                    diff.add(active);</span>
+                }
+            }
+        }
+
+<span class="fc" id="L233">        return diff;</span>
+    }
+
+<span class="fc" id="L236">    enum Difference { CONSISTENT, FULLY_INCONSISTENT, PARTIALLY_INCONSISTENT }</span>
+
+    /**
+     * TODO: This function could be optimized into a depth first traversal of the two trees in parallel.
+     *
+     * Takes two trees and a range for which they have hashes, but are inconsistent.
+     * @return FULLY_INCONSISTENT if active is inconsistent, PARTIALLY_INCONSISTENT if only a subrange is inconsistent.
+     */
+    @VisibleForTesting
+    static Difference differenceHelper(MerkleTree ltree, MerkleTree rtree, List&lt;TreeRange&gt; diff, TreeRange active)
+    {
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (active.depth == Byte.MAX_VALUE)</span>
+<span class="nc" id="L248">            return CONSISTENT;</span>
+
+<span class="fc" id="L250">        Token midpoint = ltree.partitioner().midpoint(active.left, active.right);</span>
+        // sanity check for midpoint calculation, see CASSANDRA-13052
+<span class="pc bpc" id="L252" title="2 of 4 branches missed.">        if (midpoint.equals(active.left) || midpoint.equals(active.right))</span>
+        {
+            // If the midpoint equals either the left or the right, we have a range that's too small to split - we'll simply report the
+            // whole range as inconsistent
+<span class="nc" id="L256">            logger.trace(&quot;({}) No sane midpoint ({}) for range {} , marking whole range as inconsistent&quot;, active.depth, midpoint, active);</span>
+<span class="nc" id="L257">            return FULLY_INCONSISTENT;</span>
+        }
+
+<span class="fc" id="L260">        TreeRange left = new TreeRange(active.left, midpoint, active.depth + 1);</span>
+<span class="fc" id="L261">        TreeRange right = new TreeRange(midpoint, active.right, active.depth + 1);</span>
+<span class="fc" id="L262">        logger.trace(&quot;({}) Hashing sub-ranges [{}, {}] for {} divided by midpoint {}&quot;, active.depth, left, right, active, midpoint);</span>
+        Node lnode, rnode;
+
+        // see if we should recurse left
+<span class="fc" id="L266">        lnode = ltree.find(left);</span>
+<span class="fc" id="L267">        rnode = rtree.find(left);</span>
+
+<span class="fc" id="L269">        Difference ldiff = CONSISTENT;</span>
+<span class="fc bfc" id="L270" title="All 6 branches covered.">        if (null != lnode &amp;&amp; null != rnode &amp;&amp; lnode.hashesDiffer(rnode))</span>
+        {
+<span class="fc" id="L272">            logger.trace(&quot;({}) Inconsistent digest on left sub-range {}: [{}, {}]&quot;, active.depth, left, lnode, rnode);</span>
+
+<span class="fc bfc" id="L274" title="All 2 branches covered.">            if (lnode instanceof Leaf)</span>
+<span class="fc" id="L275">                ldiff = FULLY_INCONSISTENT;</span>
+            else
+<span class="fc" id="L277">                ldiff = differenceHelper(ltree, rtree, diff, left);</span>
+        }
+<span class="fc bfc" id="L279" title="All 4 branches covered.">        else if (null == lnode || null == rnode)</span>
+        {
+<span class="fc" id="L281">            logger.trace(&quot;({}) Left sub-range fully inconsistent {}&quot;, active.depth, left);</span>
+<span class="fc" id="L282">            ldiff = FULLY_INCONSISTENT;</span>
+        }
+
+        // see if we should recurse right
+<span class="fc" id="L286">        lnode = ltree.find(right);</span>
+<span class="fc" id="L287">        rnode = rtree.find(right);</span>
+
+<span class="fc" id="L289">        Difference rdiff = CONSISTENT;</span>
+<span class="fc bfc" id="L290" title="All 6 branches covered.">        if (null != lnode &amp;&amp; null != rnode &amp;&amp; lnode.hashesDiffer(rnode))</span>
+        {
+<span class="fc" id="L292">            logger.trace(&quot;({}) Inconsistent digest on right sub-range {}: [{}, {}]&quot;, active.depth, right, lnode, rnode);</span>
+
+<span class="fc bfc" id="L294" title="All 2 branches covered.">            if (rnode instanceof Leaf)</span>
+<span class="fc" id="L295">                rdiff = FULLY_INCONSISTENT;</span>
+            else
+<span class="fc" id="L297">                rdiff = differenceHelper(ltree, rtree, diff, right);</span>
+        }
+<span class="fc bfc" id="L299" title="All 4 branches covered.">        else if (null == lnode || null == rnode)</span>
+        {
+<span class="fc" id="L301">            logger.trace(&quot;({}) Right sub-range fully inconsistent {}&quot;, active.depth, right);</span>
+<span class="fc" id="L302">            rdiff = FULLY_INCONSISTENT;</span>
+        }
+
+<span class="fc bfc" id="L305" title="All 4 branches covered.">        if (ldiff == FULLY_INCONSISTENT &amp;&amp; rdiff == FULLY_INCONSISTENT)</span>
+        {
+            // both children are fully inconsistent
+<span class="fc" id="L308">            logger.trace(&quot;({}) Fully inconsistent range [{}, {}]&quot;, active.depth, left, right);</span>
+<span class="fc" id="L309">            return FULLY_INCONSISTENT;</span>
+        }
+<span class="fc bfc" id="L311" title="All 2 branches covered.">        else if (ldiff == FULLY_INCONSISTENT)</span>
+        {
+<span class="fc" id="L313">            logger.trace(&quot;({}) Adding left sub-range to diff as fully inconsistent {}&quot;, active.depth, left);</span>
+<span class="fc" id="L314">            diff.add(left);</span>
+<span class="fc" id="L315">            return PARTIALLY_INCONSISTENT;</span>
+        }
+<span class="fc bfc" id="L317" title="All 2 branches covered.">        else if (rdiff == FULLY_INCONSISTENT)</span>
+        {
+<span class="fc" id="L319">            logger.trace(&quot;({}) Adding right sub-range to diff as fully inconsistent {}&quot;, active.depth, right);</span>
+<span class="fc" id="L320">            diff.add(right);</span>
+<span class="fc" id="L321">            return PARTIALLY_INCONSISTENT;</span>
+        }
+<span class="fc" id="L323">        logger.trace(&quot;({}) Range {} partially inconstent&quot;, active.depth, active);</span>
+<span class="fc" id="L324">        return PARTIALLY_INCONSISTENT;</span>
+    }
+
+    /**
+     * Exceptions that stop recursion early when we are sure that no answer
+     * can be found.
+     */
+<span class="fc" id="L331">    static abstract class StopRecursion extends Exception</span>
+    {
+<span class="nc" id="L333">        static class  TooDeep extends StopRecursion {}</span>
+<span class="fc" id="L334">        static class BadRange extends StopRecursion {}</span>
+    }
+
+    /**
+     * Find the {@link Node} node that matches the given {@code range}.
+     *
+     * @param range Range to find
+     * @return {@link Node} found. If nothing found, return {@code null}
+     */
+    @VisibleForTesting
+    private Node find(Range&lt;Token&gt; range)
+    {
+        try
+        {
+<span class="fc" id="L348">            return findHelper(root, fullRange, range);</span>
+        }
+<span class="fc" id="L350">        catch (StopRecursion e)</span>
+        {
+<span class="fc" id="L352">            return null;</span>
+        }
+    }
+
+    /**
+     * @throws StopRecursion If no match could be found for the range.
+     */
+    private Node findHelper(Node current, Range&lt;Token&gt; activeRange, Range&lt;Token&gt; find) throws StopRecursion
+    {
+        while (true)
+        {
+<span class="fc bfc" id="L363" title="All 2 branches covered.">            if (current instanceof Leaf)</span>
+            {
+<span class="fc bfc" id="L365" title="All 2 branches covered.">                if (!find.contains(activeRange))</span>
+<span class="fc" id="L366">                    throw new StopRecursion.BadRange(); // we are not fully contained in this range!</span>
+
+<span class="fc" id="L368">                return current;</span>
+            }
+
+<span class="pc bpc" id="L371" title="1 of 2 branches missed.">            assert current instanceof Inner;</span>
+<span class="fc" id="L372">            Inner inner = (Inner) current;</span>
+
+<span class="fc bfc" id="L374" title="All 2 branches covered.">            if (find.contains(activeRange)) // this node is fully contained in the range</span>
+<span class="fc" id="L375">                return inner.fillInnerHashes();</span>
+
+<span class="fc" id="L377">            Token midpoint = inner.token();</span>
+<span class="fc" id="L378">            Range&lt;Token&gt;  leftRange = new Range&lt;&gt;(activeRange.left, midpoint);</span>
+<span class="fc" id="L379">            Range&lt;Token&gt; rightRange = new Range&lt;&gt;(midpoint, activeRange.right);</span>
+
+            // else: one of our children contains the range
+
+<span class="fc bfc" id="L383" title="All 2 branches covered.">            if (leftRange.contains(find)) // left child contains/matches the range</span>
+            {
+<span class="fc" id="L385">                activeRange = leftRange;</span>
+<span class="fc" id="L386">                current = inner.left();</span>
+            }
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">            else if (rightRange.contains(find)) // right child contains/matches the range</span>
+            {
+<span class="fc" id="L390">                activeRange = rightRange;</span>
+<span class="fc" id="L391">                current = inner.right();</span>
+            }
+            else
+            {
+<span class="nc" id="L395">                throw new StopRecursion.BadRange();</span>
+            }
+<span class="fc" id="L397">        }</span>
+    }
+
+    /**
+     * Splits the range containing the given token, if no tree limits would be
+     * violated. If the range would be split to a depth below hashdepth, or if
+     * the tree already contains maxsize subranges, this operation will fail.
+     *
+     * @return True if the range was successfully split.
+     */
+    public boolean split(Token t)
+    {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        if (size &gt;= maxsize)</span>
+<span class="nc" id="L410">            return false;</span>
+
+        try
+        {
+<span class="nc" id="L414">            root = splitHelper(root, fullRange.left, fullRange.right, 0, t);</span>
+        }
+<span class="nc" id="L416">        catch (StopRecursion.TooDeep e)</span>
+        {
+<span class="nc" id="L418">            return false;</span>
+<span class="nc" id="L419">        }</span>
+<span class="nc" id="L420">        return true;</span>
+    }
+
+    private OnHeapNode splitHelper(Node node, Token pleft, Token pright, int depth, Token t) throws StopRecursion.TooDeep
+    {
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (depth &gt;= hashdepth)</span>
+<span class="nc" id="L426">            throw new StopRecursion.TooDeep();</span>
+
+<span class="nc bnc" id="L428" title="All 2 branches missed.">        if (node instanceof Leaf)</span>
+        {
+<span class="nc" id="L430">            Token midpoint = partitioner.midpoint(pleft, pright);</span>
+
+            // We should not create a non-sensical range where start and end are the same token (this is non-sensical because range are
+            // start exclusive). Note that we shouldn't hit that unless the full range is very small or we are fairly deep
+<span class="nc bnc" id="L434" title="All 4 branches missed.">            if (midpoint.equals(pleft) || midpoint.equals(pright))</span>
+<span class="nc" id="L435">                throw new StopRecursion.TooDeep();</span>
+
+            // split
+<span class="nc" id="L438">            size++;</span>
+<span class="nc" id="L439">            return new OnHeapInner(midpoint, new OnHeapLeaf(), new OnHeapLeaf());</span>
+        }
+        // else: node.
+
+        // recurse on the matching child
+<span class="nc bnc" id="L444" title="All 2 branches missed.">        assert node instanceof OnHeapInner;</span>
+<span class="nc" id="L445">        OnHeapInner inner = (OnHeapInner) node;</span>
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (Range.contains(pleft, inner.token(), t)) // left child contains token</span>
+<span class="nc" id="L448">            inner.left(splitHelper(inner.left(), pleft, inner.token(), depth + 1, t));</span>
+        else // else: right child contains token
+<span class="nc" id="L450">            inner.right(splitHelper(inner.right(), inner.token(), pright, depth + 1, t));</span>
+
+<span class="nc" id="L452">        return inner;</span>
+    }
+
+    /**
+     * Returns a lazy iterator of invalid TreeRanges that need to be filled
+     * in order to make the given Range valid.
+     */
+    TreeRangeIterator rangeIterator()
+    {
+<span class="fc" id="L461">        return new TreeRangeIterator(this);</span>
+    }
+
+    EstimatedHistogram histogramOfRowSizePerLeaf()
+    {
+<span class="fc" id="L466">        HistogramBuilder histbuild = new HistogramBuilder();</span>
+<span class="fc bfc" id="L467" title="All 2 branches covered.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="fc" id="L469">            histbuild.add(range.node.sizeOfRange());</span>
+<span class="fc" id="L470">        }</span>
+<span class="fc" id="L471">        return histbuild.buildWithStdevRangesAroundMean();</span>
+    }
+
+    EstimatedHistogram histogramOfRowCountPerLeaf()
+    {
+<span class="fc" id="L476">        HistogramBuilder histbuild = new HistogramBuilder();</span>
+<span class="fc bfc" id="L477" title="All 2 branches covered.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="fc" id="L479">            histbuild.add(range.node.partitionsInRange());</span>
+<span class="fc" id="L480">        }</span>
+<span class="fc" id="L481">        return histbuild.buildWithStdevRangesAroundMean();</span>
+    }
+
+    public long rowCount()
+    {
+<span class="nc" id="L486">        long count = 0;</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        for (TreeRange range : new TreeRangeIterator(this))</span>
+        {
+<span class="nc" id="L489">            count += range.node.partitionsInRange();</span>
+<span class="nc" id="L490">        }</span>
+<span class="nc" id="L491">        return count;</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L497">        StringBuilder buff = new StringBuilder();</span>
+<span class="nc" id="L498">        buff.append(&quot;#&lt;MerkleTree root=&quot;);</span>
+<span class="nc" id="L499">        root.toString(buff, 8);</span>
+<span class="nc" id="L500">        buff.append('&gt;');</span>
+<span class="nc" id="L501">        return buff.toString();</span>
+    }
+
+    @Override
+    public boolean equals(Object other)
+    {
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        if (!(other instanceof MerkleTree))</span>
+<span class="nc" id="L508">            return false;</span>
+<span class="nc" id="L509">        MerkleTree that = (MerkleTree) other;</span>
+
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        return this.root.equals(that.root)</span>
+<span class="nc bnc" id="L512" title="All 10 branches missed.">            &amp;&amp; this.fullRange.equals(that.fullRange)</span>
+            &amp;&amp; this.partitioner == that.partitioner
+            &amp;&amp; this.hashdepth == that.hashdepth
+            &amp;&amp; this.maxsize == that.maxsize
+            &amp;&amp; this.size == that.size;
+    }
+
+    /**
+     * The public interface to a range in the tree.
+     *
+     * NB: A TreeRange should not be returned by a public method unless the
+     * parents of the range it represents are already invalidated, since it
+     * will allow someone to modify the hash. Alternatively, a TreeRange
+     * may be created with a null tree, indicating that it is read only.
+     */
+<span class="fc" id="L527">    public static class TreeRange extends Range&lt;Token&gt;</span>
+    {
+        private final MerkleTree tree;
+        public final int depth;
+        private final Node node;
+
+        TreeRange(MerkleTree tree, Token left, Token right, int depth, Node node)
+        {
+<span class="fc" id="L535">            super(left, right);</span>
+<span class="fc" id="L536">            this.tree = tree;</span>
+<span class="fc" id="L537">            this.depth = depth;</span>
+<span class="fc" id="L538">            this.node = node;</span>
+<span class="fc" id="L539">        }</span>
+
+        TreeRange(Token left, Token right, int depth)
+        {
+<span class="fc" id="L543">            this(null, left, right, depth, null);</span>
+<span class="fc" id="L544">        }</span>
+
+        public void hash(byte[] hash)
+        {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            assert tree != null : &quot;Not intended for modification!&quot;;</span>
+<span class="nc" id="L549">            node.hash(hash);</span>
+<span class="nc" id="L550">        }</span>
+
+        /**
+         * @param entry Row to mix into the hash for this range.
+         */
+        public void addHash(RowHash entry)
+        {
+<span class="fc" id="L557">            addHash(entry.hash, entry.size);</span>
+<span class="fc" id="L558">        }</span>
+
+        void addHash(byte[] hash, long partitionSize)
+        {
+<span class="pc bpc" id="L562" title="1 of 2 branches missed.">            assert tree != null : &quot;Not intended for modification!&quot;;</span>
+
+<span class="pc bpc" id="L564" title="1 of 2 branches missed.">            assert node instanceof OnHeapLeaf;</span>
+<span class="fc" id="L565">            ((OnHeapLeaf) node).addHash(hash, partitionSize);</span>
+<span class="fc" id="L566">        }</span>
+
+        public void addAll(Iterator&lt;RowHash&gt; entries)
+        {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            while (entries.hasNext()) addHash(entries.next());</span>
+<span class="nc" id="L571">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="fc" id="L576">            return &quot;#&lt;TreeRange &quot; + super.toString() + &quot; depth=&quot; + depth + '&gt;';</span>
+        }
+    }
+
+    /**
+     * Returns the leaf (range) of a given tree in increasing order.
+     * If the full range covered by the tree don't wrap, then it will return the
+     * ranges in increasing order.
+     * If the full range wrap, the first *and* last range returned by the
+     * iterator will be the wrapping range. It is the only case where the same
+     * leaf will be returned twice.
+     */
+    public static class TreeRangeIterator extends AbstractIterator&lt;TreeRange&gt; implements Iterable&lt;TreeRange&gt;, PeekingIterator&lt;TreeRange&gt;
+    {
+        // stack of ranges to visit
+        private final ArrayDeque&lt;TreeRange&gt; tovisit;
+        // interesting range
+        private final MerkleTree tree;
+
+        TreeRangeIterator(MerkleTree tree)
+<span class="fc" id="L596">        {</span>
+<span class="fc" id="L597">            tovisit = new ArrayDeque&lt;&gt;();</span>
+<span class="fc" id="L598">            tovisit.add(new TreeRange(tree, tree.fullRange.left, tree.fullRange.right, 0, tree.root));</span>
+<span class="fc" id="L599">            this.tree = tree;</span>
+<span class="fc" id="L600">        }</span>
+
+        /**
+         * Find the next TreeRange.
+         *
+         * @return The next TreeRange.
+         */
+        public TreeRange computeNext()
+        {
+<span class="fc bfc" id="L609" title="All 2 branches covered.">            while (!tovisit.isEmpty())</span>
+            {
+<span class="fc" id="L611">                TreeRange active = tovisit.pop();</span>
+
+<span class="fc bfc" id="L613" title="All 2 branches covered.">                if (active.node instanceof Leaf)</span>
+                {
+                    // found a leaf invalid range
+<span class="fc bfc" id="L616" title="All 4 branches covered.">                    if (active.isWrapAround() &amp;&amp; !tovisit.isEmpty())</span>
+                        // put to be taken again last
+<span class="fc" id="L618">                        tovisit.addLast(active);</span>
+<span class="fc" id="L619">                    return active;</span>
+                }
+
+<span class="fc" id="L622">                Inner node = (Inner)active.node;</span>
+<span class="fc" id="L623">                TreeRange left = new TreeRange(tree, active.left, node.token(), active.depth + 1, node.left());</span>
+<span class="fc" id="L624">                TreeRange right = new TreeRange(tree, node.token(), active.right, active.depth + 1, node.right());</span>
+
+<span class="fc bfc" id="L626" title="All 2 branches covered.">                if (right.isWrapAround())</span>
+                {
+                    // whatever is on the left is 'after' everything we have seen so far (it has greater tokens)
+<span class="fc" id="L629">                    tovisit.addLast(left);</span>
+<span class="fc" id="L630">                    tovisit.addFirst(right);</span>
+                }
+                else
+                {
+                    // do left first then right
+<span class="fc" id="L635">                    tovisit.addFirst(right);</span>
+<span class="fc" id="L636">                    tovisit.addFirst(left);</span>
+                }
+<span class="fc" id="L638">            }</span>
+<span class="fc" id="L639">            return endOfData();</span>
+        }
+
+        public Iterator&lt;TreeRange&gt; iterator()
+        {
+<span class="fc" id="L644">            return this;</span>
+        }
+    }
+
+    /**
+     * Hash value representing a row, to be used to pass hashes to the MerkleTree.
+     * The byte[] hash value should contain a digest of the key and value of the row
+     * created using a very strong hash function.
+     */
+    public static class RowHash
+    {
+        public final Token token;
+        public final byte[] hash;
+        public final long size;
+
+        public RowHash(Token token, byte[] hash, long size)
+<span class="fc" id="L660">        {</span>
+<span class="fc" id="L661">            this.token = token;</span>
+<span class="fc" id="L662">            this.hash  = hash;</span>
+<span class="fc" id="L663">            this.size  = size;</span>
+<span class="fc" id="L664">        }</span>
+
+        @Override
+        public String toString()
+        {
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            return &quot;#&lt;RowHash &quot; + token + ' ' + (hash == null ? &quot;null&quot; : Hex.bytesToHex(hash)) + &quot; @ &quot; + size + &quot; bytes&gt;&quot;;</span>
+        }
+    }
+
+    public void serialize(DataOutputPlus out, int version) throws IOException
+    {
+<span class="fc" id="L675">        out.writeByte(hashdepth);</span>
+<span class="fc" id="L676">        out.writeLong(maxsize);</span>
+<span class="fc" id="L677">        out.writeLong(size);</span>
+<span class="fc" id="L678">        out.writeUTF(partitioner.getClass().getCanonicalName());</span>
+<span class="fc" id="L679">        Token.serializer.serialize(fullRange.left, out, version);</span>
+<span class="fc" id="L680">        Token.serializer.serialize(fullRange.right, out, version);</span>
+<span class="fc" id="L681">        root.serialize(out, version);</span>
+<span class="fc" id="L682">    }</span>
+
+    public long serializedSize(int version)
+    {
+<span class="fc" id="L686">        long size = 1 // mt.hashdepth</span>
+<span class="fc" id="L687">                  + sizeof(maxsize)</span>
+<span class="fc" id="L688">                  + sizeof(this.size)</span>
+<span class="fc" id="L689">                  + sizeof(partitioner.getClass().getCanonicalName());</span>
+<span class="fc" id="L690">        size += Token.serializer.serializedSize(fullRange.left, version);</span>
+<span class="fc" id="L691">        size += Token.serializer.serializedSize(fullRange.right, version);</span>
+<span class="fc" id="L692">        size += root.serializedSize(version);</span>
+<span class="fc" id="L693">        return size;</span>
+    }
+
+    public static MerkleTree deserialize(DataInputPlus in, int version) throws IOException
+    {
+<span class="fc" id="L698">        return deserialize(in, DatabaseDescriptor.useOffheapMerkleTrees(), version);</span>
+    }
+
+    public static MerkleTree deserialize(DataInputPlus in, boolean offHeapRequested, int version) throws IOException
+    {
+<span class="fc" id="L703">        int hashDepth = in.readByte();</span>
+<span class="fc" id="L704">        long maxSize = in.readLong();</span>
+<span class="fc" id="L705">        int innerNodeCount = Ints.checkedCast(in.readLong());</span>
+
+        IPartitioner partitioner;
+        try
+        {
+<span class="fc" id="L710">            partitioner = FBUtilities.newPartitioner(in.readUTF());</span>
+        }
+<span class="nc" id="L712">        catch (ConfigurationException e)</span>
+        {
+<span class="nc" id="L714">            throw new IOException(e);</span>
+<span class="fc" id="L715">        }</span>
+
+<span class="fc" id="L717">        Token left = Token.serializer.deserialize(in, partitioner, version);</span>
+<span class="fc" id="L718">        Token right = Token.serializer.deserialize(in, partitioner, version);</span>
+<span class="fc" id="L719">        Range&lt;Token&gt; fullRange = new Range&lt;&gt;(left, right);</span>
+<span class="fc" id="L720">        Node root = deserializeTree(in, partitioner, innerNodeCount, offHeapRequested, version);</span>
+<span class="fc" id="L721">        return new MerkleTree(root, partitioner, fullRange, hashDepth, maxSize, innerNodeCount);</span>
+    }
+
+    private static boolean shouldUseOffHeapTrees(IPartitioner partitioner, boolean offHeapRequested)
+    {
+<span class="pc bpc" id="L726" title="3 of 4 branches missed.">        boolean offHeapSupported = partitioner instanceof Murmur3Partitioner || partitioner instanceof RandomPartitioner;</span>
+
+<span class="pc bpc" id="L728" title="4 of 6 branches missed.">        if (offHeapRequested &amp;&amp; !offHeapSupported &amp;&amp; !warnedOnce)</span>
+        {
+<span class="nc" id="L730">            logger.warn(&quot;Configuration requests off-heap merkle trees, but partitioner does not support it. Ignoring.&quot;);</span>
+<span class="nc" id="L731">            warnedOnce = true;</span>
+        }
+
+<span class="pc bpc" id="L734" title="2 of 4 branches missed.">        return offHeapRequested &amp;&amp; offHeapSupported;</span>
+    }
+    private static boolean warnedOnce;
+
+    private static ByteBuffer allocate(int innerNodeCount, IPartitioner partitioner)
+    {
+<span class="fc" id="L740">        int size = offHeapBufferSize(innerNodeCount, partitioner);</span>
+<span class="fc" id="L741">        logger.debug(&quot;Allocating direct buffer of size {} for an off-heap merkle tree&quot;, size);</span>
+<span class="fc" id="L742">        ByteBuffer buffer = ByteBuffer.allocateDirect(size);</span>
+<span class="pc bpc" id="L743" title="1 of 2 branches missed.">        if (Ref.DEBUG_ENABLED)</span>
+<span class="fc" id="L744">            MemoryUtil.setAttachment(buffer, new Ref.DirectBufferRef&lt;&gt;(null, null));</span>
+<span class="fc" id="L745">        return buffer;</span>
+    }
+
+    private static Node deserializeTree(DataInputPlus in, IPartitioner partitioner, int innerNodeCount, boolean offHeapRequested, int version) throws IOException
+    {
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">        return shouldUseOffHeapTrees(partitioner, offHeapRequested)</span>
+<span class="fc" id="L751">             ? deserializeOffHeap(in, partitioner, innerNodeCount, version)</span>
+<span class="nc" id="L752">             : OnHeapNode.deserialize(in, partitioner, version);</span>
+    }
+
+    /*
+     * Coordinating multiple trees from multiple replicas can get expensive.
+     * On the deserialization path, we know in advance what the tree looks like,
+     * So we can pre-size an offheap buffer and deserialize into that.
+     */
+    MerkleTree tryMoveOffHeap() throws IOException
+    {
+<span class="pc bpc" id="L762" title="2 of 4 branches missed.">        return root instanceof OnHeapNode &amp;&amp; shouldUseOffHeapTrees(partitioner, DatabaseDescriptor.useOffheapMerkleTrees())</span>
+<span class="fc" id="L763">             ? moveOffHeap()</span>
+<span class="nc" id="L764">             : this;</span>
+    }
+
+    @VisibleForTesting
+    MerkleTree moveOffHeap() throws IOException
+    {
+<span class="pc bpc" id="L770" title="1 of 2 branches missed.">        assert root instanceof OnHeapNode;</span>
+<span class="fc" id="L771">        root.fillInnerHashes(); // ensure on-heap trees' inner node hashes have been computed</span>
+<span class="fc" id="L772">        ByteBuffer buffer = allocate(Ints.checkedCast(size), partitioner);</span>
+<span class="fc" id="L773">        int pointer = ((OnHeapNode) root).serializeOffHeap(buffer, partitioner);</span>
+<span class="fc" id="L774">        OffHeapNode newRoot = fromPointer(pointer, buffer, partitioner);</span>
+<span class="fc" id="L775">        return new MerkleTree(newRoot, partitioner, fullRange, hashdepth, maxsize, size);</span>
+    }
+
+    private static OffHeapNode deserializeOffHeap(DataInputPlus in, IPartitioner partitioner, int innerNodeCount, int version) throws IOException
+    {
+<span class="fc" id="L780">        ByteBuffer buffer = allocate(innerNodeCount, partitioner);</span>
+<span class="fc" id="L781">        int pointer = OffHeapNode.deserialize(in, buffer, partitioner, version);</span>
+<span class="fc" id="L782">        return fromPointer(pointer, buffer, partitioner);</span>
+    }
+
+    private static OffHeapNode fromPointer(int pointer, ByteBuffer buffer, IPartitioner partitioner)
+    {
+<span class="fc bfc" id="L787" title="All 2 branches covered.">        return pointer &gt;= 0 ? new OffHeapInner(buffer, pointer, partitioner) : new OffHeapLeaf(buffer, ~pointer);</span>
+    }
+
+    private static int offHeapBufferSize(int innerNodeCount, IPartitioner partitioner)
+    {
+<span class="fc" id="L792">        return innerNodeCount * OffHeapInner.maxOffHeapSize(partitioner) + (innerNodeCount + 1) * OffHeapLeaf.maxOffHeapSize();</span>
+    }
+
+    interface Node
+    {
+        byte[] hash();
+
+        boolean hasEmptyHash();
+
+        void hash(byte[] hash);
+
+        boolean hashesDiffer(Node other);
+
+        default Node fillInnerHashes()
+        {
+<span class="fc" id="L807">            return this;</span>
+        }
+
+        default long sizeOfRange()
+        {
+<span class="nc" id="L812">            return 0;</span>
+        }
+
+        default long partitionsInRange()
+        {
+<span class="nc" id="L817">            return 0;</span>
+        }
+
+        void serialize(DataOutputPlus out, int version) throws IOException;
+        int serializedSize(int version);
+
+        void toString(StringBuilder buff, int maxdepth);
+
+        static String toString(byte[] hash)
+        {
+<span class="nc bnc" id="L827" title="All 2 branches missed.">            return hash == null</span>
+<span class="nc" id="L828">                 ? &quot;null&quot;</span>
+<span class="nc" id="L829">                 : '[' + Hex.bytesToHex(hash) + ']';</span>
+        }
+
+        boolean equals(Node node);
+    }
+
+    static abstract class OnHeapNode implements Node
+    {
+        long sizeOfRange;
+        long partitionsInRange;
+
+        protected byte[] hash;
+
+        OnHeapNode(byte[] hash)
+<span class="fc" id="L843">        {</span>
+<span class="pc bpc" id="L844" title="1 of 2 branches missed.">            if (hash == null)</span>
+<span class="nc" id="L845">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L847">            this.hash = hash;</span>
+<span class="fc" id="L848">        }</span>
+
+        public byte[] hash()
+        {
+<span class="fc" id="L852">            return hash;</span>
+        }
+
+        public boolean hasEmptyHash()
+        {
+            //noinspection ArrayEquality
+<span class="fc bfc" id="L858" title="All 2 branches covered.">            return hash == EMPTY_HASH;</span>
+        }
+
+        public void hash(byte[] hash)
+        {
+<span class="pc bpc" id="L863" title="1 of 2 branches missed.">            if (hash == null)</span>
+<span class="nc" id="L864">                throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L866">            this.hash = hash;</span>
+<span class="fc" id="L867">        }</span>
+
+        public boolean hashesDiffer(Node other)
+        {
+<span class="nc bnc" id="L871" title="All 2 branches missed.">            return other instanceof OnHeapNode</span>
+<span class="nc" id="L872">                 ? hashesDiffer( (OnHeapNode) other)</span>
+<span class="nc" id="L873">                 : hashesDiffer((OffHeapNode) other);</span>
+        }
+
+        private boolean hashesDiffer(OnHeapNode other)
+        {
+<span class="nc bnc" id="L878" title="All 2 branches missed.">            return !Arrays.equals(hash(), other.hash());</span>
+        }
+
+        private boolean hashesDiffer(OffHeapNode other)
+        {
+<span class="nc bnc" id="L883" title="All 2 branches missed.">            return compare(hash(), other.buffer(), other.hashBytesOffset(), HASH_SIZE) != 0;</span>
+        }
+
+        @Override
+        public long sizeOfRange()
+        {
+<span class="fc" id="L889">            return sizeOfRange;</span>
+        }
+
+        @Override
+        public long partitionsInRange()
+        {
+<span class="fc" id="L895">            return partitionsInRange;</span>
+        }
+
+        static OnHeapNode deserialize(DataInputPlus in, IPartitioner p, int version) throws IOException
+        {
+<span class="nc" id="L900">            byte ident = in.readByte();</span>
+
+<span class="nc bnc" id="L902" title="All 3 branches missed.">            switch (ident)</span>
+            {
+                case Inner.IDENT:
+<span class="nc" id="L905">                    return OnHeapInner.deserializeWithoutIdent(in, p, version);</span>
+                case Leaf.IDENT:
+<span class="nc" id="L907">                    return OnHeapLeaf.deserializeWithoutIdent(in);</span>
+                default:
+<span class="nc" id="L909">                    throw new IOException(&quot;Unexpected node type: &quot; + ident);</span>
+            }
+        }
+
+        abstract int serializeOffHeap(ByteBuffer buffer, IPartitioner p) throws IOException;
+    }
+
+    static abstract class OffHeapNode implements Node
+    {
+        protected final ByteBuffer buffer;
+        protected final int offset;
+
+        OffHeapNode(ByteBuffer buffer, int offset)
+<span class="fc" id="L922">        {</span>
+<span class="fc" id="L923">            this.buffer = buffer;</span>
+<span class="fc" id="L924">            this.offset = offset;</span>
+<span class="fc" id="L925">        }</span>
+
+        ByteBuffer buffer()
+        {
+<span class="fc" id="L929">            return buffer;</span>
+        }
+
+        public byte[] hash()
+        {
+<span class="fc" id="L934">            final int position = buffer.position();</span>
+<span class="fc" id="L935">            buffer.position(hashBytesOffset());</span>
+<span class="fc" id="L936">            byte[] array = new byte[HASH_SIZE];</span>
+<span class="fc" id="L937">            buffer.get(array);</span>
+<span class="fc" id="L938">            buffer.position(position);</span>
+<span class="fc" id="L939">            return array;</span>
+        }
+
+        public boolean hasEmptyHash()
+        {
+<span class="fc bfc" id="L944" title="All 2 branches covered.">            return compare(buffer(), hashBytesOffset(), HASH_SIZE, EMPTY_HASH) == 0;</span>
+        }
+
+        public void hash(byte[] hash)
+        {
+<span class="nc" id="L949">            throw new UnsupportedOperationException();</span>
+        }
+
+        public boolean hashesDiffer(Node other)
+        {
+<span class="pc bpc" id="L954" title="1 of 2 branches missed.">            return other instanceof OnHeapNode</span>
+<span class="nc" id="L955">                 ? hashesDiffer((OnHeapNode) other)</span>
+<span class="fc" id="L956">                 : hashesDiffer((OffHeapNode) other);</span>
+        }
+
+        private boolean hashesDiffer(OnHeapNode other)
+        {
+<span class="nc bnc" id="L961" title="All 2 branches missed.">            return compare(buffer(), hashBytesOffset(), HASH_SIZE, other.hash()) != 0;</span>
+        }
+
+        private boolean hashesDiffer(OffHeapNode other)
+        {
+<span class="fc" id="L966">            int thisOffset = hashBytesOffset();</span>
+<span class="fc" id="L967">            int otherOffset = other.hashBytesOffset();</span>
+
+<span class="fc bfc" id="L969" title="All 2 branches covered.">            for (int i = 0; i &lt; HASH_SIZE; i += 8)</span>
+<span class="fc bfc" id="L970" title="All 2 branches covered.">                if (buffer().getLong(thisOffset + i) != other.buffer().getLong(otherOffset + i))</span>
+<span class="fc" id="L971">                    return true;</span>
+
+<span class="fc" id="L973">            return false;</span>
+        }
+
+        void release()
+        {
+<span class="fc" id="L978">            Object attachment = MemoryUtil.getAttachment(buffer);</span>
+<span class="pc bpc" id="L979" title="1 of 2 branches missed.">            if (attachment instanceof Ref.DirectBufferRef)</span>
+<span class="fc" id="L980">                ((Ref.DirectBufferRef) attachment).release();</span>
+<span class="fc" id="L981">            FileUtils.clean(buffer);</span>
+<span class="fc" id="L982">        }</span>
+
+        abstract int hashBytesOffset();
+
+        static int deserialize(DataInputPlus in, ByteBuffer buffer, IPartitioner p, int version) throws IOException
+        {
+<span class="fc" id="L988">            byte ident = in.readByte();</span>
+
+<span class="pc bpc" id="L990" title="1 of 3 branches missed.">            switch (ident)</span>
+            {
+                case Inner.IDENT:
+<span class="fc" id="L993">                    return OffHeapInner.deserializeWithoutIdent(in, buffer, p, version);</span>
+                case Leaf.IDENT:
+<span class="fc" id="L995">                    return  OffHeapLeaf.deserializeWithoutIdent(in, buffer);</span>
+                default:
+<span class="nc" id="L997">                    throw new IOException(&quot;Unexpected node type: &quot; + ident);</span>
+            }
+        }
+    }
+
+    /**
+     * A leaf node in the MerkleTree. Because the MerkleTree represents a much
+     * larger perfect binary tree of depth hashdepth, a Leaf object contains
+     * the value that would be contained in the perfect tree at its position.
+     *
+     * When rows are added to the MerkleTree using TreeRange.validate(), the
+     * tree extending below the Leaf is generated in memory, but only the root
+     * is stored in the Leaf.
+     */
+<span class="pc bpc" id="L1011" title="1 of 2 branches missed.">    interface Leaf extends Node</span>
+    {
+        static final byte IDENT = 1;
+
+        default void serialize(DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L1017">            byte[] hash = hash();</span>
+<span class="pc bpc" id="L1018" title="2 of 4 branches missed.">            assert hash.length == HASH_SIZE: String.format(&quot;Expected hash length to be %d, but given %d&quot;, HASH_SIZE, hash.length);</span>
+
+<span class="fc" id="L1020">            out.writeByte(Leaf.IDENT);</span>
+
+<span class="fc bfc" id="L1022" title="All 2 branches covered.">            if (!hasEmptyHash())</span>
+            {
+<span class="fc" id="L1024">                out.writeByte(HASH_SIZE);</span>
+<span class="fc" id="L1025">                out.write(hash);</span>
+            }
+            else
+            {
+<span class="fc" id="L1029">                out.writeByte(0);</span>
+            }
+<span class="fc" id="L1031">        }</span>
+
+        default int serializedSize(int version)
+        {
+<span class="fc bfc" id="L1035" title="All 2 branches covered.">            return 2 + (hasEmptyHash() ? 0 : HASH_SIZE);</span>
+        }
+
+        default void toString(StringBuilder buff, int maxdepth)
+        {
+<span class="nc" id="L1040">            buff.append(toString());</span>
+<span class="nc" id="L1041">        }</span>
+
+        default boolean equals(Node other)
+        {
+<span class="nc bnc" id="L1045" title="All 4 branches missed.">            return other instanceof Leaf &amp;&amp; !hashesDiffer(other);</span>
+        }
+    }
+
+    static class OnHeapLeaf extends OnHeapNode implements Leaf
+    {
+        OnHeapLeaf()
+        {
+<span class="fc" id="L1053">            super(EMPTY_HASH);</span>
+<span class="fc" id="L1054">        }</span>
+
+        OnHeapLeaf(byte[] hash)
+        {
+<span class="fc" id="L1058">            super(hash);</span>
+<span class="fc" id="L1059">        }</span>
+
+        /**
+         * Mixes the given value into our hash. If our hash is null,
+         * our hash will become the given value.
+         */
+        void addHash(byte[] partitionHash, long partitionSize)
+        {
+<span class="fc bfc" id="L1067" title="All 2 branches covered.">            if (hasEmptyHash())</span>
+<span class="fc" id="L1068">                hash(partitionHash);</span>
+            else
+<span class="fc" id="L1070">                xorOntoLeft(hash, partitionHash);</span>
+
+<span class="fc" id="L1072">            sizeOfRange += partitionSize;</span>
+<span class="fc" id="L1073">            partitionsInRange += 1;</span>
+<span class="fc" id="L1074">        }</span>
+
+        static OnHeapLeaf deserializeWithoutIdent(DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L1078">            int size = in.readByte();</span>
+<span class="nc bnc" id="L1079" title="All 3 branches missed.">            switch (size)</span>
+            {
+                case HASH_SIZE:
+<span class="nc" id="L1082">                    byte[] hash = new byte[HASH_SIZE];</span>
+<span class="nc" id="L1083">                    in.readFully(hash);</span>
+<span class="nc" id="L1084">                    return new OnHeapLeaf(hash);</span>
+                case 0:
+<span class="nc" id="L1086">                    return new OnHeapLeaf();</span>
+                default:
+<span class="nc" id="L1088">                    throw new IllegalStateException(format(&quot;Hash of size %d encountered, expecting %d or %d&quot;, size, HASH_SIZE, 0));</span>
+            }
+        }
+
+        int serializeOffHeap(ByteBuffer buffer, IPartitioner p)
+        {
+<span class="pc bpc" id="L1094" title="1 of 2 branches missed.">            if (buffer.remaining() &lt; OffHeapLeaf.maxOffHeapSize())</span>
+<span class="nc" id="L1095">                throw new IllegalStateException(&quot;Insufficient remaining bytes to deserialize a Leaf node off-heap&quot;);</span>
+
+<span class="pc bpc" id="L1097" title="1 of 2 branches missed.">            if (hash.length != HASH_SIZE)</span>
+<span class="nc" id="L1098">                throw new IllegalArgumentException(&quot;Hash of unexpected size when serializing a Leaf off-heap: &quot; + hash.length);</span>
+
+<span class="fc" id="L1100">            final int position = buffer.position();</span>
+<span class="fc" id="L1101">            buffer.put(hash);</span>
+<span class="fc" id="L1102">            return ~position;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1108">            return &quot;#&lt;OnHeapLeaf &quot; + Node.toString(hash()) + '&gt;';</span>
+        }
+    }
+
+    static class OffHeapLeaf extends OffHeapNode implements Leaf
+    {
+        static final int HASH_BYTES_OFFSET = 0;
+
+        OffHeapLeaf(ByteBuffer buffer, int offset)
+        {
+<span class="fc" id="L1118">            super(buffer, offset);</span>
+<span class="fc" id="L1119">        }</span>
+
+        public int hashBytesOffset()
+        {
+<span class="fc" id="L1123">            return offset + HASH_BYTES_OFFSET;</span>
+        }
+
+        static int deserializeWithoutIdent(DataInput in, ByteBuffer buffer) throws IOException
+        {
+<span class="pc bpc" id="L1128" title="1 of 2 branches missed.">            if (buffer.remaining() &lt; maxOffHeapSize())</span>
+<span class="nc" id="L1129">                throw new IllegalStateException(&quot;Insufficient remaining bytes to deserialize a Leaf node off-heap&quot;);</span>
+
+<span class="fc" id="L1131">            final int position = buffer.position();</span>
+
+<span class="fc" id="L1133">            int hashLength = in.readByte();</span>
+<span class="fc bfc" id="L1134" title="All 2 branches covered.">            if (hashLength &gt; 0)</span>
+            {
+<span class="pc bpc" id="L1136" title="1 of 2 branches missed.">                if (hashLength != HASH_SIZE)</span>
+<span class="nc" id="L1137">                    throw new IllegalStateException(&quot;Hash of unexpected size when deserializing an off-heap Leaf node: &quot; + hashLength);</span>
+
+<span class="fc" id="L1139">                byte[] hashBytes = getTempArray(HASH_SIZE);</span>
+<span class="fc" id="L1140">                in.readFully(hashBytes, 0, HASH_SIZE);</span>
+<span class="fc" id="L1141">                buffer.put(hashBytes, 0, HASH_SIZE);</span>
+<span class="fc" id="L1142">            }</span>
+            else
+            {
+<span class="fc" id="L1145">                buffer.put(EMPTY_HASH, 0, HASH_SIZE);</span>
+            }
+
+<span class="fc" id="L1148">            return ~position;</span>
+        }
+
+        static int maxOffHeapSize()
+        {
+<span class="fc" id="L1153">            return HASH_SIZE;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1159">            return &quot;#&lt;OffHeapLeaf &quot; + Node.toString(hash()) + '&gt;';</span>
+        }
+    }
+
+    /**
+     * An inner node in the MerkleTree. Inners can contain cached hash values, which
+     * are the binary hash of their two children.
+     */
+    interface Inner extends Node
+    {
+        static final byte IDENT = 2;
+
+        public Token token();
+
+        public Node left();
+        public Node right();
+
+        default void serialize(DataOutputPlus out, int version) throws IOException
+        {
+<span class="fc" id="L1178">            out.writeByte(Inner.IDENT);</span>
+<span class="fc" id="L1179">            Token.serializer.serialize(token(), out, version);</span>
+<span class="fc" id="L1180">            left().serialize(out, version);</span>
+<span class="fc" id="L1181">            right().serialize(out, version);</span>
+<span class="fc" id="L1182">        }</span>
+
+        default int serializedSize(int version)
+        {
+<span class="fc" id="L1186">            return 1</span>
+<span class="fc" id="L1187">                 + (int) Token.serializer.serializedSize(token(), version)</span>
+<span class="fc" id="L1188">                 + left().serializedSize(version)</span>
+<span class="fc" id="L1189">                 + right().serializedSize(version);</span>
+        }
+
+        default void toString(StringBuilder buff, int maxdepth)
+        {
+<span class="nc" id="L1194">            buff.append(&quot;#&lt;&quot;).append(getClass().getSimpleName())</span>
+<span class="nc" id="L1195">                .append(' ').append(token())</span>
+<span class="nc" id="L1196">                .append(&quot; hash=&quot;).append(Node.toString(hash()))</span>
+<span class="nc" id="L1197">                .append(&quot; children=[&quot;);</span>
+
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">            if (maxdepth &lt; 1)</span>
+            {
+<span class="nc" id="L1201">                buff.append('#');</span>
+            }
+            else
+            {
+<span class="nc" id="L1205">                Node left = left();</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">                if (left == null)</span>
+<span class="nc" id="L1207">                    buff.append(&quot;null&quot;);</span>
+                else
+<span class="nc" id="L1209">                    left.toString(buff, maxdepth - 1);</span>
+
+<span class="nc" id="L1211">                buff.append(' ');</span>
+
+<span class="nc" id="L1213">                Node right = right();</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">                if (right == null)</span>
+<span class="nc" id="L1215">                    buff.append(&quot;null&quot;);</span>
+                else
+<span class="nc" id="L1217">                    right.toString(buff, maxdepth - 1);</span>
+            }
+
+<span class="nc" id="L1220">            buff.append(&quot;]&gt;&quot;);</span>
+<span class="nc" id="L1221">        }</span>
+
+        default boolean equals(Node other)
+        {
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">            if (!(other instanceof Inner))</span>
+<span class="nc" id="L1226">                return false;</span>
+<span class="nc" id="L1227">            Inner that = (Inner) other;</span>
+<span class="nc bnc" id="L1228" title="All 6 branches missed.">            return !hashesDiffer(other) &amp;&amp; this.left().equals(that.left()) &amp;&amp; this.right().equals(that.right());</span>
+        }
+
+        default void unsafeInvalidate()
+        {
+<span class="nc" id="L1233">        }</span>
+    }
+
+    static class OnHeapInner extends OnHeapNode implements Inner
+    {
+        private final Token token;
+
+        private OnHeapNode left;
+        private OnHeapNode right;
+
+        private boolean computed;
+
+        OnHeapInner(Token token, OnHeapNode left, OnHeapNode right)
+        {
+<span class="fc" id="L1247">            super(EMPTY_HASH);</span>
+
+<span class="fc" id="L1249">            this.token = token;</span>
+<span class="fc" id="L1250">            this.left = left;</span>
+<span class="fc" id="L1251">            this.right = right;</span>
+<span class="fc" id="L1252">        }</span>
+
+        public Token token()
+        {
+<span class="fc" id="L1256">            return token;</span>
+        }
+
+        public OnHeapNode left()
+        {
+<span class="fc" id="L1261">            return left;</span>
+        }
+
+        public OnHeapNode right()
+        {
+<span class="fc" id="L1266">            return right;</span>
+        }
+
+        void left(OnHeapNode child)
+        {
+<span class="nc" id="L1271">            left = child;</span>
+<span class="nc" id="L1272">        }</span>
+
+        void right(OnHeapNode child)
+        {
+<span class="nc" id="L1276">            right = child;</span>
+<span class="nc" id="L1277">        }</span>
+
+        @Override
+        public Node fillInnerHashes()
+        {
+<span class="pc bpc" id="L1282" title="1 of 2 branches missed.">            if (!computed) // hash and size haven't been calculated; compute children then compute this</span>
+            {
+<span class="fc" id="L1284">                left.fillInnerHashes();</span>
+<span class="fc" id="L1285">                right.fillInnerHashes();</span>
+
+<span class="fc bfc" id="L1287" title="All 4 branches covered.">                if (!left.hasEmptyHash() &amp;&amp; !right.hasEmptyHash())</span>
+<span class="fc" id="L1288">                    hash = xor(left.hash(), right.hash());</span>
+<span class="fc bfc" id="L1289" title="All 2 branches covered.">                else if (left.hasEmptyHash())</span>
+<span class="fc" id="L1290">                    hash = right.hash();</span>
+<span class="pc bpc" id="L1291" title="1 of 2 branches missed.">                else if (right.hasEmptyHash())</span>
+<span class="fc" id="L1292">                    hash = left.hash();</span>
+
+<span class="fc" id="L1294">                sizeOfRange       = left.sizeOfRange()       + right.sizeOfRange();</span>
+<span class="fc" id="L1295">                partitionsInRange = left.partitionsInRange() + right.partitionsInRange();</span>
+
+<span class="fc" id="L1297">                computed = true;</span>
+            }
+
+<span class="fc" id="L1300">            return this;</span>
+        }
+
+        static OnHeapInner deserializeWithoutIdent(DataInputPlus in, IPartitioner p, int version) throws IOException
+        {
+<span class="nc" id="L1305">            Token token = Token.serializer.deserialize(in, p, version);</span>
+<span class="nc" id="L1306">            OnHeapNode  left = OnHeapNode.deserialize(in, p, version);</span>
+<span class="nc" id="L1307">            OnHeapNode right = OnHeapNode.deserialize(in, p, version);</span>
+<span class="nc" id="L1308">            return new OnHeapInner(token, left, right);</span>
+        }
+
+        int serializeOffHeap(ByteBuffer buffer, IPartitioner partitioner) throws IOException
+        {
+<span class="pc bpc" id="L1313" title="1 of 2 branches missed.">            if (buffer.remaining() &lt; OffHeapInner.maxOffHeapSize(partitioner))</span>
+<span class="nc" id="L1314">                throw new IllegalStateException(&quot;Insufficient remaining bytes to deserialize Inner node off-heap&quot;);</span>
+
+<span class="fc" id="L1316">            final int offset = buffer.position();</span>
+
+<span class="fc" id="L1318">            int tokenSize = partitioner.getTokenFactory().byteSize(token);</span>
+<span class="fc" id="L1319">            buffer.putShort(offset + OffHeapInner.TOKEN_LENGTH_OFFSET, Shorts.checkedCast(tokenSize));</span>
+<span class="fc" id="L1320">            buffer.position(offset + OffHeapInner.TOKEN_BYTES_OFFSET);</span>
+<span class="fc" id="L1321">            partitioner.getTokenFactory().serialize(token, buffer);</span>
+
+<span class="fc" id="L1323">            int  leftPointer =  left.serializeOffHeap(buffer, partitioner);</span>
+<span class="fc" id="L1324">            int rightPointer = right.serializeOffHeap(buffer, partitioner);</span>
+
+<span class="fc" id="L1326">            buffer.putInt(offset + OffHeapInner.LEFT_CHILD_POINTER_OFFSET,  leftPointer);</span>
+<span class="fc" id="L1327">            buffer.putInt(offset + OffHeapInner.RIGHT_CHILD_POINTER_OFFSET, rightPointer);</span>
+
+<span class="fc" id="L1329">            int  leftHashOffset = OffHeapInner.hashBytesOffset(leftPointer);</span>
+<span class="fc" id="L1330">            int rightHashOffset = OffHeapInner.hashBytesOffset(rightPointer);</span>
+
+<span class="fc bfc" id="L1332" title="All 2 branches covered.">            for (int i = 0; i &lt; HASH_SIZE; i += 8)</span>
+            {
+<span class="fc" id="L1334">                buffer.putLong(offset + OffHeapInner.HASH_BYTES_OFFSET + i,</span>
+<span class="fc" id="L1335">                               buffer.getLong(leftHashOffset  + i) ^ buffer.getLong(rightHashOffset + i));</span>
+            }
+
+<span class="fc" id="L1338">            return offset;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1344">            StringBuilder buff = new StringBuilder();</span>
+<span class="nc" id="L1345">            toString(buff, 1);</span>
+<span class="nc" id="L1346">            return buff.toString();</span>
+        }
+
+        @Override
+        public void unsafeInvalidate()
+        {
+<span class="nc" id="L1352">            computed = false;</span>
+<span class="nc" id="L1353">        }</span>
+    }
+
+    static class OffHeapInner extends OffHeapNode implements Inner
+    {
+        /**
+         * All we want to keep here is just a pointer to the start of the Inner leaf in the
+         * direct buffer. From there, we'll be able to deserialize the following, in this order:
+         *
+         * 1. pointer to left child (int)
+         * 2. pointer to right child (int)
+         * 3. hash bytes (space allocated as HASH_MAX_SIZE)
+         * 4. token length (short)
+         * 5. token bytes (variable length)
+         */
+        static final int LEFT_CHILD_POINTER_OFFSET  = 0;
+        static final int RIGHT_CHILD_POINTER_OFFSET = 4;
+        static final int HASH_BYTES_OFFSET          = 8;
+        static final int TOKEN_LENGTH_OFFSET        = 8 + HASH_SIZE;
+        static final int TOKEN_BYTES_OFFSET         = TOKEN_LENGTH_OFFSET + 2;
+
+        private final IPartitioner partitioner;
+
+        OffHeapInner(ByteBuffer buffer, int offset, IPartitioner partitioner)
+        {
+<span class="fc" id="L1378">            super(buffer, offset);</span>
+<span class="fc" id="L1379">            this.partitioner = partitioner;</span>
+<span class="fc" id="L1380">        }</span>
+
+        public Token token()
+        {
+<span class="fc" id="L1384">            int length = buffer.getShort(offset + TOKEN_LENGTH_OFFSET);</span>
+<span class="fc" id="L1385">            return partitioner.getTokenFactory().fromByteBuffer(buffer, offset + TOKEN_BYTES_OFFSET, length);</span>
+        }
+
+        public Node left()
+        {
+<span class="fc" id="L1390">            return child(LEFT_CHILD_POINTER_OFFSET);</span>
+        }
+
+        public Node right()
+        {
+<span class="fc" id="L1395">            return child(RIGHT_CHILD_POINTER_OFFSET);</span>
+        }
+
+        private Node child(int childOffset)
+        {
+<span class="fc" id="L1400">            int pointer = buffer.getInt(offset + childOffset);</span>
+<span class="fc bfc" id="L1401" title="All 2 branches covered.">            return pointer &gt;= 0 ? new OffHeapInner(buffer, pointer, partitioner) : new OffHeapLeaf(buffer, ~pointer);</span>
+        }
+
+        public int hashBytesOffset()
+        {
+<span class="fc" id="L1406">            return offset + HASH_BYTES_OFFSET;</span>
+        }
+
+        static int deserializeWithoutIdent(DataInputPlus in, ByteBuffer buffer, IPartitioner partitioner, int version) throws IOException
+        {
+<span class="pc bpc" id="L1411" title="1 of 2 branches missed.">            if (buffer.remaining() &lt; maxOffHeapSize(partitioner))</span>
+<span class="nc" id="L1412">                throw new IllegalStateException(&quot;Insufficient remaining bytes to deserialize Inner node off-heap&quot;);</span>
+
+<span class="fc" id="L1414">            final int offset = buffer.position();</span>
+
+<span class="fc" id="L1416">            int tokenSize = Token.serializer.deserializeSize(in);</span>
+<span class="fc" id="L1417">            byte[] tokenBytes = getTempArray(tokenSize);</span>
+<span class="fc" id="L1418">            in.readFully(tokenBytes, 0, tokenSize);</span>
+
+<span class="fc" id="L1420">            buffer.putShort(offset + OffHeapInner.TOKEN_LENGTH_OFFSET, Shorts.checkedCast(tokenSize));</span>
+<span class="fc" id="L1421">            buffer.position(offset + OffHeapInner.TOKEN_BYTES_OFFSET);</span>
+<span class="fc" id="L1422">            buffer.put(tokenBytes, 0, tokenSize);</span>
+
+<span class="fc" id="L1424">            int leftPointer  = OffHeapNode.deserialize(in, buffer, partitioner, version);</span>
+<span class="fc" id="L1425">            int rightPointer = OffHeapNode.deserialize(in, buffer, partitioner, version);</span>
+
+<span class="fc" id="L1427">            buffer.putInt(offset + OffHeapInner.LEFT_CHILD_POINTER_OFFSET,  leftPointer);</span>
+<span class="fc" id="L1428">            buffer.putInt(offset + OffHeapInner.RIGHT_CHILD_POINTER_OFFSET, rightPointer);</span>
+
+<span class="fc" id="L1430">            int leftHashOffset  = hashBytesOffset(leftPointer);</span>
+<span class="fc" id="L1431">            int rightHashOffset = hashBytesOffset(rightPointer);</span>
+
+<span class="fc bfc" id="L1433" title="All 2 branches covered.">            for (int i = 0; i &lt; HASH_SIZE; i += 8)</span>
+            {
+<span class="fc" id="L1435">                buffer.putLong(offset + OffHeapInner.HASH_BYTES_OFFSET + i,</span>
+<span class="fc" id="L1436">                               buffer.getLong(leftHashOffset  + i) ^ buffer.getLong(rightHashOffset + i));</span>
+            }
+
+<span class="fc" id="L1439">            return offset;</span>
+        }
+
+        static int maxOffHeapSize(IPartitioner partitioner)
+        {
+<span class="fc" id="L1444">            return 4 // left pointer</span>
+                 + 4 // right pointer
+                 + HASH_SIZE
+<span class="fc" id="L1447">                 + 2 + partitioner.getMaxTokenSize();</span>
+        }
+
+        static int hashBytesOffset(int pointer)
+        {
+<span class="fc bfc" id="L1452" title="All 2 branches covered.">            return pointer &gt;= 0 ? pointer + OffHeapInner.HASH_BYTES_OFFSET : ~pointer + OffHeapLeaf.HASH_BYTES_OFFSET;</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L1458">            StringBuilder buff = new StringBuilder();</span>
+<span class="nc" id="L1459">            toString(buff, 1);</span>
+<span class="nc" id="L1460">            return buff.toString();</span>
+        }
+    }
+
+    /**
+     * @return The bitwise XOR of the inputs.
+     */
+    static byte[] xor(byte[] left, byte[] right)
+    {
+<span class="pc bpc" id="L1469" title="1 of 2 branches missed.">        assert left.length == right.length;</span>
+
+<span class="fc" id="L1471">        byte[] out = Arrays.copyOf(right, right.length);</span>
+<span class="fc bfc" id="L1472" title="All 2 branches covered.">        for (int i = 0; i &lt; left.length; i++)</span>
+<span class="fc" id="L1473">            out[i] = (byte)((left[i] &amp; 0xFF) ^ (right[i] &amp; 0xFF));</span>
+<span class="fc" id="L1474">        return out;</span>
+    }
+
+    /**
+     * Bitwise XOR of the inputs, in place on the left array.
+     */
+    private static void xorOntoLeft(byte[] left, byte[] right)
+    {
+<span class="pc bpc" id="L1482" title="1 of 2 branches missed.">        assert left.length == right.length;</span>
+
+<span class="fc bfc" id="L1484" title="All 2 branches covered.">        for (int i = 0; i &lt; left.length; i++)</span>
+<span class="fc" id="L1485">            left[i] = (byte) ((left[i] &amp; 0xFF) ^ (right[i] &amp; 0xFF));</span>
+<span class="fc" id="L1486">    }</span>
+
+    /**
+     * Estimate the allowable depth while keeping the resulting heap usage of this tree under the provided
+     * number of bytes. This is important for ensuring that we do not allocate overly large trees that could
+     * OOM the JVM and cause instability.
+     *
+     * Calculated using the following logic:
+     *
+     * Let T = size of a tree of depth n
+     *
+     * T = #leafs  * sizeof(leaf) + #inner  * sizeof(inner)
+     * T = 2^n     * L            + 2^n - 1 * I
+     *
+     * T = 2^n * L + 2^n * I - I;
+     *
+     * So to solve for n given sizeof(tree_n) T:
+     *
+     * n = floor(log_2((T + I) / (L + I))
+     *
+     * @param numBytes: The number of bytes to fit the tree within
+     * @param bytesPerHash: The number of bytes stored in a leaf node, for example 2 * murmur128 will be 256 bits
+     *                    or 32 bytes
+     * @return the estimated depth that will fit within the provided number of bytes
+     */
+    public static int estimatedMaxDepthForBytes(IPartitioner partitioner, long numBytes, int bytesPerHash)
+    {
+<span class="fc" id="L1513">        byte[] hashLeft = new byte[bytesPerHash];</span>
+<span class="fc" id="L1514">        byte[] hashRigth = new byte[bytesPerHash];</span>
+<span class="fc" id="L1515">        OnHeapLeaf left = new OnHeapLeaf(hashLeft);</span>
+<span class="fc" id="L1516">        OnHeapLeaf right = new OnHeapLeaf(hashRigth);</span>
+<span class="fc" id="L1517">        Inner inner = new OnHeapInner(partitioner.getMinimumToken(), left, right);</span>
+<span class="fc" id="L1518">        inner.fillInnerHashes();</span>
+
+        // Some partioners have variable token sizes, try to estimate as close as we can by using the same
+        // heap estimate as the memtables use.
+<span class="fc" id="L1522">        long innerTokenSize = ObjectSizes.measureDeep(partitioner.getMinimumToken());</span>
+<span class="fc" id="L1523">        long realInnerTokenSize = partitioner.getMinimumToken().getHeapSize();</span>
+
+<span class="fc" id="L1525">        long sizeOfLeaf = ObjectSizes.measureDeep(left);</span>
+<span class="fc" id="L1526">        long sizeOfInner = ObjectSizes.measureDeep(inner) -</span>
+<span class="fc" id="L1527">                           (ObjectSizes.measureDeep(left) + ObjectSizes.measureDeep(right) + innerTokenSize) +</span>
+                           realInnerTokenSize;
+
+<span class="fc" id="L1530">        long adjustedBytes = Math.max(1, (numBytes + sizeOfInner) / (sizeOfLeaf + sizeOfInner));</span>
+<span class="fc" id="L1531">        return Math.max(1, (int) Math.floor(Math.log(adjustedBytes) / Math.log(2)));</span>
+    }
+
+    /*
+     * Test-only methods.
+     */
+
+    /**
+     * Invalidates the ranges containing the given token.
+     * Useful for testing.
+     */
+    @VisibleForTesting
+    void unsafeInvalidate(Token t)
+    {
+<span class="nc" id="L1545">        unsafeInvalidateHelper(root, fullRange.left, t);</span>
+<span class="nc" id="L1546">    }</span>
+
+    private void unsafeInvalidateHelper(Node node, Token pleft, Token t)
+    {
+<span class="nc" id="L1550">        node.hash(EMPTY_HASH);</span>
+
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">        if (node instanceof Leaf)</span>
+<span class="nc" id="L1553">            return;</span>
+
+<span class="nc bnc" id="L1555" title="All 2 branches missed.">        assert node instanceof Inner;</span>
+<span class="nc" id="L1556">        Inner inner = (Inner) node;</span>
+<span class="nc" id="L1557">        inner.unsafeInvalidate();</span>
+
+<span class="nc bnc" id="L1559" title="All 2 branches missed.">        if (Range.contains(pleft, inner.token(), t))</span>
+<span class="nc" id="L1560">            unsafeInvalidateHelper(inner.left(), pleft, t); // left child contains token</span>
+        else
+<span class="nc" id="L1562">            unsafeInvalidateHelper(inner.right(), inner.token(), t); // right child contains token</span>
+<span class="nc" id="L1563">    }</span>
+
+    /**
+     * Hash the given range in the tree. The range must have been generated
+     * with recursive applications of partitioner.midpoint().
+     *
+     * NB: Currently does not support wrapping ranges that do not end with
+     * partitioner.getMinimumToken().
+     *
+     * @return {@link #EMPTY_HASH} if any subrange of the range is invalid, or if the exact
+     *         range cannot be calculated using this tree.
+     */
+    @VisibleForTesting
+    byte[] hash(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L1578">        return find(range).hash();</span>
+    }
+
+    interface Consumer&lt;E extends Exception&gt;
+    {
+        void accept(Node node) throws E;
+    }
+
+    @VisibleForTesting
+    &lt;E extends Exception&gt; boolean ifHashesRange(Range&lt;Token&gt; range, Consumer&lt;E&gt; consumer) throws E
+    {
+        try
+        {
+<span class="nc" id="L1591">            Node node = findHelper(root, new Range&lt;&gt;(fullRange.left, fullRange.right), range);</span>
+<span class="nc bnc" id="L1592" title="All 2 branches missed.">            boolean hasHash = !node.hasEmptyHash();</span>
+<span class="nc bnc" id="L1593" title="All 2 branches missed.">            if (hasHash)</span>
+<span class="nc" id="L1594">                consumer.accept(node);</span>
+<span class="nc" id="L1595">            return hasHash;</span>
+        }
+<span class="nc" id="L1597">        catch (StopRecursion e)</span>
+        {
+<span class="nc" id="L1599">            return false;</span>
+        }
+    }
+
+    @VisibleForTesting
+    boolean hashesRange(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L1606">        return ifHashesRange(range, n -&gt; {});</span>
+    }
+
+    /**
+     * For testing purposes.
+     * Gets the smallest range containing the token.
+     */
+    @VisibleForTesting
+    public TreeRange get(Token t)
+    {
+<span class="nc" id="L1616">        return getHelper(root, fullRange.left, fullRange.right, t);</span>
+    }
+
+    private TreeRange getHelper(Node node, Token pleft, Token pright, Token t)
+    {
+<span class="nc" id="L1621">        int depth = 0;</span>
+
+        while (true)
+        {
+<span class="nc bnc" id="L1625" title="All 2 branches missed.">            if (node instanceof Leaf)</span>
+            {
+                // we've reached a hash: wrap it up and deliver it
+<span class="nc" id="L1628">                return new TreeRange(this, pleft, pright, depth, node);</span>
+            }
+
+<span class="nc bnc" id="L1631" title="All 2 branches missed.">            assert node instanceof Inner;</span>
+<span class="nc" id="L1632">            Inner inner = (Inner) node;</span>
+
+<span class="nc bnc" id="L1634" title="All 2 branches missed.">            if (Range.contains(pleft, inner.token(), t)) // left child contains token</span>
+            {
+<span class="nc" id="L1636">                pright = inner.token();</span>
+<span class="nc" id="L1637">                node = inner.left();</span>
+            }
+            else // right child contains token
+            {
+<span class="nc" id="L1641">                pleft = inner.token();</span>
+<span class="nc" id="L1642">                node = inner.right();</span>
+            }
+
+<span class="nc" id="L1645">            depth++;</span>
+<span class="nc" id="L1646">        }</span>
+    }
+
+    private void fillInnerHashes()
+    {
+<span class="fc" id="L1651">        root.fillInnerHashes();</span>
+<span class="fc" id="L1652">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

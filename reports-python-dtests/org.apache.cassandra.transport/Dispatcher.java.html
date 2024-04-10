@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Dispatcher.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">Dispatcher.java</span></div><h1>Dispatcher.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.transport;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.channel.Channel;
+import io.netty.channel.EventLoop;
+import io.netty.util.AttributeKey;
+import org.apache.cassandra.concurrent.DebuggableTask.RunnableDebuggableTask;
+import org.apache.cassandra.concurrent.LocalAwareExecutorPlus;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.metrics.ClientMetrics;
+import org.apache.cassandra.net.FrameEncoder;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.reads.thresholds.CoordinatorWarnings;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
+import org.apache.cassandra.transport.Flusher.FlushItem;
+import org.apache.cassandra.transport.messages.ErrorMessage;
+import org.apache.cassandra.transport.messages.EventMessage;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.MonotonicClock;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.concurrent.SharedExecutorPool.SHARED;
+
+public class Dispatcher
+{
+<span class="fc" id="L54">    private static final Logger logger = LoggerFactory.getLogger(Dispatcher.class);</span>
+
+    @VisibleForTesting
+<span class="fc" id="L57">    static final LocalAwareExecutorPlus requestExecutor = SHARED.newExecutor(DatabaseDescriptor.getNativeTransportMaxThreads(),</span>
+                                                                             DatabaseDescriptor::setNativeTransportMaxThreads,
+                                                                             &quot;transport&quot;,
+                                                                             &quot;Native-Transport-Requests&quot;);
+
+    /** CASSANDRA-17812: Rate-limit new client connection setup to avoid overwhelming during bcrypt
+     *
+     * authExecutor is a separate thread pool for handling requests on connections that need to be authenticated.
+     * Calls to AUTHENTICATE can be expensive if the number of rounds for bcrypt is configured to a high value,
+     * so during a connection storm checking the password hash would starve existing connected clients for CPU and
+     * trigger timeouts if on the same thread pool as standard requests.
+     *
+     * Moving authentication requests to a small, separate pool prevents starvation handling all other
+     * requests. If the authExecutor pool backs up, it may cause authentication timeouts but the clients should
+     * back off and retry while the rest of the system continues to make progress.
+     *
+     * Setting less than 1 will service auth requests on the standard {@link Dispatcher#requestExecutor}
+     */
+    @VisibleForTesting
+<span class="fc" id="L76">    static final LocalAwareExecutorPlus authExecutor = SHARED.newExecutor(Math.max(1, DatabaseDescriptor.getNativeTransportMaxAuthThreads()),</span>
+                                                                          DatabaseDescriptor::setNativeTransportMaxAuthThreads,
+                                                                          &quot;transport&quot;,
+                                                                          &quot;Native-Transport-Auth-Requests&quot;);
+
+<span class="fc" id="L81">    private static final ConcurrentMap&lt;EventLoop, Flusher&gt; flusherLookup = new ConcurrentHashMap&lt;&gt;();</span>
+    private final boolean useLegacyFlusher;
+
+    /**
+     * Takes a Channel, Request and the Response produced by processRequest and outputs a FlushItem
+     * appropriate for the pipeline, which is specific to the protocol version. V5 and above will
+     * produce FlushItem.Framed instances whereas earlier versions require FlushItem.Unframed.
+     * The instances of these FlushItem subclasses are specialized to release resources in the
+     * right way for the specific pipeline that produced them.
+     */
+    // TODO parameterize with FlushItem subclass
+    interface FlushItemConverter
+    {
+        FlushItem&lt;?&gt; toFlushItem(Channel channel, Message.Request request, Message.Response response);
+    }
+
+    public Dispatcher(boolean useLegacyFlusher)
+<span class="fc" id="L98">    {</span>
+<span class="fc" id="L99">        this.useLegacyFlusher = useLegacyFlusher;</span>
+<span class="fc" id="L100">    }</span>
+
+    public void dispatch(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure)
+    {
+        // if native_transport_max_auth_threads is &lt; 1, don't delegate to new pool on auth messages
+<span class="pc bpc" id="L105" title="2 of 6 branches missed.">        boolean isAuthQuery = DatabaseDescriptor.getNativeTransportMaxAuthThreads() &gt; 0 &amp;&amp;</span>
+                              (request.type == Message.Type.AUTH_RESPONSE || request.type == Message.Type.CREDENTIALS);
+
+        // Importantly, the authExecutor will handle the AUTHENTICATE message which may be CPU intensive.
+<span class="fc bfc" id="L109" title="All 2 branches covered.">        LocalAwareExecutorPlus executor = isAuthQuery ? authExecutor : requestExecutor;</span>
+
+<span class="fc" id="L111">        executor.submit(new RequestProcessor(channel, request, forFlusher, backpressure));</span>
+<span class="fc" id="L112">        ClientMetrics.instance.markRequestDispatched();</span>
+<span class="fc" id="L113">    }</span>
+
+    public class RequestProcessor implements RunnableDebuggableTask
+    {
+        private final Channel channel;
+        private final Message.Request request;
+        private final FlushItemConverter forFlusher;
+        private final Overload backpressure;
+        
+<span class="fc" id="L122">        private final long approxCreationTimeNanos = MonotonicClock.Global.approxTime.now();</span>
+        private volatile long approxStartTimeNanos;
+        
+        public RequestProcessor(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure)
+<span class="fc" id="L126">        {</span>
+<span class="fc" id="L127">            this.channel = channel;</span>
+<span class="fc" id="L128">            this.request = request;</span>
+<span class="fc" id="L129">            this.forFlusher = forFlusher;</span>
+<span class="fc" id="L130">            this.backpressure = backpressure;</span>
+<span class="fc" id="L131">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="fc" id="L136">            approxStartTimeNanos = MonotonicClock.Global.approxTime.now();</span>
+<span class="fc" id="L137">            processRequest(channel, request, forFlusher, backpressure, approxStartTimeNanos);</span>
+<span class="fc" id="L138">        }</span>
+
+        @Override
+        public long creationTimeNanos()
+        {
+<span class="nc" id="L143">            return approxCreationTimeNanos;</span>
+        }
+
+        @Override
+        public long startTimeNanos()
+        {
+<span class="nc" id="L149">            return approxStartTimeNanos;</span>
+        }
+
+        @Override
+        public String description()
+        {
+<span class="nc" id="L155">            return request.toString();</span>
+        }
+    }
+
+    /**
+     * Note: this method may be executed on the netty event loop, during initial protocol negotiation; the caller is
+     * responsible for cleaning up any global or thread-local state. (ex. tracing, client warnings, etc.).
+     */
+    private static Message.Response processRequest(ServerConnection connection, Message.Request request, Overload backpressure, long startTimeNanos)
+    {
+<span class="fc bfc" id="L165" title="All 2 branches covered.">        if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))</span>
+<span class="fc" id="L166">            ClientWarn.instance.captureWarnings();</span>
+
+        // even if ClientWarn is disabled, still setup CoordinatorTrackWarnings, as this will populate metrics and
+        // emit logs on the server; the warnings will just be ignored and not sent to the client
+<span class="fc bfc" id="L170" title="All 2 branches covered.">        if (request.isTrackable())</span>
+<span class="fc" id="L171">            CoordinatorWarnings.init();</span>
+
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (backpressure == Overload.REQUESTS)</span>
+        {
+<span class="nc" id="L175">            String message = String.format(&quot;Request breached global limit of %d requests/second and triggered backpressure.&quot;,</span>
+<span class="nc" id="L176">                                           ClientResourceLimits.getNativeTransportMaxRequestsPerSecond());</span>
+
+<span class="nc" id="L178">            NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);</span>
+<span class="nc" id="L179">            ClientWarn.instance.warn(message);</span>
+<span class="nc" id="L180">        }</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">        else if (backpressure == Overload.BYTES_IN_FLIGHT)</span>
+        {
+<span class="fc" id="L183">            String message = String.format(&quot;Request breached limit(s) on bytes in flight (Endpoint: %d, Global: %d) and triggered backpressure.&quot;,</span>
+<span class="fc" id="L184">                                           ClientResourceLimits.getEndpointLimit(), ClientResourceLimits.getGlobalLimit());</span>
+
+<span class="fc" id="L186">            NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);</span>
+<span class="fc" id="L187">            ClientWarn.instance.warn(message);</span>
+        }
+
+<span class="fc" id="L190">        QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());</span>
+
+<span class="fc" id="L192">        Message.logger.trace(&quot;Received: {}, v={}&quot;, request, connection.getVersion());</span>
+<span class="fc" id="L193">        connection.requests.inc();</span>
+<span class="fc" id="L194">        Message.Response response = request.execute(qstate, startTimeNanos);</span>
+
+<span class="fc bfc" id="L196" title="All 2 branches covered.">        if (request.isTrackable())</span>
+<span class="fc" id="L197">            CoordinatorWarnings.done();</span>
+
+<span class="fc" id="L199">        response.setStreamId(request.getStreamId());</span>
+<span class="fc" id="L200">        response.setWarnings(ClientWarn.instance.getWarnings());</span>
+<span class="fc" id="L201">        response.attach(connection);</span>
+<span class="fc" id="L202">        connection.applyStateTransition(request.type, response.type);</span>
+<span class="fc" id="L203">        return response;</span>
+    }
+    
+    /**
+     * Note: this method may be executed on the netty event loop.
+     */
+    static Message.Response processRequest(Channel channel, Message.Request request, Overload backpressure, long approxStartTimeNanos)
+    {
+        try
+        {
+<span class="fc" id="L213">            return processRequest((ServerConnection) request.connection(), request, backpressure, approxStartTimeNanos);</span>
+        }
+<span class="nc" id="L215">        catch (Throwable t)</span>
+        {
+<span class="nc" id="L217">            JVMStabilityInspector.inspectThrowable(t);</span>
+
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (request.isTrackable())</span>
+<span class="nc" id="L220">                CoordinatorWarnings.done();</span>
+
+<span class="nc" id="L222">            Predicate&lt;Throwable&gt; handler = ExceptionHandlers.getUnexpectedExceptionHandler(channel, true);</span>
+<span class="nc" id="L223">            ErrorMessage error = ErrorMessage.fromException(t, handler);</span>
+<span class="nc" id="L224">            error.setStreamId(request.getStreamId());</span>
+<span class="nc" id="L225">            error.setWarnings(ClientWarn.instance.getWarnings());</span>
+<span class="nc" id="L226">            return error;</span>
+        }
+        finally
+        {
+<span class="fc" id="L230">            CoordinatorWarnings.reset();</span>
+<span class="fc" id="L231">            ClientWarn.instance.resetWarnings();</span>
+        }
+    }
+
+    /**
+     * Note: this method is not expected to execute on the netty event loop.
+     */
+    void processRequest(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure, long approxStartTimeNanos)
+    {
+<span class="fc" id="L240">        Message.Response response = processRequest(channel, request, backpressure, approxStartTimeNanos);</span>
+<span class="fc" id="L241">        FlushItem&lt;?&gt; toFlush = forFlusher.toFlushItem(channel, request, response);</span>
+<span class="fc" id="L242">        Message.logger.trace(&quot;Responding: {}, v={}&quot;, response, request.connection().getVersion());</span>
+<span class="fc" id="L243">        flush(toFlush);</span>
+<span class="fc" id="L244">    }</span>
+
+    private void flush(FlushItem&lt;?&gt; item)
+    {
+<span class="fc" id="L248">        EventLoop loop = item.channel.eventLoop();</span>
+<span class="fc" id="L249">        Flusher flusher = flusherLookup.get(loop);</span>
+<span class="fc bfc" id="L250" title="All 2 branches covered.">        if (flusher == null)</span>
+        {
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">            Flusher created = useLegacyFlusher ? Flusher.legacy(loop) : Flusher.immediate(loop);</span>
+<span class="fc" id="L253">            Flusher alt = flusherLookup.putIfAbsent(loop, flusher = created);</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">            if (alt != null)</span>
+<span class="fc" id="L255">                flusher = alt;</span>
+        }
+
+<span class="fc" id="L258">        flusher.enqueue(item);</span>
+<span class="fc" id="L259">        flusher.start();</span>
+<span class="fc" id="L260">    }</span>
+
+    public static void shutdown()
+    {
+<span class="nc" id="L264">        requestExecutor.shutdown();</span>
+<span class="nc" id="L265">        authExecutor.shutdown();</span>
+<span class="nc" id="L266">    }</span>
+
+    /**
+     * Dispatcher for EventMessages. In {@link Server.ConnectionTracker#send(Event)}, the strategy
+     * for delivering events to registered clients is dependent on protocol version and the configuration
+     * of the pipeline. For v5 and newer connections, the event message is encoded into an Envelope,
+     * wrapped in a FlushItem and then delivered via the pipeline's flusher, in a similar way to
+     * a Response returned from {@link #processRequest(Channel, Message.Request, FlushItemConverter, Overload, long)}.
+     * It's worth noting that events are not generally fired as a direct response to a client request,
+     * so this flush item has a null request attribute. The dispatcher itself is created when the
+     * pipeline is first configured during protocol negotiation and is attached to the channel for
+     * later retrieval.
+     *
+     * Pre-v5 connections simply write the EventMessage directly to the pipeline.
+     */
+<span class="fc" id="L281">    static final AttributeKey&lt;Consumer&lt;EventMessage&gt;&gt; EVENT_DISPATCHER = AttributeKey.valueOf(&quot;EVTDISP&quot;);</span>
+    Consumer&lt;EventMessage&gt; eventDispatcher(final Channel channel,
+                                           final ProtocolVersion version,
+                                           final FrameEncoder.PayloadAllocator allocator)
+    {
+<span class="fc" id="L286">        return eventMessage -&gt; flush(new FlushItem.Framed(channel,</span>
+<span class="fc" id="L287">                                                          eventMessage.encode(version),</span>
+                                                          null,
+                                                          allocator,
+<span class="fc" id="L290">                                                          f -&gt; f.response.release()));</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

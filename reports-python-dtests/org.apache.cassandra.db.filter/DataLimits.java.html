@@ -1,0 +1,1272 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DataLimits.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.filter</a> &gt; <span class="el_source">DataLimits.java</span></div><h1>DataLimits.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.db.filter;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.aggregation.GroupMaker;
+import org.apache.cassandra.db.aggregation.GroupingState;
+import org.apache.cassandra.db.aggregation.AggregationSpecification;
+import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.db.partitions.*;
+import org.apache.cassandra.db.transform.BasePartitions;
+import org.apache.cassandra.db.transform.BaseRows;
+import org.apache.cassandra.db.transform.StoppingTransformation;
+import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+/**
+ * Object in charge of tracking if we have fetch enough data for a given query.
+ *
+ * This is more complicated than a single count because we support PER PARTITION
+ * limits, but also due to GROUP BY and paging.
+ */
+<span class="fc" id="L44">public abstract class DataLimits</span>
+{
+<span class="fc" id="L46">    public static final Serializer serializer = new Serializer();</span>
+
+    public static final int NO_LIMIT = Integer.MAX_VALUE;
+
+<span class="fc" id="L50">    public static final DataLimits NONE = new CQLLimits(NO_LIMIT)</span>
+<span class="fc" id="L51">    {</span>
+        @Override
+        public boolean hasEnoughLiveData(CachedPartition cached, long nowInSec, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+<span class="nc" id="L55">            return false;</span>
+        }
+
+        @Override
+        public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter,
+                                                  long nowInSec,
+                                                  boolean countPartitionsWithOnlyStaticData)
+        {
+<span class="fc" id="L63">            return iter;</span>
+        }
+
+        @Override
+        public UnfilteredRowIterator filter(UnfilteredRowIterator iter,
+                                            long nowInSec,
+                                            boolean countPartitionsWithOnlyStaticData)
+        {
+<span class="nc" id="L71">            return iter;</span>
+        }
+
+        @Override
+        public PartitionIterator filter(PartitionIterator iter, long nowInSec, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+<span class="fc" id="L77">            return iter;</span>
+        }
+    };
+
+    // We currently deal with distinct queries by querying full partitions but limiting the result at 1 row per
+    // partition (see SelectStatement.makeFilter). So an &quot;unbounded&quot; distinct is still actually doing some filtering.
+<span class="fc" id="L83">    public static final DataLimits DISTINCT_NONE = new CQLLimits(NO_LIMIT, 1, true);</span>
+
+<span class="fc" id="L85">    public enum Kind</span>
+    {
+<span class="fc" id="L87">        CQL_LIMIT,</span>
+<span class="fc" id="L88">        CQL_PAGING_LIMIT,</span>
+<span class="fc" id="L89">        @Deprecated THRIFT_LIMIT, //Deprecated and unused in 4.0, stop publishing in 5.0, reclaim in 6.0</span>
+<span class="fc" id="L90">        @Deprecated SUPER_COLUMN_COUNTING_LIMIT, //Deprecated and unused in 4.0, stop publishing in 5.0, reclaim in 6.0</span>
+<span class="fc" id="L91">        CQL_GROUP_BY_LIMIT,</span>
+<span class="fc" id="L92">        CQL_GROUP_BY_PAGING_LIMIT,</span>
+    }
+
+    public static DataLimits cqlLimits(int cqlRowLimit)
+    {
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">        return cqlRowLimit == NO_LIMIT ? NONE : new CQLLimits(cqlRowLimit);</span>
+    }
+
+    public static DataLimits cqlLimits(int cqlRowLimit, int perPartitionLimit)
+    {
+<span class="fc bfc" id="L102" title="All 4 branches covered.">        return cqlRowLimit == NO_LIMIT &amp;&amp; perPartitionLimit == NO_LIMIT</span>
+<span class="fc" id="L103">             ? NONE</span>
+<span class="fc" id="L104">             : new CQLLimits(cqlRowLimit, perPartitionLimit);</span>
+    }
+
+    private static DataLimits cqlLimits(int cqlRowLimit, int perPartitionLimit, boolean isDistinct)
+    {
+<span class="pc bpc" id="L109" title="2 of 6 branches missed.">        return cqlRowLimit == NO_LIMIT &amp;&amp; perPartitionLimit == NO_LIMIT &amp;&amp; !isDistinct</span>
+<span class="fc" id="L110">             ? NONE</span>
+<span class="fc" id="L111">             : new CQLLimits(cqlRowLimit, perPartitionLimit, isDistinct);</span>
+    }
+
+    public static DataLimits groupByLimits(int groupLimit,
+                                           int groupPerPartitionLimit,
+                                           int rowLimit,
+                                           AggregationSpecification groupBySpec)
+    {
+<span class="fc" id="L119">        return new CQLGroupByLimits(groupLimit, groupPerPartitionLimit, rowLimit, groupBySpec);</span>
+    }
+
+    public static DataLimits distinctLimits(int cqlRowLimit)
+    {
+<span class="fc" id="L124">        return CQLLimits.distinct(cqlRowLimit);</span>
+    }
+
+    public abstract Kind kind();
+
+    public abstract boolean isUnlimited();
+    public abstract boolean isDistinct();
+
+    public boolean isGroupByLimit()
+    {
+<span class="fc" id="L134">        return false;</span>
+    }
+
+    public boolean isExhausted(Counter counter)
+    {
+<span class="fc bfc" id="L139" title="All 2 branches covered.">        return counter.counted() &lt; count();</span>
+    }
+
+    public abstract DataLimits forPaging(int pageSize);
+    public abstract DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining);
+
+    public abstract DataLimits forShortReadRetry(int toFetch);
+
+    /**
+     * Creates a &lt;code&gt;DataLimits&lt;/code&gt; instance to be used for paginating internally GROUP BY queries.
+     *
+     * @param state the &lt;code&gt;GroupMaker&lt;/code&gt; state
+     * @return a &lt;code&gt;DataLimits&lt;/code&gt; instance to be used for paginating internally GROUP BY queries
+     */
+    public DataLimits forGroupByInternalPaging(GroupingState state)
+    {
+<span class="nc" id="L155">        throw new UnsupportedOperationException();</span>
+    }
+
+    public abstract boolean hasEnoughLiveData(CachedPartition cached,
+                                              long nowInSec,
+                                              boolean countPartitionsWithOnlyStaticData,
+                                              boolean enforceStrictLiveness);
+
+    /**
+     * Returns a new {@code Counter} for this limits.
+     *
+     * @param nowInSec the current time in second (to decide what is expired or not).
+     * @param assumeLiveData if true, the counter will assume that every row passed is live and won't
+     * thus check for liveness, otherwise it will. This should be {@code true} when used on a
+     * {@code RowIterator} (since it only returns live rows), false otherwise.
+     * @param countPartitionsWithOnlyStaticData if {@code true} the partitions with only static data should be counted
+     * as 1 valid row.
+     * @param enforceStrictLiveness whether the row should be purged if there is no PK liveness info,
+     * normally retrieved from {@link org.apache.cassandra.schema.TableMetadata#enforceStrictLiveness()}
+     * @return a new {@code Counter} for this limits.
+     */
+    public abstract Counter newCounter(long nowInSec,
+                                       boolean assumeLiveData,
+                                       boolean countPartitionsWithOnlyStaticData,
+                                       boolean enforceStrictLiveness);
+
+    /**
+     * The max number of results this limits enforces.
+     * &lt;p&gt;
+     * Note that the actual definition of &quot;results&quot; depends a bit: for &quot;normal&quot; queries it's a number of rows,
+     * but for GROUP BY queries it's a number of groups.
+     *
+     * @return the maximum number of results this limits enforces.
+     */
+    public abstract int count();
+
+    public abstract int perPartitionCount();
+
+    /**
+     * Returns equivalent limits but where any internal state kept to track where we are of paging and/or grouping is
+     * discarded.
+     */
+    public abstract DataLimits withoutState();
+
+    public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter,
+                                              long nowInSec,
+                                              boolean countPartitionsWithOnlyStaticData)
+    {
+<span class="fc" id="L203">        return this.newCounter(nowInSec,</span>
+                               false,
+                               countPartitionsWithOnlyStaticData,
+<span class="fc" id="L206">                               iter.metadata().enforceStrictLiveness())</span>
+<span class="fc" id="L207">                   .applyTo(iter);</span>
+    }
+
+    public UnfilteredRowIterator filter(UnfilteredRowIterator iter,
+                                        long nowInSec,
+                                        boolean countPartitionsWithOnlyStaticData)
+    {
+<span class="nc" id="L214">        return this.newCounter(nowInSec,</span>
+                               false,
+                               countPartitionsWithOnlyStaticData,
+<span class="nc" id="L217">                               iter.metadata().enforceStrictLiveness())</span>
+<span class="nc" id="L218">                   .applyTo(iter);</span>
+    }
+
+    public PartitionIterator filter(PartitionIterator iter, long nowInSec, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+    {
+<span class="fc" id="L223">        return this.newCounter(nowInSec, true, countPartitionsWithOnlyStaticData, enforceStrictLiveness).applyTo(iter);</span>
+    }
+
+    /**
+     * Estimate the number of results that a full scan of the provided cfs would yield.
+     */
+    public abstract float estimateTotalResults(ColumnFamilyStore cfs);
+
+    public static abstract class Counter extends StoppingTransformation&lt;BaseRowIterator&lt;?&gt;&gt;
+    {
+        protected final long nowInSec;
+        protected final boolean assumeLiveData;
+        private final boolean enforceStrictLiveness;
+
+        // false means we do not propagate our stop signals onto the iterator, we only count
+<span class="fc" id="L238">        protected boolean enforceLimits = true;</span>
+
+        protected Counter(long nowInSec, boolean assumeLiveData, boolean enforceStrictLiveness)
+<span class="fc" id="L241">        {</span>
+<span class="fc" id="L242">            this.nowInSec = nowInSec;</span>
+<span class="fc" id="L243">            this.assumeLiveData = assumeLiveData;</span>
+<span class="fc" id="L244">            this.enforceStrictLiveness = enforceStrictLiveness;</span>
+<span class="fc" id="L245">        }</span>
+
+        public Counter onlyCount()
+        {
+<span class="fc" id="L249">            this.enforceLimits = false;</span>
+<span class="fc" id="L250">            return this;</span>
+        }
+
+        public PartitionIterator applyTo(PartitionIterator partitions)
+        {
+<span class="fc" id="L255">            return Transformation.apply(partitions, this);</span>
+        }
+
+        public UnfilteredPartitionIterator applyTo(UnfilteredPartitionIterator partitions)
+        {
+<span class="fc" id="L260">            return Transformation.apply(partitions, this);</span>
+        }
+
+        public UnfilteredRowIterator applyTo(UnfilteredRowIterator partition)
+        {
+<span class="fc" id="L265">            return (UnfilteredRowIterator) applyToPartition(partition);</span>
+        }
+
+        public RowIterator applyTo(RowIterator partition)
+        {
+<span class="fc" id="L270">            return (RowIterator) applyToPartition(partition);</span>
+        }
+
+        /**
+         * The number of results counted.
+         * &lt;p&gt;
+         * Note that the definition of &quot;results&quot; should be the same that for {@link #count}.
+         *
+         * @return the number of results counted.
+         */
+        public abstract int counted();
+
+        public abstract int countedInCurrentPartition();
+
+        /**
+         * The number of rows counted.
+         *
+         * @return the number of rows counted.
+         */
+        public abstract int rowsCounted();
+
+        /**
+         * The number of rows counted in the current partition.
+         *
+         * @return the number of rows counted in the current partition.
+         */
+        public abstract int rowsCountedInCurrentPartition();
+
+        public abstract boolean isDone();
+        public abstract boolean isDoneForPartition();
+
+        protected boolean isLive(Row row)
+        {
+<span class="fc bfc" id="L303" title="All 4 branches covered.">            return assumeLiveData || row.hasLiveData(nowInSec, enforceStrictLiveness);</span>
+        }
+
+        @Override
+        protected BaseRowIterator&lt;?&gt; applyToPartition(BaseRowIterator&lt;?&gt; partition)
+        {
+<span class="fc bfc" id="L309" title="All 2 branches covered.">            return partition instanceof UnfilteredRowIterator ? Transformation.apply((UnfilteredRowIterator) partition, this)</span>
+<span class="fc" id="L310">                                                              : Transformation.apply((RowIterator) partition, this);</span>
+        }
+
+        // called before we process a given partition
+        protected abstract void applyToPartition(DecoratedKey partitionKey, Row staticRow);
+
+        @Override
+        protected void attachTo(BasePartitions partitions)
+        {
+<span class="fc bfc" id="L319" title="All 2 branches covered.">            if (enforceLimits)</span>
+<span class="fc" id="L320">                super.attachTo(partitions);</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">            if (isDone())</span>
+<span class="fc" id="L322">                stop();</span>
+<span class="fc" id="L323">        }</span>
+
+        @Override
+        protected void attachTo(BaseRows rows)
+        {
+<span class="fc bfc" id="L328" title="All 2 branches covered.">            if (enforceLimits)</span>
+<span class="fc" id="L329">                super.attachTo(rows);</span>
+<span class="fc" id="L330">            applyToPartition(rows.partitionKey(), rows.staticRow());</span>
+<span class="fc bfc" id="L331" title="All 2 branches covered.">            if (isDoneForPartition())</span>
+<span class="fc" id="L332">                stopInPartition();</span>
+<span class="fc" id="L333">        }</span>
+
+        @Override
+        public void onClose()
+        {
+<span class="fc" id="L338">            super.onClose();</span>
+<span class="fc" id="L339">        }</span>
+    }
+
+    /**
+     * Limits used by CQL; this counts rows.
+     */
+    private static class CQLLimits extends DataLimits
+    {
+        protected final int rowLimit;
+        protected final int perPartitionLimit;
+
+        // Whether the query is a distinct query or not.
+        protected final boolean isDistinct;
+
+        private CQLLimits(int rowLimit)
+        {
+<span class="fc" id="L355">            this(rowLimit, NO_LIMIT);</span>
+<span class="fc" id="L356">        }</span>
+
+        private CQLLimits(int rowLimit, int perPartitionLimit)
+        {
+<span class="fc" id="L360">            this(rowLimit, perPartitionLimit, false);</span>
+<span class="fc" id="L361">        }</span>
+
+        private CQLLimits(int rowLimit, int perPartitionLimit, boolean isDistinct)
+<span class="fc" id="L364">        {</span>
+<span class="fc" id="L365">            this.rowLimit = rowLimit;</span>
+<span class="fc" id="L366">            this.perPartitionLimit = perPartitionLimit;</span>
+<span class="fc" id="L367">            this.isDistinct = isDistinct;</span>
+<span class="fc" id="L368">        }</span>
+
+        private static CQLLimits distinct(int rowLimit)
+        {
+<span class="fc" id="L372">            return new CQLLimits(rowLimit, 1, true);</span>
+        }
+
+        public Kind kind()
+        {
+<span class="fc" id="L377">            return Kind.CQL_LIMIT;</span>
+        }
+
+        public boolean isUnlimited()
+        {
+<span class="pc bpc" id="L382" title="1 of 4 branches missed.">            return rowLimit == NO_LIMIT &amp;&amp; perPartitionLimit == NO_LIMIT;</span>
+        }
+
+        public boolean isDistinct()
+        {
+<span class="nc" id="L387">            return isDistinct;</span>
+        }
+
+        public DataLimits forPaging(int pageSize)
+        {
+<span class="fc" id="L392">            return new CQLLimits(pageSize, perPartitionLimit, isDistinct);</span>
+        }
+
+        public DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
+        {
+<span class="fc" id="L397">            return new CQLPagingLimits(pageSize, perPartitionLimit, isDistinct, lastReturnedKey, lastReturnedKeyRemaining);</span>
+        }
+
+        public DataLimits forShortReadRetry(int toFetch)
+        {
+<span class="fc" id="L402">            return new CQLLimits(toFetch, perPartitionLimit, isDistinct);</span>
+        }
+
+        public boolean hasEnoughLiveData(CachedPartition cached, long nowInSec, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+            // We want the number of row that are currently live. Getting that precise number forces
+            // us to iterate the cached partition in general, but we can avoid that if:
+            //   - The number of rows with at least one non-expiring cell is greater than what we ask,
+            //     in which case we know we have enough live.
+            //   - The number of rows is less than requested, in which case we  know we won't have enough.
+<span class="nc bnc" id="L412" title="All 2 branches missed.">            if (cached.rowsWithNonExpiringCells() &gt;= rowLimit)</span>
+<span class="nc" id="L413">                return true;</span>
+
+<span class="nc bnc" id="L415" title="All 2 branches missed.">            if (cached.rowCount() &lt; rowLimit)</span>
+<span class="nc" id="L416">                return false;</span>
+
+            // Otherwise, we need to re-count
+
+<span class="nc" id="L420">            DataLimits.Counter counter = newCounter(nowInSec, false, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+<span class="nc" id="L421">            try (UnfilteredRowIterator cacheIter = cached.unfilteredIterator(ColumnFilter.selection(cached.columns()), Slices.ALL, false);</span>
+<span class="nc" id="L422">                 UnfilteredRowIterator iter = counter.applyTo(cacheIter))</span>
+            {
+                // Consume the iterator until we've counted enough
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                while (iter.hasNext())</span>
+<span class="nc" id="L426">                    iter.next();</span>
+<span class="nc" id="L427">                return counter.isDone();</span>
+            }
+        }
+
+        public Counter newCounter(long nowInSec,
+                                  boolean assumeLiveData,
+                                  boolean countPartitionsWithOnlyStaticData,
+                                  boolean enforceStrictLiveness)
+        {
+<span class="fc" id="L436">            return new CQLCounter(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+        }
+
+        public int count()
+        {
+<span class="fc" id="L441">            return rowLimit;</span>
+        }
+
+        public int perPartitionCount()
+        {
+<span class="fc" id="L446">            return perPartitionLimit;</span>
+        }
+
+        public DataLimits withoutState()
+        {
+<span class="fc" id="L451">            return this;</span>
+        }
+
+        public float estimateTotalResults(ColumnFamilyStore cfs)
+        {
+            // TODO: we should start storing stats on the number of rows (instead of the number of cells, which
+            // is what getMeanColumns returns)
+<span class="fc" id="L458">            float rowsPerPartition = ((float) cfs.getMeanEstimatedCellPerPartitionCount()) / cfs.metadata().regularColumns().size();</span>
+<span class="fc" id="L459">            return rowsPerPartition * (cfs.estimateKeys());</span>
+        }
+
+        protected class CQLCounter extends Counter
+        {
+            protected int rowsCounted;
+            protected int rowsInCurrentPartition;
+            protected final boolean countPartitionsWithOnlyStaticData;
+
+            protected boolean hasLiveStaticRow;
+
+            public CQLCounter(long nowInSec,
+                              boolean assumeLiveData,
+                              boolean countPartitionsWithOnlyStaticData,
+                              boolean enforceStrictLiveness)
+<span class="fc" id="L474">            {</span>
+<span class="fc" id="L475">                super(nowInSec, assumeLiveData, enforceStrictLiveness);</span>
+<span class="fc" id="L476">                this.countPartitionsWithOnlyStaticData = countPartitionsWithOnlyStaticData;</span>
+<span class="fc" id="L477">            }</span>
+
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
+            {
+<span class="fc" id="L482">                rowsInCurrentPartition = 0;</span>
+<span class="fc bfc" id="L483" title="All 4 branches covered.">                hasLiveStaticRow = !staticRow.isEmpty() &amp;&amp; isLive(staticRow);</span>
+<span class="fc" id="L484">            }</span>
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+<span class="fc bfc" id="L489" title="All 2 branches covered.">                if (isLive(row))</span>
+<span class="fc" id="L490">                    incrementRowCount();</span>
+<span class="fc" id="L491">                return row;</span>
+            }
+
+            @Override
+            public void onPartitionClose()
+            {
+                // Normally, we don't count static rows as from a CQL point of view, it will be merge with other
+                // rows in the partition. However, if we only have the static row, it will be returned as one row
+                // so count it.
+<span class="fc bfc" id="L500" title="All 6 branches covered.">                if (countPartitionsWithOnlyStaticData &amp;&amp; hasLiveStaticRow &amp;&amp; rowsInCurrentPartition == 0)</span>
+<span class="fc" id="L501">                    incrementRowCount();</span>
+<span class="fc" id="L502">                super.onPartitionClose();</span>
+<span class="fc" id="L503">            }</span>
+
+            protected void incrementRowCount()
+            {
+<span class="fc bfc" id="L507" title="All 2 branches covered.">                if (++rowsCounted &gt;= rowLimit)</span>
+<span class="fc" id="L508">                    stop();</span>
+<span class="fc bfc" id="L509" title="All 2 branches covered.">                if (++rowsInCurrentPartition &gt;= perPartitionLimit)</span>
+<span class="fc" id="L510">                    stopInPartition();</span>
+<span class="fc" id="L511">            }</span>
+
+            public int counted()
+            {
+<span class="fc" id="L515">                return rowsCounted;</span>
+            }
+
+            public int countedInCurrentPartition()
+            {
+<span class="fc" id="L520">                return rowsInCurrentPartition;</span>
+            }
+
+            public int rowsCounted()
+            {
+<span class="fc" id="L525">                return rowsCounted;</span>
+            }
+
+            public int rowsCountedInCurrentPartition()
+            {
+<span class="fc" id="L530">                return rowsInCurrentPartition;</span>
+            }
+
+            public boolean isDone()
+            {
+<span class="fc bfc" id="L535" title="All 2 branches covered.">                return rowsCounted &gt;= rowLimit;</span>
+            }
+
+            public boolean isDoneForPartition()
+            {
+<span class="pc bpc" id="L540" title="1 of 4 branches missed.">                return isDone() || rowsInCurrentPartition &gt;= perPartitionLimit;</span>
+            }
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="fc" id="L547">            StringBuilder sb = new StringBuilder();</span>
+
+<span class="fc bfc" id="L549" title="All 2 branches covered.">            if (rowLimit != NO_LIMIT)</span>
+            {
+<span class="fc" id="L551">                sb.append(&quot;LIMIT &quot;).append(rowLimit);</span>
+<span class="pc bpc" id="L552" title="1 of 2 branches missed.">                if (perPartitionLimit != NO_LIMIT)</span>
+<span class="nc" id="L553">                    sb.append(' ');</span>
+            }
+
+<span class="pc bpc" id="L556" title="1 of 2 branches missed.">            if (perPartitionLimit != NO_LIMIT)</span>
+<span class="nc" id="L557">                sb.append(&quot;PER PARTITION LIMIT &quot;).append(perPartitionLimit);</span>
+
+<span class="fc" id="L559">            return sb.toString();</span>
+        }
+    }
+
+    private static class CQLPagingLimits extends CQLLimits
+    {
+        private final ByteBuffer lastReturnedKey;
+        private final int lastReturnedKeyRemaining;
+
+        public CQLPagingLimits(int rowLimit, int perPartitionLimit, boolean isDistinct, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
+        {
+<span class="fc" id="L570">            super(rowLimit, perPartitionLimit, isDistinct);</span>
+<span class="fc" id="L571">            this.lastReturnedKey = lastReturnedKey;</span>
+<span class="fc" id="L572">            this.lastReturnedKeyRemaining = lastReturnedKeyRemaining;</span>
+<span class="fc" id="L573">        }</span>
+
+        @Override
+        public Kind kind()
+        {
+<span class="fc" id="L578">            return Kind.CQL_PAGING_LIMIT;</span>
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize)
+        {
+<span class="nc" id="L584">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
+        {
+<span class="nc" id="L590">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public DataLimits withoutState()
+        {
+<span class="fc" id="L596">            return new CQLLimits(rowLimit, perPartitionLimit, isDistinct);</span>
+        }
+
+        @Override
+        public Counter newCounter(long nowInSec, boolean assumeLiveData, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+<span class="fc" id="L602">            return new PagingAwareCounter(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+        }
+
+        private class PagingAwareCounter extends CQLCounter
+        {
+            private PagingAwareCounter(long nowInSec,
+                                       boolean assumeLiveData,
+                                       boolean countPartitionsWithOnlyStaticData,
+                                       boolean enforceStrictLiveness)
+<span class="fc" id="L611">            {</span>
+<span class="fc" id="L612">                super(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+<span class="fc" id="L613">            }</span>
+
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
+            {
+<span class="fc bfc" id="L618" title="All 2 branches covered.">                if (partitionKey.getKey().equals(lastReturnedKey))</span>
+                {
+<span class="fc" id="L620">                    rowsInCurrentPartition = perPartitionLimit - lastReturnedKeyRemaining;</span>
+                    // lastReturnedKey is the last key for which we're returned rows in the first page.
+                    // So, since we know we have returned rows, we know we have accounted for the static row
+                    // if any already, so force hasLiveStaticRow to false so we make sure to not count it
+                    // once more.
+<span class="fc" id="L625">                    hasLiveStaticRow = false;</span>
+                }
+                else
+                {
+<span class="fc" id="L629">                    super.applyToPartition(partitionKey, staticRow);</span>
+                }
+<span class="fc" id="L631">            }</span>
+        }
+    }
+
+    /**
+     * &lt;code&gt;CQLLimits&lt;/code&gt; used for GROUP BY queries or queries with aggregates.
+     * &lt;p&gt;Internally, GROUP BY queries are always paginated by number of rows to avoid OOMExceptions. By consequence,
+     * the limits keep track of the number of rows as well as the number of groups.&lt;/p&gt;
+     * &lt;p&gt;A group can only be counted if the next group or the end of the data is reached.&lt;/p&gt;
+     */
+    private static class CQLGroupByLimits extends CQLLimits
+    {
+        /**
+         * The &lt;code&gt;GroupMaker&lt;/code&gt; state
+         */
+        protected final GroupingState state;
+
+        /**
+         * The GROUP BY specification
+         */
+        protected final AggregationSpecification groupBySpec;
+
+        /**
+         * The limit on the number of groups
+         */
+        protected final int groupLimit;
+
+        /**
+         * The limit on the number of groups per partition
+         */
+        protected final int groupPerPartitionLimit;
+
+        public CQLGroupByLimits(int groupLimit,
+                                int groupPerPartitionLimit,
+                                int rowLimit,
+                                AggregationSpecification groupBySpec)
+        {
+<span class="fc" id="L668">            this(groupLimit, groupPerPartitionLimit, rowLimit, groupBySpec, GroupingState.EMPTY_STATE);</span>
+<span class="fc" id="L669">        }</span>
+
+        private CQLGroupByLimits(int groupLimit,
+                                 int groupPerPartitionLimit,
+                                 int rowLimit,
+                                 AggregationSpecification groupBySpec,
+                                 GroupingState state)
+        {
+<span class="fc" id="L677">            super(rowLimit, NO_LIMIT, false);</span>
+<span class="fc" id="L678">            this.groupLimit = groupLimit;</span>
+<span class="fc" id="L679">            this.groupPerPartitionLimit = groupPerPartitionLimit;</span>
+<span class="fc" id="L680">            this.groupBySpec = groupBySpec;</span>
+<span class="fc" id="L681">            this.state = state;</span>
+<span class="fc" id="L682">        }</span>
+
+        @Override
+        public Kind kind()
+        {
+<span class="fc" id="L687">            return Kind.CQL_GROUP_BY_LIMIT;</span>
+        }
+
+        @Override
+        public boolean isGroupByLimit()
+        {
+<span class="fc" id="L693">            return true;</span>
+        }
+
+        public boolean isUnlimited()
+        {
+<span class="pc bpc" id="L698" title="5 of 6 branches missed.">            return groupLimit == NO_LIMIT &amp;&amp; groupPerPartitionLimit == NO_LIMIT &amp;&amp; rowLimit == NO_LIMIT;</span>
+        }
+
+        public DataLimits forShortReadRetry(int toFetch)
+        {
+<span class="fc" id="L703">            return new CQLLimits(toFetch);</span>
+        }
+
+        @Override
+        public float estimateTotalResults(ColumnFamilyStore cfs)
+        {
+            // For the moment, we return the estimated number of rows as we have no good way of estimating 
+            // the number of groups that will be returned. Hopefully, we should be able to fix
+            // that problem at some point.
+<span class="fc" id="L712">            return super.estimateTotalResults(cfs);</span>
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize)
+        {
+<span class="fc" id="L718">            return new CQLGroupByLimits(pageSize,</span>
+                                        groupPerPartitionLimit,
+                                        rowLimit,
+                                        groupBySpec,
+                                        state);
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
+        {
+<span class="fc" id="L728">            return new CQLGroupByPagingLimits(pageSize,</span>
+                                              groupPerPartitionLimit,
+                                              rowLimit,
+                                              groupBySpec,
+                                              state,
+                                              lastReturnedKey,
+                                              lastReturnedKeyRemaining);
+        }
+
+        @Override
+        public DataLimits forGroupByInternalPaging(GroupingState state)
+        {
+<span class="fc" id="L740">            return new CQLGroupByLimits(rowLimit,</span>
+                                        groupPerPartitionLimit,
+                                        rowLimit,
+                                        groupBySpec,
+                                        state);
+        }
+
+        @Override
+        public Counter newCounter(long nowInSec,
+                                  boolean assumeLiveData,
+                                  boolean countPartitionsWithOnlyStaticData,
+                                  boolean enforceStrictLiveness)
+        {
+<span class="fc" id="L753">            return new GroupByAwareCounter(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+        }
+
+        @Override
+        public int count()
+        {
+<span class="fc" id="L759">            return groupLimit;</span>
+        }
+
+        @Override
+        public int perPartitionCount()
+        {
+<span class="fc" id="L765">            return groupPerPartitionLimit;</span>
+        }
+
+        @Override
+        public DataLimits withoutState()
+        {
+<span class="pc bpc" id="L771" title="1 of 2 branches missed.">            return state == GroupingState.EMPTY_STATE</span>
+<span class="fc" id="L772">                 ? this</span>
+<span class="nc" id="L773">                 : new CQLGroupByLimits(groupLimit, groupPerPartitionLimit, rowLimit, groupBySpec);</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L779">            StringBuilder sb = new StringBuilder();</span>
+
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            if (groupLimit != NO_LIMIT)</span>
+            {
+<span class="nc" id="L783">                sb.append(&quot;GROUP LIMIT &quot;).append(groupLimit);</span>
+<span class="nc bnc" id="L784" title="All 4 branches missed.">                if (groupPerPartitionLimit != NO_LIMIT || rowLimit != NO_LIMIT)</span>
+<span class="nc" id="L785">                    sb.append(' ');</span>
+            }
+
+<span class="nc bnc" id="L788" title="All 2 branches missed.">            if (groupPerPartitionLimit != NO_LIMIT)</span>
+            {
+<span class="nc" id="L790">                sb.append(&quot;GROUP PER PARTITION LIMIT &quot;).append(groupPerPartitionLimit);</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">                if (rowLimit != NO_LIMIT)</span>
+<span class="nc" id="L792">                    sb.append(' ');</span>
+            }
+
+<span class="nc bnc" id="L795" title="All 2 branches missed.">            if (rowLimit != NO_LIMIT)</span>
+            {
+<span class="nc" id="L797">                sb.append(&quot;LIMIT &quot;).append(rowLimit);</span>
+            }
+
+<span class="nc" id="L800">            return sb.toString();</span>
+        }
+
+        @Override
+        public boolean isExhausted(Counter counter)
+        {
+<span class="fc bfc" id="L806" title="All 2 branches covered.">            return ((GroupByAwareCounter) counter).rowsCounted &lt; rowLimit</span>
+<span class="fc bfc" id="L807" title="All 2 branches covered.">                    &amp;&amp; counter.counted() &lt; groupLimit;</span>
+        }
+
+        protected class GroupByAwareCounter extends Counter
+        {
+            private final GroupMaker groupMaker;
+
+            protected final boolean countPartitionsWithOnlyStaticData;
+
+            /**
+             * The key of the partition being processed.
+             */
+            protected DecoratedKey currentPartitionKey;
+
+            /**
+             * The number of rows counted so far.
+             */
+            protected int rowsCounted;
+
+            /**
+             * The number of rows counted so far in the current partition.
+             */
+            protected int rowsCountedInCurrentPartition;
+
+            /**
+             * The number of groups counted so far. A group is counted only once it is complete
+             * (e.g the next one has been reached).
+             */
+            protected int groupCounted;
+
+            /**
+             * The number of groups in the current partition.
+             */
+            protected int groupInCurrentPartition;
+
+            protected boolean hasUnfinishedGroup;
+
+            protected boolean hasLiveStaticRow;
+
+            protected boolean hasReturnedRowsFromCurrentPartition;
+
+            private GroupByAwareCounter(long nowInSec,
+                                        boolean assumeLiveData,
+                                        boolean countPartitionsWithOnlyStaticData,
+                                        boolean enforceStrictLiveness)
+<span class="fc" id="L852">            {</span>
+<span class="fc" id="L853">                super(nowInSec, assumeLiveData, enforceStrictLiveness);</span>
+<span class="fc" id="L854">                this.groupMaker = groupBySpec.newGroupMaker(state);</span>
+<span class="fc" id="L855">                this.countPartitionsWithOnlyStaticData = countPartitionsWithOnlyStaticData;</span>
+
+                // If the end of the partition was reached at the same time than the row limit, the last group might
+                // not have been counted yet. Due to that we need to guess, based on the state, if the previous group
+                // is still open.
+<span class="fc" id="L860">                hasUnfinishedGroup = state.hasClustering();</span>
+<span class="fc" id="L861">            }</span>
+
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
+            {
+<span class="fc bfc" id="L866" title="All 2 branches covered.">                if (partitionKey.getKey().equals(state.partitionKey()))</span>
+                {
+                    // The only case were we could have state.partitionKey() equals to the partition key
+                    // is if some of the partition rows have been returned in the previous page but the
+                    // partition was not exhausted (as the state partition key has not been updated yet).
+                    // Since we know we have returned rows, we know we have accounted for
+                    // the static row if any already, so force hasLiveStaticRow to false so we make sure to not count it
+                    // once more.
+<span class="fc" id="L874">                    hasLiveStaticRow = false;</span>
+<span class="fc" id="L875">                    hasReturnedRowsFromCurrentPartition = true;</span>
+<span class="fc" id="L876">                    hasUnfinishedGroup = true;</span>
+                }
+                else
+                {
+                    // We need to increment our count of groups if we have reached a new one and unless we had no new
+                    // content added since we closed our last group (that is, if hasUnfinishedGroup). Note that we may get
+                    // here with hasUnfinishedGroup == false in the following cases:
+                    // * the partition limit was reached for the previous partition
+                    // * the previous partition was containing only one static row
+                    // * the rows of the last group of the previous partition were all marked as deleted
+<span class="pc bpc" id="L886" title="1 of 4 branches missed.">                    if (hasUnfinishedGroup &amp;&amp; groupMaker.isNewGroup(partitionKey, Clustering.STATIC_CLUSTERING))</span>
+                    {
+<span class="fc" id="L888">                        incrementGroupCount();</span>
+                        // If we detect, before starting the new partition, that we are done, we need to increase
+                        // the per partition group count of the previous partition as the next page will start from
+                        // there.
+<span class="fc bfc" id="L892" title="All 2 branches covered.">                        if (isDone())</span>
+<span class="fc" id="L893">                            incrementGroupInCurrentPartitionCount();</span>
+<span class="fc" id="L894">                        hasUnfinishedGroup = false;</span>
+                    }
+<span class="fc" id="L896">                    hasReturnedRowsFromCurrentPartition = false;</span>
+<span class="fc bfc" id="L897" title="All 4 branches covered.">                    hasLiveStaticRow = !staticRow.isEmpty() &amp;&amp; isLive(staticRow);</span>
+                }
+<span class="fc" id="L899">                currentPartitionKey = partitionKey;</span>
+                // If we are done we need to preserve the groupInCurrentPartition and rowsCountedInCurrentPartition
+                // because the pager need to retrieve the count associated to the last value it has returned.
+<span class="fc bfc" id="L902" title="All 2 branches covered.">                if (!isDone())</span>
+                {
+<span class="fc" id="L904">                    groupInCurrentPartition = 0;</span>
+<span class="fc" id="L905">                    rowsCountedInCurrentPartition = 0;</span>
+                }
+<span class="fc" id="L907">            }</span>
+
+            @Override
+            protected Row applyToStatic(Row row)
+            {
+                // It's possible that we're &quot;done&quot; if the partition we just started bumped the number of groups (in
+                // applyToPartition() above), in which case Transformation will still call this method. In that case, we
+                // want to ignore the static row, it should (and will) be returned with the next page/group if needs be.
+<span class="fc bfc" id="L915" title="All 4 branches covered.">                if (enforceLimits &amp;&amp; isDone())</span>
+                {
+<span class="fc" id="L917">                    hasLiveStaticRow = false; // The row has not been returned</span>
+<span class="fc" id="L918">                    return Rows.EMPTY_STATIC_ROW;</span>
+                }
+<span class="fc" id="L920">                return row;</span>
+            }
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+                // We want to check if the row belongs to a new group even if it has been deleted. The goal being
+                // to minimize the chances of having to go through the same data twice if we detect on the next
+                // non deleted row that we have reached the limit.
+<span class="fc bfc" id="L929" title="All 2 branches covered.">                if (groupMaker.isNewGroup(currentPartitionKey, row.clustering()))</span>
+                {
+<span class="fc bfc" id="L931" title="All 2 branches covered.">                    if (hasUnfinishedGroup)</span>
+                    {
+<span class="fc" id="L933">                        incrementGroupCount();</span>
+<span class="fc" id="L934">                        incrementGroupInCurrentPartitionCount();</span>
+                    }
+<span class="fc" id="L936">                    hasUnfinishedGroup = false;</span>
+                }
+
+                // That row may have made us increment the group count, which may mean we're done for this partition, in
+                // which case we shouldn't count this row (it won't be returned).
+<span class="fc bfc" id="L941" title="All 4 branches covered.">                if (enforceLimits &amp;&amp; isDoneForPartition())</span>
+                {
+<span class="fc" id="L943">                    hasUnfinishedGroup = false;</span>
+<span class="fc" id="L944">                    return null;</span>
+                }
+
+<span class="fc bfc" id="L947" title="All 2 branches covered.">                if (isLive(row))</span>
+                {
+<span class="fc" id="L949">                    hasUnfinishedGroup = true;</span>
+<span class="fc" id="L950">                    incrementRowCount();</span>
+<span class="fc" id="L951">                    hasReturnedRowsFromCurrentPartition = true;</span>
+                }
+
+<span class="fc" id="L954">                return row;</span>
+            }
+
+            @Override
+            public int counted()
+            {
+<span class="fc" id="L960">                return groupCounted;</span>
+            }
+
+            @Override
+            public int countedInCurrentPartition()
+            {
+<span class="fc" id="L966">                return groupInCurrentPartition;</span>
+            }
+
+            @Override
+            public int rowsCounted()
+            {
+<span class="fc" id="L972">                return rowsCounted;</span>
+            }
+
+            @Override
+            public int rowsCountedInCurrentPartition()
+            {
+<span class="fc" id="L978">                return rowsCountedInCurrentPartition;</span>
+            }
+
+            protected void incrementRowCount()
+            {
+<span class="fc" id="L983">                rowsCountedInCurrentPartition++;</span>
+<span class="fc bfc" id="L984" title="All 2 branches covered.">                if (++rowsCounted &gt;= rowLimit)</span>
+<span class="fc" id="L985">                    stop();</span>
+<span class="fc" id="L986">            }</span>
+
+            private void incrementGroupCount()
+            {
+<span class="fc" id="L990">                groupCounted++;</span>
+<span class="fc bfc" id="L991" title="All 2 branches covered.">                if (groupCounted &gt;= groupLimit)</span>
+<span class="fc" id="L992">                    stop();</span>
+<span class="fc" id="L993">            }</span>
+
+            private void incrementGroupInCurrentPartitionCount()
+            {
+<span class="fc" id="L997">                groupInCurrentPartition++;</span>
+<span class="fc bfc" id="L998" title="All 2 branches covered.">                if (groupInCurrentPartition &gt;= groupPerPartitionLimit)</span>
+<span class="fc" id="L999">                    stopInPartition();</span>
+<span class="fc" id="L1000">            }</span>
+
+            @Override
+            public boolean isDoneForPartition()
+            {
+<span class="fc bfc" id="L1005" title="All 4 branches covered.">                return isDone() || groupInCurrentPartition &gt;= groupPerPartitionLimit;</span>
+            }
+
+            @Override
+            public boolean isDone()
+            {
+<span class="fc bfc" id="L1011" title="All 2 branches covered.">                return groupCounted &gt;= groupLimit;</span>
+            }
+
+            @Override
+            public void onPartitionClose()
+            {
+                // Normally, we don't count static rows as from a CQL point of view, it will be merge with other
+                // rows in the partition. However, if we only have the static row, it will be returned as one group
+                // so count it.
+<span class="fc bfc" id="L1020" title="All 6 branches covered.">                if (countPartitionsWithOnlyStaticData &amp;&amp; hasLiveStaticRow &amp;&amp; !hasReturnedRowsFromCurrentPartition)</span>
+                {
+<span class="fc" id="L1022">                    incrementRowCount();</span>
+<span class="fc" id="L1023">                    incrementGroupCount();</span>
+<span class="fc" id="L1024">                    incrementGroupInCurrentPartitionCount();</span>
+<span class="fc" id="L1025">                    hasUnfinishedGroup = false;</span>
+                }
+<span class="fc" id="L1027">                super.onPartitionClose();</span>
+<span class="fc" id="L1028">            }</span>
+
+            @Override
+            public void onClose()
+            {
+                // Groups are only counted when the end of the group is reached.
+                // The end of a group is detected by 2 ways:
+                // 1) a new group is reached
+                // 2) the end of the data is reached
+                // We know that the end of the data is reached if the group limit has not been reached
+                // and the number of rows counted is smaller than the internal page size.
+<span class="fc bfc" id="L1039" title="All 6 branches covered.">                if (hasUnfinishedGroup &amp;&amp; groupCounted &lt; groupLimit &amp;&amp; rowsCounted &lt; rowLimit)</span>
+                {
+<span class="fc" id="L1041">                    incrementGroupCount();</span>
+<span class="fc" id="L1042">                    incrementGroupInCurrentPartitionCount();</span>
+                }
+
+<span class="fc" id="L1045">                super.onClose();</span>
+<span class="fc" id="L1046">            }</span>
+        }
+    }
+
+<span class="fc" id="L1050">    private static class CQLGroupByPagingLimits extends CQLGroupByLimits</span>
+    {
+        private final ByteBuffer lastReturnedKey;
+
+        private final int lastReturnedKeyRemaining;
+
+        public CQLGroupByPagingLimits(int groupLimit,
+                                      int groupPerPartitionLimit,
+                                      int rowLimit,
+                                      AggregationSpecification groupBySpec,
+                                      GroupingState state,
+                                      ByteBuffer lastReturnedKey,
+                                      int lastReturnedKeyRemaining)
+        {
+<span class="fc" id="L1064">            super(groupLimit,</span>
+                  groupPerPartitionLimit,
+                  rowLimit,
+                  groupBySpec,
+                  state);
+
+<span class="fc" id="L1070">            this.lastReturnedKey = lastReturnedKey;</span>
+<span class="fc" id="L1071">            this.lastReturnedKeyRemaining = lastReturnedKeyRemaining;</span>
+<span class="fc" id="L1072">        }</span>
+
+        @Override
+        public Kind kind()
+        {
+<span class="fc" id="L1077">            return Kind.CQL_GROUP_BY_PAGING_LIMIT;</span>
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize)
+        {
+<span class="nc" id="L1083">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public DataLimits forPaging(int pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining)
+        {
+<span class="nc" id="L1089">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public DataLimits forGroupByInternalPaging(GroupingState state)
+        {
+<span class="nc" id="L1095">            throw new UnsupportedOperationException();</span>
+        }
+
+        @Override
+        public Counter newCounter(long nowInSec, boolean assumeLiveData, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+        {
+<span class="pc bpc" id="L1101" title="1 of 4 branches missed.">            assert state == GroupingState.EMPTY_STATE || lastReturnedKey.equals(state.partitionKey());</span>
+<span class="fc" id="L1102">            return new PagingGroupByAwareCounter(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+        }
+
+        @Override
+        public DataLimits withoutState()
+        {
+<span class="fc" id="L1108">            return new CQLGroupByLimits(groupLimit, groupPerPartitionLimit, rowLimit, groupBySpec);</span>
+        }
+
+        private class PagingGroupByAwareCounter extends GroupByAwareCounter
+        {
+            private PagingGroupByAwareCounter(long nowInSec, boolean assumeLiveData, boolean countPartitionsWithOnlyStaticData, boolean enforceStrictLiveness)
+<span class="fc" id="L1114">            {</span>
+<span class="fc" id="L1115">                super(nowInSec, assumeLiveData, countPartitionsWithOnlyStaticData, enforceStrictLiveness);</span>
+<span class="fc" id="L1116">            }</span>
+
+            @Override
+            public void applyToPartition(DecoratedKey partitionKey, Row staticRow)
+            {
+<span class="fc bfc" id="L1121" title="All 2 branches covered.">                if (partitionKey.getKey().equals(lastReturnedKey))</span>
+                {
+<span class="fc" id="L1123">                    currentPartitionKey = partitionKey;</span>
+<span class="fc" id="L1124">                    groupInCurrentPartition = groupPerPartitionLimit - lastReturnedKeyRemaining;</span>
+<span class="fc" id="L1125">                    hasReturnedRowsFromCurrentPartition = true;</span>
+<span class="fc" id="L1126">                    hasLiveStaticRow = false;</span>
+<span class="fc" id="L1127">                    hasUnfinishedGroup = state.hasClustering();</span>
+                }
+                else
+                {
+<span class="fc" id="L1131">                    super.applyToPartition(partitionKey, staticRow);</span>
+                }
+<span class="fc" id="L1133">            }</span>
+        }
+    }
+
+<span class="fc" id="L1137">    public static class Serializer</span>
+    {
+        public void serialize(DataLimits limits, DataOutputPlus out, int version, ClusteringComparator comparator) throws IOException
+        {
+<span class="fc" id="L1141">            out.writeByte(limits.kind().ordinal());</span>
+<span class="pc bpc" id="L1142" title="1 of 3 branches missed.">            switch (limits.kind())</span>
+            {
+                case CQL_LIMIT:
+                case CQL_PAGING_LIMIT:
+<span class="fc" id="L1146">                    CQLLimits cqlLimits = (CQLLimits)limits;</span>
+<span class="fc" id="L1147">                    out.writeUnsignedVInt32(cqlLimits.rowLimit);</span>
+<span class="fc" id="L1148">                    out.writeUnsignedVInt32(cqlLimits.perPartitionLimit);</span>
+<span class="fc" id="L1149">                    out.writeBoolean(cqlLimits.isDistinct);</span>
+<span class="fc bfc" id="L1150" title="All 2 branches covered.">                    if (limits.kind() == Kind.CQL_PAGING_LIMIT)</span>
+                    {
+<span class="fc" id="L1152">                        CQLPagingLimits pagingLimits = (CQLPagingLimits)cqlLimits;</span>
+<span class="fc" id="L1153">                        ByteBufferUtil.writeWithVIntLength(pagingLimits.lastReturnedKey, out);</span>
+<span class="fc" id="L1154">                        out.writeUnsignedVInt32(pagingLimits.lastReturnedKeyRemaining);</span>
+<span class="fc" id="L1155">                    }</span>
+                    break;
+                case CQL_GROUP_BY_LIMIT:
+                case CQL_GROUP_BY_PAGING_LIMIT:
+<span class="fc" id="L1159">                    CQLGroupByLimits groupByLimits = (CQLGroupByLimits) limits;</span>
+<span class="fc" id="L1160">                    out.writeUnsignedVInt32(groupByLimits.groupLimit);</span>
+<span class="fc" id="L1161">                    out.writeUnsignedVInt32(groupByLimits.groupPerPartitionLimit);</span>
+<span class="fc" id="L1162">                    out.writeUnsignedVInt32(groupByLimits.rowLimit);</span>
+
+<span class="fc" id="L1164">                    AggregationSpecification groupBySpec = groupByLimits.groupBySpec;</span>
+<span class="fc" id="L1165">                    AggregationSpecification.serializer.serialize(groupBySpec, out, version);</span>
+
+<span class="fc" id="L1167">                    GroupingState.serializer.serialize(groupByLimits.state, out, version, comparator);</span>
+
+<span class="fc bfc" id="L1169" title="All 2 branches covered.">                    if (limits.kind() == Kind.CQL_GROUP_BY_PAGING_LIMIT)</span>
+                    {
+<span class="fc" id="L1171">                        CQLGroupByPagingLimits pagingLimits = (CQLGroupByPagingLimits) groupByLimits;</span>
+<span class="fc" id="L1172">                        ByteBufferUtil.writeWithVIntLength(pagingLimits.lastReturnedKey, out);</span>
+<span class="fc" id="L1173">                        out.writeUnsignedVInt32(pagingLimits.lastReturnedKeyRemaining);</span>
+                     }
+                     break;
+            }
+<span class="fc" id="L1177">        }</span>
+
+        public DataLimits deserialize(DataInputPlus in, int version, TableMetadata metadata) throws IOException
+        {
+<span class="fc" id="L1181">            Kind kind = Kind.values()[in.readUnsignedByte()];</span>
+<span class="pc bpc" id="L1182" title="1 of 3 branches missed.">            switch (kind)</span>
+            {
+                case CQL_LIMIT:
+                case CQL_PAGING_LIMIT:
+                {
+<span class="fc" id="L1187">                    int rowLimit = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1188">                    int perPartitionLimit = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1189">                    boolean isDistinct = in.readBoolean();</span>
+<span class="fc bfc" id="L1190" title="All 2 branches covered.">                    if (kind == Kind.CQL_LIMIT)</span>
+<span class="fc" id="L1191">                        return cqlLimits(rowLimit, perPartitionLimit, isDistinct);</span>
+<span class="fc" id="L1192">                    ByteBuffer lastKey = ByteBufferUtil.readWithVIntLength(in);</span>
+<span class="fc" id="L1193">                    int lastRemaining = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1194">                    return new CQLPagingLimits(rowLimit, perPartitionLimit, isDistinct, lastKey, lastRemaining);</span>
+                }
+                case CQL_GROUP_BY_LIMIT:
+                case CQL_GROUP_BY_PAGING_LIMIT:
+                {
+<span class="fc" id="L1199">                    int groupLimit = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1200">                    int groupPerPartitionLimit = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1201">                    int rowLimit = in.readUnsignedVInt32();</span>
+
+<span class="fc" id="L1203">                    AggregationSpecification groupBySpec = AggregationSpecification.serializer.deserialize(in, version, metadata);</span>
+
+<span class="fc" id="L1205">                    GroupingState state = GroupingState.serializer.deserialize(in, version, metadata.comparator);</span>
+
+<span class="fc bfc" id="L1207" title="All 2 branches covered.">                    if (kind == Kind.CQL_GROUP_BY_LIMIT)</span>
+<span class="fc" id="L1208">                        return new CQLGroupByLimits(groupLimit,</span>
+                                                    groupPerPartitionLimit,
+                                                    rowLimit,
+                                                    groupBySpec,
+                                                    state);
+
+<span class="fc" id="L1214">                    ByteBuffer lastKey = ByteBufferUtil.readWithVIntLength(in);</span>
+<span class="fc" id="L1215">                    int lastRemaining = in.readUnsignedVInt32();</span>
+<span class="fc" id="L1216">                    return new CQLGroupByPagingLimits(groupLimit,</span>
+                                                      groupPerPartitionLimit,
+                                                      rowLimit,
+                                                      groupBySpec,
+                                                      state,
+                                                      lastKey,
+                                                      lastRemaining);
+                }
+            }
+<span class="nc" id="L1225">            throw new AssertionError();</span>
+        }
+
+        public long serializedSize(DataLimits limits, int version, ClusteringComparator comparator)
+        {
+<span class="fc" id="L1230">            long size = TypeSizes.sizeof((byte) limits.kind().ordinal());</span>
+<span class="pc bpc" id="L1231" title="1 of 3 branches missed.">            switch (limits.kind())</span>
+            {
+                case CQL_LIMIT:
+                case CQL_PAGING_LIMIT:
+<span class="fc" id="L1235">                    CQLLimits cqlLimits = (CQLLimits) limits;</span>
+<span class="fc" id="L1236">                    size += TypeSizes.sizeofUnsignedVInt(cqlLimits.rowLimit);</span>
+<span class="fc" id="L1237">                    size += TypeSizes.sizeofUnsignedVInt(cqlLimits.perPartitionLimit);</span>
+<span class="fc" id="L1238">                    size += TypeSizes.sizeof(cqlLimits.isDistinct);</span>
+<span class="fc bfc" id="L1239" title="All 2 branches covered.">                    if (limits.kind() == Kind.CQL_PAGING_LIMIT)</span>
+                    {
+<span class="fc" id="L1241">                        CQLPagingLimits pagingLimits = (CQLPagingLimits) cqlLimits;</span>
+<span class="fc" id="L1242">                        size += ByteBufferUtil.serializedSizeWithVIntLength(pagingLimits.lastReturnedKey);</span>
+<span class="fc" id="L1243">                        size += TypeSizes.sizeofUnsignedVInt(pagingLimits.lastReturnedKeyRemaining);</span>
+<span class="fc" id="L1244">                    }</span>
+                    break;
+                case CQL_GROUP_BY_LIMIT:
+                case CQL_GROUP_BY_PAGING_LIMIT:
+<span class="fc" id="L1248">                    CQLGroupByLimits groupByLimits = (CQLGroupByLimits) limits;</span>
+<span class="fc" id="L1249">                    size += TypeSizes.sizeofUnsignedVInt(groupByLimits.groupLimit);</span>
+<span class="fc" id="L1250">                    size += TypeSizes.sizeofUnsignedVInt(groupByLimits.groupPerPartitionLimit);</span>
+<span class="fc" id="L1251">                    size += TypeSizes.sizeofUnsignedVInt(groupByLimits.rowLimit);</span>
+
+<span class="fc" id="L1253">                    AggregationSpecification groupBySpec = groupByLimits.groupBySpec;</span>
+<span class="fc" id="L1254">                    size += AggregationSpecification.serializer.serializedSize(groupBySpec, version);</span>
+
+<span class="fc" id="L1256">                    size += GroupingState.serializer.serializedSize(groupByLimits.state, version, comparator);</span>
+
+<span class="fc bfc" id="L1258" title="All 2 branches covered.">                    if (limits.kind() == Kind.CQL_GROUP_BY_PAGING_LIMIT)</span>
+                    {
+<span class="fc" id="L1260">                        CQLGroupByPagingLimits pagingLimits = (CQLGroupByPagingLimits) groupByLimits;</span>
+<span class="fc" id="L1261">                        size += ByteBufferUtil.serializedSizeWithVIntLength(pagingLimits.lastReturnedKey);</span>
+<span class="fc" id="L1262">                        size += TypeSizes.sizeofUnsignedVInt(pagingLimits.lastReturnedKeyRemaining);</span>
+<span class="fc" id="L1263">                    }</span>
+                    break;
+                default:
+<span class="nc" id="L1266">                    throw new AssertionError();</span>
+            }
+<span class="fc" id="L1268">            return size;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>RequestCallbacks.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">RequestCallbacks.java</span></div><h1>RequestCallbacks.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeoutException;
+
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.metrics.InternodeOutboundMetrics;
+import org.apache.cassandra.service.AbstractWriteResponseHandler;
+
+import static java.lang.String.format;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.concurrent.ExecutorFactory.SimulatorSemantics.DISCARD;
+import static org.apache.cassandra.concurrent.Stage.INTERNAL_RESPONSE;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.MonotonicClock.Global.preciseTime;
+
+/**
+ * An expiring map of request callbacks.
+ *
+ * Used to match response (id, peer) pairs to corresponding {@link RequestCallback}s, or, if said responses
+ * don't arrive in a timely manner (within verb's timeout), to expire the callbacks.
+ *
+ * Since we reuse the same request id for multiple messages now, the map is keyed by (id, peer) tuples
+ * rather than just id as it used to before 4.0.
+ */
+public class RequestCallbacks implements OutboundMessageCallbacks
+{
+<span class="fc" id="L60">    private static final Logger logger = LoggerFactory.getLogger(RequestCallbacks.class);</span>
+
+    private final MessagingService messagingService;
+<span class="fc" id="L63">    private final ScheduledExecutorPlus executor = executorFactory().scheduled(&quot;Callback-Map-Reaper&quot;, DISCARD);</span>
+<span class="fc" id="L64">    private final ConcurrentMap&lt;CallbackKey, CallbackInfo&gt; callbacks = new ConcurrentHashMap&lt;&gt;();</span>
+
+    RequestCallbacks(MessagingService messagingService)
+<span class="fc" id="L67">    {</span>
+<span class="fc" id="L68">        this.messagingService = messagingService;</span>
+
+<span class="fc" id="L70">        long expirationInterval = defaultExpirationInterval();</span>
+<span class="fc" id="L71">        executor.scheduleWithFixedDelay(this::expire, expirationInterval, expirationInterval, NANOSECONDS);</span>
+<span class="fc" id="L72">    }</span>
+
+    /**
+     * @return the registered {@link CallbackInfo} for this id and peer, or {@code null} if unset or expired.
+     */
+    @Nullable
+    CallbackInfo get(long id, InetAddressAndPort peer)
+    {
+<span class="nc" id="L80">        return callbacks.get(key(id, peer));</span>
+    }
+
+    /**
+     * Remove and return the {@link CallbackInfo} associated with given id and peer, if known.
+     */
+    @Nullable
+    @VisibleForTesting
+    public CallbackInfo remove(long id, InetAddressAndPort peer)
+    {
+<span class="fc" id="L90">        return callbacks.remove(key(id, peer));</span>
+    }
+
+    /**
+     * Register the provided {@link RequestCallback}, inferring expiry and id from the provided {@link Message}.
+     */
+    public void addWithExpiration(RequestCallback&lt;?&gt; cb, Message&lt;?&gt; message, InetAddressAndPort to)
+    {
+        // mutations need to call the overload
+<span class="pc bpc" id="L99" title="2 of 4 branches missed.">        assert message.verb() != Verb.MUTATION_REQ &amp;&amp; message.verb() != Verb.COUNTER_MUTATION_REQ;</span>
+<span class="fc" id="L100">        CallbackInfo previous = callbacks.put(key(message.id(), to), new CallbackInfo(message, to, cb));</span>
+<span class="pc bpc" id="L101" title="1 of 2 branches missed.">        assert previous == null : format(&quot;Callback already exists for id %d/%s! (%s)&quot;, message.id(), to, previous);</span>
+<span class="fc" id="L102">    }</span>
+
+    public void addWithExpiration(AbstractWriteResponseHandler&lt;?&gt; cb, Message&lt;?&gt; message, Replica to)
+    {
+<span class="pc bpc" id="L106" title="1 of 6 branches missed.">        assert message.verb() == Verb.MUTATION_REQ || message.verb() == Verb.COUNTER_MUTATION_REQ || message.verb() == Verb.PAXOS_COMMIT_REQ;</span>
+<span class="fc" id="L107">        CallbackInfo previous = callbacks.put(key(message.id(), to.endpoint()), new CallbackInfo(message, to.endpoint(), cb));</span>
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        assert previous == null : format(&quot;Callback already exists for id %d/%s! (%s)&quot;, message.id(), to.endpoint(), previous);</span>
+<span class="fc" id="L109">    }</span>
+
+    @VisibleForTesting
+    public void removeAndRespond(long id, InetAddressAndPort peer, Message message)
+    {
+<span class="nc" id="L114">        CallbackInfo ci = remove(id, peer);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if (null != ci) ci.callback.onResponse(message);</span>
+<span class="nc" id="L116">    }</span>
+
+    private void removeAndExpire(long id, InetAddressAndPort peer)
+    {
+<span class="fc" id="L120">        CallbackInfo ci = remove(id, peer);</span>
+<span class="fc bfc" id="L121" title="All 2 branches covered.">        if (null != ci) onExpired(ci);</span>
+<span class="fc" id="L122">    }</span>
+
+    private void expire()
+    {
+<span class="fc" id="L126">        long start = preciseTime.now();</span>
+<span class="fc" id="L127">        int n = 0;</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">        for (Map.Entry&lt;CallbackKey, CallbackInfo&gt; entry : callbacks.entrySet())</span>
+        {
+<span class="fc bfc" id="L130" title="All 2 branches covered.">            if (entry.getValue().isReadyToDieAt(start))</span>
+            {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">                if (callbacks.remove(entry.getKey(), entry.getValue()))</span>
+                {
+<span class="fc" id="L134">                    n++;</span>
+<span class="fc" id="L135">                    onExpired(entry.getValue());</span>
+                }
+            }
+<span class="fc" id="L138">        }</span>
+<span class="fc" id="L139">        logger.trace(&quot;Expired {} entries&quot;, n);</span>
+<span class="fc" id="L140">    }</span>
+
+    private void forceExpire()
+    {
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        for (Map.Entry&lt;CallbackKey, CallbackInfo&gt; entry : callbacks.entrySet())</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            if (callbacks.remove(entry.getKey(), entry.getValue()))</span>
+<span class="nc" id="L146">                onExpired(entry.getValue());</span>
+<span class="nc" id="L147">    }</span>
+
+    private void onExpired(CallbackInfo info)
+    {
+<span class="fc" id="L151">        messagingService.latencySubscribers.maybeAdd(info.callback, info.peer, info.timeout(), NANOSECONDS);</span>
+
+<span class="fc" id="L153">        InternodeOutboundMetrics.totalExpiredCallbacks.mark();</span>
+<span class="fc" id="L154">        messagingService.markExpiredCallback(info.peer);</span>
+
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        if (info.invokeOnFailure())</span>
+<span class="fc" id="L157">            INTERNAL_RESPONSE.submit(() -&gt; info.callback.onFailure(info.peer, RequestFailureReason.TIMEOUT));</span>
+<span class="fc" id="L158">    }</span>
+
+    void shutdownNow(boolean expireCallbacks)
+    {
+<span class="nc" id="L162">        executor.shutdownNow();</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        if (expireCallbacks)</span>
+<span class="nc" id="L164">            forceExpire();</span>
+<span class="nc" id="L165">    }</span>
+
+    void shutdownGracefully()
+    {
+<span class="fc" id="L169">        expire();</span>
+<span class="pc bpc" id="L170" title="1 of 2 branches missed.">        if (!callbacks.isEmpty())</span>
+<span class="nc" id="L171">            executor.schedule(this::shutdownGracefully, 100L, MILLISECONDS);</span>
+        else
+<span class="fc" id="L173">            executor.shutdownNow();</span>
+<span class="fc" id="L174">    }</span>
+
+    void awaitTerminationUntil(long deadlineNanos) throws TimeoutException, InterruptedException
+    {
+<span class="pc bpc" id="L178" title="1 of 2 branches missed.">        if (!executor.isTerminated())</span>
+        {
+<span class="nc" id="L180">            long wait = deadlineNanos - nanoTime();</span>
+<span class="nc bnc" id="L181" title="All 4 branches missed.">            if (wait &lt;= 0 || !executor.awaitTermination(wait, NANOSECONDS))</span>
+<span class="nc" id="L182">                throw new TimeoutException();</span>
+        }
+<span class="fc" id="L184">    }</span>
+
+    @VisibleForTesting
+    public void unsafeClear()
+    {
+<span class="nc" id="L189">        callbacks.clear();</span>
+<span class="nc" id="L190">    }</span>
+
+    private static CallbackKey key(long id, InetAddressAndPort peer)
+    {
+<span class="fc" id="L194">        return new CallbackKey(id, peer);</span>
+    }
+
+    private static class CallbackKey
+    {
+        final long id;
+        final InetAddressAndPort peer;
+
+        CallbackKey(long id, InetAddressAndPort peer)
+<span class="fc" id="L203">        {</span>
+<span class="fc" id="L204">            this.id = id;</span>
+<span class="fc" id="L205">            this.peer = peer;</span>
+<span class="fc" id="L206">        }</span>
+
+        @Override
+        public boolean equals(Object o)
+        {
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">            if (!(o instanceof CallbackKey))</span>
+<span class="nc" id="L212">                return false;</span>
+<span class="fc" id="L213">            CallbackKey that = (CallbackKey) o;</span>
+<span class="pc bpc" id="L214" title="1 of 4 branches missed.">            return this.id == that.id &amp;&amp; this.peer.equals(that.peer);</span>
+        }
+
+        @Override
+        public int hashCode()
+        {
+<span class="fc" id="L220">            return Long.hashCode(id) + 31 * peer.hashCode();</span>
+        }
+
+        @Override
+        public String toString()
+        {
+<span class="nc" id="L226">            return &quot;{id:&quot; + id + &quot;, peer:&quot; + peer + '}';</span>
+        }
+    }
+
+    @VisibleForTesting
+    public static class CallbackInfo
+    {
+        final long createdAtNanos;
+        final long expiresAtNanos;
+
+        final InetAddressAndPort peer;
+        public final RequestCallback callback;
+
+        private CallbackInfo(Message message, InetAddressAndPort peer, RequestCallback callback)
+<span class="fc" id="L240">        {</span>
+<span class="fc" id="L241">            this.createdAtNanos = message.createdAtNanos();</span>
+<span class="fc" id="L242">            this.expiresAtNanos = message.expiresAtNanos();</span>
+<span class="fc" id="L243">            this.peer = peer;</span>
+<span class="fc" id="L244">            this.callback = callback;</span>
+<span class="fc" id="L245">        }</span>
+
+        public long timeout()
+        {
+<span class="fc" id="L249">            return expiresAtNanos - createdAtNanos;</span>
+        }
+
+        boolean isReadyToDieAt(long atNano)
+        {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">            return atNano &gt; expiresAtNanos;</span>
+        }
+
+        boolean invokeOnFailure()
+        {
+<span class="fc" id="L259">            return callback.invokeOnFailure();</span>
+        }
+
+        public String toString()
+        {
+<span class="nc" id="L264">            return &quot;{peer:&quot; + peer + &quot;, callback:&quot; + callback + &quot;, invokeOnFailure:&quot; + invokeOnFailure() + '}';</span>
+        }
+    }
+
+    @Override
+    public void onOverloaded(Message&lt;?&gt; message, InetAddressAndPort peer)
+    {
+<span class="nc" id="L271">        removeAndExpire(message, peer);</span>
+<span class="nc" id="L272">    }</span>
+
+    @Override
+    public void onExpired(Message&lt;?&gt; message, InetAddressAndPort peer)
+    {
+<span class="fc" id="L277">        removeAndExpire(message, peer);</span>
+<span class="fc" id="L278">    }</span>
+
+    @Override
+    public void onFailedSerialize(Message&lt;?&gt; message, InetAddressAndPort peer, int messagingVersion, int bytesWrittenToNetwork, Throwable failure)
+    {
+<span class="nc" id="L283">        removeAndExpire(message, peer);</span>
+<span class="nc" id="L284">    }</span>
+
+    @Override
+    public void onDiscardOnClose(Message&lt;?&gt; message, InetAddressAndPort peer)
+    {
+<span class="fc" id="L289">        removeAndExpire(message, peer);</span>
+<span class="fc" id="L290">    }</span>
+
+    private void removeAndExpire(Message message, InetAddressAndPort peer)
+    {
+<span class="fc" id="L294">        removeAndExpire(message.id(), peer);</span>
+
+        /* in case of a write sent to a different DC, also expire all forwarding targets */
+<span class="fc" id="L297">        ForwardingInfo forwardTo = message.forwardTo();</span>
+<span class="pc bpc" id="L298" title="1 of 2 branches missed.">        if (null != forwardTo)</span>
+<span class="nc" id="L299">            forwardTo.forEach(this::removeAndExpire);</span>
+<span class="fc" id="L300">    }</span>
+
+    public static long defaultExpirationInterval()
+    {
+<span class="fc" id="L304">        return DatabaseDescriptor.getMinRpcTimeout(NANOSECONDS) / 2;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

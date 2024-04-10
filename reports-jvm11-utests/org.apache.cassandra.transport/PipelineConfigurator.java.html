@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PipelineConfigurator.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">PipelineConfigurator.java</span></div><h1>PipelineConfigurator.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.transport;
+
+import java.net.InetSocketAddress;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Strings;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.*;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.timeout.IdleStateEvent;
+import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.util.Version;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.security.ISslContextFactory;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.transport.messages.StartupMessage;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_UNSAFE_VERBOSE_DEBUG_CLIENT_PROTOCOL;
+import static org.apache.cassandra.net.SocketFactory.newSslHandler;
+
+/**
+ * Takes care of intializing a Netty Channel and Pipeline for client protocol connections.
+ * The pipeline is first set up with some common handlers for connection limiting, dropping
+ * idle connections and optionally SSL, along with a handler to deal with the handshake
+ * between client and server. That handshake handler calls back to this class to reconfigure
+ * the pipeline once the protocol version for the connection has been established.
+ */
+public class PipelineConfigurator
+{
+<span class="fc" id="L63">    private static final Logger logger = LoggerFactory.getLogger(PipelineConfigurator.class);</span>
+
+    // Not to be used in production, this causes a Netty logging handler to be added to the pipeline,
+    // which will throttle a system under any normal load.
+<span class="fc" id="L67">    private static final boolean DEBUG = TEST_UNSAFE_VERBOSE_DEBUG_CLIENT_PROTOCOL.getBoolean();</span>
+
+    public static final String SSL_FACTORY_CONTEXT_DESCRIPTION = &quot;client_encryption_options&quot;;
+
+    // Stateless handlers
+<span class="fc" id="L72">    private static final ConnectionLimitHandler connectionLimitHandler = new ConnectionLimitHandler();</span>
+
+    // Names of handlers used regardless of protocol version
+    private static final String CONNECTION_LIMIT_HANDLER    = &quot;connectionLimitHandler&quot;;
+    private static final String IDLE_STATE_HANDLER          = &quot;idleStateHandler&quot;;
+    private static final String INITIAL_HANDLER             = &quot;initialHandler&quot;;
+    private static final String EXCEPTION_HANDLER           = &quot;exceptionHandler&quot;;
+    private static final String DEBUG_HANDLER               = &quot;debugHandler&quot;;
+    private static final String SSL_HANDLER                 = &quot;ssl&quot;;
+
+    // Names of handlers used in pre-V5 pipelines only
+    private static final String ENVELOPE_DECODER            = &quot;envelopeDecoder&quot;;
+    private static final String ENVELOPE_ENCODER            = &quot;envelopeEncoder&quot;;
+    private static final String MESSAGE_DECOMPRESSOR        = &quot;decompressor&quot;;
+    private static final String MESSAGE_COMPRESSOR          = &quot;compressor&quot;;
+    private static final String MESSAGE_DECODER             = &quot;messageDecoder&quot;;
+    private static final String MESSAGE_ENCODER             = &quot;messageEncoder&quot;;
+    private static final String LEGACY_MESSAGE_PROCESSOR    = &quot;legacyCqlProcessor&quot;;
+
+    // Names of handlers used in V5 and later pipelines
+    private static final String FRAME_DECODER               = &quot;frameDecoder&quot;;
+    private static final String FRAME_ENCODER               = &quot;frameEncoder&quot;;
+    private static final String MESSAGE_PROCESSOR           = &quot;cqlProcessor&quot;;
+
+    private final boolean epoll;
+    private final boolean keepAlive;
+    private final EncryptionOptions.TlsEncryptionPolicy tlsEncryptionPolicy;
+    private final Dispatcher dispatcher;
+
+    public PipelineConfigurator(boolean epoll,
+                                boolean keepAlive,
+                                boolean legacyFlusher,
+                                EncryptionOptions.TlsEncryptionPolicy encryptionPolicy)
+<span class="fc" id="L105">    {</span>
+<span class="fc" id="L106">        this.epoll               = epoll;</span>
+<span class="fc" id="L107">        this.keepAlive           = keepAlive;</span>
+<span class="fc" id="L108">        this.tlsEncryptionPolicy = encryptionPolicy;</span>
+<span class="fc" id="L109">        this.dispatcher          = dispatcher(legacyFlusher);</span>
+<span class="fc" id="L110">    }</span>
+
+    public ChannelFuture initializeChannel(final EventLoopGroup workerGroup,
+                                           final InetSocketAddress socket,
+                                           final Connection.Factory connectionFactory)
+    {
+<span class="fc" id="L116">        ServerBootstrap bootstrap = new ServerBootstrap()</span>
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">                                    .channel(epoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class)</span>
+<span class="fc" id="L118">                                    .childOption(ChannelOption.TCP_NODELAY, true)</span>
+<span class="fc" id="L119">                                    .childOption(ChannelOption.SO_LINGER, 0)</span>
+<span class="fc" id="L120">                                    .childOption(ChannelOption.SO_KEEPALIVE, keepAlive)</span>
+<span class="fc" id="L121">                                    .childOption(ChannelOption.ALLOCATOR, CBUtil.allocator)</span>
+<span class="fc" id="L122">                                    .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(8 * 1024, 32 * 1024));</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">        if (workerGroup != null)</span>
+<span class="fc" id="L124">            bootstrap = bootstrap.group(workerGroup);</span>
+
+<span class="fc" id="L126">        ChannelInitializer&lt;Channel&gt; initializer = initializer(connectionFactory);</span>
+<span class="fc" id="L127">        bootstrap.childHandler(initializer);</span>
+
+        // Bind and start to accept incoming connections.
+<span class="fc" id="L130">        logger.info(&quot;Using Netty Version: {}&quot;, Version.identify().entrySet());</span>
+<span class="fc" id="L131">        logger.info(&quot;Starting listening for CQL clients on {} ({})...&quot;, socket, tlsEncryptionPolicy.description());</span>
+<span class="fc" id="L132">        return bootstrap.bind(socket);</span>
+    }
+
+    protected ChannelInitializer&lt;Channel&gt; initializer(Connection.Factory connectionFactory)
+    {
+        // the initializer will perform the common initial setup
+        // then any additional steps mandated by the encryption options
+<span class="fc" id="L139">        final EncryptionConfig encryptionConfig = encryptionConfig();</span>
+<span class="fc" id="L140">        return new ChannelInitializer&lt;Channel&gt;()</span>
+<span class="fc" id="L141">        {</span>
+            protected void initChannel(Channel channel) throws Exception
+            {
+<span class="fc" id="L144">                configureInitialPipeline(channel, connectionFactory);</span>
+<span class="fc" id="L145">                encryptionConfig.applyTo(channel);</span>
+<span class="fc" id="L146">            }</span>
+        };
+    }
+
+    // Essentially just a Consumer&lt;Channel&gt; which may throw
+    interface EncryptionConfig
+    {
+        void applyTo(Channel channel) throws Exception;
+    }
+
+    protected EncryptionConfig encryptionConfig()
+    {
+<span class="fc" id="L158">        final EncryptionOptions encryptionOptions = DatabaseDescriptor.getNativeProtocolEncryptionOptions();</span>
+<span class="pc bpc" id="L159" title="3 of 4 branches missed.">        switch (tlsEncryptionPolicy)</span>
+        {
+            case UNENCRYPTED:
+                // if encryption is not enabled, no further steps are required after the initial setup
+<span class="fc" id="L163">                return channel -&gt; {};</span>
+            case OPTIONAL:
+                // If optional, install a handler which detects whether or not the client is sending
+                // encrypted bytes. If so, on receipt of the next bytes, replace that handler with
+                // an SSL Handler, otherwise just remove it and proceed with an unencrypted channel.
+<span class="nc" id="L168">                logger.debug(&quot;Enabling optionally encrypted CQL connections between client and server&quot;);</span>
+<span class="nc" id="L169">                return channel -&gt; {</span>
+<span class="nc" id="L170">                    SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions,</span>
+                                                                             encryptionOptions.require_client_auth,
+                                                                             ISslContextFactory.SocketType.SERVER,
+                                                                             SSL_FACTORY_CONTEXT_DESCRIPTION);
+
+<span class="nc" id="L175">                    channel.pipeline().addFirst(SSL_HANDLER, new ByteToMessageDecoder()</span>
+                    {
+                        @Override
+                        protected void decode(ChannelHandlerContext channelHandlerContext, ByteBuf byteBuf, List&lt;Object&gt; list) throws Exception
+                        {
+                            if (byteBuf.readableBytes() &lt; 5)
+                            {
+                                // To detect if SSL must be used we need to have at least 5 bytes, so return here and try again
+                                // once more bytes a ready.
+                                return;
+                            }
+                            if (SslHandler.isEncrypted(byteBuf))
+                            {
+                                // Connection uses SSL/TLS, replace the detection handler with a SslHandler and so use
+                                // encryption.
+                                InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? (InetSocketAddress) channel.remoteAddress() : null;
+                                SslHandler sslHandler = newSslHandler(channel, sslContext, peer);
+                                channelHandlerContext.pipeline().replace(SSL_HANDLER, SSL_HANDLER, sslHandler);
+                            }
+                            else
+                            {
+                                // Connection use no TLS/SSL encryption, just remove the detection handler and continue without
+                                // SslHandler in the pipeline.
+                                channelHandlerContext.pipeline().remove(SSL_HANDLER);
+                            }
+                        }
+                    });
+<span class="nc" id="L202">                };</span>
+            case ENCRYPTED:
+<span class="nc" id="L204">                logger.debug(&quot;Enabling encrypted CQL connections between client and server&quot;);</span>
+<span class="nc" id="L205">                return channel -&gt; {</span>
+<span class="nc" id="L206">                    SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions,</span>
+                                                                             encryptionOptions.require_client_auth,
+                                                                             ISslContextFactory.SocketType.SERVER,
+                                                                             SSL_FACTORY_CONTEXT_DESCRIPTION);
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                    InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? (InetSocketAddress) channel.remoteAddress() : null;</span>
+<span class="nc" id="L211">                    channel.pipeline().addFirst(SSL_HANDLER, newSslHandler(channel, sslContext, peer));</span>
+<span class="nc" id="L212">                };</span>
+            default:
+<span class="nc" id="L214">                throw new IllegalStateException(&quot;Unrecognized TLS encryption policy: &quot; + this.tlsEncryptionPolicy);</span>
+        }
+    }
+
+    public void configureInitialPipeline(Channel channel, Connection.Factory connectionFactory)
+    {
+<span class="fc" id="L220">        ChannelPipeline pipeline = channel.pipeline();</span>
+
+        // Add the ConnectionLimitHandler to the pipeline if configured to do so.
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">        if (DatabaseDescriptor.getNativeTransportMaxConcurrentConnections() &gt; 0</span>
+<span class="pc bpc" id="L224" title="1 of 2 branches missed.">            || DatabaseDescriptor.getNativeTransportMaxConcurrentConnectionsPerIp() &gt; 0)</span>
+        {
+            // Add as first to the pipeline so the limit is enforced as first action.
+<span class="nc" id="L227">            pipeline.addFirst(CONNECTION_LIMIT_HANDLER, connectionLimitHandler);</span>
+        }
+
+<span class="fc" id="L230">        long idleTimeout = DatabaseDescriptor.nativeTransportIdleTimeout();</span>
+<span class="fc bfc" id="L231" title="All 2 branches covered.">        if (idleTimeout &gt; 0)</span>
+        {
+<span class="fc" id="L233">            pipeline.addLast(IDLE_STATE_HANDLER, new IdleStateHandler(false, 0, 0, idleTimeout, TimeUnit.MILLISECONDS)</span>
+<span class="fc" id="L234">            {</span>
+                @Override
+                protected void channelIdle(ChannelHandlerContext ctx, IdleStateEvent evt)
+                {
+<span class="fc" id="L238">                    logger.info(&quot;Closing client connection {} after timeout of {}ms&quot;, channel.remoteAddress(), idleTimeout);</span>
+<span class="fc" id="L239">                    ctx.close();</span>
+<span class="fc" id="L240">                }</span>
+            });
+        }
+
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">        if (DEBUG)</span>
+<span class="nc" id="L245">            pipeline.addLast(DEBUG_HANDLER, new LoggingHandler(LogLevel.INFO));</span>
+
+<span class="fc" id="L247">        pipeline.addLast(ENVELOPE_ENCODER, Envelope.Encoder.instance);</span>
+<span class="fc" id="L248">        pipeline.addLast(INITIAL_HANDLER, new InitialConnectionHandler(new Envelope.Decoder(), connectionFactory, this));</span>
+        // The exceptionHandler will take care of handling exceptionCaught(...) events while still running
+        // on the same EventLoop as all previous added handlers in the pipeline. This is important as the used
+        // eventExecutorGroup may not enforce strict ordering for channel events.
+        // As the exceptionHandler runs in the EventLoop as the previous handlers we are sure all exceptions are
+        // correctly handled before the handler itself is removed.
+        // See https://issues.apache.org/jira/browse/CASSANDRA-13649
+<span class="fc" id="L255">        pipeline.addLast(EXCEPTION_HANDLER, PreV5Handlers.ExceptionHandler.instance);</span>
+<span class="fc" id="L256">        onInitialPipelineReady(pipeline);</span>
+<span class="fc" id="L257">    }</span>
+
+    public void configureModernPipeline(ChannelHandlerContext ctx,
+                                        ClientResourceLimits.Allocator resourceAllocator,
+                                        ProtocolVersion version,
+                                        Map&lt;String, String&gt; options)
+    {
+<span class="fc" id="L264">        BufferPoolAllocator allocator = GlobalBufferPoolAllocator.instance;</span>
+<span class="fc" id="L265">        ctx.channel().config().setOption(ChannelOption.ALLOCATOR, allocator);</span>
+
+        // Transport level encoders/decoders
+<span class="fc" id="L268">        String compression = options.get(StartupMessage.COMPRESSION);</span>
+<span class="fc" id="L269">        FrameDecoder frameDecoder = frameDecoder(compression, allocator);</span>
+<span class="fc" id="L270">        FrameEncoder frameEncoder = frameEncoder(compression);</span>
+<span class="fc" id="L271">        FrameEncoder.PayloadAllocator payloadAllocator = frameEncoder.allocator();</span>
+<span class="fc" id="L272">        ChannelInboundHandlerAdapter exceptionHandler = ExceptionHandlers.postV5Handler(payloadAllocator, version);</span>
+
+        // CQL level encoders/decoders
+<span class="fc" id="L275">        Message.Decoder&lt;Message.Request&gt; messageDecoder = messageDecoder();</span>
+<span class="fc" id="L276">        Envelope.Decoder envelopeDecoder = new Envelope.Decoder();</span>
+
+        // Any non-fatal errors caught in CQLMessageHandler propagate back to the client
+        // via the pipeline. Firing the exceptionCaught event on an inbound handler context
+        // (in this case, the initial context) will cause it to propagate to to the
+        // exceptionHandler provided none of the the intermediate handlers drop it
+        // in their exceptionCaught implementation
+<span class="fc" id="L283">        ChannelPipeline pipeline = ctx.channel().pipeline();</span>
+<span class="fc" id="L284">        final ChannelHandlerContext firstContext = pipeline.firstContext();</span>
+<span class="fc" id="L285">        CQLMessageHandler.ErrorHandler errorHandler = firstContext::fireExceptionCaught;</span>
+
+        // Capacity tracking and resource management
+<span class="fc" id="L288">        int queueCapacity = DatabaseDescriptor.getNativeTransportReceiveQueueCapacityInBytes();</span>
+<span class="fc" id="L289">        ClientResourceLimits.ResourceProvider resourceProvider = resourceProvider(resourceAllocator);</span>
+<span class="fc" id="L290">        AbstractMessageHandler.OnHandlerClosed onClosed = handler -&gt; resourceProvider.release();</span>
+<span class="fc" id="L291">        boolean throwOnOverload = &quot;1&quot;.equals(options.get(StartupMessage.THROW_ON_OVERLOAD));</span>
+
+<span class="fc" id="L293">        CQLMessageHandler.MessageConsumer&lt;Message.Request&gt; messageConsumer = messageConsumer();</span>
+<span class="fc" id="L294">        CQLMessageHandler&lt;Message.Request&gt; processor =</span>
+<span class="fc" id="L295">            new CQLMessageHandler&lt;&gt;(ctx.channel(),</span>
+                                    version,
+                                    frameDecoder,
+                                    envelopeDecoder,
+                                    messageDecoder,
+                                    messageConsumer,
+                                    payloadAllocator,
+                                    queueCapacity,
+                                    resourceProvider,
+                                    onClosed,
+                                    errorHandler,
+                                    throwOnOverload);
+
+<span class="fc" id="L308">        pipeline.remove(ENVELOPE_ENCODER);    // remove old outbound cql envelope encoder</span>
+<span class="fc" id="L309">        pipeline.addBefore(INITIAL_HANDLER, FRAME_DECODER, frameDecoder);</span>
+<span class="fc" id="L310">        pipeline.addBefore(INITIAL_HANDLER, FRAME_ENCODER, frameEncoder);</span>
+<span class="fc" id="L311">        pipeline.addBefore(INITIAL_HANDLER, MESSAGE_PROCESSOR, processor);</span>
+<span class="fc" id="L312">        pipeline.replace(EXCEPTION_HANDLER, EXCEPTION_HANDLER, exceptionHandler);</span>
+<span class="fc" id="L313">        pipeline.remove(INITIAL_HANDLER);</span>
+
+        // Handles delivering event messages to registered clients
+<span class="fc" id="L316">        ctx.channel()</span>
+<span class="fc" id="L317">           .attr(Dispatcher.EVENT_DISPATCHER)</span>
+<span class="fc" id="L318">           .set(dispatcher.eventDispatcher(ctx.channel(), version, payloadAllocator));</span>
+<span class="fc" id="L319">        onNegotiationComplete(pipeline);</span>
+<span class="fc" id="L320">    }</span>
+
+<span class="fc" id="L322">    protected void onInitialPipelineReady(ChannelPipeline pipeline) {}</span>
+<span class="fc" id="L323">    protected void onNegotiationComplete(ChannelPipeline pipeline) {}</span>
+
+    protected ClientResourceLimits.ResourceProvider resourceProvider(ClientResourceLimits.Allocator allocator)
+    {
+<span class="fc" id="L327">        return new ClientResourceLimits.ResourceProvider.Default(allocator);</span>
+    }
+
+    protected Dispatcher dispatcher(boolean useLegacyFlusher)
+    {
+<span class="fc" id="L332">        return new Dispatcher(useLegacyFlusher);</span>
+    }
+
+    protected CQLMessageHandler.MessageConsumer&lt;Message.Request&gt; messageConsumer()
+    {
+<span class="fc" id="L337">        return dispatcher::dispatch;</span>
+    }
+
+    protected Message.Decoder&lt;Message.Request&gt; messageDecoder()
+    {
+<span class="fc" id="L342">        return Message.requestDecoder();</span>
+    }
+
+    protected FrameDecoder frameDecoder(String compression, BufferPoolAllocator allocator)
+    {
+<span class="fc bfc" id="L347" title="All 2 branches covered.">        if (null == compression)</span>
+<span class="fc" id="L348">            return FrameDecoderCrc.create(allocator);</span>
+<span class="pc bpc" id="L349" title="1 of 2 branches missed.">        if (compression.equalsIgnoreCase(&quot;LZ4&quot;))</span>
+<span class="fc" id="L350">            return FrameDecoderLZ4.fast(allocator);</span>
+<span class="nc" id="L351">        throw new ProtocolException(&quot;Unsupported compression type: &quot; + compression);</span>
+    }
+
+    protected FrameEncoder frameEncoder(String compression)
+    {
+<span class="fc bfc" id="L356" title="All 2 branches covered.">        if (Strings.isNullOrEmpty(compression))</span>
+<span class="fc" id="L357">            return FrameEncoderCrc.instance;</span>
+<span class="pc bpc" id="L358" title="1 of 2 branches missed.">        if (compression.equalsIgnoreCase(&quot;LZ4&quot;))</span>
+<span class="fc" id="L359">            return FrameEncoderLZ4.fastInstance;</span>
+<span class="nc" id="L360">        throw new ProtocolException(&quot;Unsupported compression type: &quot; + compression);</span>
+    }
+
+    public void configureLegacyPipeline(ChannelHandlerContext ctx, ClientResourceLimits.Allocator limits)
+    {
+<span class="fc" id="L365">        ChannelPipeline pipeline = ctx.channel().pipeline();</span>
+<span class="fc" id="L366">        pipeline.addBefore(ENVELOPE_ENCODER, ENVELOPE_DECODER, new Envelope.Decoder());</span>
+<span class="fc" id="L367">        pipeline.addBefore(INITIAL_HANDLER, MESSAGE_DECOMPRESSOR, Envelope.Decompressor.instance);</span>
+<span class="fc" id="L368">        pipeline.addBefore(INITIAL_HANDLER, MESSAGE_COMPRESSOR, Envelope.Compressor.instance);</span>
+<span class="fc" id="L369">        pipeline.addBefore(INITIAL_HANDLER, MESSAGE_DECODER, PreV5Handlers.ProtocolDecoder.instance);</span>
+<span class="fc" id="L370">        pipeline.addBefore(INITIAL_HANDLER, MESSAGE_ENCODER, PreV5Handlers.ProtocolEncoder.instance);</span>
+<span class="fc" id="L371">        pipeline.addBefore(INITIAL_HANDLER, LEGACY_MESSAGE_PROCESSOR, new PreV5Handlers.LegacyDispatchHandler(dispatcher, limits));</span>
+<span class="fc" id="L372">        pipeline.remove(INITIAL_HANDLER);</span>
+<span class="fc" id="L373">        onNegotiationComplete(pipeline);</span>
+<span class="fc" id="L374">    }</span>
+}
+
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

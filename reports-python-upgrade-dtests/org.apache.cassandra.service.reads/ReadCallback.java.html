@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReadCallback.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads</a> &gt; <span class="el_source">ReadCallback.java</span></div><h1>ReadCallback.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.service.reads;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.MessageParams;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.utils.concurrent.Condition;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadResponse;
+import org.apache.cassandra.exceptions.ReadFailureException;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.locator.Endpoints;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.ParamType;
+import org.apache.cassandra.net.RequestCallback;
+import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.service.reads.thresholds.CoordinatorWarnings;
+import org.apache.cassandra.service.reads.thresholds.WarningContext;
+import org.apache.cassandra.service.reads.thresholds.WarningsSnapshot;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.atomic.AtomicIntegerFieldUpdater.newUpdater;
+import static org.apache.cassandra.tracing.Tracing.isTracing;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
+
+public class ReadCallback&lt;E extends Endpoints&lt;E&gt;, P extends ReplicaPlan.ForRead&lt;E, P&gt;&gt; implements RequestCallback&lt;ReadResponse&gt;
+{
+<span class="fc" id="L61">    protected static final Logger logger = LoggerFactory.getLogger(ReadCallback.class);</span>
+
+    public final ResponseResolver&lt;E, P&gt; resolver;
+<span class="fc" id="L64">    final Condition condition = newOneTimeCondition();</span>
+    private final long queryStartNanoTime;
+    final int blockFor; // TODO: move to replica plan as well?
+    // this uses a plain reference, but is initialised before handoff to any other threads; the later updates
+    // may not be visible to the threads immediately, but ReplicaPlan only contains final fields, so they will never see an uninitialised object
+    final ReplicaPlan.Shared&lt;E, P&gt; replicaPlan;
+    private final ReadCommand command;
+<span class="fc" id="L71">    private static final AtomicIntegerFieldUpdater&lt;ReadCallback&gt; failuresUpdater</span>
+<span class="fc" id="L72">            = newUpdater(ReadCallback.class, &quot;failures&quot;);</span>
+<span class="fc" id="L73">    private volatile int failures = 0;</span>
+    private final Map&lt;InetAddressAndPort, RequestFailureReason&gt; failureReasonByEndpoint;
+    private volatile WarningContext warningContext;
+<span class="fc" id="L76">    private static final AtomicReferenceFieldUpdater&lt;ReadCallback, WarningContext&gt; warningsUpdater</span>
+<span class="fc" id="L77">        = AtomicReferenceFieldUpdater.newUpdater(ReadCallback.class, WarningContext.class, &quot;warningContext&quot;);</span>
+
+    public ReadCallback(ResponseResolver&lt;E, P&gt; resolver, ReadCommand command, ReplicaPlan.Shared&lt;E, P&gt; replicaPlan, long queryStartNanoTime)
+<span class="fc" id="L80">    {</span>
+<span class="fc" id="L81">        this.command = command;</span>
+<span class="fc" id="L82">        this.resolver = resolver;</span>
+<span class="fc" id="L83">        this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L84">        this.replicaPlan = replicaPlan;</span>
+<span class="fc" id="L85">        this.blockFor = replicaPlan.get().readQuorum();</span>
+<span class="fc" id="L86">        this.failureReasonByEndpoint = new ConcurrentHashMap&lt;&gt;();</span>
+        // we don't support read repair (or rapid read protection) for range scans yet (CASSANDRA-6897)
+<span class="pc bpc" id="L88" title="1 of 4 branches missed.">        assert !(command instanceof PartitionRangeReadCommand) || blockFor &gt;= replicaPlan().contacts().size();</span>
+
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L91">            logger.trace(&quot;Blockfor is {}; setting up requests to {}&quot;, blockFor, this.replicaPlan);</span>
+<span class="fc" id="L92">    }</span>
+
+    protected P replicaPlan()
+    {
+<span class="fc" id="L96">        return replicaPlan.get();</span>
+    }
+
+    public boolean await(long timePastStart, TimeUnit unit)
+    {
+<span class="fc" id="L101">        long time = unit.toNanos(timePastStart) - (nanoTime() - queryStartNanoTime);</span>
+        try
+        {
+<span class="fc" id="L104">            return condition.await(time, NANOSECONDS);</span>
+        }
+<span class="nc" id="L106">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L108">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    public void awaitResults() throws ReadFailureException, ReadTimeoutException
+    {
+<span class="fc" id="L114">        boolean signaled = await(command.getTimeout(MILLISECONDS), TimeUnit.MILLISECONDS);</span>
+        /**
+         * Here we are checking isDataPresent in addition to the responses size because there is a possibility
+         * that an asynchronous speculative execution request could be returning after a local failure already
+         * signaled. Responses may have been set while the data reference is not yet.
+         * See {@link DigestResolver#preprocess(Message)}
+         * CASSANDRA-16097
+         */
+<span class="fc" id="L122">        int received = resolver.responses.size();</span>
+<span class="pc bpc" id="L123" title="3 of 6 branches missed.">        boolean failed = failures &gt; 0 &amp;&amp; (blockFor &gt; received || !resolver.isDataPresent());</span>
+        // If all messages came back as a TIMEOUT then signaled=true and failed=true.
+        // Need to distinguish between a timeout and a failure (network, bad data, etc.), so store an extra field.
+        // see CASSANDRA-17828
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">        boolean timedout = !signaled;</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">        if (failed)</span>
+<span class="fc" id="L129">            timedout = RequestCallback.isTimeout(new HashMap&lt;&gt;(failureReasonByEndpoint));</span>
+<span class="fc" id="L130">        WarningContext warnings = warningContext;</span>
+        // save the snapshot so abort state is not changed between now and when mayAbort gets called
+<span class="fc" id="L132">        WarningsSnapshot snapshot = null;</span>
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">        if (warnings != null)</span>
+        {
+<span class="nc" id="L135">            snapshot = warnings.snapshot();</span>
+            // this is possible due to a race condition between waiting and responding
+            // network thread creates the WarningContext to update metrics, but we are actively reading and see it is empty
+            // this is likely to happen when a timeout happens or from a speculative response
+<span class="nc bnc" id="L139" title="All 2 branches missed.">            if (!snapshot.isEmpty())</span>
+<span class="nc" id="L140">                CoordinatorWarnings.update(command, snapshot);</span>
+        }
+<span class="pc bpc" id="L142" title="1 of 4 branches missed.">        if (signaled &amp;&amp; !failed)</span>
+<span class="fc" id="L143">            return;</span>
+
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">        if (isTracing())</span>
+        {
+<span class="nc bnc" id="L147" title="All 4 branches missed.">            String gotData = received &gt; 0 ? (resolver.isDataPresent() ? &quot; (including data)&quot; : &quot; (only digests)&quot;) : &quot;&quot;;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            Tracing.trace(&quot;{}; received {} of {} responses{}&quot;, !timedout ? &quot;Failed&quot; : &quot;Timed out&quot;, received, blockFor, gotData);</span>
+<span class="nc" id="L149">        }</span>
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">        else if (logger.isDebugEnabled())</span>
+        {
+<span class="pc bpc" id="L152" title="3 of 4 branches missed.">            String gotData = received &gt; 0 ? (resolver.isDataPresent() ? &quot; (including data)&quot; : &quot; (only digests)&quot;) : &quot;&quot;;</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            logger.debug(&quot;{}; received {} of {} responses{}&quot;, !timedout ? &quot;Failed&quot; : &quot;Timed out&quot;, received, blockFor, gotData);</span>
+        }
+
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">        if (snapshot != null)</span>
+<span class="nc" id="L157">            snapshot.maybeAbort(command, replicaPlan().consistencyLevel(), received, blockFor, resolver.isDataPresent(), failureReasonByEndpoint);</span>
+
+        // Same as for writes, see AbstractWriteResponseHandler
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">        throw !timedout</span>
+<span class="fc" id="L161">            ? new ReadFailureException(replicaPlan().consistencyLevel(), received, blockFor, resolver.isDataPresent(), failureReasonByEndpoint)</span>
+<span class="pc" id="L162">            : new ReadTimeoutException(replicaPlan().consistencyLevel(), received, blockFor, resolver.isDataPresent());</span>
+    }
+
+    public int blockFor()
+    {
+<span class="nc" id="L167">        return blockFor;</span>
+    }
+
+    @Override
+    public void onResponse(Message&lt;ReadResponse&gt; message)
+    {
+<span class="fc" id="L173">        assertWaitingFor(message.from());</span>
+<span class="fc" id="L174">        Map&lt;ParamType, Object&gt; params = message.header.params();</span>
+<span class="fc" id="L175">        InetAddressAndPort from = message.from();</span>
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">        if (WarningContext.isSupported(params.keySet()))</span>
+        {
+<span class="nc" id="L178">            RequestFailureReason reason = getWarningContext().updateCounters(params, from);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (reason != null)</span>
+            {
+<span class="nc" id="L181">                onFailure(message.from(), reason);</span>
+<span class="nc" id="L182">                return;</span>
+            }
+        }
+<span class="fc" id="L185">        resolver.preprocess(message);</span>
+
+        /*
+         * Ensure that data is present and the response accumulator has properly published the
+         * responses it has received. This may result in not signaling immediately when we receive
+         * the minimum number of required results, but it guarantees at least the minimum will
+         * be accessible when we do signal. (see CASSANDRA-16807)
+         */
+<span class="fc bfc" id="L193" title="All 4 branches covered.">        if (resolver.isDataPresent() &amp;&amp; resolver.responses.size() &gt;= blockFor)</span>
+<span class="fc" id="L194">            condition.signalAll();</span>
+<span class="fc" id="L195">    }</span>
+
+    private WarningContext getWarningContext()
+    {
+        WarningContext current;
+        do {
+
+<span class="nc" id="L202">            current = warningContext;</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (current != null)</span>
+<span class="nc" id="L204">                return current;</span>
+
+<span class="nc" id="L206">            current = new WarningContext();</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        } while (!warningsUpdater.compareAndSet(this, null, current));</span>
+<span class="nc" id="L208">        return current;</span>
+    }
+
+    public void response(ReadResponse result)
+    {
+<span class="fc bfc" id="L213" title="All 2 branches covered.">        Verb kind = command.isRangeRequest() ? Verb.RANGE_RSP : Verb.READ_RSP;</span>
+<span class="fc" id="L214">        Message&lt;ReadResponse&gt; message = Message.internalResponse(kind, result);</span>
+<span class="fc" id="L215">        message = MessageParams.addToMessage(message);</span>
+<span class="fc" id="L216">        onResponse(message);</span>
+<span class="fc" id="L217">    }</span>
+
+    @Override
+    public boolean trackLatencyForSnitch()
+    {
+<span class="fc" id="L222">        return true;</span>
+    }
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+    {
+<span class="fc" id="L228">        assertWaitingFor(from);</span>
+                
+<span class="fc" id="L230">        failureReasonByEndpoint.put(from, failureReason);</span>
+
+<span class="pc bpc" id="L232" title="1 of 2 branches missed.">        if (blockFor + failuresUpdater.incrementAndGet(this) &gt; replicaPlan().contacts().size())</span>
+<span class="fc" id="L233">            condition.signalAll();</span>
+<span class="fc" id="L234">    }</span>
+
+    @Override
+    public boolean invokeOnFailure()
+    {
+<span class="fc" id="L239">        return true;</span>
+    }
+
+    /**
+     * Verify that a message doesn't come from an unexpected replica.
+     */
+    private void assertWaitingFor(InetAddressAndPort from)
+    {
+<span class="pc bfc" id="L247" title="All 2 branches covered.">        assert !replicaPlan().consistencyLevel().isDatacenterLocal()</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">               || DatabaseDescriptor.getLocalDataCenter().equals(DatabaseDescriptor.getEndpointSnitch().getDatacenter(from))</span>
+               : &quot;Received read response from unexpected replica: &quot; + from;
+<span class="fc" id="L250">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

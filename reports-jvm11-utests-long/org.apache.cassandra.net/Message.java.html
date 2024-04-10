@@ -1,0 +1,1130 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>Message.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.net</a> &gt; <span class="el_source">Message.java</span></div><h1>Message.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.net;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Ints;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
+import org.apache.cassandra.io.IVersionedSerializer;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.tracing.Tracing.TraceType;
+import org.apache.cassandra.utils.MonotonicClockTranslation;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.TimeUUID;
+
+import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static org.apache.cassandra.db.TypeSizes.sizeof;
+import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
+import static org.apache.cassandra.net.MessagingService.VERSION_40;
+import static org.apache.cassandra.net.MessagingService.VERSION_50;
+import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
+import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+import static org.apache.cassandra.utils.vint.VIntCoding.*;
+
+/**
+ * Immutable main unit of internode communication - what used to be {@code MessageIn} and {@code MessageOut} fused
+ * in one class.
+ *
+ * @param &lt;T&gt; The type of the message payload.
+ */
+public class Message&lt;T&gt;
+{
+<span class="fc" id="L67">    private static final Logger logger = LoggerFactory.getLogger(Message.class);</span>
+<span class="fc" id="L68">    private static final NoSpamLogger noSpam1m = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+
+    public final Header header;
+    public final T payload;
+
+    Message(Header header, T payload)
+<span class="fc" id="L74">    {</span>
+<span class="fc" id="L75">        this.header = header;</span>
+<span class="fc" id="L76">        this.payload = payload;</span>
+<span class="fc" id="L77">    }</span>
+
+    /** Sender of the message. */
+    public InetAddressAndPort from()
+    {
+<span class="fc" id="L82">        return header.from;</span>
+    }
+
+    /** Whether the message has crossed the node boundary, that is whether it originated from another node. */
+    public boolean isCrossNode()
+    {
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        return !from().equals(getBroadcastAddressAndPort());</span>
+    }
+
+    /**
+     * id of the request/message. In 4.0+ can be shared between multiple messages of the same logical request,
+     * whilst in versions above a new id would be allocated for each message sent.
+     */
+    public long id()
+    {
+<span class="nc" id="L97">        return header.id;</span>
+    }
+
+    public Verb verb()
+    {
+<span class="nc" id="L102">        return header.verb;</span>
+    }
+
+    public boolean isFailureResponse()
+    {
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        return verb() == Verb.FAILURE_RSP;</span>
+    }
+
+    /**
+     * Creation time of the message. If cross-node timeouts are enabled ({@link DatabaseDescriptor#hasCrossNodeTimeout()},
+     * {@code deserialize()} will use the marshalled value, otherwise will use current time on the deserializing machine.
+     */
+    public long createdAtNanos()
+    {
+<span class="nc" id="L116">        return header.createdAtNanos;</span>
+    }
+
+    public long expiresAtNanos()
+    {
+<span class="nc" id="L121">        return header.expiresAtNanos;</span>
+    }
+
+    /** For how long the message has lived. */
+    public long elapsedSinceCreated(TimeUnit units)
+    {
+<span class="nc" id="L127">        return units.convert(approxTime.now() - createdAtNanos(), NANOSECONDS);</span>
+    }
+
+    public long creationTimeMillis()
+    {
+<span class="nc" id="L132">        return approxTime.translate().toMillisSinceEpoch(createdAtNanos());</span>
+    }
+
+    /** Whether a failure response should be returned upon failure */
+    boolean callBackOnFailure()
+    {
+<span class="nc" id="L138">        return header.callBackOnFailure();</span>
+    }
+
+    public boolean trackWarnings()
+    {
+<span class="nc" id="L143">        return header.trackWarnings();</span>
+    }
+
+    /** See CASSANDRA-14145 */
+    public boolean trackRepairedData()
+    {
+<span class="nc" id="L149">        return header.trackRepairedData();</span>
+    }
+
+    /** Used for cross-DC write optimisation - pick one node in the DC and have it relay the write to its local peers */
+    @Nullable
+    public ForwardingInfo forwardTo()
+    {
+<span class="nc" id="L156">        return header.forwardTo();</span>
+    }
+
+    /** The originator of the request - used when forwarding and will differ from {@link #from()} */
+    @Nullable
+    public InetAddressAndPort respondTo()
+    {
+<span class="nc" id="L163">        return header.respondTo();</span>
+    }
+
+    @Nullable
+    public TimeUUID traceSession()
+    {
+<span class="nc" id="L169">        return header.traceSession();</span>
+    }
+
+    @Nullable
+    public TraceType traceType()
+    {
+<span class="nc" id="L175">        return header.traceType();</span>
+    }
+
+    /*
+     * request/response convenience
+     */
+
+    /**
+     * Make a request {@link Message} with supplied verb and payload. Will fill in remaining fields
+     * automatically.
+     *
+     * If you know that you will need to set some params or flags - prefer using variants of {@code out()}
+     * that allow providing them at point of message constructions, rather than allocating new messages
+     * with those added flags and params. See {@code outWithFlag()}, {@code outWithFlags()}, and {@code outWithParam()}
+     * family.
+     */
+    public static &lt;T&gt; Message&lt;T&gt; out(Verb verb, T payload)
+    {
+<span class="pc bpc" id="L193" title="1 of 2 branches missed.">        assert !verb.isResponse();</span>
+
+<span class="fc" id="L195">        return outWithParam(nextId(), verb, payload, null, null);</span>
+    }
+
+    public static &lt;T&gt; Message&lt;T&gt; synthetic(InetAddressAndPort from, Verb verb, T payload)
+    {
+<span class="nc" id="L200">        return new Message&lt;&gt;(new Header(-1, verb, from, -1, -1, 0, NO_PARAMS), payload);</span>
+    }
+
+    public static &lt;T&gt; Message&lt;T&gt; out(Verb verb, T payload, long expiresAtNanos)
+    {
+<span class="nc" id="L205">        return outWithParam(nextId(), verb, expiresAtNanos, payload, 0, null, null);</span>
+    }
+
+    public static &lt;T&gt; Message&lt;T&gt; outWithFlag(Verb verb, T payload, MessageFlag flag)
+    {
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        assert !verb.isResponse();</span>
+<span class="nc" id="L211">        return outWithParam(nextId(), verb, 0, payload, flag.addTo(0), null, null);</span>
+    }
+
+    public static &lt;T&gt; Message&lt;T&gt; outWithFlags(Verb verb, T payload, MessageFlag flag1, MessageFlag flag2)
+    {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        assert !verb.isResponse();</span>
+<span class="nc" id="L217">        return outWithParam(nextId(), verb, 0, payload, flag2.addTo(flag1.addTo(0)), null, null);</span>
+    }
+
+    @VisibleForTesting
+    static &lt;T&gt; Message&lt;T&gt; outWithParam(long id, Verb verb, T payload, ParamType paramType, Object paramValue)
+    {
+<span class="fc" id="L223">        return outWithParam(id, verb, 0, payload, paramType, paramValue);</span>
+    }
+
+    private static &lt;T&gt; Message&lt;T&gt; outWithParam(long id, Verb verb, long expiresAtNanos, T payload, ParamType paramType, Object paramValue)
+    {
+<span class="fc" id="L228">        return outWithParam(id, verb, expiresAtNanos, payload, 0, paramType, paramValue);</span>
+    }
+
+    private static &lt;T&gt; Message&lt;T&gt; outWithParam(long id, Verb verb, long expiresAtNanos, T payload, int flags, ParamType paramType, Object paramValue)
+    {
+<span class="fc" id="L233">        return withParam(getBroadcastAddressAndPort(), id, verb, expiresAtNanos, payload, flags, paramType, paramValue);</span>
+    }
+
+    private static &lt;T&gt; Message&lt;T&gt; withParam(InetAddressAndPort from, long id, Verb verb, long expiresAtNanos, T payload, int flags, ParamType paramType, Object paramValue)
+    {
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">        if (payload == null)</span>
+<span class="nc" id="L239">            throw new IllegalArgumentException();</span>
+
+<span class="fc" id="L241">        long createdAtNanos = approxTime.now();</span>
+<span class="pc bpc" id="L242" title="1 of 2 branches missed.">        if (expiresAtNanos == 0)</span>
+<span class="fc" id="L243">            expiresAtNanos = verb.expiresAtNanos(createdAtNanos);</span>
+
+<span class="fc" id="L245">        return new Message&lt;&gt;(new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, buildParams(paramType, paramValue)), payload);</span>
+    }
+
+    public static &lt;T&gt; Message&lt;T&gt; internalResponse(Verb verb, T payload)
+    {
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">        assert verb.isResponse();</span>
+<span class="fc" id="L251">        return outWithParam(0, verb, payload, null, null);</span>
+    }
+
+    /**
+     * Used by the {@code MultiRangeReadCommand} to split multi-range responses from a replica
+     * into single-range responses.
+     */
+    public static &lt;T&gt; Message&lt;T&gt; remoteResponse(InetAddressAndPort from, Verb verb, T payload)
+    {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        assert verb.isResponse();</span>
+<span class="nc" id="L261">        long createdAtNanos = approxTime.now();</span>
+<span class="nc" id="L262">        long expiresAtNanos = verb.expiresAtNanos(createdAtNanos);</span>
+<span class="nc" id="L263">        return new Message&lt;&gt;(new Header(0, verb, from, createdAtNanos, expiresAtNanos, 0, NO_PARAMS), payload);</span>
+    }
+
+    /** Builds a response Message with provided payload, and all the right fields inferred from request Message */
+    public &lt;T&gt; Message&lt;T&gt; responseWith(T payload)
+    {
+<span class="nc" id="L269">        return outWithParam(id(), verb().responseVerb, expiresAtNanos(), payload, null, null);</span>
+    }
+
+    /** Builds a response Message with no payload, and all the right fields inferred from request Message */
+    public Message&lt;NoPayload&gt; emptyResponse()
+    {
+<span class="nc" id="L275">        return responseWith(NoPayload.noPayload);</span>
+    }
+
+    /** Builds a failure response Message with an explicit reason, and fields inferred from request Message */
+    public Message&lt;RequestFailureReason&gt; failureResponse(RequestFailureReason reason)
+    {
+<span class="nc" id="L281">        return failureResponse(id(), expiresAtNanos(), reason);</span>
+    }
+
+    static Message&lt;RequestFailureReason&gt; failureResponse(long id, long expiresAtNanos, RequestFailureReason reason)
+    {
+<span class="nc" id="L286">        return outWithParam(id, Verb.FAILURE_RSP, expiresAtNanos, reason, null, null);</span>
+    }
+
+    public &lt;V&gt; Message&lt;V&gt; withPayload(V newPayload)
+    {
+<span class="nc" id="L291">        return new Message&lt;&gt;(header, newPayload);</span>
+    }
+
+    Message&lt;T&gt; withCallBackOnFailure()
+    {
+<span class="nc" id="L296">        return new Message&lt;&gt;(header.withFlag(MessageFlag.CALL_BACK_ON_FAILURE), payload);</span>
+    }
+
+    public Message&lt;T&gt; withForwardTo(ForwardingInfo peers)
+    {
+<span class="nc" id="L301">        return new Message&lt;&gt;(header.withParam(ParamType.FORWARD_TO, peers), payload);</span>
+    }
+
+    public Message&lt;T&gt; withFrom(InetAddressAndPort from)
+    {
+<span class="nc" id="L306">        return new Message&lt;&gt;(header.withFrom(from), payload);</span>
+    }
+
+    public Message&lt;T&gt; withFlag(MessageFlag flag)
+    {
+<span class="nc" id="L311">        return new Message&lt;&gt;(header.withFlag(flag), payload);</span>
+    }
+
+    public Message&lt;T&gt; withParam(ParamType type, Object value)
+    {
+<span class="nc" id="L316">        return new Message&lt;&gt;(header.withParam(type, value), payload);</span>
+    }
+
+    public Message&lt;T&gt; withParams(Map&lt;ParamType, Object&gt; values)
+    {
+<span class="pc bpc" id="L321" title="2 of 4 branches missed.">        if (values == null || values.isEmpty())</span>
+<span class="fc" id="L322">            return this;</span>
+<span class="nc" id="L323">        return new Message&lt;&gt;(header.withParams(values), payload);</span>
+    }
+
+<span class="fc" id="L326">    private static final EnumMap&lt;ParamType, Object&gt; NO_PARAMS = new EnumMap&lt;&gt;(ParamType.class);</span>
+
+    private static Map&lt;ParamType, Object&gt; buildParams(ParamType type, Object value)
+    {
+<span class="fc" id="L330">        Map&lt;ParamType, Object&gt; params = NO_PARAMS;</span>
+<span class="pc bpc" id="L331" title="1 of 2 branches missed.">        if (Tracing.isTracing())</span>
+<span class="nc" id="L332">            params = Tracing.instance.addTraceHeaders(new EnumMap&lt;&gt;(ParamType.class));</span>
+
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">        if (type != null)</span>
+        {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            if (params.isEmpty())</span>
+<span class="nc" id="L337">                params = new EnumMap&lt;&gt;(ParamType.class);</span>
+<span class="nc" id="L338">            params.put(type, value);</span>
+        }
+
+<span class="fc" id="L341">        return params;</span>
+    }
+
+    private static Map&lt;ParamType, Object&gt; addParam(Map&lt;ParamType, Object&gt; params, ParamType type, Object value)
+    {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (type == null)</span>
+<span class="nc" id="L347">            return params;</span>
+
+<span class="nc" id="L349">        params = new EnumMap&lt;&gt;(params);</span>
+<span class="nc" id="L350">        params.put(type, value);</span>
+<span class="nc" id="L351">        return params;</span>
+    }
+
+    private static Map&lt;ParamType, Object&gt; addParams(Map&lt;ParamType, Object&gt; params, Map&lt;ParamType, Object&gt; values)
+    {
+<span class="nc bnc" id="L356" title="All 4 branches missed.">        if (values == null || values.isEmpty())</span>
+<span class="nc" id="L357">            return params;</span>
+
+<span class="nc" id="L359">        params = new EnumMap&lt;&gt;(params);</span>
+<span class="nc" id="L360">        params.putAll(values);</span>
+<span class="nc" id="L361">        return params;</span>
+    }
+
+    /*
+     * id generation
+     */
+
+    private static final long NO_ID = 0L; // this is a valid ID for pre40 nodes
+
+<span class="fc" id="L370">    private static final AtomicInteger nextId = new AtomicInteger(0);</span>
+
+    private static long nextId()
+    {
+        long id;
+        do
+        {
+<span class="fc" id="L377">            id = nextId.incrementAndGet();</span>
+        }
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">        while (id == NO_ID);</span>
+
+<span class="fc" id="L381">        return id;</span>
+    }
+
+    /**
+     * WARNING: this is inaccurate for messages from pre40 nodes, which can use 0 as an id (but will do so rarely)
+     */
+    @VisibleForTesting
+    boolean hasId()
+    {
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        return id() != NO_ID;</span>
+    }
+
+    /** we preface every message with this number so the recipient can validate the sender is sane */
+    static final int PROTOCOL_MAGIC = 0xCA552DFA;
+
+    static void validateLegacyProtocolMagic(int magic) throws InvalidLegacyProtocolMagic
+    {
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">        if (magic != PROTOCOL_MAGIC)</span>
+<span class="nc" id="L399">            throw new InvalidLegacyProtocolMagic(magic);</span>
+<span class="fc" id="L400">    }</span>
+
+    public static final class InvalidLegacyProtocolMagic extends IOException
+    {
+        public final int read;
+        private InvalidLegacyProtocolMagic(int read)
+        {
+<span class="nc" id="L407">            super(String.format(&quot;Read %d, Expected %d&quot;, read, PROTOCOL_MAGIC));</span>
+<span class="nc" id="L408">            this.read = read;</span>
+<span class="nc" id="L409">        }</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L414">        return &quot;(from:&quot; + from() + &quot;, type:&quot; + verb().stage + &quot; verb:&quot; + verb() + ')';</span>
+    }
+
+    /**
+     * Split into a separate object to allow partial message deserialization without wasting work and allocation
+     * afterwards, if the entire message is necessary and available.
+     */
+    public static class Header
+    {
+        public final long id;
+        public final Verb verb;
+        public final InetAddressAndPort from;
+        public final long createdAtNanos;
+        public final long expiresAtNanos;
+        private final int flags;
+        private final Map&lt;ParamType, Object&gt; params;
+
+        private Header(long id, Verb verb, InetAddressAndPort from, long createdAtNanos, long expiresAtNanos, int flags, Map&lt;ParamType, Object&gt; params)
+<span class="fc" id="L432">        {</span>
+<span class="fc" id="L433">            this.id = id;</span>
+<span class="fc" id="L434">            this.verb = verb;</span>
+<span class="fc" id="L435">            this.from = from;</span>
+<span class="fc" id="L436">            this.expiresAtNanos = expiresAtNanos;</span>
+<span class="fc" id="L437">            this.createdAtNanos = createdAtNanos;</span>
+<span class="fc" id="L438">            this.flags = flags;</span>
+<span class="fc" id="L439">            this.params = params;</span>
+<span class="fc" id="L440">        }</span>
+
+        Header withFrom(InetAddressAndPort from)
+        {
+<span class="nc" id="L444">            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, params);</span>
+        }
+
+        Header withFlag(MessageFlag flag)
+        {
+<span class="nc" id="L449">            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flag.addTo(flags), params);</span>
+        }
+
+        Header withParam(ParamType type, Object value)
+        {
+<span class="nc" id="L454">            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, addParam(params, type, value));</span>
+        }
+
+        Header withParams(Map&lt;ParamType, Object&gt; values)
+        {
+<span class="nc" id="L459">            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, addParams(params, values));</span>
+        }
+
+        boolean callBackOnFailure()
+        {
+<span class="nc" id="L464">            return MessageFlag.CALL_BACK_ON_FAILURE.isIn(flags);</span>
+        }
+
+        boolean trackRepairedData()
+        {
+<span class="nc" id="L469">            return MessageFlag.TRACK_REPAIRED_DATA.isIn(flags);</span>
+        }
+
+        boolean trackWarnings()
+        {
+<span class="nc" id="L474">            return MessageFlag.TRACK_WARNINGS.isIn(flags);</span>
+        }
+
+        @Nullable
+        ForwardingInfo forwardTo()
+        {
+<span class="nc" id="L480">            return (ForwardingInfo) params.get(ParamType.FORWARD_TO);</span>
+        }
+
+        @Nullable
+        InetAddressAndPort respondTo()
+        {
+<span class="nc" id="L486">            InetAddressAndPort respondTo = (InetAddressAndPort) params.get(ParamType.RESPOND_TO);</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">            if (respondTo == null) respondTo = from;</span>
+<span class="nc" id="L488">            return respondTo;</span>
+        }
+
+        @Nullable
+        public TimeUUID traceSession()
+        {
+<span class="nc" id="L494">            return (TimeUUID) params.get(ParamType.TRACE_SESSION);</span>
+        }
+
+        @Nullable
+        public TraceType traceType()
+        {
+<span class="nc" id="L500">            return (TraceType) params.getOrDefault(ParamType.TRACE_TYPE, TraceType.QUERY);</span>
+        }
+
+        public Map&lt;ParamType, Object&gt; params()
+        {
+<span class="fc" id="L505">            return Collections.unmodifiableMap(params);</span>
+        }
+
+        @Nullable
+        public Map&lt;String,byte[]&gt; customParams()
+        {
+<span class="nc" id="L511">            return (Map&lt;String,byte[]&gt;) params.get(ParamType.CUSTOM_MAP);</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;WeakerAccess&quot;)
+    public static class Builder&lt;T&gt;
+    {
+        private Verb verb;
+        private InetAddressAndPort from;
+        private T payload;
+        private int flags = 0;
+        private final Map&lt;ParamType, Object&gt; params = new EnumMap&lt;&gt;(ParamType.class);
+        private long createdAtNanos;
+        private long expiresAtNanos;
+        private long id;
+
+        private boolean hasId;
+
+        private Builder()
+        {
+        }
+
+        public Builder&lt;T&gt; from(InetAddressAndPort from)
+        {
+            this.from = from;
+            return this;
+        }
+
+        public Builder&lt;T&gt; withPayload(T payload)
+        {
+            this.payload = payload;
+            return this;
+        }
+
+        public Builder&lt;T&gt; withFlag(MessageFlag flag)
+        {
+            flags = flag.addTo(flags);
+            return this;
+        }
+
+        public Builder&lt;T&gt; withFlags(int flags)
+        {
+            this.flags = flags;
+            return this;
+        }
+
+        public Builder&lt;T&gt; withParam(ParamType type, Object value)
+        {
+            params.put(type, value);
+            return this;
+        }
+
+        public Builder&lt;T&gt; withCustomParam(String name, byte[] value)
+        {
+            Map&lt;String,byte[]&gt; customParams  = (Map&lt;String,byte[]&gt;)
+                    params.computeIfAbsent(ParamType.CUSTOM_MAP, (t) -&gt; new HashMap&lt;String,byte[]&gt;());
+
+            customParams.put(name, value);
+            return this;
+        }
+
+        /**
+         * A shortcut to add tracing params.
+         * Effectively, it is the same as calling {@link #withParam(ParamType, Object)} with tracing params
+         * If there is already tracing params, calling this method overrides any existing ones.
+         */
+        public Builder&lt;T&gt; withTracingParams()
+        {
+            if (Tracing.isTracing())
+                Tracing.instance.addTraceHeaders(params);
+            return this;
+        }
+
+        public Builder&lt;T&gt; withoutParam(ParamType type)
+        {
+            params.remove(type);
+            return this;
+        }
+
+        public Builder&lt;T&gt; withParams(Map&lt;ParamType, Object&gt; params)
+        {
+            this.params.putAll(params);
+            return this;
+        }
+
+        public Builder&lt;T&gt; ofVerb(Verb verb)
+        {
+            this.verb = verb;
+            if (expiresAtNanos == 0 &amp;&amp; verb != null &amp;&amp; createdAtNanos != 0)
+                expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
+            if (!this.verb.isResponse() &amp;&amp; from == null) // default to sending from self if we're a request verb
+                from = getBroadcastAddressAndPort();
+            return this;
+        }
+
+        public Builder&lt;T&gt; withCreatedAt(long createdAtNanos)
+        {
+            this.createdAtNanos = createdAtNanos;
+            if (expiresAtNanos == 0 &amp;&amp; verb != null)
+                expiresAtNanos = verb.expiresAtNanos(createdAtNanos);
+            return this;
+        }
+
+        public Builder&lt;T&gt; withExpiresAt(long expiresAtNanos)
+        {
+            this.expiresAtNanos = expiresAtNanos;
+            return this;
+        }
+
+        public Builder&lt;T&gt; withId(long id)
+        {
+            this.id = id;
+            hasId = true;
+            return this;
+        }
+
+        public Message&lt;T&gt; build()
+        {
+            if (verb == null)
+                throw new IllegalArgumentException();
+            if (from == null)
+                throw new IllegalArgumentException();
+            if (payload == null)
+                throw new IllegalArgumentException();
+
+            return new Message&lt;&gt;(new Header(hasId ? id : nextId(), verb, from, createdAtNanos, expiresAtNanos, flags, params), payload);
+        }
+    }
+
+    public static &lt;T&gt; Builder&lt;T&gt; builder(Message&lt;T&gt; message)
+    {
+<span class="nc" id="L642">        return new Builder&lt;T&gt;().from(message.from())</span>
+<span class="nc" id="L643">                               .withId(message.id())</span>
+<span class="nc" id="L644">                               .ofVerb(message.verb())</span>
+<span class="nc" id="L645">                               .withCreatedAt(message.createdAtNanos())</span>
+<span class="nc" id="L646">                               .withExpiresAt(message.expiresAtNanos())</span>
+<span class="nc" id="L647">                               .withFlags(message.header.flags)</span>
+<span class="nc" id="L648">                               .withParams(message.header.params)</span>
+<span class="nc" id="L649">                               .withPayload(message.payload);</span>
+    }
+
+    public static &lt;T&gt; Builder&lt;T&gt; builder(Verb verb, T payload)
+    {
+<span class="nc" id="L654">        return new Builder&lt;T&gt;().ofVerb(verb)</span>
+<span class="nc" id="L655">                               .withCreatedAt(approxTime.now())</span>
+<span class="nc" id="L656">                               .withPayload(payload);</span>
+    }
+
+<span class="fc" id="L659">    public static final Serializer serializer = new Serializer();</span>
+
+    /**
+     * Each message contains a header with several fixed fields, an optional key-value params section, and then
+     * the message payload itself. Below is a visualization of the layout.
+     *
+     *  The params are prefixed by the count of key-value pairs; this value is encoded as unsigned vint.
+     *  An individual param has an unsvint id (more specifically, a {@link ParamType}), and a byte array value.
+     *  The param value is prefixed with it's length, encoded as an unsigned vint, followed by by the value's bytes.
+     *
+     * Legacy Notes (see {@link Serializer#serialize(Message, DataOutputPlus, int)} for complete details):
+     * - pre 4.0, the IP address was sent along in the header, before the verb. The IP address may be either IPv4 (4 bytes) or IPv6 (16 bytes)
+     * - pre-4.0, the verb was encoded as a 4-byte integer; in 4.0 and up it is an unsigned vint
+     * - pre-4.0, the payloadSize was encoded as a 4-byte integer; in 4.0 and up it is an unsigned vint
+     * - pre-4.0, the count of param key-value pairs was encoded as a 4-byte integer; in 4.0 and up it is an unsigned vint
+     * - pre-4.0, param names were encoded as strings; in 4.0 they are encoded as enum id vints
+     * - pre-4.0, expiry time wasn't encoded at all; in 4.0 it's an unsigned vint
+     * - pre-4.0, message id was an int; in 4.0 and up it's an unsigned vint
+     * - pre-4.0, messages included PROTOCOL MAGIC BYTES; post-4.0, we rely on frame CRCs instead
+     * - pre-4.0, messages would serialize boolean params as dummy ONE_BYTEs; post-4.0 we have a dedicated 'flags' vint
+     *
+     * &lt;pre&gt;
+     * {@code
+     *            1 1 1 1 1 2 2 2 2 2 3
+     *  0 2 4 6 8 0 2 4 6 8 0 2 4 6 8 0
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Message ID (vint)             |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Creation timestamp (int)      |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Expiry (vint)                 |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Verb (vint)                   |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Flags (vint)                  |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Param count (vint)            |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |                               /
+     * /           Params              /
+     * /                               |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * | Payload size (vint)           |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |                               /
+     * /           Payload             /
+     * /                               |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * }
+     * &lt;/pre&gt;
+     */
+    public static final class Serializer
+    {
+        private static final int CREATION_TIME_SIZE = 4;
+
+        private Serializer()
+        {
+        }
+
+        public &lt;T&gt; void serialize(Message&lt;T&gt; message, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L720">            serializeHeader(message.header, out, version);</span>
+<span class="nc" id="L721">            out.writeUnsignedVInt32(message.payloadSize(version));</span>
+<span class="nc" id="L722">            message.verb().serializer().serialize(message.payload, out, version);</span>
+<span class="nc" id="L723">        }</span>
+
+        public &lt;T&gt; Message&lt;T&gt; deserialize(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
+        {
+<span class="nc" id="L727">            Header header = deserializeHeader(in, peer, version);</span>
+<span class="nc" id="L728">            skipUnsignedVInt(in); // payload size, not needed by payload deserializer</span>
+<span class="nc" id="L729">            T payload = (T) header.verb.serializer().deserialize(in, version);</span>
+<span class="nc" id="L730">            return new Message&lt;&gt;(header, payload);</span>
+        }
+
+        /**
+         * A partial variant of deserialize, taking in a previously deserialized {@link Header} as an argument.
+         *
+         * Skip deserializing the {@link Header} from the input stream in favour of using the provided header.
+         */
+        public &lt;T&gt; Message&lt;T&gt; deserialize(DataInputPlus in, Header header, int version) throws IOException
+        {
+<span class="nc" id="L740">            skipHeader(in);</span>
+<span class="nc" id="L741">            skipUnsignedVInt(in); // payload size, not needed by payload deserializer</span>
+<span class="nc" id="L742">            T payload = (T) header.verb.serializer().deserialize(in, version);</span>
+<span class="nc" id="L743">            return new Message&lt;&gt;(header, payload);</span>
+        }
+
+        private &lt;T&gt; int serializedSize(Message&lt;T&gt; message, int version)
+        {
+<span class="nc" id="L748">            long size = 0;</span>
+<span class="nc" id="L749">            size += serializedHeader(message.header, version);</span>
+<span class="nc" id="L750">            int payloadSize = message.payloadSize(version);</span>
+<span class="nc" id="L751">            size += sizeofUnsignedVInt(payloadSize) + payloadSize;</span>
+<span class="nc" id="L752">            return Ints.checkedCast(size);</span>
+        }
+
+        /**
+         * Size of the next message in the stream. Returns -1 if there aren't sufficient bytes read yet to determine size.
+         */
+        int inferMessageSize(ByteBuffer buf, int readerIndex, int readerLimit)
+        {
+<span class="nc" id="L760">            int index = readerIndex;</span>
+
+<span class="nc" id="L762">            int idSize = computeUnsignedVIntSize(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">            if (idSize &lt; 0)</span>
+<span class="nc" id="L764">                return -1; // not enough bytes to read id</span>
+<span class="nc" id="L765">            index += idSize;</span>
+
+<span class="nc" id="L767">            index += CREATION_TIME_SIZE;</span>
+<span class="nc bnc" id="L768" title="All 2 branches missed.">            if (index &gt; readerLimit)</span>
+<span class="nc" id="L769">                return -1;</span>
+
+<span class="nc" id="L771">            int expirationSize = computeUnsignedVIntSize(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">            if (expirationSize &lt; 0)</span>
+<span class="nc" id="L773">                return -1;</span>
+<span class="nc" id="L774">            index += expirationSize;</span>
+
+<span class="nc" id="L776">            int verbIdSize = computeUnsignedVIntSize(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">            if (verbIdSize &lt; 0)</span>
+<span class="nc" id="L778">                return -1;</span>
+<span class="nc" id="L779">            index += verbIdSize;</span>
+
+<span class="nc" id="L781">            int flagsSize = computeUnsignedVIntSize(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            if (flagsSize &lt; 0)</span>
+<span class="nc" id="L783">                return -1;</span>
+<span class="nc" id="L784">            index += flagsSize;</span>
+
+<span class="nc" id="L786">            int paramsSize = extractParamsSize(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (paramsSize &lt; 0)</span>
+<span class="nc" id="L788">                return -1;</span>
+<span class="nc" id="L789">            index += paramsSize;</span>
+
+<span class="nc" id="L791">            long payloadSize = getUnsignedVInt(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">            if (payloadSize &lt; 0)</span>
+<span class="nc" id="L793">                return -1;</span>
+<span class="nc" id="L794">            index += computeUnsignedVIntSize(payloadSize) + payloadSize;</span>
+
+<span class="nc" id="L796">            int size = index - readerIndex;</span>
+
+<span class="nc bnc" id="L798" title="All 2 branches missed.">            if (size &gt; DatabaseDescriptor.getInternodeMaxMessageSizeInBytes())</span>
+<span class="nc" id="L799">                throw new OversizedMessageException(size);</span>
+<span class="nc" id="L800">            return size;</span>
+        }
+
+        /**
+         * Partially deserialize the message - by only extracting the header and leaving the payload alone.
+         *
+         * To get the rest of the message without repeating the work done here, use {@link #deserialize(DataInputPlus, Header, int)}
+         * method.
+         *
+         * It's assumed that the provided buffer contains all the bytes necessary to deserialize the header fully.
+         */
+        Header extractHeader(ByteBuffer buf, InetAddressAndPort from, long currentTimeNanos, int version) throws IOException
+        {
+<span class="nc" id="L813">            MonotonicClockTranslation timeSnapshot = approxTime.translate();</span>
+
+<span class="nc" id="L815">            int index = buf.position();</span>
+
+<span class="nc" id="L817">            long id = getUnsignedVInt(buf, index);</span>
+<span class="nc" id="L818">            index += computeUnsignedVIntSize(id);</span>
+
+<span class="nc" id="L820">            int createdAtMillis = buf.getInt(index);</span>
+<span class="nc" id="L821">            index += sizeof(createdAtMillis);</span>
+
+<span class="nc" id="L823">            long expiresInMillis = getUnsignedVInt(buf, index);</span>
+<span class="nc" id="L824">            index += computeUnsignedVIntSize(expiresInMillis);</span>
+
+<span class="nc" id="L826">            Verb verb = Verb.fromId(getUnsignedVInt32(buf, index));</span>
+<span class="nc" id="L827">            index += computeUnsignedVIntSize(verb.id);</span>
+
+<span class="nc" id="L829">            int flags = getUnsignedVInt32(buf, index);</span>
+<span class="nc" id="L830">            index += computeUnsignedVIntSize(flags);</span>
+
+<span class="nc" id="L832">            Map&lt;ParamType, Object&gt; params = extractParams(buf, index, version);</span>
+
+<span class="nc" id="L834">            long createdAtNanos = calculateCreationTimeNanos(createdAtMillis, timeSnapshot, currentTimeNanos);</span>
+<span class="nc" id="L835">            long expiresAtNanos = getExpiresAtNanos(createdAtNanos, currentTimeNanos, TimeUnit.MILLISECONDS.toNanos(expiresInMillis));</span>
+
+<span class="nc" id="L837">            return new Header(id, verb, from, createdAtNanos, expiresAtNanos, flags, params);</span>
+        }
+
+        private static long getExpiresAtNanos(long createdAtNanos, long currentTimeNanos, long expirationPeriodNanos)
+        {
+<span class="nc bnc" id="L842" title="All 4 branches missed.">            if (!DatabaseDescriptor.hasCrossNodeTimeout() || createdAtNanos &gt; currentTimeNanos)</span>
+<span class="nc" id="L843">                createdAtNanos = currentTimeNanos;</span>
+<span class="nc" id="L844">            return createdAtNanos + expirationPeriodNanos;</span>
+        }
+
+        private void serializeHeader(Header header, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L849">            out.writeUnsignedVInt(header.id);</span>
+            // int cast cuts off the high-order half of the timestamp, which we can assume remains
+            // the same between now and when the recipient reconstructs it.
+<span class="nc" id="L852">            out.writeInt((int) approxTime.translate().toMillisSinceEpoch(header.createdAtNanos));</span>
+<span class="nc" id="L853">            out.writeUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));</span>
+<span class="nc" id="L854">            out.writeUnsignedVInt32(header.verb.id);</span>
+<span class="nc" id="L855">            out.writeUnsignedVInt32(header.flags);</span>
+<span class="nc" id="L856">            serializeParams(header.params, out, version);</span>
+<span class="nc" id="L857">        }</span>
+
+        private Header deserializeHeader(DataInputPlus in, InetAddressAndPort peer, int version) throws IOException
+        {
+<span class="nc" id="L861">            long id = in.readUnsignedVInt();</span>
+<span class="nc" id="L862">            long currentTimeNanos = approxTime.now();</span>
+<span class="nc" id="L863">            MonotonicClockTranslation timeSnapshot = approxTime.translate();</span>
+<span class="nc" id="L864">            long creationTimeNanos = calculateCreationTimeNanos(in.readInt(), timeSnapshot, currentTimeNanos);</span>
+<span class="nc" id="L865">            long expiresAtNanos = getExpiresAtNanos(creationTimeNanos, currentTimeNanos, TimeUnit.MILLISECONDS.toNanos(in.readUnsignedVInt()));</span>
+<span class="nc" id="L866">            Verb verb = Verb.fromId(in.readUnsignedVInt32());</span>
+<span class="nc" id="L867">            int flags = in.readUnsignedVInt32();</span>
+<span class="nc" id="L868">            Map&lt;ParamType, Object&gt; params = deserializeParams(in, version);</span>
+<span class="nc" id="L869">            return new Header(id, verb, peer, creationTimeNanos, expiresAtNanos, flags, params);</span>
+        }
+
+        private void skipHeader(DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L874">            skipUnsignedVInt(in); // id</span>
+<span class="nc" id="L875">            in.skipBytesFully(4); // createdAt</span>
+<span class="nc" id="L876">            skipUnsignedVInt(in); // expiresIn</span>
+<span class="nc" id="L877">            skipUnsignedVInt(in); // verb</span>
+<span class="nc" id="L878">            skipUnsignedVInt(in); // flags</span>
+<span class="nc" id="L879">            skipParams(in); // params</span>
+<span class="nc" id="L880">        }</span>
+
+        private int serializedHeader(Header header, int version)
+        {
+<span class="nc" id="L884">            long size = 0;</span>
+<span class="nc" id="L885">            size += sizeofUnsignedVInt(header.id);</span>
+<span class="nc" id="L886">            size += CREATION_TIME_SIZE;</span>
+<span class="nc" id="L887">            size += sizeofUnsignedVInt(NANOSECONDS.toMillis(header.expiresAtNanos - header.createdAtNanos));</span>
+<span class="nc" id="L888">            size += sizeofUnsignedVInt(header.verb.id);</span>
+<span class="nc" id="L889">            size += sizeofUnsignedVInt(header.flags);</span>
+<span class="nc" id="L890">            size += serializedParamsSize(header.params, version);</span>
+<span class="nc" id="L891">            return Ints.checkedCast(size);</span>
+        }
+
+        /*
+         * created at + cross-node
+         */
+
+<span class="fc" id="L898">        private static final long TIMESTAMP_WRAPAROUND_GRACE_PERIOD_START  = 0xFFFFFFFFL - MINUTES.toMillis(15L);</span>
+<span class="fc" id="L899">        private static final long TIMESTAMP_WRAPAROUND_GRACE_PERIOD_END    =               MINUTES.toMillis(15L);</span>
+
+        @VisibleForTesting
+        static long calculateCreationTimeNanos(int messageTimestampMillis, MonotonicClockTranslation timeSnapshot, long currentTimeNanos)
+        {
+<span class="nc" id="L904">            long currentTimeMillis = timeSnapshot.toMillisSinceEpoch(currentTimeNanos);</span>
+            // Reconstruct the message construction time sent by the remote host (we sent only the lower 4 bytes, assuming the
+            // higher 4 bytes wouldn't change between the sender and receiver)
+<span class="nc" id="L907">            long highBits = currentTimeMillis &amp; 0xFFFFFFFF00000000L;</span>
+
+<span class="nc" id="L909">            long sentLowBits = messageTimestampMillis &amp; 0x00000000FFFFFFFFL;</span>
+<span class="nc" id="L910">            long currentLowBits =   currentTimeMillis &amp; 0x00000000FFFFFFFFL;</span>
+
+            // if our sent bits occur within a grace period of a wrap around event,
+            // and our current bits are no more than the same grace period after a wrap around event,
+            // assume a wrap around has occurred, and deduct one highBit
+<span class="nc bnc" id="L915" title="All 4 branches missed.">            if (      sentLowBits &gt; TIMESTAMP_WRAPAROUND_GRACE_PERIOD_START</span>
+                      &amp;&amp; currentLowBits &lt; TIMESTAMP_WRAPAROUND_GRACE_PERIOD_END)
+            {
+<span class="nc" id="L918">                highBits -= 0x0000000100000000L;</span>
+            }
+            // if the message timestamp wrapped, but we still haven't, add one highBit
+<span class="nc bnc" id="L921" title="All 4 branches missed.">            else if (sentLowBits &lt; TIMESTAMP_WRAPAROUND_GRACE_PERIOD_END</span>
+                     &amp;&amp; currentLowBits &gt; TIMESTAMP_WRAPAROUND_GRACE_PERIOD_START)
+            {
+<span class="nc" id="L924">                highBits += 0x0000000100000000L;</span>
+            }
+
+<span class="nc" id="L927">            long sentTimeMillis = (highBits | sentLowBits);</span>
+
+<span class="nc bnc" id="L929" title="All 2 branches missed.">            if (Math.abs(currentTimeMillis - sentTimeMillis) &gt; MINUTES.toMillis(15))</span>
+            {
+<span class="nc" id="L931">                noSpam1m.warn(&quot;Bad timestamp {} generated, overriding with currentTimeMillis = {}&quot;, sentTimeMillis, currentTimeMillis);</span>
+<span class="nc" id="L932">                sentTimeMillis = currentTimeMillis;</span>
+            }
+
+<span class="nc" id="L935">            return timeSnapshot.fromMillisSinceEpoch(sentTimeMillis);</span>
+        }
+
+        /*
+         * param ser/deser
+         */
+
+        private void serializeParams(Map&lt;ParamType, Object&gt; params, DataOutputPlus out, int version) throws IOException
+        {
+<span class="nc" id="L944">            out.writeUnsignedVInt32(params.size());</span>
+
+<span class="nc bnc" id="L946" title="All 2 branches missed.">            for (Map.Entry&lt;ParamType, Object&gt; kv : params.entrySet())</span>
+            {
+<span class="nc" id="L948">                ParamType type = kv.getKey();</span>
+<span class="nc" id="L949">                out.writeUnsignedVInt32(type.id);</span>
+
+<span class="nc" id="L951">                IVersionedSerializer serializer = type.serializer;</span>
+<span class="nc" id="L952">                Object value = kv.getValue();</span>
+
+<span class="nc" id="L954">                int length = Ints.checkedCast(serializer.serializedSize(value, version));</span>
+<span class="nc" id="L955">                out.writeUnsignedVInt32(length);</span>
+
+<span class="nc" id="L957">                serializer.serialize(value, out, version);</span>
+<span class="nc" id="L958">            }</span>
+<span class="nc" id="L959">        }</span>
+
+        private Map&lt;ParamType, Object&gt; deserializeParams(DataInputPlus in, int version) throws IOException
+        {
+<span class="nc" id="L963">            int count = in.readUnsignedVInt32();</span>
+
+<span class="nc bnc" id="L965" title="All 2 branches missed.">            if (count == 0)</span>
+<span class="nc" id="L966">                return NO_PARAMS;</span>
+
+<span class="nc" id="L968">            Map&lt;ParamType, Object&gt; params = new EnumMap&lt;&gt;(ParamType.class);</span>
+
+<span class="nc bnc" id="L970" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++)</span>
+            {
+<span class="nc" id="L972">                ParamType type = ParamType.lookUpById(in.readUnsignedVInt32());</span>
+
+<span class="nc" id="L974">                int length = in.readUnsignedVInt32();</span>
+
+<span class="nc bnc" id="L976" title="All 2 branches missed.">                if (null != type)</span>
+                {
+<span class="nc" id="L978">                    params.put(type, type.serializer.deserialize(in, version));</span>
+                }
+                else
+                {
+<span class="nc" id="L982">                    in.skipBytesFully(length); // forward compatibiliy with minor version changes</span>
+                }
+            }
+
+<span class="nc" id="L986">            return params;</span>
+        }
+
+        private Map&lt;ParamType, Object&gt; extractParams(ByteBuffer buf, int readerIndex, int version) throws IOException
+        {
+<span class="nc" id="L991">            long count = getUnsignedVInt(buf, readerIndex);</span>
+
+<span class="nc bnc" id="L993" title="All 2 branches missed.">            if (count == 0)</span>
+<span class="nc" id="L994">                return NO_PARAMS;</span>
+
+<span class="nc" id="L996">            final int position = buf.position();</span>
+<span class="nc" id="L997">            buf.position(readerIndex);</span>
+
+<span class="nc" id="L999">            try (DataInputBuffer in = new DataInputBuffer(buf, false))</span>
+            {
+<span class="nc" id="L1001">                return deserializeParams(in, version);</span>
+            }
+            finally
+            {
+<span class="nc" id="L1005">                buf.position(position);</span>
+            }
+        }
+
+        private void skipParams(DataInputPlus in) throws IOException
+        {
+<span class="nc" id="L1011">            int count = in.readUnsignedVInt32();</span>
+
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">            for (int i = 0; i &lt; count; i++)</span>
+            {
+<span class="nc" id="L1015">                skipUnsignedVInt(in);</span>
+<span class="nc" id="L1016">                in.skipBytesFully(in.readUnsignedVInt32());</span>
+            }
+<span class="nc" id="L1018">        }</span>
+
+        private long serializedParamsSize(Map&lt;ParamType, Object&gt; params, int version)
+        {
+<span class="nc" id="L1022">            long size = computeUnsignedVIntSize(params.size());</span>
+
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">            for (Map.Entry&lt;ParamType, Object&gt; kv : params.entrySet())</span>
+            {
+<span class="nc" id="L1026">                ParamType type = kv.getKey();</span>
+<span class="nc" id="L1027">                Object value = kv.getValue();</span>
+
+<span class="nc" id="L1029">                long valueLength = type.serializer.serializedSize(value, version);</span>
+
+<span class="nc" id="L1031">                size += sizeofUnsignedVInt(type.id) + sizeofUnsignedVInt(valueLength);</span>
+
+<span class="nc" id="L1033">                size += valueLength;</span>
+<span class="nc" id="L1034">            }</span>
+
+<span class="nc" id="L1036">            return size;</span>
+        }
+
+        private int extractParamsSize(ByteBuffer buf, int readerIndex, int readerLimit)
+        {
+<span class="nc" id="L1041">            int index = readerIndex;</span>
+
+<span class="nc" id="L1043">            long paramsCount = getUnsignedVInt(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L1044" title="All 2 branches missed.">            if (paramsCount &lt; 0)</span>
+<span class="nc" id="L1045">                return -1;</span>
+<span class="nc" id="L1046">            index += computeUnsignedVIntSize(paramsCount);</span>
+
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">            for (int i = 0; i &lt; paramsCount; i++)</span>
+            {
+<span class="nc" id="L1050">                long type = getUnsignedVInt(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">                if (type &lt; 0)</span>
+<span class="nc" id="L1052">                    return -1;</span>
+<span class="nc" id="L1053">                index += computeUnsignedVIntSize(type);</span>
+
+<span class="nc" id="L1055">                long length = getUnsignedVInt(buf, index, readerLimit);</span>
+<span class="nc bnc" id="L1056" title="All 2 branches missed.">                if (length &lt; 0)</span>
+<span class="nc" id="L1057">                    return -1;</span>
+<span class="nc" id="L1058">                index += computeUnsignedVIntSize(length) + length;</span>
+            }
+
+<span class="nc" id="L1061">            return index - readerIndex;</span>
+        }
+
+        private &lt;T&gt; int payloadSize(Message&lt;T&gt; message, int version)
+        {
+<span class="nc bnc" id="L1066" title="All 4 branches missed.">            long payloadSize = message.payload != null &amp;&amp; message.payload != NoPayload.noPayload</span>
+<span class="nc" id="L1067">                             ? message.getPayloadSerializer().serializedSize(message.payload, version)</span>
+<span class="nc" id="L1068">                             : 0;</span>
+<span class="nc" id="L1069">            return Ints.checkedCast(payloadSize);</span>
+        }
+    }
+
+    private IVersionedAsymmetricSerializer&lt;T, ?&gt; getPayloadSerializer()
+    {
+<span class="nc" id="L1075">        return verb().serializer();</span>
+    }
+
+    private int serializedSize40;
+    private int serializedSize50;
+
+    /**
+     * Serialized size of the entire message, for the provided messaging version. Caches the calculated value.
+     */
+    public int serializedSize(int version)
+    {
+<span class="nc bnc" id="L1086" title="All 3 branches missed.">        switch (version)</span>
+        {
+            case VERSION_40:
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">                if (serializedSize40 == 0)</span>
+<span class="nc" id="L1090">                    serializedSize40 = serializer.serializedSize(this, VERSION_40);</span>
+<span class="nc" id="L1091">                return serializedSize40;</span>
+            case VERSION_50:
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">                if (serializedSize50 == 0)</span>
+<span class="nc" id="L1094">                    serializedSize50 = serializer.serializedSize(this, VERSION_50);</span>
+<span class="nc" id="L1095">                return serializedSize50;</span>
+            default:
+<span class="nc" id="L1097">                throw new IllegalStateException(&quot;Unkown serialization version &quot; + version);</span>
+        }
+    }
+
+<span class="fc" id="L1101">    private int payloadSize40   = -1;</span>
+<span class="fc" id="L1102">    private int payloadSize50   = -1;</span>
+
+    private int payloadSize(int version)
+    {
+<span class="nc bnc" id="L1106" title="All 3 branches missed.">        switch (version)</span>
+        {
+            case VERSION_40:
+<span class="nc bnc" id="L1109" title="All 2 branches missed.">                if (payloadSize40 &lt; 0)</span>
+<span class="nc" id="L1110">                    payloadSize40 = serializer.payloadSize(this, VERSION_40);</span>
+<span class="nc" id="L1111">                return payloadSize40;</span>
+            case VERSION_50:
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">                if (payloadSize50 &lt; 0)</span>
+<span class="nc" id="L1114">                    payloadSize50 = serializer.payloadSize(this, VERSION_50);</span>
+<span class="nc" id="L1115">                return payloadSize50;</span>
+
+            default:
+<span class="nc" id="L1118">                throw new IllegalStateException(&quot;Unkown serialization version &quot; + version);</span>
+        }
+    }
+
+    static class OversizedMessageException extends RuntimeException
+    {
+        OversizedMessageException(int size)
+        {
+<span class="nc" id="L1126">            super(&quot;Message of size &quot; + size + &quot; bytes exceeds allowed maximum of &quot; + DatabaseDescriptor.getInternodeMaxMessageSizeInBytes() + &quot; bytes&quot;);</span>
+<span class="nc" id="L1127">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

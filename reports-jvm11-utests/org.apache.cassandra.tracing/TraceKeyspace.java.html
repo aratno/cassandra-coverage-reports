@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TraceKeyspace.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.tracing</a> &gt; <span class="el_source">TraceKeyspace.java</span></div><h1>TraceKeyspace.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.tracing;
+
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import com.google.common.collect.ImmutableSet;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+public final class TraceKeyspace
+{
+    private TraceKeyspace()
+    {
+    }
+
+<span class="fc" id="L50">    private static final int DEFAULT_RF = CassandraRelevantProperties.SYSTEM_TRACES_DEFAULT_RF.getInt();</span>
+
+    /**
+     * Generation is used as a timestamp for automatic table creation on startup.
+     * If you make any changes to the tables below, make sure to increment the
+     * generation and document your change here.
+     *
+     * gen 1577836800000000: (3.0) maps to Jan 1 2020; an arbitrary cut-off date by which we assume no nodes older than 2.0.2
+     *                       will ever start; see the note below for why this is necessary; actual change in 3.0:
+     *                       removed default ttl, reduced bloom filter fp chance from 0.1 to 0.01.
+     * gen 1577836800000001: (pre-)adds coordinator_port column to sessions and source_port column to events in 3.0, 3.11, 4.0
+     * gen 1577836800000002: compression chunk length reduced to 16KiB, memtable_flush_period_in_ms now unset on all tables in 4.0
+     *
+     * * Until CASSANDRA-6016 (Oct 13, 2.0.2) and in all of 1.2, we used to create system_traces keyspace and
+     *   tables in the same way that we created the purely local 'system' keyspace - using current time on node bounce
+     *   (+1). For new definitions to take, we need to bump the generation further than that.
+     */
+    public static final long GENERATION = 1577836800000002L;
+
+    public static final String SESSIONS = &quot;sessions&quot;;
+    public static final String EVENTS = &quot;events&quot;;
+<span class="fc" id="L71">    public static final Set&lt;String&gt; TABLE_NAMES = ImmutableSet.of(SESSIONS, EVENTS);</span>
+
+<span class="fc" id="L73">    private static final TableMetadata Sessions =</span>
+<span class="fc" id="L74">        parse(SESSIONS,</span>
+                &quot;tracing sessions&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;session_id uuid,&quot;
+                + &quot;command text,&quot;
+                + &quot;client inet,&quot;
+                + &quot;coordinator inet,&quot;
+                + &quot;coordinator_port int,&quot;
+                + &quot;duration int,&quot;
+                + &quot;parameters map&lt;text, text&gt;,&quot;
+                + &quot;request text,&quot;
+                + &quot;started_at timestamp,&quot;
+                + &quot;PRIMARY KEY ((session_id)))&quot;);
+
+<span class="fc" id="L88">    private static final TableMetadata Events =</span>
+<span class="fc" id="L89">        parse(EVENTS,</span>
+                &quot;tracing events&quot;,
+                &quot;CREATE TABLE %s (&quot;
+                + &quot;session_id uuid,&quot;
+                + &quot;event_id timeuuid,&quot;
+                + &quot;activity text,&quot;
+                + &quot;source inet,&quot;
+                + &quot;source_port int,&quot;
+                + &quot;source_elapsed int,&quot;
+                + &quot;thread text,&quot;
+                + &quot;PRIMARY KEY ((session_id), event_id))&quot;);
+
+    private static TableMetadata parse(String table, String description, String cql)
+    {
+<span class="fc" id="L103">        return CreateTableStatement.parse(format(cql, table), SchemaConstants.TRACE_KEYSPACE_NAME)</span>
+<span class="fc" id="L104">                                   .id(TableId.forSystemTable(SchemaConstants.TRACE_KEYSPACE_NAME, table))</span>
+<span class="fc" id="L105">                                   .gcGraceSeconds(0)</span>
+<span class="fc" id="L106">                                   .comment(description)</span>
+<span class="fc" id="L107">                                   .build();</span>
+    }
+
+    public static KeyspaceMetadata metadata()
+    {
+<span class="fc" id="L112">        return KeyspaceMetadata.create(SchemaConstants.TRACE_KEYSPACE_NAME, KeyspaceParams.simple(Math.max(DEFAULT_RF, DatabaseDescriptor.getDefaultKeyspaceRF())), Tables.of(Sessions, Events));</span>
+    }
+
+    static Mutation makeStartSessionMutation(ByteBuffer sessionId,
+                                             InetAddress client,
+                                             Map&lt;String, String&gt; parameters,
+                                             String request,
+                                             long startedAt,
+                                             String command,
+                                             int ttl)
+    {
+<span class="fc" id="L123">        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Sessions, sessionId);</span>
+<span class="fc" id="L124">        Row.SimpleBuilder rb = builder.row();</span>
+<span class="fc" id="L125">        rb.ttl(ttl)</span>
+<span class="fc" id="L126">          .add(&quot;client&quot;, client)</span>
+<span class="fc" id="L127">          .add(&quot;coordinator&quot;, FBUtilities.getBroadcastAddressAndPort().getAddress());</span>
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">        if (!Gossiper.instance.hasMajorVersion3Nodes())</span>
+<span class="nc" id="L129">            rb.add(&quot;coordinator_port&quot;, FBUtilities.getBroadcastAddressAndPort().getPort());</span>
+<span class="fc" id="L130">        rb.add(&quot;request&quot;, request)</span>
+<span class="fc" id="L131">          .add(&quot;started_at&quot;, new Date(startedAt))</span>
+<span class="fc" id="L132">          .add(&quot;command&quot;, command)</span>
+<span class="fc" id="L133">          .appendAll(&quot;parameters&quot;, parameters);</span>
+
+<span class="fc" id="L135">        return builder.buildAsMutation();</span>
+    }
+
+    static Mutation makeStopSessionMutation(ByteBuffer sessionId, int elapsed, int ttl)
+    {
+<span class="fc" id="L140">        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Sessions, sessionId);</span>
+<span class="fc" id="L141">        builder.row()</span>
+<span class="fc" id="L142">               .ttl(ttl)</span>
+<span class="fc" id="L143">               .add(&quot;duration&quot;, elapsed);</span>
+<span class="fc" id="L144">        return builder.buildAsMutation();</span>
+    }
+
+    static Mutation makeEventMutation(ByteBuffer sessionId, String message, int elapsed, String threadName, int ttl)
+    {
+<span class="fc" id="L149">        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Events, sessionId);</span>
+<span class="fc" id="L150">        Row.SimpleBuilder rowBuilder = builder.row(nextTimeUUID())</span>
+<span class="fc" id="L151">                                              .ttl(ttl);</span>
+
+<span class="fc" id="L153">        rowBuilder.add(&quot;activity&quot;, message)</span>
+<span class="fc" id="L154">                  .add(&quot;source&quot;, FBUtilities.getBroadcastAddressAndPort().getAddress());</span>
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">        if (!Gossiper.instance.hasMajorVersion3Nodes())</span>
+<span class="nc" id="L156">            rowBuilder.add(&quot;source_port&quot;, FBUtilities.getBroadcastAddressAndPort().getPort());</span>
+<span class="fc" id="L157">        rowBuilder.add(&quot;thread&quot;, threadName);</span>
+
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">        if (elapsed &gt;= 0)</span>
+<span class="fc" id="L160">            rowBuilder.add(&quot;source_elapsed&quot;, elapsed);</span>
+
+<span class="fc" id="L162">        return builder.buildAsMutation();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

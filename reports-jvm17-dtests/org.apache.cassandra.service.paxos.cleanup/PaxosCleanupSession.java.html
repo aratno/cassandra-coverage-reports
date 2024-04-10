@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>PaxosCleanupSession.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.paxos.cleanup</a> &gt; <span class="el_source">PaxosCleanupSession.java</span></div><h1>PaxosCleanupSession.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.paxos.cleanup;
+
+import java.lang.ref.WeakReference;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
+import org.apache.cassandra.gms.IFailureDetectionEventListener;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.RequestCallbackWithFailure;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.PAXOS_CLEANUP_SESSION_TIMEOUT_SECONDS;
+import static org.apache.cassandra.net.Verb.PAXOS2_CLEANUP_REQ;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
+public class PaxosCleanupSession extends AsyncFuture&lt;Void&gt; implements Runnable,
+                                                                      IEndpointStateChangeSubscriber,
+                                                                      IFailureDetectionEventListener,
+                                                                      RequestCallbackWithFailure&lt;Void&gt;
+{
+<span class="fc" id="L55">    private static final Map&lt;UUID, PaxosCleanupSession&gt; sessions = new ConcurrentHashMap&lt;&gt;();</span>
+
+    static final long TIMEOUT_NANOS;
+    static
+    {
+<span class="fc" id="L60">        long timeoutSeconds = PAXOS_CLEANUP_SESSION_TIMEOUT_SECONDS.getLong();</span>
+<span class="fc" id="L61">        TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(timeoutSeconds);</span>
+<span class="fc" id="L62">    }</span>
+
+    private static class TimeoutTask implements Runnable
+    {
+        private final WeakReference&lt;PaxosCleanupSession&gt; ref;
+
+        TimeoutTask(PaxosCleanupSession session)
+<span class="fc" id="L69">        {</span>
+<span class="fc" id="L70">            this.ref = new WeakReference&lt;&gt;(session);</span>
+<span class="fc" id="L71">        }</span>
+
+        @Override
+        public void run()
+        {
+<span class="nc" id="L76">            PaxosCleanupSession session = ref.get();</span>
+<span class="nc bnc" id="L77" title="All 4 branches missed.">            if (session == null || session.isDone())</span>
+<span class="nc" id="L78">                return;</span>
+
+<span class="nc" id="L80">            long remaining = session.lastMessageSentNanos + TIMEOUT_NANOS - nanoTime();</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">            if (remaining &gt; 0)</span>
+<span class="nc" id="L82">                schedule(remaining);</span>
+            else
+<span class="nc" id="L84">                session.fail(String.format(&quot;Paxos cleanup session %s timed out&quot;, session.session));</span>
+<span class="nc" id="L85">        }</span>
+
+        ScheduledFuture&lt;?&gt; schedule(long delayNanos)
+        {
+<span class="fc" id="L89">            return ScheduledExecutors.scheduledTasks.scheduleTimeoutWithDelay(this, delayNanos, TimeUnit.NANOSECONDS);</span>
+        }
+
+        private static ScheduledFuture&lt;?&gt; schedule(PaxosCleanupSession session)
+        {
+<span class="fc" id="L94">            return new TimeoutTask(session).schedule(TIMEOUT_NANOS);</span>
+        }
+    }
+
+<span class="fc" id="L98">    private final UUID session = UUID.randomUUID();</span>
+    private final TableId tableId;
+    private final Collection&lt;Range&lt;Token&gt;&gt; ranges;
+<span class="fc" id="L101">    private final Queue&lt;InetAddressAndPort&gt; pendingCleanups = new ConcurrentLinkedQueue&lt;&gt;();</span>
+<span class="fc" id="L102">    private InetAddressAndPort inProgress = null;</span>
+<span class="fc" id="L103">    private volatile long lastMessageSentNanos = nanoTime();</span>
+    private ScheduledFuture&lt;?&gt; timeout;
+
+    PaxosCleanupSession(Collection&lt;InetAddressAndPort&gt; endpoints, TableId tableId, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+<span class="fc" id="L107">    {</span>
+<span class="fc" id="L108">        this.tableId = tableId;</span>
+<span class="fc" id="L109">        this.ranges = ranges;</span>
+
+<span class="fc" id="L111">        pendingCleanups.addAll(endpoints);</span>
+<span class="fc" id="L112">    }</span>
+
+    private static void setSession(PaxosCleanupSession session)
+    {
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">        Preconditions.checkState(!sessions.containsKey(session.session));</span>
+<span class="fc" id="L117">        sessions.put(session.session, session);</span>
+<span class="fc" id="L118">    }</span>
+
+    private static void removeSession(PaxosCleanupSession session)
+    {
+<span class="fc" id="L122">        Preconditions.checkState(sessions.containsKey(session.session));</span>
+<span class="fc" id="L123">        sessions.remove(session.session);</span>
+<span class="fc" id="L124">    }</span>
+
+    @Override
+    public void run()
+    {
+<span class="fc" id="L129">        setSession(this);</span>
+<span class="fc" id="L130">        startNextOrFinish();</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (!isDone())</span>
+<span class="fc" id="L132">            timeout = TimeoutTask.schedule(this);</span>
+<span class="fc" id="L133">    }</span>
+
+    private void startCleanup(InetAddressAndPort endpoint)
+    {
+<span class="fc" id="L137">        lastMessageSentNanos = nanoTime();</span>
+<span class="fc" id="L138">        PaxosCleanupRequest completer = new PaxosCleanupRequest(session, tableId, ranges);</span>
+<span class="fc" id="L139">        Message&lt;PaxosCleanupRequest&gt; msg = Message.out(PAXOS2_CLEANUP_REQ, completer);</span>
+<span class="fc" id="L140">        MessagingService.instance().sendWithCallback(msg, endpoint, this);</span>
+<span class="fc" id="L141">    }</span>
+
+    private synchronized void startNextOrFinish()
+    {
+<span class="fc" id="L145">        InetAddressAndPort endpoint = pendingCleanups.poll();</span>
+
+<span class="fc bfc" id="L147" title="All 2 branches covered.">        if (endpoint == null)</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">            Preconditions.checkState(inProgress == null, &quot;Unable to complete paxos cleanup session %s, still waiting on %s&quot;, session, inProgress);</span>
+        else
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">            Preconditions.checkState(inProgress == null, &quot;Unable to start paxos cleanup on %s for %s, still waiting on response from %s&quot;, endpoint, session, inProgress);</span>
+
+<span class="fc" id="L152">        inProgress = endpoint;</span>
+
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        if (endpoint != null)</span>
+        {
+<span class="fc" id="L156">            startCleanup(endpoint);</span>
+        }
+        else
+        {
+<span class="fc" id="L160">            removeSession(this);</span>
+<span class="fc" id="L161">            trySuccess(null);</span>
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">            if (timeout != null)</span>
+<span class="fc" id="L163">                timeout.cancel(true);</span>
+        }
+<span class="fc" id="L165">    }</span>
+
+    private synchronized void fail(String message)
+    {
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">        if (isDone())</span>
+<span class="nc" id="L170">            return;</span>
+<span class="fc" id="L171">        removeSession(this);</span>
+<span class="fc" id="L172">        tryFailure(new PaxosCleanupException(message));</span>
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">        if (timeout != null)</span>
+<span class="fc" id="L174">            timeout.cancel(true);</span>
+<span class="fc" id="L175">    }</span>
+
+    private synchronized void finish(InetAddressAndPort from, PaxosCleanupResponse finished)
+    {
+<span class="fc" id="L179">        Preconditions.checkArgument(from.equals(inProgress), &quot;Received unexpected cleanup complete response from %s for session %s. Expected %s&quot;, from, session, inProgress);</span>
+<span class="fc" id="L180">        inProgress = null;</span>
+
+<span class="fc bfc" id="L182" title="All 2 branches covered.">        if (finished.wasSuccessful)</span>
+        {
+<span class="fc" id="L184">            startNextOrFinish();</span>
+        }
+        else
+        {
+<span class="fc" id="L188">            fail(String.format(&quot;Paxos cleanup session %s failed on %s with message: %s&quot;, session, from, finished.message));</span>
+        }
+<span class="fc" id="L190">    }</span>
+
+    public static void finishSession(InetAddressAndPort from, PaxosCleanupResponse response)
+    {
+<span class="fc" id="L194">        PaxosCleanupSession session = sessions.get(response.session);</span>
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">        if (session != null)</span>
+<span class="fc" id="L196">            session.finish(from, response);</span>
+<span class="fc" id="L197">    }</span>
+
+    private synchronized void maybeKillSession(InetAddressAndPort unavailable, String reason)
+    {
+        // don't fail if we've already completed the cleanup for the unavailable endpoint,
+        // if it's something that affects availability, the ongoing sessions will fail themselves
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (!pendingCleanups.contains(unavailable))</span>
+<span class="nc" id="L204">            return;</span>
+
+<span class="nc" id="L206">        fail(String.format(&quot;Paxos cleanup session %s failed after %s %s&quot;, session, unavailable, reason));</span>
+<span class="nc" id="L207">    }</span>
+
+    @Override
+    public void onJoin(InetAddressAndPort endpoint, EndpointState epState)
+    {
+
+<span class="nc" id="L213">    }</span>
+
+    @Override
+    public void beforeChange(InetAddressAndPort endpoint, EndpointState currentState, ApplicationState newStateKey, VersionedValue newValue)
+    {
+
+<span class="nc" id="L219">    }</span>
+
+    @Override
+    public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value)
+    {
+
+<span class="nc" id="L225">    }</span>
+
+    @Override
+    public void onAlive(InetAddressAndPort endpoint, EndpointState state)
+    {
+
+<span class="nc" id="L231">    }</span>
+
+    @Override
+    public void onDead(InetAddressAndPort endpoint, EndpointState state)
+    {
+<span class="nc" id="L236">        maybeKillSession(endpoint, &quot;marked dead&quot;);</span>
+<span class="nc" id="L237">    }</span>
+
+    @Override
+    public void onRemove(InetAddressAndPort endpoint)
+    {
+<span class="nc" id="L242">        maybeKillSession(endpoint, &quot;removed from ring&quot;);</span>
+<span class="nc" id="L243">    }</span>
+
+    @Override
+    public void onRestart(InetAddressAndPort endpoint, EndpointState state)
+    {
+<span class="nc" id="L248">        maybeKillSession(endpoint, &quot;restarted&quot;);</span>
+<span class="nc" id="L249">    }</span>
+
+    @Override
+    public void convict(InetAddressAndPort ep, double phi)
+    {
+<span class="nc" id="L254">        maybeKillSession(ep, &quot;convicted by failure detector&quot;);</span>
+<span class="nc" id="L255">    }</span>
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason reason)
+    {
+<span class="nc" id="L260">        fail(from.toString() + ' ' + reason + &quot; for cleanup request for paxos cleanup session  &quot; + session);</span>
+<span class="nc" id="L261">    }</span>
+
+    @Override
+    public void onResponse(Message&lt;Void&gt; msg)
+    {
+        // noop, we're only interested in failures
+<span class="fc" id="L267">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

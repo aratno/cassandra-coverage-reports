@@ -1,0 +1,1117 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>LocalSessions.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair.consistent</a> &gt; <span class="el_source">LocalSessions.java</span></div><h1>LocalSessions.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.repair.consistent;
+
+import java.io.IOException;
+import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.google.common.primitives.Ints;
+import com.google.common.util.concurrent.FutureCallback;
+
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.repair.KeyspaceRepairManager;
+import org.apache.cassandra.repair.consistent.admin.CleanupSummary;
+import org.apache.cassandra.repair.consistent.admin.PendingStat;
+import org.apache.cassandra.repair.consistent.admin.PendingStats;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.UUIDType;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.repair.messages.FailSession;
+import org.apache.cassandra.repair.messages.FinalizeCommit;
+import org.apache.cassandra.repair.messages.FinalizePromise;
+import org.apache.cassandra.repair.messages.FinalizePropose;
+import org.apache.cassandra.repair.messages.PrepareConsistentRequest;
+import org.apache.cassandra.repair.messages.PrepareConsistentResponse;
+import org.apache.cassandra.repair.messages.RepairMessage;
+import org.apache.cassandra.repair.messages.StatusRequest;
+import org.apache.cassandra.repair.messages.StatusResponse;
+import org.apache.cassandra.repair.SharedContext;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.repair.NoSuchRepairSessionException;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Future;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.REPAIR_CLEANUP_INTERVAL_SECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.REPAIR_DELETE_TIMEOUT_SECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.REPAIR_FAIL_TIMEOUT_SECONDS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.REPAIR_STATUS_CHECK_TIMEOUT_SECONDS;
+import static org.apache.cassandra.net.Verb.FAILED_SESSION_MSG;
+import static org.apache.cassandra.net.Verb.FINALIZE_PROMISE_MSG;
+import static org.apache.cassandra.net.Verb.PREPARE_CONSISTENT_RSP;
+import static org.apache.cassandra.net.Verb.STATUS_REQ;
+import static org.apache.cassandra.net.Verb.STATUS_RSP;
+import static org.apache.cassandra.repair.consistent.ConsistentSession.State.*;
+
+/**
+ * Manages all consistent repair sessions a node is participating in.
+ * &lt;p/&gt;
+ * Since sessions need to be loaded, and since we need to handle cases where sessions might not exist, most of the logic
+ * around local sessions is implemented in this class, with the LocalSession class being treated more like a simple struct,
+ * in contrast with {@link CoordinatorSession}
+ */
+public class LocalSessions
+{
+<span class="fc" id="L118">    private static final Logger logger = LoggerFactory.getLogger(LocalSessions.class);</span>
+<span class="fc" id="L119">    private static final Set&lt;Listener&gt; listeners = new CopyOnWriteArraySet&lt;&gt;();</span>
+
+    /**
+     * Amount of time a session can go without any activity before we start checking the status of other
+     * participants to see if we've missed a message
+     */
+<span class="fc" id="L125">    static final int CHECK_STATUS_TIMEOUT = REPAIR_STATUS_CHECK_TIMEOUT_SECONDS.getInt();</span>
+
+    /**
+     * Amount of time a session can go without any activity before being automatically set to FAILED
+     */
+<span class="fc" id="L130">    static final int AUTO_FAIL_TIMEOUT = REPAIR_FAIL_TIMEOUT_SECONDS.getInt();</span>
+
+    /**
+     * Amount of time a completed session is kept around after completion before being deleted, this gives
+     * compaction plenty of time to move sstables from successful sessions into the repaired bucket
+     */
+<span class="fc" id="L136">    static final int AUTO_DELETE_TIMEOUT = REPAIR_DELETE_TIMEOUT_SECONDS.getInt();</span>
+    /**
+     * How often LocalSessions.cleanup is run
+     */
+<span class="fc" id="L140">    public static final int CLEANUP_INTERVAL = REPAIR_CLEANUP_INTERVAL_SECONDS.getInt();</span>
+
+    private static Set&lt;TableId&gt; uuidToTableId(Set&lt;UUID&gt; src)
+    {
+<span class="nc" id="L144">        return ImmutableSet.copyOf(Iterables.transform(src, TableId::fromUUID));</span>
+    }
+
+    private static Set&lt;UUID&gt; tableIdToUuid(Set&lt;TableId&gt; src)
+    {
+<span class="nc" id="L149">        return ImmutableSet.copyOf(Iterables.transform(src, TableId::asUUID));</span>
+    }
+
+<span class="fc" id="L152">    private final String keyspace = SchemaConstants.SYSTEM_KEYSPACE_NAME;</span>
+<span class="fc" id="L153">    private final String table = SystemKeyspace.REPAIRS;</span>
+    private final SharedContext ctx;
+<span class="fc" id="L155">    private boolean started = false;</span>
+<span class="fc" id="L156">    private volatile ImmutableMap&lt;TimeUUID, LocalSession&gt; sessions = ImmutableMap.of();</span>
+<span class="fc" id="L157">    private volatile ImmutableMap&lt;TableId, RepairedState&gt; repairedStates = ImmutableMap.of();</span>
+
+    public LocalSessions(SharedContext ctx)
+<span class="fc" id="L160">    {</span>
+<span class="fc" id="L161">        this.ctx = ctx;</span>
+<span class="fc" id="L162">    }</span>
+
+    @VisibleForTesting
+    int getNumSessions()
+    {
+<span class="nc" id="L167">        return sessions.size();</span>
+    }
+
+    @VisibleForTesting
+    protected InetAddressAndPort getBroadcastAddressAndPort()
+    {
+<span class="nc" id="L173">        return ctx.broadcastAddressAndPort();</span>
+    }
+
+    @VisibleForTesting
+    protected boolean isAlive(InetAddressAndPort address)
+    {
+<span class="nc" id="L179">        return ctx.failureDetector().isAlive(address);</span>
+    }
+
+    @VisibleForTesting
+    protected boolean isNodeInitialized()
+    {
+<span class="fc" id="L185">        return StorageService.instance.isInitialized();</span>
+    }
+
+    public List&lt;Map&lt;String, String&gt;&gt; sessionInfo(boolean all, Set&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L190">        Iterable&lt;LocalSession&gt; currentSessions = sessions.values();</span>
+
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        if (!all)</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            currentSessions = Iterables.filter(currentSessions, s -&gt; !s.isCompleted());</span>
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (!ranges.isEmpty())</span>
+<span class="nc" id="L196">            currentSessions = Iterables.filter(currentSessions, s -&gt; s.intersects(ranges));</span>
+
+<span class="nc" id="L198">        return Lists.newArrayList(Iterables.transform(currentSessions, LocalSessionInfo::sessionToMap));</span>
+    }
+
+    private RepairedState getRepairedState(TableId tid)
+    {
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (!repairedStates.containsKey(tid))</span>
+        {
+<span class="nc" id="L205">            synchronized (this)</span>
+            {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                if (!repairedStates.containsKey(tid))</span>
+                {
+<span class="nc" id="L209">                    repairedStates = ImmutableMap.&lt;TableId, RepairedState&gt;builder()</span>
+<span class="nc" id="L210">                                     .putAll(repairedStates)</span>
+<span class="nc" id="L211">                                     .put(tid, new RepairedState())</span>
+<span class="nc" id="L212">                                     .build();</span>
+                }
+<span class="nc" id="L214">            }</span>
+        }
+<span class="nc" id="L216">        return Verify.verifyNotNull(repairedStates.get(tid));</span>
+    }
+
+    private void maybeUpdateRepairedState(LocalSession session)
+    {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (!shouldStoreSession(session))</span>
+<span class="nc" id="L222">            return;</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        for (TableId tid : session.tableIds)</span>
+        {
+<span class="nc" id="L226">            RepairedState state = getRepairedState(tid);</span>
+<span class="nc" id="L227">            state.add(session.ranges, session.repairedAt);</span>
+<span class="nc" id="L228">        }</span>
+<span class="nc" id="L229">    }</span>
+
+    private boolean shouldStoreSession(LocalSession session)
+    {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (session.getState() != FINALIZED)</span>
+<span class="nc" id="L234">            return false;</span>
+
+        // if the session is finalized but has repairedAt set to 0, it was
+        // a forced repair, and we shouldn't update the repaired state
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        return session.repairedAt != ActiveRepairService.UNREPAIRED_SSTABLE;</span>
+    }
+
+    /**
+     * Determine if all ranges and tables covered by this session
+     * have since been re-repaired by a more recent session
+     */
+    private boolean isSuperseded(LocalSession session)
+    {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        for (TableId tid : session.tableIds)</span>
+        {
+<span class="nc" id="L249">            RepairedState state = repairedStates.get(tid);</span>
+
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            if (state == null)</span>
+<span class="nc" id="L252">                return false;</span>
+
+<span class="nc" id="L254">            long minRepaired = state.minRepairedAt(session.ranges);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">            if (minRepaired &lt;= session.repairedAt)</span>
+<span class="nc" id="L256">                return false;</span>
+<span class="nc" id="L257">        }</span>
+
+<span class="nc" id="L259">        return true;</span>
+    }
+
+    public RepairedState.Stats getRepairedStats(TableId tid, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L264">        RepairedState state = repairedStates.get(tid);</span>
+
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        if (state == null)</span>
+<span class="nc" id="L267">            return RepairedState.Stats.EMPTY;</span>
+
+<span class="nc" id="L269">        return state.getRepairedStats(ranges);</span>
+    }
+
+    public PendingStats getPendingStats(TableId tid, Collection&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L274">        ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tid);</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        Preconditions.checkArgument(cfs != null);</span>
+
+<span class="nc" id="L277">        PendingStat.Builder pending = new PendingStat.Builder();</span>
+<span class="nc" id="L278">        PendingStat.Builder finalized = new PendingStat.Builder();</span>
+<span class="nc" id="L279">        PendingStat.Builder failed = new PendingStat.Builder();</span>
+
+<span class="nc" id="L281">        Map&lt;TimeUUID, PendingStat&gt; stats = cfs.getPendingRepairStats();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        for (Map.Entry&lt;TimeUUID, PendingStat&gt; entry : stats.entrySet())</span>
+        {
+<span class="nc" id="L284">            TimeUUID sessionID = entry.getKey();</span>
+<span class="nc" id="L285">            PendingStat stat = entry.getValue();</span>
+<span class="nc" id="L286">            Verify.verify(sessionID.equals(Iterables.getOnlyElement(stat.sessions)));</span>
+
+<span class="nc" id="L288">            LocalSession session = sessions.get(sessionID);</span>
+<span class="nc" id="L289">            Verify.verifyNotNull(session);</span>
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">            if (!Iterables.any(ranges, r -&gt; r.intersects(session.ranges)))</span>
+<span class="nc" id="L292">                continue;</span>
+
+<span class="nc bnc" id="L294" title="All 3 branches missed.">            switch (session.getState())</span>
+            {
+                case FINALIZED:
+<span class="nc" id="L297">                    finalized.addStat(stat);</span>
+<span class="nc" id="L298">                    break;</span>
+                case FAILED:
+<span class="nc" id="L300">                    failed.addStat(stat);</span>
+<span class="nc" id="L301">                    break;</span>
+                default:
+<span class="nc" id="L303">                    pending.addStat(stat);</span>
+            }
+<span class="nc" id="L305">        }</span>
+
+<span class="nc" id="L307">        return new PendingStats(cfs.getKeyspaceName(), cfs.name, pending.build(), finalized.build(), failed.build());</span>
+    }
+
+    public CleanupSummary cleanup(TableId tid, Collection&lt;Range&lt;Token&gt;&gt; ranges, boolean force)
+    {
+<span class="nc" id="L312">        Iterable&lt;LocalSession&gt; candidates = Iterables.filter(sessions.values(),</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                                                             ls -&gt; ls.isCompleted()</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                                                                   &amp;&amp; ls.tableIds.contains(tid)</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">                                                                   &amp;&amp; Range.intersects(ls.ranges, ranges));</span>
+
+<span class="nc" id="L317">        ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tid);</span>
+<span class="nc" id="L318">        Set&lt;TimeUUID&gt; sessionIds = Sets.newHashSet(Iterables.transform(candidates, s -&gt; s.sessionID));</span>
+
+
+<span class="nc" id="L321">        return cfs.releaseRepairData(sessionIds, force);</span>
+    }
+
+    /**
+     * hook for operators to cancel sessions, cancelling from a non-coordinator is an error, unless
+     * force is set to true. Messages are sent out to other participants, but we don't wait for a response
+     */
+    public void cancelSession(TimeUUID sessionID, boolean force)
+    {
+<span class="nc" id="L330">        logger.info(&quot;Cancelling local repair session {}&quot;, sessionID);</span>
+<span class="nc" id="L331">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        Preconditions.checkArgument(session != null, &quot;Session {} does not exist&quot;, sessionID);</span>
+<span class="nc bnc" id="L333" title="All 4 branches missed.">        Preconditions.checkArgument(force || session.coordinator.equals(getBroadcastAddressAndPort()),</span>
+                                    &quot;Cancel session %s from it's coordinator (%s) or use --force&quot;,
+                                    sessionID, session.coordinator);
+
+<span class="nc" id="L337">        setStateAndSave(session, FAILED);</span>
+<span class="nc" id="L338">        Message&lt;FailSession&gt; message = Message.out(FAILED_SESSION_MSG, new FailSession(sessionID));</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        for (InetAddressAndPort participant : session.participants)</span>
+        {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if (!participant.equals(getBroadcastAddressAndPort()))</span>
+<span class="nc" id="L342">                sendMessage(participant, message);</span>
+<span class="nc" id="L343">        }</span>
+<span class="nc" id="L344">    }</span>
+
+    /**
+     * Loads sessions out of the repairs table and sets state to started
+     */
+    public synchronized void start()
+    {
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">        Preconditions.checkArgument(!started, &quot;LocalSessions.start can only be called once&quot;);</span>
+<span class="fc" id="L352">        Preconditions.checkArgument(sessions.isEmpty(), &quot;No sessions should be added before start&quot;);</span>
+<span class="fc" id="L353">        UntypedResultSet rows = QueryProcessor.executeInternalWithPaging(String.format(&quot;SELECT * FROM %s.%s&quot;, keyspace, table), 1000);</span>
+<span class="fc" id="L354">        Map&lt;TimeUUID, LocalSession&gt; loadedSessions = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L355">        Map&lt;TableId, List&lt;RepairedState.Level&gt;&gt; initialLevels = new HashMap&lt;&gt;();</span>
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">        for (UntypedResultSet.Row row : rows)</span>
+        {
+            try
+            {
+<span class="nc" id="L360">                LocalSession session = load(row);</span>
+<span class="nc" id="L361">                loadedSessions.put(session.sessionID, session);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                if (shouldStoreSession(session))</span>
+                {
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                    for (TableId tid : session.tableIds)</span>
+<span class="nc" id="L365">                        initialLevels.computeIfAbsent(tid, (t) -&gt; new ArrayList&lt;&gt;())</span>
+<span class="nc" id="L366">                                     .add(new RepairedState.Level(session.ranges, session.repairedAt));</span>
+                }
+            }
+<span class="nc" id="L369">            catch (IllegalArgumentException | NullPointerException e)</span>
+            {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                logger.warn(&quot;Unable to load malformed repair session {}, removing&quot;, row.has(&quot;parent_id&quot;) ? row.getTimeUUID(&quot;parent_id&quot;) : null);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                if (row.has(&quot;parent_id&quot;))</span>
+<span class="nc" id="L373">                    deleteRow(row.getTimeUUID(&quot;parent_id&quot;));</span>
+<span class="nc" id="L374">            }</span>
+<span class="nc" id="L375">        }</span>
+<span class="pc bpc" id="L376" title="1 of 2 branches missed.">        for (Map.Entry&lt;TableId, List&lt;RepairedState.Level&gt;&gt; entry : initialLevels.entrySet())</span>
+<span class="nc" id="L377">            getRepairedState(entry.getKey()).addAll(entry.getValue());</span>
+
+<span class="fc" id="L379">        sessions = ImmutableMap.copyOf(loadedSessions);</span>
+<span class="fc" id="L380">        failOngoingRepairs();</span>
+<span class="fc" id="L381">        started = true;</span>
+<span class="fc" id="L382">    }</span>
+
+    public synchronized void stop()
+    {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (!started)</span>
+<span class="nc" id="L387">            return;</span>
+<span class="nc" id="L388">        started = false;</span>
+<span class="nc" id="L389">        failOngoingRepairs();</span>
+<span class="nc" id="L390">    }</span>
+
+    private void failOngoingRepairs()
+    {
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">        for (LocalSession session : sessions.values())</span>
+        {
+<span class="nc" id="L396">            synchronized (session)</span>
+            {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                switch (session.getState())</span>
+                {
+                    case FAILED:
+                    case FINALIZED:
+                    case FINALIZE_PROMISED:
+<span class="nc" id="L403">                        continue;</span>
+                    default:
+<span class="nc" id="L405">                        logger.info(&quot;Found repair session {} with state = {} - failing the repair&quot;, session.sessionID, session.getState());</span>
+<span class="nc" id="L406">                        failSession(session, true);</span>
+                }
+<span class="nc" id="L408">            }</span>
+<span class="nc" id="L409">        }</span>
+<span class="fc" id="L410">    }</span>
+
+    public boolean isStarted()
+    {
+<span class="nc" id="L414">        return started;</span>
+    }
+
+    private static boolean shouldCheckStatus(LocalSession session, long now)
+    {
+<span class="nc bnc" id="L419" title="All 4 branches missed.">        return !session.isCompleted() &amp;&amp; (now &gt; session.getLastUpdate() + CHECK_STATUS_TIMEOUT);</span>
+    }
+
+    private static boolean shouldFail(LocalSession session, long now)
+    {
+<span class="nc bnc" id="L424" title="All 4 branches missed.">        return !session.isCompleted() &amp;&amp; (now &gt; session.getLastUpdate() + AUTO_FAIL_TIMEOUT);</span>
+    }
+
+    private static boolean shouldDelete(LocalSession session, long now)
+    {
+<span class="nc bnc" id="L429" title="All 4 branches missed.">        return session.isCompleted() &amp;&amp; (now &gt; session.getLastUpdate() + AUTO_DELETE_TIMEOUT);</span>
+    }
+
+    /**
+     * Auto fails and auto deletes timed out and old sessions
+     * Compaction will clean up the sstables still owned by a deleted session
+     */
+    public void cleanup()
+    {
+<span class="fc" id="L438">        logger.trace(&quot;Running LocalSessions.cleanup&quot;);</span>
+<span class="pc bpc" id="L439" title="1 of 2 branches missed.">        if (!isNodeInitialized())</span>
+        {
+<span class="fc" id="L441">            logger.trace(&quot;node not initialized, aborting local session cleanup&quot;);</span>
+<span class="fc" id="L442">            return;</span>
+        }
+<span class="nc" id="L444">        Set&lt;LocalSession&gt; currentSessions = new HashSet&lt;&gt;(sessions.values());</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">        for (LocalSession session : currentSessions)</span>
+        {
+<span class="nc" id="L447">            synchronized (session)</span>
+            {
+<span class="nc" id="L449">                long now = ctx.clock().nowInSeconds();</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                if (shouldFail(session, now))</span>
+                {
+<span class="nc" id="L452">                    logger.warn(&quot;Auto failing timed out repair session {}&quot;, session);</span>
+<span class="nc" id="L453">                    failSession(session.sessionID, false);</span>
+                }
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                else if (shouldDelete(session, now))</span>
+                {
+<span class="nc bnc" id="L457" title="All 4 branches missed.">                    if (session.getState() == FINALIZED &amp;&amp; !isSuperseded(session))</span>
+                    {
+                        // if we delete a non-superseded session, some ranges will be mis-reported as
+                        // not having been repaired in repair_admin after a restart
+<span class="nc" id="L461">                        logger.info(&quot;Skipping delete of FINALIZED LocalSession {} because it has &quot; +</span>
+                                    &quot;not been superseded by a more recent session&quot;, session.sessionID);
+                    }
+<span class="nc bnc" id="L464" title="All 2 branches missed.">                    else if (!sessionHasData(session))</span>
+                    {
+<span class="nc" id="L466">                        logger.info(&quot;Auto deleting repair session {}&quot;, session);</span>
+<span class="nc" id="L467">                        deleteSession(session.sessionID);</span>
+                    }
+                    else
+                    {
+<span class="nc" id="L471">                        logger.warn(&quot;Skipping delete of LocalSession {} because it still contains sstables&quot;, session.sessionID);</span>
+                    }
+                }
+<span class="nc bnc" id="L474" title="All 2 branches missed.">                else if (shouldCheckStatus(session, now))</span>
+                {
+<span class="nc" id="L476">                    sendStatusRequest(session);</span>
+                }
+<span class="nc" id="L478">            }</span>
+<span class="nc" id="L479">        }</span>
+<span class="nc" id="L480">    }</span>
+
+    private static ByteBuffer serializeRange(Range&lt;Token&gt; range)
+    {
+<span class="nc" id="L484">        int size = (int) Token.serializer.serializedSize(range.left, 0);</span>
+<span class="nc" id="L485">        size += (int) Token.serializer.serializedSize(range.right, 0);</span>
+<span class="nc" id="L486">        try (DataOutputBuffer buffer = new DataOutputBuffer(size))</span>
+        {
+<span class="nc" id="L488">            Token.serializer.serialize(range.left, buffer, 0);</span>
+<span class="nc" id="L489">            Token.serializer.serialize(range.right, buffer, 0);</span>
+<span class="nc" id="L490">            return buffer.buffer();</span>
+        }
+<span class="nc" id="L492">        catch (IOException e)</span>
+        {
+<span class="nc" id="L494">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    private static Set&lt;ByteBuffer&gt; serializeRanges(Set&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L500">        Set&lt;ByteBuffer&gt; buffers = new HashSet&lt;&gt;(ranges.size());</span>
+<span class="nc" id="L501">        ranges.forEach(r -&gt; buffers.add(serializeRange(r)));</span>
+<span class="nc" id="L502">        return buffers;</span>
+    }
+
+    private static Range&lt;Token&gt; deserializeRange(ByteBuffer bb)
+    {
+<span class="nc" id="L507">        try (DataInputBuffer in = new DataInputBuffer(bb, false))</span>
+        {
+<span class="nc" id="L509">            IPartitioner partitioner = DatabaseDescriptor.getPartitioner();</span>
+<span class="nc" id="L510">            Token left = Token.serializer.deserialize(in, partitioner, 0);</span>
+<span class="nc" id="L511">            Token right = Token.serializer.deserialize(in, partitioner, 0);</span>
+<span class="nc" id="L512">            return new Range&lt;&gt;(left, right);</span>
+        }
+<span class="nc" id="L514">        catch (IOException e)</span>
+        {
+<span class="nc" id="L516">            throw new RuntimeException(e);</span>
+        }
+    }
+
+    private static Set&lt;Range&lt;Token&gt;&gt; deserializeRanges(Set&lt;ByteBuffer&gt; buffers)
+    {
+<span class="nc" id="L522">        Set&lt;Range&lt;Token&gt;&gt; ranges = new HashSet&lt;&gt;(buffers.size());</span>
+<span class="nc" id="L523">        buffers.forEach(bb -&gt; ranges.add(deserializeRange(bb)));</span>
+<span class="nc" id="L524">        return ranges;</span>
+    }
+
+    /**
+     * Save session state to table
+     */
+    @VisibleForTesting
+    void save(LocalSession session)
+    {
+<span class="nc" id="L533">        String query = &quot;INSERT INTO %s.%s &quot; +</span>
+                       &quot;(parent_id, &quot; +
+                       &quot;started_at, &quot; +
+                       &quot;last_update, &quot; +
+                       &quot;repaired_at, &quot; +
+                       &quot;state, &quot; +
+                       &quot;coordinator, &quot; +
+                       &quot;coordinator_port, &quot; +
+                       &quot;participants, &quot; +
+                       &quot;participants_wp,&quot; +
+                       &quot;ranges, &quot; +
+                       &quot;cfids) &quot; +
+                       &quot;VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)&quot;;
+
+<span class="nc" id="L547">        QueryProcessor.executeInternal(String.format(query, keyspace, table),</span>
+                                       session.sessionID,
+<span class="nc" id="L549">                                       Date.from(Instant.ofEpochSecond(session.startedAt)),</span>
+<span class="nc" id="L550">                                       Date.from(Instant.ofEpochSecond(session.getLastUpdate())),</span>
+<span class="nc" id="L551">                                       Date.from(Instant.ofEpochMilli(session.repairedAt)),</span>
+<span class="nc" id="L552">                                       session.getState().ordinal(),</span>
+<span class="nc" id="L553">                                       session.coordinator.getAddress(),</span>
+<span class="nc" id="L554">                                       session.coordinator.getPort(),</span>
+<span class="nc" id="L555">                                       session.participants.stream().map(participant -&gt; participant.getAddress()).collect(Collectors.toSet()),</span>
+<span class="nc" id="L556">                                       session.participants.stream().map(participant -&gt; participant.getHostAddressAndPort()).collect(Collectors.toSet()),</span>
+<span class="nc" id="L557">                                       serializeRanges(session.ranges),</span>
+<span class="nc" id="L558">                                       tableIdToUuid(session.tableIds));</span>
+
+<span class="nc" id="L560">        maybeUpdateRepairedState(session);</span>
+<span class="nc" id="L561">    }</span>
+
+    private static int dateToSeconds(Date d)
+    {
+<span class="nc" id="L565">        return Ints.checkedCast(TimeUnit.MILLISECONDS.toSeconds(d.getTime()));</span>
+    }
+
+    private LocalSession load(UntypedResultSet.Row row)
+    {
+<span class="nc" id="L570">        LocalSession.Builder builder = LocalSession.builder(ctx);</span>
+<span class="nc" id="L571">        builder.withState(ConsistentSession.State.valueOf(row.getInt(&quot;state&quot;)));</span>
+<span class="nc" id="L572">        builder.withSessionID(row.getTimeUUID(&quot;parent_id&quot;));</span>
+<span class="nc" id="L573">        InetAddressAndPort coordinator = InetAddressAndPort.getByAddressOverrideDefaults(</span>
+<span class="nc" id="L574">            row.getInetAddress(&quot;coordinator&quot;),</span>
+<span class="nc" id="L575">            row.getInt(&quot;coordinator_port&quot;));</span>
+<span class="nc" id="L576">        builder.withCoordinator(coordinator);</span>
+<span class="nc" id="L577">        builder.withTableIds(uuidToTableId(row.getSet(&quot;cfids&quot;, UUIDType.instance)));</span>
+<span class="nc" id="L578">        builder.withRepairedAt(row.getTimestamp(&quot;repaired_at&quot;).getTime());</span>
+<span class="nc" id="L579">        builder.withRanges(deserializeRanges(row.getSet(&quot;ranges&quot;, BytesType.instance)));</span>
+        //There is no cross version streaming and thus no cross version repair so assume that
+        //any valid repair sessions has the participants_wp column and any that doesn't is malformed
+<span class="nc" id="L582">        Set&lt;String&gt; participants = row.getSet(&quot;participants_wp&quot;, UTF8Type.instance);</span>
+<span class="nc" id="L583">        builder.withParticipants(participants.stream().map(participant -&gt;</span>
+                                                             {
+                                                                 try
+                                                                 {
+<span class="nc" id="L587">                                                                     return InetAddressAndPort.getByName(participant);</span>
+                                                                 }
+<span class="nc" id="L589">                                                                 catch (UnknownHostException e)</span>
+                                                                 {
+<span class="nc" id="L591">                                                                     throw new RuntimeException(e);</span>
+                                                                 }
+<span class="nc" id="L593">                                                             }).collect(Collectors.toSet()));</span>
+<span class="nc" id="L594">        builder.withStartedAt(dateToSeconds(row.getTimestamp(&quot;started_at&quot;)));</span>
+<span class="nc" id="L595">        builder.withLastUpdate(dateToSeconds(row.getTimestamp(&quot;last_update&quot;)));</span>
+
+<span class="nc" id="L597">        return buildSession(builder);</span>
+    }
+
+    private void deleteRow(TimeUUID sessionID)
+    {
+<span class="nc" id="L602">        String query = &quot;DELETE FROM %s.%s WHERE parent_id=?&quot;;</span>
+<span class="nc" id="L603">        QueryProcessor.executeInternal(String.format(query, keyspace, table), sessionID);</span>
+<span class="nc" id="L604">    }</span>
+
+    private void syncTable()
+    {
+<span class="nc" id="L608">        TableId tid = Schema.instance.getTableMetadata(keyspace, table).id;</span>
+<span class="nc" id="L609">        ColumnFamilyStore cfm = Schema.instance.getColumnFamilyStoreInstance(tid);</span>
+<span class="nc" id="L610">        cfm.forceBlockingFlush(ColumnFamilyStore.FlushReason.INTERNALLY_FORCED);</span>
+<span class="nc" id="L611">    }</span>
+
+    /**
+     * Loads a session directly from the table. Should be used for testing only
+     */
+    @VisibleForTesting
+    LocalSession loadUnsafe(TimeUUID sessionId)
+    {
+<span class="nc" id="L619">        String query = &quot;SELECT * FROM %s.%s WHERE parent_id=?&quot;;</span>
+<span class="nc" id="L620">        UntypedResultSet result = QueryProcessor.executeInternal(String.format(query, keyspace, table), sessionId);</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">        if (result.isEmpty())</span>
+<span class="nc" id="L622">            return null;</span>
+
+<span class="nc" id="L624">        UntypedResultSet.Row row = result.one();</span>
+<span class="nc" id="L625">        return load(row);</span>
+    }
+
+    @VisibleForTesting
+    protected LocalSession buildSession(LocalSession.Builder builder)
+    {
+<span class="nc" id="L631">        return new LocalSession(builder);</span>
+    }
+
+    public LocalSession getSession(TimeUUID sessionID)
+    {
+<span class="nc" id="L636">        return sessions.get(sessionID);</span>
+    }
+
+    @VisibleForTesting
+    synchronized void putSessionUnsafe(LocalSession session)
+    {
+<span class="nc" id="L642">        putSession(session);</span>
+<span class="nc" id="L643">        save(session);</span>
+<span class="nc" id="L644">    }</span>
+
+    private synchronized void putSession(LocalSession session)
+    {
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        Preconditions.checkArgument(!sessions.containsKey(session.sessionID),</span>
+                                    &quot;LocalSession %s already exists&quot;, session.sessionID);
+<span class="nc" id="L650">        Preconditions.checkArgument(started, &quot;sessions cannot be added before LocalSessions is started&quot;);</span>
+<span class="nc" id="L651">        sessions = ImmutableMap.&lt;TimeUUID, LocalSession&gt;builder()</span>
+<span class="nc" id="L652">                               .putAll(sessions)</span>
+<span class="nc" id="L653">                               .put(session.sessionID, session)</span>
+<span class="nc" id="L654">                               .build();</span>
+<span class="nc" id="L655">    }</span>
+
+    private synchronized void removeSession(TimeUUID sessionID)
+    {
+<span class="nc bnc" id="L659" title="All 2 branches missed.">        Preconditions.checkArgument(sessionID != null);</span>
+<span class="nc" id="L660">        Map&lt;TimeUUID, LocalSession&gt; temp = new HashMap&lt;&gt;(sessions);</span>
+<span class="nc" id="L661">        temp.remove(sessionID);</span>
+<span class="nc" id="L662">        sessions = ImmutableMap.copyOf(temp);</span>
+<span class="nc" id="L663">    }</span>
+
+    @VisibleForTesting
+    LocalSession createSessionUnsafe(TimeUUID sessionId, ActiveRepairService.ParentRepairSession prs, Set&lt;InetAddressAndPort&gt; peers)
+    {
+<span class="nc" id="L668">        LocalSession.Builder builder = LocalSession.builder(ctx);</span>
+<span class="nc" id="L669">        builder.withState(ConsistentSession.State.PREPARING);</span>
+<span class="nc" id="L670">        builder.withSessionID(sessionId);</span>
+<span class="nc" id="L671">        builder.withCoordinator(prs.coordinator);</span>
+
+<span class="nc" id="L673">        builder.withTableIds(prs.getTableIds());</span>
+<span class="nc" id="L674">        builder.withRepairedAt(prs.repairedAt);</span>
+<span class="nc" id="L675">        builder.withRanges(prs.getRanges());</span>
+<span class="nc" id="L676">        builder.withParticipants(peers);</span>
+
+<span class="nc" id="L678">        long now = ctx.clock().nowInSeconds();</span>
+<span class="nc" id="L679">        builder.withStartedAt(now);</span>
+<span class="nc" id="L680">        builder.withLastUpdate(now);</span>
+
+<span class="nc" id="L682">        return buildSession(builder);</span>
+    }
+
+    protected ActiveRepairService.ParentRepairSession getParentRepairSession(TimeUUID sessionID) throws NoSuchRepairSessionException
+    {
+
+<span class="nc" id="L688">        return ctx.repair().getParentRepairSession(sessionID);</span>
+    }
+
+    protected void sendMessage(InetAddressAndPort destination, Message&lt;? extends RepairMessage&gt; message)
+    {
+<span class="nc" id="L693">        logger.trace(&quot;sending {} to {}&quot;, message.payload, destination);</span>
+<span class="nc" id="L694">        ctx.messaging().send(message, destination);</span>
+<span class="nc" id="L695">    }</span>
+
+    @VisibleForTesting
+    void setStateAndSave(LocalSession session, ConsistentSession.State state)
+    {
+<span class="nc" id="L700">        synchronized (session)</span>
+        {
+<span class="nc" id="L702">            Preconditions.checkArgument(session.getState().canTransitionTo(state),</span>
+                                        &quot;Invalid state transition %s -&gt; %s&quot;,
+<span class="nc" id="L704">                                        session.getState(), state);</span>
+<span class="nc" id="L705">            logger.trace(&quot;Changing LocalSession state from {} -&gt; {} for {}&quot;, session.getState(), state, session.sessionID);</span>
+<span class="nc" id="L706">            boolean wasCompleted = session.isCompleted();</span>
+<span class="nc" id="L707">            session.setState(state);</span>
+<span class="nc" id="L708">            session.setLastUpdate();</span>
+<span class="nc" id="L709">            save(session);</span>
+
+<span class="nc bnc" id="L711" title="All 4 branches missed.">            if (session.isCompleted() &amp;&amp; !wasCompleted)</span>
+            {
+<span class="nc" id="L713">                sessionCompleted(session);</span>
+            }
+<span class="nc bnc" id="L715" title="All 2 branches missed.">            for (Listener listener : listeners)</span>
+<span class="nc" id="L716">                listener.onIRStateChange(session);</span>
+<span class="nc" id="L717">        }</span>
+<span class="nc" id="L718">    }</span>
+
+    public void failSession(TimeUUID sessionID)
+    {
+<span class="nc" id="L722">        failSession(sessionID, true);</span>
+<span class="nc" id="L723">    }</span>
+
+    public void failSession(TimeUUID sessionID, boolean sendMessage)
+    {
+<span class="nc" id="L727">        failSession(getSession(sessionID), sendMessage);</span>
+<span class="nc" id="L728">    }</span>
+
+    public void failSession(LocalSession session, boolean sendMessage)
+    {
+<span class="nc bnc" id="L732" title="All 2 branches missed.">        if (session != null)</span>
+        {
+<span class="nc" id="L734">            synchronized (session)</span>
+            {
+<span class="nc bnc" id="L736" title="All 2 branches missed.">                if (session.getState() == FINALIZED)</span>
+                {
+<span class="nc" id="L738">                    logger.error(&quot;Can't change the state of session {} from FINALIZED to FAILED&quot;, session.sessionID, new RuntimeException());</span>
+<span class="nc" id="L739">                    return;</span>
+                }
+<span class="nc bnc" id="L741" title="All 2 branches missed.">                else if (session.getState() != FAILED)</span>
+                {
+<span class="nc" id="L743">                    logger.info(&quot;Failing local repair session {}&quot;, session.sessionID);</span>
+<span class="nc" id="L744">                    setStateAndSave(session, FAILED);</span>
+                }
+<span class="nc" id="L746">            }</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">            if (sendMessage)</span>
+            {
+<span class="nc" id="L749">                sendMessage(session.coordinator, Message.out(FAILED_SESSION_MSG, new FailSession(session.sessionID)));</span>
+            }
+        }
+<span class="nc" id="L752">    }</span>
+
+    public synchronized void deleteSession(TimeUUID sessionID)
+    {
+<span class="nc" id="L756">        logger.info(&quot;Deleting local repair session {}&quot;, sessionID);</span>
+<span class="nc" id="L757">        LocalSession session = getSession(sessionID);</span>
+<span class="nc" id="L758">        Preconditions.checkArgument(session.isCompleted(), &quot;Cannot delete incomplete sessions&quot;);</span>
+
+<span class="nc" id="L760">        deleteRow(sessionID);</span>
+<span class="nc" id="L761">        removeSession(sessionID);</span>
+<span class="nc" id="L762">    }</span>
+
+    @VisibleForTesting
+    Future&lt;List&lt;Void&gt;&gt; prepareSession(KeyspaceRepairManager repairManager,
+                                      TimeUUID sessionID,
+                                      Collection&lt;ColumnFamilyStore&gt; tables,
+                                      RangesAtEndpoint tokenRanges,
+                                      ExecutorService executor,
+                                      BooleanSupplier isCancelled)
+    {
+<span class="nc" id="L772">        return repairManager.prepareIncrementalRepair(sessionID, tables, tokenRanges, executor, isCancelled);</span>
+    }
+
+    RangesAtEndpoint filterLocalRanges(String keyspace, Set&lt;Range&lt;Token&gt;&gt; ranges)
+    {
+<span class="nc" id="L777">        RangesAtEndpoint localRanges = StorageService.instance.getLocalReplicas(keyspace);</span>
+<span class="nc" id="L778">        RangesAtEndpoint.Builder builder = RangesAtEndpoint.builder(localRanges.endpoint());</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        for (Range&lt;Token&gt; range : ranges)</span>
+        {
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            for (Replica replica : localRanges)</span>
+            {
+<span class="nc bnc" id="L783" title="All 2 branches missed.">                if (replica.range().equals(range))</span>
+                {
+<span class="nc" id="L785">                    builder.add(replica);</span>
+                }
+<span class="nc bnc" id="L787" title="All 2 branches missed.">                else if (replica.contains(range))</span>
+                {
+<span class="nc" id="L789">                    builder.add(replica.decorateSubrange(range));</span>
+                }
+<span class="nc" id="L791">            }</span>
+
+<span class="nc" id="L793">        }</span>
+<span class="nc" id="L794">        return builder.build();</span>
+    }
+
+    /**
+     * The PrepareConsistentRequest promotes the parent repair session to a consistent incremental
+     * session, and isolates the data to be repaired from the rest of the table's data
+     *
+     * No response is sent to the repair coordinator until the data preparation / isolation has completed
+     * successfully. If the data preparation fails, a failure message is sent to the coordinator,
+     * cancelling the session.
+     */
+    public void handlePrepareMessage(InetAddressAndPort from, PrepareConsistentRequest request)
+    {
+<span class="nc" id="L807">        logger.trace(&quot;received {} from {}&quot;, request, from);</span>
+<span class="nc" id="L808">        TimeUUID sessionID = request.parentSession;</span>
+<span class="nc" id="L809">        InetAddressAndPort coordinator = request.coordinator;</span>
+<span class="nc" id="L810">        Set&lt;InetAddressAndPort&gt; peers = request.participants;</span>
+
+        ActiveRepairService.ParentRepairSession parentSession;
+        try
+        {
+<span class="nc" id="L815">            parentSession = getParentRepairSession(sessionID);</span>
+        }
+<span class="nc" id="L817">        catch (Throwable e)</span>
+        {
+<span class="nc" id="L819">            logger.error(&quot;Error retrieving ParentRepairSession for session {}, responding with failure&quot;, sessionID);</span>
+<span class="nc" id="L820">            sendMessage(coordinator, Message.out(PREPARE_CONSISTENT_RSP, new PrepareConsistentResponse(sessionID, getBroadcastAddressAndPort(), false)));</span>
+<span class="nc" id="L821">            return;</span>
+<span class="nc" id="L822">        }</span>
+
+<span class="nc" id="L824">        LocalSession session = createSessionUnsafe(sessionID, parentSession, peers);</span>
+<span class="nc" id="L825">        putSessionUnsafe(session);</span>
+<span class="nc" id="L826">        logger.info(&quot;Beginning local incremental repair session {}&quot;, session);</span>
+
+<span class="nc" id="L828">        ExecutorService executor = ctx.executorFactory().pooled(&quot;Repair-&quot; + sessionID, parentSession.getColumnFamilyStores().size());</span>
+
+<span class="nc" id="L830">        KeyspaceRepairManager repairManager = parentSession.getKeyspace().getRepairManager();</span>
+<span class="nc" id="L831">        RangesAtEndpoint tokenRanges = filterLocalRanges(parentSession.getKeyspace().getName(), parentSession.getRanges());</span>
+<span class="nc" id="L832">        Future&lt;List&lt;Void&gt;&gt; repairPreparation = prepareSession(repairManager, sessionID, parentSession.getColumnFamilyStores(),</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">                                                          tokenRanges, executor, () -&gt; session.getState() != PREPARING);</span>
+
+<span class="nc" id="L835">        repairPreparation.addCallback(new FutureCallback&lt;List&lt;Void&gt;&gt;()</span>
+        {
+            public void onSuccess(@Nullable List&lt;Void&gt; result)
+            {
+                try
+                {
+                    logger.info(&quot;Prepare phase for incremental repair session {} completed&quot;, sessionID);
+                    if (!prepareSessionExceptFailed(session))
+                        logger.info(&quot;Session {} failed before anticompaction completed&quot;, sessionID);
+                    Message&lt;PrepareConsistentResponse&gt; message =
+                        Message.out(PREPARE_CONSISTENT_RSP,
+                                    new PrepareConsistentResponse(sessionID, getBroadcastAddressAndPort(), session.getState() != FAILED));
+                    sendMessage(coordinator, message);
+                }
+                finally
+                {
+                    executor.shutdown();
+                }
+            }
+
+            public void onFailure(Throwable t)
+            {
+                try
+                {
+                    if (Throwables.anyCauseMatches(t, (throwable) -&gt; throwable instanceof CompactionInterruptedException))
+                        logger.info(&quot;Anticompaction interrupted for session {}: {}&quot;, sessionID, t.getMessage());
+                    else if (Throwables.anyCauseMatches(t, (throwable) -&gt; throwable instanceof NoSuchRepairSessionException))
+                        logger.warn(&quot;No such repair session: {}&quot;, sessionID);
+                    else
+                        logger.error(&quot;Prepare phase for incremental repair session {} failed&quot;, sessionID, t);
+                    sendMessage(coordinator,
+                                Message.out(PREPARE_CONSISTENT_RSP,
+                                            new PrepareConsistentResponse(sessionID, getBroadcastAddressAndPort(), false)));
+                    failSession(sessionID, false);
+                }
+                finally
+                {
+                    executor.shutdown();
+                }
+            }
+        });
+<span class="nc" id="L876">    }</span>
+
+    /**
+     * Checks for the session state, and sets it to prepared unless it is on a failed state.
+     * Making the checks inside a synchronized block to prevent the session state from
+     * being changed between the read and the update.
+     *
+     * @param session The local session to be set to prepared.
+     * @return true if the session is prepared, false if not, i.e. session failed
+     */
+    private boolean prepareSessionExceptFailed(LocalSession session) {
+<span class="nc" id="L887">        synchronized (session)</span>
+        {
+<span class="nc bnc" id="L889" title="All 2 branches missed.">            if (session.getState() == FAILED)</span>
+<span class="nc" id="L890">                return false;</span>
+
+<span class="nc" id="L892">            setStateAndSave(session, PREPARED);</span>
+<span class="nc" id="L893">            return true;</span>
+        }
+    }
+
+    public void maybeSetRepairing(TimeUUID sessionID)
+    {
+<span class="nc" id="L899">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L900" title="All 4 branches missed.">        if (session != null &amp;&amp; session.getState() != REPAIRING)</span>
+        {
+<span class="nc" id="L902">            logger.info(&quot;Setting local incremental repair session {} to REPAIRING&quot;, session);</span>
+<span class="nc" id="L903">            setStateAndSave(session, REPAIRING);</span>
+        }
+<span class="nc" id="L905">    }</span>
+
+    public void handleFinalizeProposeMessage(InetAddressAndPort from, FinalizePropose propose)
+    {
+<span class="nc" id="L909">        logger.trace(&quot;received {} from {}&quot;, propose, from);</span>
+<span class="nc" id="L910">        TimeUUID sessionID = propose.sessionID;</span>
+<span class="nc" id="L911">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L912" title="All 2 branches missed.">        if (session == null)</span>
+        {
+<span class="nc" id="L914">            logger.info(&quot;Received FinalizePropose message for unknown repair session {}, responding with failure&quot;, sessionID);</span>
+<span class="nc" id="L915">            sendMessage(from, Message.out(FAILED_SESSION_MSG, new FailSession(sessionID)));</span>
+<span class="nc" id="L916">            return;</span>
+        }
+
+        try
+        {
+<span class="nc" id="L921">            setStateAndSave(session, FINALIZE_PROMISED);</span>
+
+            /*
+             Flushing the repairs table here, *before* responding to the coordinator prevents a scenario where we respond
+             with a promise to the coordinator, but there is a failure before the commit log mutation with the
+             FINALIZE_PROMISED status is synced to disk. This could cause the state for this session to revert to an
+             earlier status on startup, which would prevent the failure recovery mechanism from ever being able to promote
+             this session to FINALIZED, likely creating inconsistencies in the repaired data sets across nodes.
+             */
+<span class="nc" id="L930">            syncTable();</span>
+
+<span class="nc" id="L932">            sendMessage(from, Message.out(FINALIZE_PROMISE_MSG, new FinalizePromise(sessionID, getBroadcastAddressAndPort(), true)));</span>
+<span class="nc" id="L933">            logger.info(&quot;Received FinalizePropose message for incremental repair session {}, responded with FinalizePromise&quot;, sessionID);</span>
+        }
+<span class="nc" id="L935">        catch (IllegalArgumentException e)</span>
+        {
+<span class="nc" id="L937">            logger.error(&quot;Error handling FinalizePropose message for {}&quot;, session, e);</span>
+<span class="nc" id="L938">            failSession(sessionID);</span>
+<span class="nc" id="L939">        }</span>
+<span class="nc" id="L940">    }</span>
+
+    @VisibleForTesting
+    protected void sessionCompleted(LocalSession session)
+    {
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        for (TableId tid: session.tableIds)</span>
+        {
+<span class="nc" id="L947">            ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tid);</span>
+<span class="nc bnc" id="L948" title="All 2 branches missed.">            if (cfs != null)</span>
+            {
+<span class="nc" id="L950">                cfs.getRepairManager().incrementalSessionCompleted(session.sessionID);</span>
+            }
+<span class="nc" id="L952">        }</span>
+<span class="nc" id="L953">    }</span>
+
+    /**
+     * Finalizes the repair session, completing it as successful.
+     *
+     * This only changes the state of the session, it doesn't promote the siloed sstables to repaired. That will happen
+     * as part of the compaction process, and avoids having to worry about in progress compactions interfering with the
+     * promotion.
+     */
+    public void handleFinalizeCommitMessage(InetAddressAndPort from, FinalizeCommit commit)
+    {
+<span class="nc" id="L964">        logger.trace(&quot;received {} from {}&quot;, commit, from);</span>
+<span class="nc" id="L965">        TimeUUID sessionID = commit.sessionID;</span>
+<span class="nc" id="L966">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">        if (session == null)</span>
+        {
+<span class="nc" id="L969">            logger.warn(&quot;Ignoring FinalizeCommit message for unknown repair session {}&quot;, sessionID);</span>
+<span class="nc" id="L970">            return;</span>
+        }
+
+<span class="nc" id="L973">        setStateAndSave(session, FINALIZED);</span>
+<span class="nc" id="L974">        logger.info(&quot;Finalized local repair session {}&quot;, sessionID);</span>
+<span class="nc" id="L975">    }</span>
+
+    public void handleFailSessionMessage(InetAddressAndPort from, FailSession msg)
+    {
+<span class="nc" id="L979">        logger.trace(&quot;received {} from {}&quot;, msg, from);</span>
+<span class="nc" id="L980">        failSession(msg.sessionID, false);</span>
+<span class="nc" id="L981">    }</span>
+
+    public void sendStatusRequest(LocalSession session)
+    {
+<span class="nc" id="L985">        logger.info(&quot;Attempting to learn the outcome of unfinished local incremental repair session {}&quot;, session.sessionID);</span>
+<span class="nc" id="L986">        Message&lt;StatusRequest&gt; request = Message.out(STATUS_REQ, new StatusRequest(session.sessionID));</span>
+
+<span class="nc bnc" id="L988" title="All 2 branches missed.">        for (InetAddressAndPort participant : session.participants)</span>
+        {
+<span class="nc bnc" id="L990" title="All 4 branches missed.">            if (!getBroadcastAddressAndPort().equals(participant) &amp;&amp; isAlive(participant))</span>
+            {
+<span class="nc" id="L992">                sendMessage(participant, request);</span>
+            }
+<span class="nc" id="L994">        }</span>
+<span class="nc" id="L995">    }</span>
+
+    public void handleStatusRequest(InetAddressAndPort from, StatusRequest request)
+    {
+<span class="nc" id="L999">        logger.trace(&quot;received {} from {}&quot;, request, from);</span>
+<span class="nc" id="L1000">        TimeUUID sessionID = request.sessionID;</span>
+<span class="nc" id="L1001">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">        if (session == null)</span>
+        {
+<span class="nc" id="L1004">            logger.warn(&quot;Received status request message for unknown session {}&quot;, sessionID);</span>
+<span class="nc" id="L1005">            sendMessage(from, Message.out(STATUS_RSP, new StatusResponse(sessionID, FAILED)));</span>
+        }
+        else
+        {
+<span class="nc" id="L1009">            sendMessage(from, Message.out(STATUS_RSP, new StatusResponse(sessionID, session.getState())));</span>
+<span class="nc" id="L1010">            logger.info(&quot;Responding to status response message for incremental repair session {} with local state {}&quot;, sessionID, session.getState());</span>
+       }
+<span class="nc" id="L1012">    }</span>
+
+    public void handleStatusResponse(InetAddressAndPort from, StatusResponse response)
+    {
+<span class="nc" id="L1016">        logger.trace(&quot;received {} from {}&quot;, response, from);</span>
+<span class="nc" id="L1017">        TimeUUID sessionID = response.sessionID;</span>
+<span class="nc" id="L1018">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">        if (session == null)</span>
+        {
+<span class="nc" id="L1021">            logger.warn(&quot;Received StatusResponse message for unknown repair session {}&quot;, sessionID);</span>
+<span class="nc" id="L1022">            return;</span>
+        }
+
+        // only change local state if response state is FINALIZED or FAILED, since those are
+        // the only statuses that would indicate we've missed a message completing the session
+<span class="nc bnc" id="L1027" title="All 4 branches missed.">        if (response.state == FINALIZED || response.state == FAILED)</span>
+        {
+<span class="nc" id="L1029">            setStateAndSave(session, response.state);</span>
+<span class="nc" id="L1030">            logger.info(&quot;Unfinished local incremental repair session {} set to state {}&quot;, sessionID, response.state);</span>
+        }
+        else
+        {
+<span class="nc" id="L1034">            logger.info(&quot;Received StatusResponse for repair session {} with state {}, which is not actionable. Doing nothing.&quot;, sessionID, response.state);</span>
+        }
+<span class="nc" id="L1036">    }</span>
+
+    /**
+     * determines if a local session exists, and if it's not finalized or failed
+     */
+    public boolean isSessionInProgress(TimeUUID sessionID)
+    {
+<span class="nc" id="L1043">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L1044" title="All 6 branches missed.">        return session != null &amp;&amp; session.getState() != FINALIZED &amp;&amp; session.getState() != FAILED;</span>
+    }
+
+    /**
+     * determines if a local session exists, and if it's in the finalized state
+     */
+    public boolean isSessionFinalized(TimeUUID sessionID)
+    {
+<span class="nc" id="L1052">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L1053" title="All 4 branches missed.">        return session != null &amp;&amp; session.getState() == FINALIZED;</span>
+    }
+
+    /**
+     * determines if a local session exists
+     */
+    public boolean sessionExists(TimeUUID sessionID)
+    {
+<span class="nc bnc" id="L1061" title="All 2 branches missed.">        return getSession(sessionID) != null;</span>
+    }
+
+    @VisibleForTesting
+    protected boolean sessionHasData(LocalSession session)
+    {
+<span class="nc" id="L1067">        Predicate&lt;TableId&gt; predicate = tid -&gt; {</span>
+<span class="nc" id="L1068">            ColumnFamilyStore cfs = Schema.instance.getColumnFamilyStoreInstance(tid);</span>
+<span class="nc bnc" id="L1069" title="All 4 branches missed.">            return cfs != null &amp;&amp; cfs.getCompactionStrategyManager().hasDataForPendingRepair(session.sessionID);</span>
+
+        };
+<span class="nc" id="L1072">        return Iterables.any(session.tableIds, predicate::test);</span>
+    }
+
+    /**
+     * Returns the repairedAt time for a sessions which is unknown, failed, or finalized
+     * calling this for a session which is in progress throws an exception
+     */
+    public long getFinalSessionRepairedAt(TimeUUID sessionID)
+    {
+<span class="nc" id="L1081">        LocalSession session = getSession(sessionID);</span>
+<span class="nc bnc" id="L1082" title="All 4 branches missed.">        if (session == null || session.getState() == FAILED)</span>
+        {
+<span class="nc" id="L1084">            return ActiveRepairService.UNREPAIRED_SSTABLE;</span>
+        }
+<span class="nc bnc" id="L1086" title="All 2 branches missed.">        else if (session.getState() == FINALIZED)</span>
+        {
+<span class="nc" id="L1088">            return session.repairedAt;</span>
+        }
+        else
+        {
+<span class="nc" id="L1092">            throw new IllegalStateException(&quot;Cannot get final repaired at value for in progress session: &quot; + session);</span>
+        }
+    }
+
+    public static void registerListener(Listener listener)
+    {
+<span class="nc" id="L1098">        listeners.add(listener);</span>
+<span class="nc" id="L1099">    }</span>
+
+    public static void unregisterListener(Listener listener)
+    {
+<span class="nc" id="L1103">        listeners.remove(listener);</span>
+<span class="nc" id="L1104">    }</span>
+
+    @VisibleForTesting
+    public static void unsafeClearListeners()
+    {
+<span class="nc" id="L1109">        listeners.clear();</span>
+<span class="nc" id="L1110">    }</span>
+
+    public interface Listener
+    {
+        void onIRStateChange(LocalSession session);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

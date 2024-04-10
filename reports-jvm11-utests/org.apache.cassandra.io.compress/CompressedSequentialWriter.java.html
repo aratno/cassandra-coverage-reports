@@ -1,0 +1,441 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompressedSequentialWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.compress</a> &gt; <span class="el_source">CompressedSequentialWriter.java</span></div><h1>CompressedSequentialWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.compress;
+
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.util.Optional;
+import java.util.zip.CRC32;
+
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
+import org.apache.cassandra.io.util.ChecksumWriter;
+import org.apache.cassandra.io.util.DataPosition;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.io.util.SequentialWriterOption;
+import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.utils.Throwables.merge;
+
+<span class="fc" id="L43">public class CompressedSequentialWriter extends SequentialWriter</span>
+{
+    private final ChecksumWriter crcMetadata;
+
+    // holds offset in the file where current chunk should be written
+    // changed only by flush() method where data buffer gets compressed and stored to the file
+<span class="fc" id="L49">    private long chunkOffset = 0;</span>
+
+    // index file writer (random I/O)
+    private final CompressionMetadata.Writer metadataWriter;
+    private final ICompressor compressor;
+
+    // used to store compressed data
+    private ByteBuffer compressed;
+
+    // holds a number of already written chunks
+<span class="fc" id="L59">    private int chunkCount = 0;</span>
+
+<span class="fc" id="L61">    private long uncompressedSize = 0, compressedSize = 0;</span>
+
+    private final MetadataCollector sstableMetadataCollector;
+
+<span class="fc" id="L65">    private final ByteBuffer crcCheckBuffer = ByteBuffer.allocate(4);</span>
+    private final Optional&lt;File&gt; digestFile;
+
+    private final int maxCompressedLength;
+
+    /**
+     * Create CompressedSequentialWriter without digest file.
+     *
+     * @param file File to write
+     * @param offsetsFile File to write compression metadata
+     * @param digestFile File to write digest
+     * @param option Write option (buffer size and type will be set the same as compression params)
+     * @param parameters Compression mparameters
+     * @param sstableMetadataCollector Metadata collector
+     */
+    public CompressedSequentialWriter(File file,
+                                      File offsetsFile,
+                                      File digestFile,
+                                      SequentialWriterOption option,
+                                      CompressionParams parameters,
+                                      MetadataCollector sstableMetadataCollector)
+    {
+<span class="fc" id="L87">        super(file, SequentialWriterOption.newBuilder()</span>
+<span class="fc" id="L88">                            .bufferSize(option.bufferSize())</span>
+<span class="fc" id="L89">                            .bufferType(option.bufferType())</span>
+<span class="fc" id="L90">                            .bufferSize(parameters.chunkLength())</span>
+<span class="fc" id="L91">                            .bufferType(parameters.getSstableCompressor().preferredBufferType())</span>
+<span class="fc" id="L92">                            .finishOnClose(option.finishOnClose())</span>
+<span class="fc" id="L93">                            .build());</span>
+<span class="fc" id="L94">        this.compressor = parameters.getSstableCompressor();</span>
+<span class="fc" id="L95">        this.digestFile = Optional.ofNullable(digestFile);</span>
+
+        // buffer for compression should be the same size as buffer itself
+<span class="fc" id="L98">        compressed = compressor.preferredBufferType().allocate(compressor.initialCompressedBufferLength(buffer.capacity()));</span>
+
+<span class="fc" id="L100">        maxCompressedLength = parameters.maxCompressedLength();</span>
+
+        /* Index File (-CompressionInfo.db component) and it's header */
+<span class="fc" id="L103">        metadataWriter = CompressionMetadata.Writer.open(parameters, offsetsFile);</span>
+
+<span class="fc" id="L105">        this.sstableMetadataCollector = sstableMetadataCollector;</span>
+<span class="fc" id="L106">        crcMetadata = new ChecksumWriter(new DataOutputStream(Channels.newOutputStream(channel)));</span>
+<span class="fc" id="L107">    }</span>
+
+    @Override
+    public long getOnDiskFilePointer()
+    {
+        try
+        {
+<span class="fc" id="L114">            return fchannel.position();</span>
+        }
+<span class="nc" id="L116">        catch (IOException e)</span>
+        {
+<span class="nc" id="L118">            throw new FSReadError(e, getPath());</span>
+        }
+    }
+
+    /**
+     * Get a quick estimation on how many bytes have been written to disk
+     *
+     * It should for the most part be exactly the same as getOnDiskFilePointer()
+     */
+    @Override
+    public long getEstimatedOnDiskBytesWritten()
+    {
+<span class="fc" id="L130">        return chunkOffset;</span>
+    }
+
+    @Override
+    public void flush()
+    {
+<span class="nc" id="L136">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    protected void flushData()
+    {
+<span class="fc" id="L142">        seekToChunkStart(); // why is this necessary? seems like it should always be at chunk start in normal operation</span>
+
+        try
+        {
+            // compressing data with buffer re-use
+<span class="fc" id="L147">            buffer.flip();</span>
+<span class="fc" id="L148">            compressed.clear();</span>
+<span class="fc" id="L149">            compressor.compress(buffer, compressed);</span>
+        }
+<span class="nc" id="L151">        catch (IOException e)</span>
+        {
+<span class="nc" id="L153">            throw new RuntimeException(&quot;Compression exception&quot;, e); // shouldn't happen</span>
+<span class="fc" id="L154">        }</span>
+
+<span class="fc" id="L156">        int uncompressedLength = buffer.position();</span>
+<span class="fc" id="L157">        int compressedLength = compressed.position();</span>
+<span class="fc" id="L158">        uncompressedSize += uncompressedLength;</span>
+<span class="fc" id="L159">        ByteBuffer toWrite = compressed;</span>
+<span class="fc bfc" id="L160" title="All 2 branches covered.">        if (compressedLength &gt;= maxCompressedLength)</span>
+        {
+<span class="fc" id="L162">            toWrite = buffer;</span>
+<span class="fc bfc" id="L163" title="All 2 branches covered.">            if (uncompressedLength &gt;= maxCompressedLength)</span>
+            {
+<span class="fc" id="L165">                compressedLength = uncompressedLength;</span>
+            }
+            else
+            {
+                // Pad the uncompressed data so that it reaches the max compressed length.
+                // This could make the chunk appear longer, but this path is only reached at the end of the file, where
+                // we use the file size to limit the buffer on reading.
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">                assert maxCompressedLength &lt;= buffer.capacity();   // verified by CompressionParams.validate</span>
+<span class="fc" id="L173">                buffer.limit(maxCompressedLength);</span>
+<span class="fc" id="L174">                ByteBufferUtil.writeZeroes(buffer, maxCompressedLength - uncompressedLength);</span>
+<span class="fc" id="L175">                compressedLength = maxCompressedLength;</span>
+            }
+        }
+<span class="fc" id="L178">        compressedSize += compressedLength;</span>
+
+        try
+        {
+            // write an offset of the newly written chunk to the index file
+<span class="fc" id="L183">            metadataWriter.addOffset(chunkOffset);</span>
+<span class="fc" id="L184">            chunkCount++;</span>
+
+            // write out the compressed data
+<span class="fc" id="L187">            toWrite.flip();</span>
+<span class="fc" id="L188">            channel.write(toWrite);</span>
+
+            // write corresponding checksum
+<span class="fc" id="L191">            toWrite.rewind();</span>
+<span class="fc" id="L192">            crcMetadata.appendDirect(toWrite, true);</span>
+<span class="fc" id="L193">            lastFlushOffset = uncompressedSize;</span>
+        }
+<span class="nc" id="L195">        catch (IOException e)</span>
+        {
+<span class="nc" id="L197">            throw new FSWriteError(e, getPath());</span>
+<span class="fc" id="L198">        }</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">        if (toWrite == buffer)</span>
+<span class="fc" id="L200">            buffer.position(uncompressedLength);</span>
+
+        // next chunk should be written right after current + length of the checksum (int)
+<span class="fc" id="L203">        chunkOffset += compressedLength + 4;</span>
+<span class="fc bfc" id="L204" title="All 2 branches covered.">        if (runPostFlush != null)</span>
+<span class="fc" id="L205">            runPostFlush.accept(getLastFlushOffset());</span>
+<span class="fc" id="L206">    }</span>
+
+    public CompressionMetadata open(long overrideLength)
+    {
+<span class="fc bfc" id="L210" title="All 2 branches covered.">        if (overrideLength &lt;= 0)</span>
+<span class="fc" id="L211">            overrideLength = uncompressedSize;</span>
+<span class="fc" id="L212">        return metadataWriter.open(overrideLength, chunkOffset);</span>
+    }
+
+    @Override
+    public DataPosition mark()
+    {
+<span class="fc bfc" id="L218" title="All 2 branches covered.">        if (!buffer.hasRemaining())</span>
+<span class="fc" id="L219">            doFlush(0);</span>
+<span class="fc" id="L220">        return new CompressedFileWriterMark(chunkOffset, current(), buffer.position(), chunkCount + 1);</span>
+    }
+
+    @Override
+    public synchronized void resetAndTruncate(DataPosition mark)
+    {
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">        assert mark instanceof CompressedFileWriterMark;</span>
+
+<span class="fc" id="L228">        CompressedFileWriterMark realMark = (CompressedFileWriterMark) mark;</span>
+
+        // reset position
+<span class="fc" id="L231">        long truncateTarget = realMark.uncDataOffset;</span>
+
+<span class="fc bfc" id="L233" title="All 2 branches covered.">        if (realMark.chunkOffset == chunkOffset)</span>
+        {
+            // simply drop bytes to the right of our mark
+<span class="fc" id="L236">            buffer.position(realMark.validBufferBytes);</span>
+<span class="fc" id="L237">            return;</span>
+        }
+
+        // synchronize current buffer with disk - we don't want any data loss
+<span class="fc" id="L241">        syncInternal();</span>
+
+<span class="fc" id="L243">        chunkOffset = realMark.chunkOffset;</span>
+
+        // compressed chunk size (- 4 bytes reserved for checksum)
+<span class="fc" id="L246">        int chunkSize = (int) (metadataWriter.chunkOffsetBy(realMark.nextChunkIndex) - chunkOffset - 4);</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">        if (compressed.capacity() &lt; chunkSize)</span>
+        {
+<span class="nc" id="L249">            FileUtils.clean(compressed);</span>
+<span class="nc" id="L250">            compressed = compressor.preferredBufferType().allocate(chunkSize);</span>
+        }
+
+        try
+        {
+<span class="fc" id="L255">            compressed.clear();</span>
+<span class="fc" id="L256">            compressed.limit(chunkSize);</span>
+<span class="fc" id="L257">            fchannel.position(chunkOffset);</span>
+<span class="fc" id="L258">            fchannel.read(compressed);</span>
+
+            try
+            {
+                // Repopulate buffer from compressed data
+<span class="fc" id="L263">                buffer.clear();</span>
+<span class="fc" id="L264">                compressed.flip();</span>
+<span class="fc bfc" id="L265" title="All 2 branches covered.">                if (chunkSize &lt; maxCompressedLength)</span>
+<span class="fc" id="L266">                    compressor.uncompress(compressed, buffer);</span>
+                else
+<span class="fc" id="L268">                    buffer.put(compressed);</span>
+            }
+<span class="nc" id="L270">            catch (IOException e)</span>
+            {
+<span class="nc" id="L272">                throw new CorruptBlockException(getPath(), chunkOffset, chunkSize, e);</span>
+<span class="fc" id="L273">            }</span>
+
+<span class="fc" id="L275">            CRC32 checksum = new CRC32();</span>
+<span class="fc" id="L276">            compressed.rewind();</span>
+<span class="fc" id="L277">            checksum.update(compressed);</span>
+
+<span class="fc" id="L279">            crcCheckBuffer.clear();</span>
+<span class="fc" id="L280">            fchannel.read(crcCheckBuffer);</span>
+<span class="fc" id="L281">            crcCheckBuffer.flip();</span>
+<span class="pc bpc" id="L282" title="1 of 2 branches missed.">            if (crcCheckBuffer.getInt() != (int) checksum.getValue())</span>
+<span class="nc" id="L283">                throw new CorruptBlockException(getPath(), chunkOffset, chunkSize);</span>
+        }
+<span class="nc" id="L285">        catch (CorruptBlockException e)</span>
+        {
+<span class="nc" id="L287">            throw new CorruptSSTableException(e, getPath());</span>
+        }
+<span class="nc" id="L289">        catch (EOFException e)</span>
+        {
+<span class="nc" id="L291">            throw new CorruptSSTableException(new CorruptBlockException(getPath(), chunkOffset, chunkSize), getPath());</span>
+        }
+<span class="nc" id="L293">        catch (IOException e)</span>
+        {
+<span class="nc" id="L295">            throw new FSReadError(e, getPath());</span>
+<span class="fc" id="L296">        }</span>
+
+        // Mark as dirty so we can guarantee the newly buffered bytes won't be lost on a rebuffer
+<span class="fc" id="L299">        buffer.position(realMark.validBufferBytes);</span>
+
+<span class="fc" id="L301">        bufferOffset = truncateTarget - buffer.position();</span>
+<span class="fc" id="L302">        chunkCount = realMark.nextChunkIndex - 1;</span>
+
+        // truncate data and index file
+<span class="fc" id="L305">        truncate(chunkOffset, bufferOffset);</span>
+<span class="fc" id="L306">        metadataWriter.resetAndTruncate(realMark.nextChunkIndex - 1);</span>
+<span class="fc" id="L307">    }</span>
+
+    private void truncate(long toFileSize, long toBufferOffset)
+    {
+        try
+        {
+<span class="fc" id="L313">            fchannel.truncate(toFileSize);</span>
+<span class="fc" id="L314">            lastFlushOffset = toBufferOffset;</span>
+        }
+<span class="nc" id="L316">        catch (IOException e)</span>
+        {
+<span class="nc" id="L318">            throw new FSWriteError(e, getPath());</span>
+<span class="fc" id="L319">        }</span>
+<span class="fc" id="L320">    }</span>
+
+    /**
+     * Seek to the offset where next compressed data chunk should be stored.
+     */
+    private void seekToChunkStart()
+    {
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">        if (getOnDiskFilePointer() != chunkOffset)</span>
+        {
+            try
+            {
+<span class="nc" id="L331">                fchannel.position(chunkOffset);</span>
+            }
+<span class="nc" id="L333">            catch (IOException e)</span>
+            {
+<span class="nc" id="L335">                throw new FSReadError(e, getPath());</span>
+<span class="nc" id="L336">            }</span>
+        }
+<span class="fc" id="L338">    }</span>
+
+    // Page management using chunk boundaries
+
+    @Override
+    public int maxBytesInPage()
+    {
+<span class="nc" id="L345">        return buffer.capacity();</span>
+    }
+
+    @Override
+    public void padToPageBoundary()
+    {
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (buffer.position() == 0)</span>
+<span class="nc" id="L352">            return;</span>
+
+<span class="nc" id="L354">        int padLength = bytesLeftInPage();</span>
+
+        // Flush as much as we have
+<span class="nc" id="L357">        doFlush(0);</span>
+        // But pretend we had a whole chunk
+<span class="nc" id="L359">        bufferOffset += padLength;</span>
+<span class="nc" id="L360">        lastFlushOffset += padLength;</span>
+<span class="nc" id="L361">    }</span>
+
+    @Override
+    public int bytesLeftInPage()
+    {
+<span class="nc" id="L366">        return buffer.remaining();</span>
+    }
+
+    @Override
+    public long paddedPosition()
+    {
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        return position() + (buffer.position() == 0 ? 0 : buffer.remaining());</span>
+    }
+
+<span class="fc" id="L375">    protected class TransactionalProxy extends SequentialWriter.TransactionalProxy</span>
+    {
+        @Override
+        protected Throwable doCommit(Throwable accumulate)
+        {
+<span class="fc" id="L380">            return super.doCommit(metadataWriter.commit(accumulate));</span>
+        }
+
+        @Override
+        protected Throwable doAbort(Throwable accumulate)
+        {
+<span class="fc" id="L386">            return super.doAbort(metadataWriter.abort(accumulate));</span>
+        }
+
+        @Override
+        protected void doPrepare()
+        {
+<span class="fc" id="L392">            syncInternal();</span>
+<span class="fc" id="L393">            digestFile.ifPresent(crcMetadata::writeFullChecksum);</span>
+<span class="fc" id="L394">            sstableMetadataCollector.addCompressionRatio(compressedSize, uncompressedSize);</span>
+<span class="fc" id="L395">            metadataWriter.finalizeLength(current(), chunkCount).prepareToCommit();</span>
+<span class="fc" id="L396">        }</span>
+
+        @Override
+        protected Throwable doPreCleanup(Throwable accumulate)
+        {
+<span class="fc" id="L401">            accumulate = super.doPreCleanup(accumulate);</span>
+<span class="fc bfc" id="L402" title="All 2 branches covered.">            if (compressed != null)</span>
+            {
+<span class="fc" id="L404">                try { FileUtils.clean(compressed); }</span>
+<span class="pc" id="L405">                catch (Throwable t) { accumulate = merge(accumulate, t); }</span>
+<span class="fc" id="L406">                compressed = null;</span>
+            }
+
+<span class="fc" id="L409">            return accumulate;</span>
+        }
+    }
+
+    @Override
+    protected SequentialWriter.TransactionalProxy txnProxy()
+    {
+<span class="fc" id="L416">        return new TransactionalProxy();</span>
+    }
+
+    /**
+     * Class to hold a mark to the position of the file
+     */
+    protected static class CompressedFileWriterMark implements DataPosition
+    {
+        // chunk offset in the compressed file
+        final long chunkOffset;
+        // uncompressed data offset (real data offset)
+        final long uncDataOffset;
+
+        final int validBufferBytes;
+        final int nextChunkIndex;
+
+        public CompressedFileWriterMark(long chunkOffset, long uncDataOffset, int validBufferBytes, int nextChunkIndex)
+<span class="fc" id="L433">        {</span>
+<span class="fc" id="L434">            this.chunkOffset = chunkOffset;</span>
+<span class="fc" id="L435">            this.uncDataOffset = uncDataOffset;</span>
+<span class="fc" id="L436">            this.validBufferBytes = validBufferBytes;</span>
+<span class="fc" id="L437">            this.nextChunkIndex = nextChunkIndex;</span>
+<span class="fc" id="L438">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

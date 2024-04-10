@@ -1,0 +1,417 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>MmappedRegions.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.util</a> &gt; <span class="el_source">MmappedRegions.java</span></div><h1>MmappedRegions.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.io.util;
+
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.Arrays;
+
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.RefCounted;
+import org.apache.cassandra.utils.concurrent.SharedCloseableImpl;
+
+import static java.util.stream.Stream.of;
+import static org.apache.cassandra.utils.Throwables.perform;
+
+public class MmappedRegions extends SharedCloseableImpl
+{
+    /**
+     * In a perfect world, MAX_SEGMENT_SIZE would be final, but we need to test with a smaller size
+     */
+<span class="fc" id="L42">    public static int MAX_SEGMENT_SIZE = Integer.MAX_VALUE;</span>
+
+    /**
+     * When we need to grow the arrays, we add this number of region slots
+     */
+    static final int REGION_ALLOC_SIZE = 15;
+
+    /**
+     * The original state, which is shared with the tidier and
+     * contains all the regions mapped so far. It also
+     * does the actual mapping.
+     */
+    private final State state;
+
+    /**
+     * A copy of the latest state. We update this each time the original state is
+     * updated and we share this with copies. If we are a copy, then this
+     * is null. Copies can only access existing regions, they cannot create
+     * new ones. This is for thread safety and because MmappedRegions is
+     * reference counted, only the original state will be cleaned-up,
+     * therefore only the original state should create new mapped regions.
+     */
+    private volatile State copy;
+
+    private MmappedRegions(ChannelProxy channel, CompressionMetadata metadata, long length)
+    {
+<span class="fc" id="L68">        this(new State(channel), metadata, length);</span>
+<span class="fc" id="L69">    }</span>
+
+    private MmappedRegions(State state, CompressionMetadata metadata, long length)
+    {
+<span class="fc" id="L73">        super(new Tidier(state));</span>
+
+<span class="fc" id="L75">        this.state = state;</span>
+
+<span class="fc bfc" id="L77" title="All 2 branches covered.">        if (metadata != null)</span>
+        {
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">            assert length == 0 : &quot;expected no length with metadata&quot;;</span>
+<span class="fc" id="L80">            updateState(metadata);</span>
+        }
+<span class="fc bfc" id="L82" title="All 2 branches covered.">        else if (length &gt; 0)</span>
+        {
+<span class="fc" id="L84">            updateState(length);</span>
+        }
+
+<span class="fc" id="L87">        this.copy = new State(state);</span>
+<span class="fc" id="L88">    }</span>
+
+    private MmappedRegions(MmappedRegions original)
+    {
+<span class="fc" id="L92">        super(original);</span>
+<span class="fc" id="L93">        this.state = original.copy;</span>
+<span class="fc" id="L94">    }</span>
+
+    public static MmappedRegions empty(ChannelProxy channel)
+    {
+<span class="fc" id="L98">        return new MmappedRegions(channel, null, 0);</span>
+    }
+
+    /**
+     * @param channel  file to map. the MmappedRegions instance will hold shared copy of given channel.
+     * @param metadata
+     * @return new instance
+     */
+    public static MmappedRegions map(ChannelProxy channel, CompressionMetadata metadata)
+    {
+<span class="fc bfc" id="L108" title="All 2 branches covered.">        if (metadata == null)</span>
+<span class="fc" id="L109">            throw new IllegalArgumentException(&quot;metadata cannot be null&quot;);</span>
+
+<span class="fc" id="L111">        return new MmappedRegions(channel, metadata, 0);</span>
+    }
+
+    public static MmappedRegions map(ChannelProxy channel, long length)
+    {
+<span class="fc bfc" id="L116" title="All 2 branches covered.">        if (length &lt;= 0)</span>
+<span class="fc" id="L117">            throw new IllegalArgumentException(&quot;Length must be positive&quot;);</span>
+
+<span class="fc" id="L119">        return new MmappedRegions(channel, null, length);</span>
+    }
+
+    /**
+     * @return a snapshot of the memory mapped regions. The snapshot can
+     * only use existing regions, it cannot create new ones.
+     */
+    public MmappedRegions sharedCopy()
+    {
+<span class="fc" id="L128">        return new MmappedRegions(this);</span>
+    }
+
+    private boolean isCopy()
+    {
+<span class="fc bfc" id="L133" title="All 2 branches covered.">        return copy == null;</span>
+    }
+
+    /**
+     * Extends this collection of mmapped regions up to the provided total length.
+     *
+     * @return {@code true} if new regions have been created
+     */
+    public boolean extend(long length)
+    {
+<span class="fc bfc" id="L143" title="All 2 branches covered.">        if (length &lt; 0)</span>
+<span class="fc" id="L144">            throw new IllegalArgumentException(&quot;Length must not be negative&quot;);</span>
+
+<span class="fc bfc" id="L146" title="All 2 branches covered.">        assert !isCopy() : &quot;Copies cannot be extended&quot;;</span>
+
+<span class="fc bfc" id="L148" title="All 2 branches covered.">        if (length &lt;= state.length)</span>
+<span class="fc" id="L149">            return false;</span>
+
+<span class="fc" id="L151">        int initialRegions = state.last;</span>
+<span class="fc" id="L152">        updateState(length);</span>
+<span class="fc" id="L153">        copy = new State(state);</span>
+<span class="pc bpc" id="L154" title="1 of 2 branches missed.">        return state.last &gt; initialRegions;</span>
+    }
+
+    /**
+     * Extends this collection of mmapped regions up to the length of the compressed file described by the provided
+     * metadata.
+     *
+     * @return {@code true} if new regions have been created
+     */
+    public boolean extend(CompressionMetadata compressionMetadata)
+    {
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">        assert !isCopy() : &quot;Copies cannot be extended&quot;;</span>
+
+<span class="fc bfc" id="L167" title="All 2 branches covered.">        if (compressionMetadata.compressedFileLength &lt;= state.length)</span>
+<span class="fc" id="L168">            return false;</span>
+
+<span class="fc" id="L170">        int initialRegions = state.last;</span>
+<span class="fc bfc" id="L171" title="All 2 branches covered.">        if (compressionMetadata.compressedFileLength - state.length &lt;= MAX_SEGMENT_SIZE)</span>
+<span class="fc" id="L172">            updateState(compressionMetadata.compressedFileLength);</span>
+        else
+<span class="fc" id="L174">            updateState(compressionMetadata);</span>
+
+<span class="fc" id="L176">        copy = new State(state);</span>
+<span class="pc bpc" id="L177" title="1 of 2 branches missed.">        return state.last &gt; initialRegions;</span>
+    }
+
+    /**
+     * Updates state by adding the remaining segments. It starts with the current state last segment end position and
+     * subsequently add new segments until all data up to the provided length are mapped.
+     */
+    private void updateState(long length)
+    {
+<span class="fc" id="L186">        state.length = length;</span>
+<span class="fc" id="L187">        long pos = state.getPosition();</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">        while (pos &lt; length)</span>
+        {
+<span class="fc" id="L190">            long size = Math.min(MAX_SEGMENT_SIZE, length - pos);</span>
+<span class="fc" id="L191">            state.add(pos, size);</span>
+<span class="fc" id="L192">            pos += size;</span>
+<span class="fc" id="L193">        }</span>
+<span class="fc" id="L194">    }</span>
+
+    private void updateState(CompressionMetadata metadata)
+    {
+<span class="fc" id="L198">        long lastSegmentOffset = state.getPosition();</span>
+<span class="fc" id="L199">        long offset = metadata.getDataOffsetForChunkOffset(lastSegmentOffset);</span>
+<span class="fc" id="L200">        long segmentSize = 0;</span>
+
+<span class="fc bfc" id="L202" title="All 2 branches covered.">        while (offset &lt; metadata.dataLength)</span>
+        {
+<span class="fc" id="L204">            CompressionMetadata.Chunk chunk = metadata.chunkFor(offset);</span>
+
+            //Reached a new mmap boundary
+<span class="fc bfc" id="L207" title="All 2 branches covered.">            if (segmentSize + chunk.length + 4 &gt; MAX_SEGMENT_SIZE)</span>
+            {
+<span class="fc bfc" id="L209" title="All 2 branches covered.">                if (segmentSize &gt; 0)</span>
+                {
+<span class="fc" id="L211">                    state.add(lastSegmentOffset, segmentSize);</span>
+<span class="fc" id="L212">                    lastSegmentOffset += segmentSize;</span>
+<span class="fc" id="L213">                    segmentSize = 0;</span>
+                }
+            }
+
+<span class="fc" id="L217">            segmentSize += chunk.length + 4; //checksum</span>
+<span class="fc" id="L218">            offset += metadata.chunkLength();</span>
+<span class="fc" id="L219">        }</span>
+
+<span class="pc bpc" id="L221" title="1 of 2 branches missed.">        if (segmentSize &gt; 0)</span>
+<span class="fc" id="L222">            state.add(lastSegmentOffset, segmentSize);</span>
+
+<span class="fc" id="L224">        state.length = lastSegmentOffset + segmentSize;</span>
+<span class="fc" id="L225">    }</span>
+
+    public boolean isValid(ChannelProxy channel)
+    {
+<span class="fc" id="L229">        return state.isValid(channel);</span>
+    }
+
+    public boolean isEmpty()
+    {
+<span class="fc" id="L234">        return state.isEmpty();</span>
+    }
+
+    public Region floor(long position)
+    {
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">        assert !isCleanedUp() : &quot;Attempted to use closed region&quot;;</span>
+<span class="fc" id="L240">        return state.floor(position);</span>
+    }
+
+    public void closeQuietly()
+    {
+<span class="fc" id="L245">        Throwable err = close(null);</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">        if (err != null)</span>
+        {
+<span class="nc" id="L248">            JVMStabilityInspector.inspectThrowable(err);</span>
+
+            // This is not supposed to happen
+<span class="nc" id="L251">            LoggerFactory.getLogger(getClass()).error(&quot;Error while closing mmapped regions&quot;, err);</span>
+        }
+<span class="fc" id="L253">    }</span>
+
+    public static final class Region implements Rebufferer.BufferHolder
+    {
+        public final long offset;
+        public final ByteBuffer buffer;
+
+        public Region(long offset, ByteBuffer buffer)
+<span class="fc" id="L261">        {</span>
+<span class="fc" id="L262">            this.offset = offset;</span>
+<span class="fc" id="L263">            this.buffer = buffer;</span>
+<span class="fc" id="L264">        }</span>
+
+        public ByteBuffer buffer()
+        {
+<span class="fc" id="L268">            return buffer.duplicate();</span>
+        }
+
+        public long offset()
+        {
+<span class="fc" id="L273">            return offset;</span>
+        }
+
+        public long end()
+        {
+<span class="fc" id="L278">            return offset + buffer.capacity();</span>
+        }
+
+        public void release()
+        {
+            // only released after no readers are present
+<span class="fc" id="L284">        }</span>
+    }
+
+<span class="fc" id="L287">    private static final class State</span>
+    {
+        /**
+         * The file channel
+         */
+        private final ChannelProxy channel;
+
+        /**
+         * An array of region buffers, synchronized with offsets
+         */
+        private ByteBuffer[] buffers;
+
+        /**
+         * An array of region offsets, synchronized with buffers
+         */
+        private long[] offsets;
+
+        /**
+         * The maximum file length we have mapped
+         */
+        private long length;
+
+        /**
+         * The index to the last region added
+         */
+        private int last;
+
+        private State(ChannelProxy channel)
+<span class="fc" id="L315">        {</span>
+<span class="fc" id="L316">            this.channel = channel.sharedCopy();</span>
+<span class="fc" id="L317">            this.buffers = new ByteBuffer[REGION_ALLOC_SIZE];</span>
+<span class="fc" id="L318">            this.offsets = new long[REGION_ALLOC_SIZE];</span>
+<span class="fc" id="L319">            this.length = 0;</span>
+<span class="fc" id="L320">            this.last = -1;</span>
+<span class="fc" id="L321">        }</span>
+
+        private State(State original)
+<span class="fc" id="L324">        {</span>
+<span class="fc" id="L325">            this.channel = original.channel;</span>
+<span class="fc" id="L326">            this.buffers = original.buffers;</span>
+<span class="fc" id="L327">            this.offsets = original.offsets;</span>
+<span class="fc" id="L328">            this.length = original.length;</span>
+<span class="fc" id="L329">            this.last = original.last;</span>
+<span class="fc" id="L330">        }</span>
+
+        private boolean isEmpty()
+        {
+<span class="fc bfc" id="L334" title="All 2 branches covered.">            return last &lt; 0;</span>
+        }
+
+        private boolean isValid(ChannelProxy channel)
+        {
+<span class="fc" id="L339">            return this.channel.filePath().equals(channel.filePath());</span>
+        }
+
+        private Region floor(long position)
+        {
+<span class="pc bpc" id="L344" title="2 of 4 branches missed.">            assert 0 &lt;= position &amp;&amp; position &lt;= length : String.format(&quot;%d &gt; %d&quot;, position, length);</span>
+
+<span class="fc" id="L346">            int idx = Arrays.binarySearch(offsets, 0, last + 1, position);</span>
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">            assert idx != -1 : String.format(&quot;Bad position %d for regions %s, last %d in %s&quot;, position, Arrays.toString(offsets), last, channel);</span>
+<span class="fc bfc" id="L348" title="All 2 branches covered.">            if (idx &lt; 0)</span>
+<span class="fc" id="L349">                idx = -(idx + 2); // round down to entry at insertion point</span>
+
+<span class="fc" id="L351">            return new Region(offsets[idx], buffers[idx]);</span>
+        }
+
+        private long getPosition()
+        {
+<span class="fc bfc" id="L356" title="All 2 branches covered.">            return last &lt; 0 ? 0 : offsets[last] + buffers[last].capacity();</span>
+        }
+
+        private void add(long pos, long size)
+        {
+<span class="fc" id="L361">            ByteBuffer buffer = channel.map(FileChannel.MapMode.READ_ONLY, pos, size);</span>
+
+<span class="fc" id="L363">            ++last;</span>
+
+<span class="fc bfc" id="L365" title="All 2 branches covered.">            if (last == offsets.length)</span>
+            {
+<span class="fc" id="L367">                offsets = Arrays.copyOf(offsets, offsets.length + REGION_ALLOC_SIZE);</span>
+<span class="fc" id="L368">                buffers = Arrays.copyOf(buffers, buffers.length + REGION_ALLOC_SIZE);</span>
+            }
+
+<span class="fc" id="L371">            offsets[last] = pos;</span>
+<span class="fc" id="L372">            buffers[last] = buffer;</span>
+<span class="fc" id="L373">        }</span>
+
+        private Throwable close(Throwable accumulate)
+        {
+<span class="fc" id="L377">            accumulate = channel.close(accumulate);</span>
+
+<span class="fc" id="L379">            return perform(accumulate, channel.filePath(), Throwables.FileOpType.READ,</span>
+<span class="fc" id="L380">                           of(buffers)</span>
+<span class="fc" id="L381">                           .map((buffer) -&gt;</span>
+<span class="fc" id="L382">                                () -&gt;</span>
+                                {
+<span class="fc bfc" id="L384" title="All 2 branches covered.">                                    if (buffer != null)</span>
+<span class="fc" id="L385">                                        FileUtils.clean(buffer);</span>
+<span class="fc" id="L386">                                }));</span>
+        }
+    }
+
+    public static final class Tidier implements RefCounted.Tidy
+    {
+        final State state;
+
+        Tidier(State state)
+<span class="fc" id="L395">        {</span>
+<span class="fc" id="L396">            this.state = state;</span>
+<span class="fc" id="L397">        }</span>
+
+        public String name()
+        {
+<span class="fc" id="L401">            return state.channel.filePath();</span>
+        }
+
+        public void tidy()
+        {
+            try
+            {
+<span class="fc" id="L408">                Throwables.maybeFail(state.close(null));</span>
+            }
+<span class="nc" id="L410">            catch (Exception e)</span>
+            {
+<span class="nc" id="L412">                throw new FSReadError(e, state.channel.filePath());</span>
+<span class="fc" id="L413">            }</span>
+<span class="fc" id="L414">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

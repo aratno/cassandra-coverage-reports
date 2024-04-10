@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>CompactionLogger.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.db.compaction</a> &gt; <span class="el_source">CompactionLogger.java</span></div><h1>CompactionLogger.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db.compaction;
+
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.lang.ref.WeakReference;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+import com.google.common.collect.MapMaker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.config.CassandraRelevantProperties.LOG_DIR;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+
+public class CompactionLogger
+{
+    public interface Strategy
+    {
+        JsonNode sstable(SSTableReader sstable);
+
+        JsonNode options();
+
+<span class="nc" id="L66">        static Strategy none = new Strategy()</span>
+        {
+            public JsonNode sstable(SSTableReader sstable)
+            {
+                return null;
+            }
+
+            public JsonNode options()
+            {
+                return null;
+            }
+        };
+    }
+
+    /**
+     * This will produce the compaction strategy's starting information.
+     */
+    public interface StrategySummary
+    {
+        JsonNode getSummary();
+    }
+
+    /**
+     * This is an interface to allow writing to a different interface.
+     */
+    public interface Writer
+    {
+        /**
+         * This is used when we are already trying to write out the start of a
+         * @param statement This should be written out to the medium capturing the logs
+         * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+         */
+        void writeStart(JsonNode statement, Object tag);
+
+        /**
+         * @param statement This should be written out to the medium capturing the logs
+         * @param summary   This can be used when a tag is not recognized by this writer; this can be because the file
+         *                  has been rolled, or otherwise the writer had to start over
+         * @param tag       This is an identifier for a strategy; each strategy should have a distinct Object
+         */
+        void write(JsonNode statement, StrategySummary summary, Object tag);
+    }
+
+    private interface CompactionStrategyAndTableFunction
+    {
+        JsonNode apply(AbstractCompactionStrategy strategy, SSTableReader sstable);
+    }
+
+<span class="fc" id="L114">    private static final JsonNodeFactory json = JsonNodeFactory.instance;</span>
+<span class="fc" id="L115">    private static final Logger logger = LoggerFactory.getLogger(CompactionLogger.class);</span>
+<span class="fc" id="L116">    private static final CompactionLogSerializer serializer = new CompactionLogSerializer();</span>
+    private final WeakReference&lt;ColumnFamilyStore&gt; cfsRef;
+    private final WeakReference&lt;CompactionStrategyManager&gt; csmRef;
+<span class="fc" id="L119">    private final AtomicInteger identifier = new AtomicInteger(0);</span>
+<span class="fc" id="L120">    private final Map&lt;AbstractCompactionStrategy, String&gt; compactionStrategyMapping = new MapMaker().weakKeys().makeMap();</span>
+<span class="fc" id="L121">    private final AtomicBoolean enabled = new AtomicBoolean(false);</span>
+
+    public CompactionLogger(ColumnFamilyStore cfs, CompactionStrategyManager csm)
+<span class="fc" id="L124">    {</span>
+<span class="fc" id="L125">        csmRef = new WeakReference&lt;&gt;(csm);</span>
+<span class="fc" id="L126">        cfsRef = new WeakReference&lt;&gt;(cfs);</span>
+<span class="fc" id="L127">    }</span>
+
+    private void forEach(Consumer&lt;AbstractCompactionStrategy&gt; consumer)
+    {
+<span class="nc" id="L131">        CompactionStrategyManager csm = csmRef.get();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (csm == null)</span>
+<span class="nc" id="L133">            return;</span>
+<span class="nc" id="L134">        csm.getStrategies()</span>
+<span class="nc" id="L135">           .forEach(l -&gt; l.forEach(consumer));</span>
+<span class="nc" id="L136">    }</span>
+
+    private ArrayNode compactionStrategyMap(Function&lt;AbstractCompactionStrategy, JsonNode&gt; select)
+    {
+<span class="nc" id="L140">        ArrayNode node = json.arrayNode();</span>
+<span class="nc" id="L141">        forEach(acs -&gt; node.add(select.apply(acs)));</span>
+<span class="nc" id="L142">        return node;</span>
+    }
+
+    private ArrayNode sstableMap(Collection&lt;SSTableReader&gt; sstables, CompactionStrategyAndTableFunction csatf)
+    {
+<span class="nc" id="L147">        CompactionStrategyManager csm = csmRef.get();</span>
+<span class="nc" id="L148">        ArrayNode node = json.arrayNode();</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        if (csm == null)</span>
+<span class="nc" id="L150">            return node;</span>
+<span class="nc" id="L151">        sstables.forEach(t -&gt; node.add(csatf.apply(csm.getCompactionStrategyFor(t), t)));</span>
+<span class="nc" id="L152">        return node;</span>
+    }
+
+    private String getId(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L157">        return compactionStrategyMapping.computeIfAbsent(strategy, s -&gt; String.valueOf(identifier.getAndIncrement()));</span>
+    }
+
+    private JsonNode formatSSTables(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L162">        ArrayNode node = json.arrayNode();</span>
+<span class="nc" id="L163">        CompactionStrategyManager csm = csmRef.get();</span>
+<span class="nc" id="L164">        ColumnFamilyStore cfs = cfsRef.get();</span>
+<span class="nc bnc" id="L165" title="All 4 branches missed.">        if (csm == null || cfs == null)</span>
+<span class="nc" id="L166">            return node;</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        for (SSTableReader sstable : cfs.getLiveSSTables())</span>
+        {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            if (csm.getCompactionStrategyFor(sstable) == strategy)</span>
+<span class="nc" id="L170">                node.add(formatSSTable(strategy, sstable));</span>
+<span class="nc" id="L171">        }</span>
+<span class="nc" id="L172">        return node;</span>
+    }
+
+    private JsonNode formatSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+    {
+<span class="nc" id="L177">        ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L178">        node.put(&quot;generation&quot;, sstable.descriptor.id.toString());</span>
+<span class="nc" id="L179">        node.put(&quot;version&quot;, sstable.descriptor.version.version);</span>
+<span class="nc" id="L180">        node.put(&quot;size&quot;, sstable.onDiskLength());</span>
+<span class="nc" id="L181">        JsonNode logResult = strategy.strategyLogger().sstable(sstable);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (logResult != null)</span>
+<span class="nc" id="L183">            node.set(&quot;details&quot;, logResult);</span>
+<span class="nc" id="L184">        return node;</span>
+    }
+
+    private JsonNode startStrategy(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L189">        ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L190">        CompactionStrategyManager csm = csmRef.get();</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (csm == null)</span>
+<span class="nc" id="L192">            return node;</span>
+<span class="nc" id="L193">        node.put(&quot;strategyId&quot;, getId(strategy));</span>
+<span class="nc" id="L194">        node.put(&quot;type&quot;, strategy.getName());</span>
+<span class="nc" id="L195">        node.set(&quot;tables&quot;, formatSSTables(strategy));</span>
+<span class="nc" id="L196">        node.put(&quot;repaired&quot;, csm.isRepaired(strategy));</span>
+<span class="nc" id="L197">        List&lt;String&gt; folders = csm.getStrategyFolders(strategy);</span>
+<span class="nc" id="L198">        ArrayNode folderNode = json.arrayNode();</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        for (String folder : folders)</span>
+        {
+<span class="nc" id="L201">            folderNode.add(folder);</span>
+<span class="nc" id="L202">        }</span>
+<span class="nc" id="L203">        node.set(&quot;folders&quot;, folderNode);</span>
+
+<span class="nc" id="L205">        JsonNode logResult = strategy.strategyLogger().options();</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (logResult != null)</span>
+<span class="nc" id="L207">            node.set(&quot;options&quot;, logResult);</span>
+<span class="nc" id="L208">        return node;</span>
+    }
+
+    private JsonNode shutdownStrategy(AbstractCompactionStrategy strategy)
+    {
+<span class="nc" id="L213">        ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L214">        node.put(&quot;strategyId&quot;, getId(strategy));</span>
+<span class="nc" id="L215">        return node;</span>
+    }
+
+    private JsonNode describeSSTable(AbstractCompactionStrategy strategy, SSTableReader sstable)
+    {
+<span class="nc" id="L220">        ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L221">        node.put(&quot;strategyId&quot;, getId(strategy));</span>
+<span class="nc" id="L222">        node.set(&quot;table&quot;, formatSSTable(strategy, sstable));</span>
+<span class="nc" id="L223">        return node;</span>
+    }
+
+    private void describeStrategy(ObjectNode node)
+    {
+<span class="nc" id="L228">        ColumnFamilyStore cfs = cfsRef.get();</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (cfs == null)</span>
+<span class="nc" id="L230">            return;</span>
+<span class="nc" id="L231">        node.put(&quot;keyspace&quot;, cfs.getKeyspaceName());</span>
+<span class="nc" id="L232">        node.put(&quot;table&quot;, cfs.getTableName());</span>
+<span class="nc" id="L233">        node.put(&quot;time&quot;, currentTimeMillis());</span>
+<span class="nc" id="L234">    }</span>
+
+    private JsonNode startStrategies()
+    {
+<span class="nc" id="L238">        ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L239">        node.put(&quot;type&quot;, &quot;enable&quot;);</span>
+<span class="nc" id="L240">        describeStrategy(node);</span>
+<span class="nc" id="L241">        node.set(&quot;strategies&quot;, compactionStrategyMap(this::startStrategy));</span>
+<span class="nc" id="L242">        return node;</span>
+    }
+
+    public void enable()
+    {
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        if (enabled.compareAndSet(false, true))</span>
+        {
+<span class="nc" id="L249">            serializer.writeStart(startStrategies(), this);</span>
+        }
+<span class="nc" id="L251">    }</span>
+
+    public void disable()
+    {
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        if (enabled.compareAndSet(true, false))</span>
+        {
+<span class="nc" id="L257">            ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L258">            node.put(&quot;type&quot;, &quot;disable&quot;);</span>
+<span class="nc" id="L259">            describeStrategy(node);</span>
+<span class="nc" id="L260">            node.set(&quot;strategies&quot;, compactionStrategyMap(this::shutdownStrategy));</span>
+<span class="nc" id="L261">            serializer.write(node, this::startStrategies, this);</span>
+        }
+<span class="fc" id="L263">    }</span>
+
+    public void flush(Collection&lt;SSTableReader&gt; sstables)
+    {
+<span class="pc bpc" id="L267" title="1 of 2 branches missed.">        if (enabled.get())</span>
+        {
+<span class="nc" id="L269">            ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L270">            node.put(&quot;type&quot;, &quot;flush&quot;);</span>
+<span class="nc" id="L271">            describeStrategy(node);</span>
+<span class="nc" id="L272">            node.set(&quot;tables&quot;, sstableMap(sstables, this::describeSSTable));</span>
+<span class="nc" id="L273">            serializer.write(node, this::startStrategies, this);</span>
+        }
+<span class="fc" id="L275">    }</span>
+
+    public void compaction(long startTime, Collection&lt;SSTableReader&gt; input, long endTime, Collection&lt;SSTableReader&gt; output)
+    {
+<span class="pc bpc" id="L279" title="1 of 2 branches missed.">        if (enabled.get())</span>
+        {
+<span class="nc" id="L281">            ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L282">            node.put(&quot;type&quot;, &quot;compaction&quot;);</span>
+<span class="nc" id="L283">            describeStrategy(node);</span>
+<span class="nc" id="L284">            node.put(&quot;start&quot;, String.valueOf(startTime));</span>
+<span class="nc" id="L285">            node.put(&quot;end&quot;, String.valueOf(endTime));</span>
+<span class="nc" id="L286">            node.set(&quot;input&quot;, sstableMap(input, this::describeSSTable));</span>
+<span class="nc" id="L287">            node.set(&quot;output&quot;, sstableMap(output, this::describeSSTable));</span>
+<span class="nc" id="L288">            serializer.write(node, this::startStrategies, this);</span>
+        }
+<span class="fc" id="L290">    }</span>
+
+    public void pending(AbstractCompactionStrategy strategy, int remaining)
+    {
+<span class="pc bpc" id="L294" title="1 of 4 branches missed.">        if (remaining != 0 &amp;&amp; enabled.get())</span>
+        {
+<span class="nc" id="L296">            ObjectNode node = json.objectNode();</span>
+<span class="nc" id="L297">            node.put(&quot;type&quot;, &quot;pending&quot;);</span>
+<span class="nc" id="L298">            describeStrategy(node);</span>
+<span class="nc" id="L299">            node.put(&quot;strategyId&quot;, getId(strategy));</span>
+<span class="nc" id="L300">            node.put(&quot;pending&quot;, remaining);</span>
+<span class="nc" id="L301">            serializer.write(node, this::startStrategies, this);</span>
+        }
+<span class="fc" id="L303">    }</span>
+
+<span class="fc" id="L305">    private static class CompactionLogSerializer implements Writer</span>
+    {
+<span class="fc" id="L307">        private static final String logDirectory = LOG_DIR.getString();</span>
+<span class="fc" id="L308">        private final ExecutorPlus loggerService = executorFactory().sequential(&quot;CompactionLogger&quot;);</span>
+        // This is only accessed on the logger service thread, so it does not need to be thread safe
+<span class="fc" id="L310">        private final Set&lt;Object&gt; rolled = new HashSet&lt;&gt;();</span>
+        private OutputStreamWriter stream;
+
+        private static OutputStreamWriter createStream() throws IOException
+        {
+<span class="nc" id="L315">            int count = 0;</span>
+<span class="nc" id="L316">            Path compactionLog = new File(logDirectory, &quot;compaction.log&quot;).toPath();</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">            if (Files.exists(compactionLog))</span>
+            {
+<span class="nc" id="L319">                Path tryPath = compactionLog;</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                while (Files.exists(tryPath))</span>
+                {
+<span class="nc" id="L322">                    tryPath = new File(logDirectory, String.format(&quot;compaction-%d.log&quot;, count++)).toPath();</span>
+                }
+<span class="nc" id="L324">                Files.move(compactionLog, tryPath);</span>
+            }
+
+<span class="nc" id="L327">            return new OutputStreamWriter(Files.newOutputStream(compactionLog, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE));</span>
+        }
+
+        private void writeLocal(String toWrite)
+        {
+            try
+            {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                if (stream == null)</span>
+<span class="nc" id="L335">                    stream = createStream();</span>
+<span class="nc" id="L336">                stream.write(toWrite);</span>
+<span class="nc" id="L337">                stream.flush();</span>
+            }
+<span class="nc" id="L339">            catch (IOException ioe)</span>
+            {
+                // We'll drop the change and log the error to the logger.
+<span class="nc" id="L342">                NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, TimeUnit.MINUTES,</span>
+                                 &quot;Could not write to the log file: {}&quot;, ioe);
+<span class="nc" id="L344">            }</span>
+
+<span class="nc" id="L346">        }</span>
+
+        public void writeStart(JsonNode statement, Object tag)
+        {
+<span class="nc" id="L350">            final String toWrite = statement.toString() + System.lineSeparator();</span>
+<span class="nc" id="L351">            loggerService.execute(() -&gt; {</span>
+<span class="nc" id="L352">                rolled.add(tag);</span>
+<span class="nc" id="L353">                writeLocal(toWrite);</span>
+<span class="nc" id="L354">            });</span>
+<span class="nc" id="L355">        }</span>
+
+        public void write(JsonNode statement, StrategySummary summary, Object tag)
+        {
+<span class="nc" id="L359">            final String toWrite = statement.toString() + System.lineSeparator();</span>
+<span class="nc" id="L360">            loggerService.execute(() -&gt; {</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                if (!rolled.contains(tag))</span>
+                {
+<span class="nc" id="L363">                    writeLocal(summary.getSummary().toString() + System.lineSeparator());</span>
+<span class="nc" id="L364">                    rolled.add(tag);</span>
+                }
+<span class="nc" id="L366">                writeLocal(toWrite);</span>
+<span class="nc" id="L367">            });</span>
+<span class="nc" id="L368">        }</span>
+    }
+
+    public static void shutdownNowAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="nc" id="L373">        ExecutorUtils.shutdownNowAndWait(timeout, unit, serializer.loggerService);</span>
+<span class="nc" id="L374">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

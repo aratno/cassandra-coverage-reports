@@ -1,0 +1,443 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>AuthCache.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.auth</a> &gt; <span class="el_source">AuthCache.java</span></div><h1>AuthCache.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.auth;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BiPredicate;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.Policy;
+import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.Shutdownable;
+import org.apache.cassandra.utils.ExecutorUtils;
+import org.apache.cassandra.utils.MBeanWrapper;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.config.CassandraRelevantProperties.AUTH_CACHE_WARMING_MAX_RETRIES;
+import static org.apache.cassandra.config.CassandraRelevantProperties.AUTH_CACHE_WARMING_RETRY_INTERVAL_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DISABLE_AUTH_CACHES_REMOTE_CONFIGURATION;
+
+public class AuthCache&lt;K, V&gt; implements AuthCacheMBean, Shutdownable
+{
+<span class="fc" id="L57">    private static final Logger logger = LoggerFactory.getLogger(AuthCache.class);</span>
+
+    public static final String MBEAN_NAME_BASE = &quot;org.apache.cassandra.auth:type=&quot;;
+
+<span class="fc" id="L61">    private volatile ScheduledFuture cacheRefresher = null;</span>
+
+    // Keep a handle on created instances so their executors can be terminated cleanly
+<span class="fc" id="L64">    private static final Set&lt;Shutdownable&gt; REGISTRY = new HashSet&lt;&gt;(4);</span>
+
+    public static void shutdownAllAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+<span class="fc" id="L68">        ExecutorUtils.shutdownNowAndWait(timeout, unit, REGISTRY);</span>
+<span class="fc" id="L69">    }</span>
+
+    /**
+     * Underlying cache. LoadingCache will call underlying load function on {@link #get} if key is not present
+     */
+    protected volatile LoadingCache&lt;K, V&gt; cache;
+    private ExecutorPlus cacheRefreshExecutor;
+
+    private final String name;
+    private final IntConsumer setValidityDelegate;
+    private final IntSupplier getValidityDelegate;
+    private final IntConsumer setUpdateIntervalDelegate;
+    private final IntSupplier getUpdateIntervalDelegate;
+    private final IntConsumer setMaxEntriesDelegate;
+    private final IntSupplier getMaxEntriesDelegate;
+    private final Consumer&lt;Boolean&gt; setActiveUpdate;
+    private final BooleanSupplier getActiveUpdate;
+    private final Function&lt;K, V&gt; loadFunction;
+    private final Supplier&lt;Map&lt;K, V&gt;&gt; bulkLoadFunction;
+    private final BooleanSupplier enableCache;
+
+    // Determines whether the presence of a specific value should trigger the invalidation of
+    // the supplied key. Used by CredentialsCache &amp; CacheRefresher to identify when the
+    // credentials for a role couldn't be loaded without throwing an exception or serving stale
+    // values until the natural expiry time.
+    private final BiPredicate&lt;K, V&gt; invalidateCondition;
+
+    /**
+     * @param name Used for MBean
+     * @param setValidityDelegate Used to set cache validity period. See {@link Policy#expireAfterWrite()}
+     * @param getValidityDelegate Getter for validity period
+     * @param setUpdateIntervalDelegate Used to set cache update interval. See {@link Policy#refreshAfterWrite()}
+     * @param getUpdateIntervalDelegate Getter for update interval
+     * @param setMaxEntriesDelegate Used to set max # entries in cache. See {@link com.github.benmanes.caffeine.cache.Policy.Eviction#setMaximum(long)}
+     * @param getMaxEntriesDelegate Getter for max entries.
+     * @param setActiveUpdate Method to process config to actively update the auth cache prior to configured cache expiration
+     * @param getActiveUpdate Getter for active update
+     * @param loadFunction Function to load the cache. Called on {@link #get(Object)}
+     * @param cacheEnabledDelegate Used to determine if cache is enabled.
+     */
+    protected AuthCache(String name,
+                        IntConsumer setValidityDelegate,
+                        IntSupplier getValidityDelegate,
+                        IntConsumer setUpdateIntervalDelegate,
+                        IntSupplier getUpdateIntervalDelegate,
+                        IntConsumer setMaxEntriesDelegate,
+                        IntSupplier getMaxEntriesDelegate,
+                        Consumer&lt;Boolean&gt; setActiveUpdate,
+                        BooleanSupplier getActiveUpdate,
+                        Function&lt;K, V&gt; loadFunction,
+                        Supplier&lt;Map&lt;K, V&gt;&gt; bulkLoadFunction,
+                        BooleanSupplier cacheEnabledDelegate)
+    {
+<span class="fc" id="L122">        this(name,</span>
+             setValidityDelegate,
+             getValidityDelegate,
+             setUpdateIntervalDelegate,
+             getUpdateIntervalDelegate,
+             setMaxEntriesDelegate,
+             getMaxEntriesDelegate,
+             setActiveUpdate,
+             getActiveUpdate,
+             loadFunction,
+             bulkLoadFunction,
+             cacheEnabledDelegate,
+<span class="nc" id="L134">             (k, v) -&gt; false);</span>
+<span class="fc" id="L135">    }</span>
+
+    /**
+     * @param name Used for MBean
+     * @param setValidityDelegate Used to set cache validity period. See {@link Policy#expireAfterWrite()}
+     * @param getValidityDelegate Getter for validity period
+     * @param setUpdateIntervalDelegate Used to set cache update interval. See {@link Policy#refreshAfterWrite()}
+     * @param getUpdateIntervalDelegate Getter for update interval
+     * @param setMaxEntriesDelegate Used to set max # entries in cache. See {@link com.github.benmanes.caffeine.cache.Policy.Eviction#setMaximum(long)}
+     * @param getMaxEntriesDelegate Getter for max entries.
+     * @param setActiveUpdate Actively update the cache before expiry
+     * @param getActiveUpdate Getter for active update
+     * @param loadFunction Function to load the cache. Called on {@link #get(Object)}
+     * @param cacheEnabledDelegate Used to determine if cache is enabled.
+     * @param invalidationCondition Used during active updates to determine if a refreshed value indicates a missing
+     *                              entry in the underlying table. If satisfied, the key will be invalidated.
+     */
+    protected AuthCache(String name,
+                        IntConsumer setValidityDelegate,
+                        IntSupplier getValidityDelegate,
+                        IntConsumer setUpdateIntervalDelegate,
+                        IntSupplier getUpdateIntervalDelegate,
+                        IntConsumer setMaxEntriesDelegate,
+                        IntSupplier getMaxEntriesDelegate,
+                        Consumer&lt;Boolean&gt; setActiveUpdate,
+                        BooleanSupplier getActiveUpdate,
+                        Function&lt;K, V&gt; loadFunction,
+                        Supplier&lt;Map&lt;K, V&gt;&gt; bulkLoadFunction,
+                        BooleanSupplier cacheEnabledDelegate,
+                        BiPredicate&lt;K, V&gt; invalidationCondition)
+<span class="fc" id="L165">    {</span>
+<span class="fc" id="L166">        this.name = checkNotNull(name);</span>
+<span class="fc" id="L167">        this.setValidityDelegate = checkNotNull(setValidityDelegate);</span>
+<span class="fc" id="L168">        this.getValidityDelegate = checkNotNull(getValidityDelegate);</span>
+<span class="fc" id="L169">        this.setUpdateIntervalDelegate = checkNotNull(setUpdateIntervalDelegate);</span>
+<span class="fc" id="L170">        this.getUpdateIntervalDelegate = checkNotNull(getUpdateIntervalDelegate);</span>
+<span class="fc" id="L171">        this.setMaxEntriesDelegate = checkNotNull(setMaxEntriesDelegate);</span>
+<span class="fc" id="L172">        this.getMaxEntriesDelegate = checkNotNull(getMaxEntriesDelegate);</span>
+<span class="fc" id="L173">        this.setActiveUpdate = checkNotNull(setActiveUpdate);</span>
+<span class="fc" id="L174">        this.getActiveUpdate = checkNotNull(getActiveUpdate);</span>
+<span class="fc" id="L175">        this.loadFunction = checkNotNull(loadFunction);</span>
+<span class="fc" id="L176">        this.bulkLoadFunction = checkNotNull(bulkLoadFunction);</span>
+<span class="fc" id="L177">        this.enableCache = checkNotNull(cacheEnabledDelegate);</span>
+<span class="fc" id="L178">        this.invalidateCondition = checkNotNull(invalidationCondition);</span>
+<span class="fc" id="L179">        init();</span>
+<span class="fc" id="L180">    }</span>
+
+    /**
+     * Do setup for the cache and MBean.
+     */
+    protected void init()
+    {
+<span class="fc" id="L187">        this.cacheRefreshExecutor = executorFactory().sequential(name + &quot;Refresh&quot;);</span>
+<span class="fc" id="L188">        cache = initCache(null);</span>
+<span class="fc" id="L189">        MBeanWrapper.instance.registerMBean(this, getObjectName());</span>
+<span class="fc" id="L190">        REGISTRY.add(this);</span>
+<span class="fc" id="L191">    }</span>
+
+    protected void unregisterMBean()
+    {
+<span class="nc" id="L195">        MBeanWrapper.instance.unregisterMBean(getObjectName(), MBeanWrapper.OnException.LOG);</span>
+<span class="nc" id="L196">    }</span>
+
+    protected String getObjectName()
+    {
+<span class="fc" id="L200">        return MBEAN_NAME_BASE + name;</span>
+    }
+
+    /**
+     * Retrieve all cached entries. Will call {@link LoadingCache#asMap()} which does not trigger &quot;load&quot;.
+     * @return a map of cached key-value pairs
+     */
+    public Map&lt;K, V&gt; getAll()
+    {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (cache == null)</span>
+<span class="nc" id="L210">            return Collections.emptyMap();</span>
+
+<span class="nc" id="L212">        return Collections.unmodifiableMap(cache.asMap());</span>
+    }
+
+    /**
+     * Retrieve a value from the cache. Will call {@link LoadingCache#get(Object)} which will
+     * &quot;load&quot; the value if it's not present, thus populating the key.
+     * @param k
+     * @return The current value of {@code K} if cached or loaded.
+     *
+     * See {@link LoadingCache#get(Object)} for possible exceptions.
+     */
+    public V get(K k)
+    {
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        if (cache == null)</span>
+<span class="fc" id="L226">            return loadFunction.apply(k);</span>
+
+<span class="fc" id="L228">        return cache.get(k);</span>
+    }
+
+    /**
+     * Invalidate the entire cache.
+     */
+    public synchronized void invalidate()
+    {
+<span class="fc" id="L236">        cache = initCache(null);</span>
+<span class="fc" id="L237">    }</span>
+
+    /**
+     * Invalidate a key.
+     * @param k key to invalidate
+     */
+    public void invalidate(K k)
+    {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">        if (cache != null)</span>
+<span class="nc" id="L246">            cache.invalidate(k);</span>
+<span class="nc" id="L247">    }</span>
+
+    /**
+     * Time in milliseconds that a value in the cache will expire after.
+     * @param validityPeriod in milliseconds
+     */
+    public synchronized void setValidity(int validityPeriod)
+    {
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (DISABLE_AUTH_CACHES_REMOTE_CONFIGURATION.getBoolean())</span>
+<span class="nc" id="L256">            throw new UnsupportedOperationException(&quot;Remote configuration of auth caches is disabled&quot;);</span>
+
+<span class="nc" id="L258">        setValidityDelegate.accept(validityPeriod);</span>
+<span class="nc" id="L259">        cache = initCache(cache);</span>
+<span class="nc" id="L260">    }</span>
+
+    public int getValidity()
+    {
+<span class="fc" id="L264">        return getValidityDelegate.getAsInt();</span>
+    }
+
+    /**
+     * Time in milliseconds after which an entry in the cache should be refreshed (it's load function called again)
+     * @param updateInterval in milliseconds
+     */
+    public synchronized void setUpdateInterval(int updateInterval)
+    {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        if (DISABLE_AUTH_CACHES_REMOTE_CONFIGURATION.getBoolean())</span>
+<span class="nc" id="L274">            throw new UnsupportedOperationException(&quot;Remote configuration of auth caches is disabled&quot;);</span>
+
+<span class="nc" id="L276">        setUpdateIntervalDelegate.accept(updateInterval);</span>
+<span class="nc" id="L277">        cache = initCache(cache);</span>
+<span class="nc" id="L278">    }</span>
+
+    public int getUpdateInterval()
+    {
+<span class="fc" id="L282">        return getUpdateIntervalDelegate.getAsInt();</span>
+    }
+
+    /**
+     * Set maximum number of entries in the cache.
+     * @param maxEntries
+     */
+    public synchronized void setMaxEntries(int maxEntries)
+    {
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (DISABLE_AUTH_CACHES_REMOTE_CONFIGURATION.getBoolean())</span>
+<span class="nc" id="L292">            throw new UnsupportedOperationException(&quot;Remote configuration of auth caches is disabled&quot;);</span>
+
+<span class="nc" id="L294">        setMaxEntriesDelegate.accept(maxEntries);</span>
+<span class="nc" id="L295">        cache = initCache(cache);</span>
+<span class="nc" id="L296">    }</span>
+
+    public int getMaxEntries()
+    {
+<span class="fc" id="L300">        return getMaxEntriesDelegate.getAsInt();</span>
+    }
+
+    public boolean getActiveUpdate()
+    {
+<span class="fc" id="L305">        return getActiveUpdate.getAsBoolean();</span>
+    }
+
+    public synchronized void setActiveUpdate(boolean update)
+    {
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (DISABLE_AUTH_CACHES_REMOTE_CONFIGURATION.getBoolean())</span>
+<span class="nc" id="L311">            throw new UnsupportedOperationException(&quot;Remote configuration of auth caches is disabled&quot;);</span>
+
+<span class="nc" id="L313">        setActiveUpdate.accept(update);</span>
+<span class="nc" id="L314">        cache = initCache(cache);</span>
+<span class="nc" id="L315">    }</span>
+
+    public long getEstimatedSize()
+    {
+<span class="pc bpc" id="L319" title="1 of 2 branches missed.">        return cache == null ? 0L : cache.estimatedSize();</span>
+    }
+
+    /**
+     * (Re-)initialise the underlying cache. Will update validity, max entries, and update interval if
+     * any have changed. The underlying {@link LoadingCache} will be initiated based on the provided {@code loadFunction}.
+     * Note: If you need some unhandled cache setting to be set you should extend {@link AuthCache} and override this method.
+     * @param existing If not null will only update cache update validity, max entries, and update interval.
+     * @return New {@link LoadingCache} if existing was null, otherwise the existing {@code cache}
+     */
+    protected LoadingCache&lt;K, V&gt; initCache(LoadingCache&lt;K, V&gt; existing)
+    {
+<span class="fc bfc" id="L331" title="All 2 branches covered.">        if (!enableCache.getAsBoolean())</span>
+<span class="fc" id="L332">            return null;</span>
+
+<span class="fc bfc" id="L334" title="All 2 branches covered.">        if (getValidity() &lt;= 0)</span>
+<span class="fc" id="L335">            return null;</span>
+
+<span class="fc" id="L337">        boolean activeUpdate = getActiveUpdate();</span>
+<span class="fc" id="L338">        logger.info(&quot;(Re)initializing {} (validity period/update interval/max entries/active update) ({}/{}/{}/{})&quot;,</span>
+<span class="fc" id="L339">                    name, getValidity(), getUpdateInterval(), getMaxEntries(), activeUpdate);</span>
+        LoadingCache&lt;K, V&gt; updatedCache;
+
+<span class="pc bpc" id="L342" title="1 of 2 branches missed.">        if (existing == null)</span>
+        {
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">            updatedCache = Caffeine.newBuilder().refreshAfterWrite(activeUpdate ? getValidity() : getUpdateInterval(), TimeUnit.MILLISECONDS)</span>
+<span class="fc" id="L345">                                   .expireAfterWrite(getValidity(), TimeUnit.MILLISECONDS)</span>
+<span class="fc" id="L346">                                   .maximumSize(getMaxEntries())</span>
+<span class="fc" id="L347">                                   .executor(cacheRefreshExecutor)</span>
+<span class="fc" id="L348">                                   .build(loadFunction::apply);</span>
+        }
+        else
+        {
+<span class="nc" id="L352">            updatedCache = cache;</span>
+            // Always set as mandatory
+<span class="nc" id="L354">            cache.policy().refreshAfterWrite().ifPresent(policy -&gt;</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                policy.setExpiresAfter(activeUpdate ? getValidity() : getUpdateInterval(), TimeUnit.MILLISECONDS));</span>
+<span class="nc" id="L356">            cache.policy().expireAfterWrite().ifPresent(policy -&gt; policy.setExpiresAfter(getValidity(), TimeUnit.MILLISECONDS));</span>
+<span class="nc" id="L357">            cache.policy().eviction().ifPresent(policy -&gt; policy.setMaximum(getMaxEntries()));</span>
+        }
+
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">        if (cacheRefresher != null)</span>
+        {
+<span class="nc" id="L362">            cacheRefresher.cancel(false); // permit the two refreshers to race until the old one dies, should be harmless.</span>
+<span class="nc" id="L363">            cacheRefresher = null;</span>
+        }
+
+<span class="pc bpc" id="L366" title="1 of 2 branches missed.">        if (activeUpdate)</span>
+        {
+<span class="nc" id="L368">            cacheRefresher = ScheduledExecutors.optionalTasks.scheduleAtFixedRate(CacheRefresher.create(name,</span>
+                                                                                                        updatedCache,
+                                                                                                        invalidateCondition),
+<span class="nc" id="L371">                                                                                  getUpdateInterval(),</span>
+<span class="nc" id="L372">                                                                                  getUpdateInterval(),</span>
+                                                                                  TimeUnit.MILLISECONDS);
+        }
+<span class="fc" id="L375">        return updatedCache;</span>
+    }
+
+    @Override
+    public boolean isTerminated()
+    {
+<span class="nc" id="L381">        return cacheRefreshExecutor.isTerminated();</span>
+    }
+
+    @Override
+    public void shutdown()
+    {
+<span class="nc" id="L387">        cacheRefreshExecutor.shutdown();</span>
+<span class="nc" id="L388">    }</span>
+
+    @Override
+    public Object shutdownNow()
+    {
+<span class="fc" id="L393">        return cacheRefreshExecutor.shutdownNow();</span>
+    }
+
+    @Override
+    public boolean awaitTermination(long timeout, TimeUnit units) throws InterruptedException
+    {
+<span class="fc" id="L399">        return cacheRefreshExecutor.awaitTermination(timeout, units);</span>
+    }
+
+    public void warm()
+    {
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        if (cache == null)</span>
+        {
+<span class="nc" id="L406">            logger.info(&quot;{} cache not enabled, skipping pre-warming&quot;, name);</span>
+<span class="nc" id="L407">            return;</span>
+        }
+
+<span class="nc" id="L410">        int retries = AUTH_CACHE_WARMING_MAX_RETRIES.getInt(10);</span>
+<span class="nc" id="L411">        long retryInterval = AUTH_CACHE_WARMING_RETRY_INTERVAL_MS.getLong(1000);</span>
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">        while (retries-- &gt; 0)</span>
+        {
+            try
+            {
+<span class="nc" id="L417">                Map&lt;K, V&gt; entries = bulkLoadFunction.get();</span>
+<span class="nc" id="L418">                cache.putAll(entries);</span>
+<span class="nc" id="L419">                break;</span>
+            }
+<span class="nc" id="L421">            catch (Exception e)</span>
+            {
+<span class="nc" id="L423">                Uninterruptibles.sleepUninterruptibly(retryInterval, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L424">            }</span>
+        }
+<span class="nc" id="L426">    }</span>
+
+    /*
+     * Implemented when we can provide an efficient way to bulk load all entries for a cache. This isn't a
+     * @FunctionalInterface due to the default impl, which is for IRoleManager, IAuthorizer, and INetworkAuthorizer.
+     * They all extend this interface so that implementations only need to provide an override if it's useful.
+     * IAuthenticator doesn't implement this interface because CredentialsCache is more tightly coupled to
+     * PasswordAuthenticator, which does expose a bulk loader.
+     */
+    public interface BulkLoader&lt;K, V&gt;
+    {
+        default Supplier&lt;Map&lt;K, V&gt;&gt; bulkLoader()
+        {
+<span class="fc" id="L439">            return Collections::emptyMap;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

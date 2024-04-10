@@ -1,0 +1,988 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TrieNode.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.tries</a> &gt; <span class="el_source">TrieNode.java</span></div><h1>TrieNode.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.tries;
+
+import java.io.DataOutput;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.io.util.SizedInts;
+
+/**
+ * Trie node types and manipulation mechanisms. The main purpose of this is to allow for handling tries directly as
+ * they are on disk without any serialization, and to enable the creation of such files.
+ * &lt;p&gt;
+ * The serialization methods take as argument a generic {@code SerializationNode} and provide a method {@code typeFor}
+ * for choosing a suitable type to represent it, which can then be used to calculate size and write the node.
+ * &lt;p&gt;
+ * To read a file containing trie nodes, one would use {@code at} to identify the node type and then the various
+ * read methods to retrieve the data. They all take a buffer (usually memory-mapped) containing the data, and a position
+ * in it that identifies the node.
+ * &lt;p&gt;
+ * These node types do not specify any treatment of payloads. They are only concerned with providing 4 bits of
+ * space for {@code payloadFlags}, and a way of calculating the position after the node. Users of this class by convention
+ * use non-zero payloadFlags to indicate a payload exists, write it (possibly in flag-dependent format) at serialization
+ * time after the node itself is written, and read it using the {@code payloadPosition} value.
+ * &lt;p&gt;
+ * To improve efficiency, multiple node types depending on the number of transitions are provided:
+ * -- payload only, which has no outgoing transitions
+ * -- single outgoing transition
+ * -- sparse, which provides a list of transition bytes with corresponding targets
+ * -- dense, where the transitions span a range of values and having the list (and the search in it) can be avoided
+ * &lt;p&gt;
+ * For each of the transition-carrying types we also have &quot;in-page&quot; versions where transition targets are the 4, 8 or 12
+ * lowest bits of the position within the same page. To save one further byte, the single in-page versions using 4 or 12
+ * bits cannot carry a payload.
+ * &lt;p&gt;
+ * This class is effectively an enumeration; abstract class permits instances to extend each other and reuse code.
+ * &lt;p&gt;
+ * See {@code org/apache/cassandra/io/sstable/format/bti/BtiFormat.md} for a description of the mechanisms of writing
+ * and reading an on-disk trie.
+ */
+<span class="nc" id="L58">@SuppressWarnings({ &quot;SameParameterValue&quot; })</span>
+public abstract class TrieNode
+{
+    /** Value used to indicate a branch (e.g. for transition and lastTransition) does not exist. */
+    public static final int NONE = -1;
+
+    // Consumption (read) methods
+
+    /**
+     * Returns the type of node stored at this position. It can then be used to call the methods below.
+     */
+    public static TrieNode at(ByteBuffer src, int position)
+    {
+<span class="nc" id="L71">        return Types.values[(src.get(position) &gt;&gt; 4) &amp; 0xF];</span>
+    }
+
+    /**
+     * Returns the 4 payload flag bits. Node types that cannot carry a payload return 0.
+     */
+    public int payloadFlags(ByteBuffer src, int position)
+    {
+<span class="nc" id="L79">        return src.get(position) &amp; 0x0F;</span>
+    }
+
+    /**
+     * Return the position just after the node, where the payload is usually stored.
+     */
+    abstract public int payloadPosition(ByteBuffer src, int position);
+
+    /**
+     * Returns search index for the given byte in the node. If exact match is present, this is &gt;= 0, otherwise as in
+     * binary search.
+     */
+    abstract public int search(ByteBuffer src, int position, int transitionByte);       // returns as binarySearch
+
+    /**
+     * Returns the upper childIndex limit. Calling transition with values 0...transitionRange - 1 is valid.
+     */
+    abstract public int transitionRange(ByteBuffer src, int position);
+
+    /**
+     * Returns the byte value for this child index, or Integer.MAX_VALUE if there are no transitions with this index or
+     * higher to permit listing the children without needing to call transitionRange.
+     *
+     * @param childIndex must be &gt;= 0, though it is allowed to pass a value greater than {@code transitionRange - 1}
+     */
+    abstract public int transitionByte(ByteBuffer src, int position, int childIndex);
+
+    /**
+     * Returns the delta between the position of this node and the position of the target of the specified transition.
+     * This is always a negative number. Dense nodes use 0 to specify &quot;no transition&quot;.
+     *
+     * @param childIndex must be &gt;= 0 and &lt; {@link #transitionRange(ByteBuffer, int)} - note that this is not validated
+     *                   and behaviour of this method is undefined for values outside of that range
+     */
+    abstract long transitionDelta(ByteBuffer src, int position, int childIndex);
+
+    /**
+     * Returns position of node to transition to for the given search index. Argument must be positive. May return NONE
+     * if a transition with that index does not exist (DENSE nodes).
+     * Position is the offset of the node within the ByteBuffer. positionLong is its global placement, which is the
+     * base for any offset calculations.
+     *
+     * @param positionLong although it seems to be obvious, this argument must be &quot;real&quot;, that is, each child must have
+     *                     the calculated absolute position &gt;= 0, otherwise the behaviour of this method is undefined
+     * @param childIndex   must be &gt;= 0 and &lt; {@link #transitionRange(ByteBuffer, int)} - note that this is not validated
+     *                     and behaviour of this method is undefined for values outside of that range
+     */
+    public long transition(ByteBuffer src, int position, long positionLong, int childIndex)
+    {
+        // note: this is not valid for dense nodes
+<span class="nc" id="L129">        return positionLong + transitionDelta(src, position, childIndex);</span>
+    }
+
+    /**
+     * Returns the highest transition for this node, or NONE if none exist (PAYLOAD_ONLY nodes).
+     */
+    public long lastTransition(ByteBuffer src, int position, long positionLong)
+    {
+<span class="nc" id="L137">        return transition(src, position, positionLong, transitionRange(src, position) - 1);</span>
+    }
+
+    /**
+     * Returns a transition that is higher than the index returned by {@code search}. This may not exist (if the
+     * argument was higher than the last transition byte), in which case this returns the given {@code defaultValue}.
+     */
+    abstract public long greaterTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue);
+
+    /**
+     * Returns a transition that is lower than the index returned by {@code search}. Returns {@code defaultValue} for
+     * {@code searchIndex} equals 0 or -1 as lesser transition for those indexes does not exist.
+     */
+    abstract public long lesserTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue);
+
+    // Construction (serialization) methods
+
+    /**
+     * Returns a node type that is suitable to store the node.
+     */
+    public static TrieNode typeFor(SerializationNode&lt;?&gt; node, long nodePosition)
+    {
+<span class="nc" id="L159">        int c = node.childCount();</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (c == 0)</span>
+<span class="nc" id="L161">            return Types.PAYLOAD_ONLY;</span>
+
+<span class="nc" id="L163">        int bitsPerPointerIndex = 0;</span>
+<span class="nc" id="L164">        long delta = node.maxPositionDelta(nodePosition);</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        assert delta &lt; 0;</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        while (!Types.singles[bitsPerPointerIndex].fits(-delta))</span>
+<span class="nc" id="L167">            ++bitsPerPointerIndex;</span>
+
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if (c == 1)</span>
+        {
+<span class="nc bnc" id="L171" title="All 4 branches missed.">            if (node.payload() != null &amp;&amp; Types.singles[bitsPerPointerIndex].bytesPerPointer == FRACTIONAL_BYTES)</span>
+<span class="nc" id="L172">                ++bitsPerPointerIndex; // next index will permit payload</span>
+
+<span class="nc" id="L174">            return Types.singles[bitsPerPointerIndex];</span>
+        }
+
+<span class="nc" id="L177">        TrieNode sparse = Types.sparses[bitsPerPointerIndex];</span>
+<span class="nc" id="L178">        TrieNode dense = Types.denses[bitsPerPointerIndex];</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        return (sparse.sizeofNode(node) &lt; dense.sizeofNode(node)) ? sparse : dense;</span>
+    }
+
+    /**
+     * Returns the size needed to serialize this node.
+     */
+    abstract public int sizeofNode(SerializationNode&lt;?&gt; node);
+
+    /**
+     * Serializes the node. All transition target positions must already have been defined. {@code payloadBits} must
+     * be four bits.
+     */
+    abstract public void serialize(DataOutputPlus out, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException;
+
+    // Implementations
+
+    final int bytesPerPointer;
+    static final int FRACTIONAL_BYTES = 0;
+
+    TrieNode(int ordinal, int bytesPerPointer)
+<span class="nc" id="L199">    {</span>
+<span class="nc" id="L200">        this.ordinal = ordinal;</span>
+<span class="nc" id="L201">        this.bytesPerPointer = bytesPerPointer;</span>
+<span class="nc" id="L202">    }</span>
+
+    final int ordinal;
+
+    static private class PayloadOnly extends TrieNode
+    {
+        // byte flags
+        // var payload
+        PayloadOnly(int ordinal)
+        {
+<span class="nc" id="L212">            super(ordinal, FRACTIONAL_BYTES);</span>
+<span class="nc" id="L213">        }</span>
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L218">            return position + 1;</span>
+        }
+
+        @Override
+        public int search(ByteBuffer src, int position, int transitionByte)
+        {
+<span class="nc" id="L224">            return -1;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L230">            return 0;</span>
+        }
+
+        @Override
+        public long transition(ByteBuffer src, int position, long positionLong, int childIndex)
+        {
+<span class="nc" id="L236">            return NONE;</span>
+        }
+
+        @Override
+        public long lastTransition(ByteBuffer src, int position, long positionLong)
+        {
+<span class="nc" id="L242">            return NONE;</span>
+        }
+
+        @Override
+        public long greaterTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc" id="L248">            return defaultValue;</span>
+        }
+
+        @Override
+        public long lesserTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc" id="L254">            return defaultValue;</span>
+        }
+
+        @Override
+        public int transitionByte(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L260">            return Integer.MAX_VALUE;</span>
+        }
+
+        @Override
+        public int transitionRange(ByteBuffer src, int position)
+        {
+<span class="nc" id="L266">            return 0;</span>
+        }
+
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L271">            return 1;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L277">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+<span class="nc" id="L278">        }</span>
+    }
+
+<span class="nc" id="L281">    static private class Single extends TrieNode</span>
+    {
+        // byte flags
+        // byte transition
+        // bytesPerPointer bytes transition target
+        // var payload
+
+        Single(int ordinal, int bytesPerPointer)
+        {
+<span class="nc" id="L290">            super(ordinal, bytesPerPointer);</span>
+<span class="nc" id="L291">        }</span>
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L296">            return position + 2 + bytesPerPointer;</span>
+        }
+
+        @Override
+        public int search(ByteBuffer src, int position, int transitionByte)
+        {
+<span class="nc" id="L302">            int c = src.get(position + 1) &amp; 0xFF;</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">            if (transitionByte == c)</span>
+<span class="nc" id="L304">                return 0;</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">            return transitionByte &lt; c ? -1 : -2;</span>
+        }
+
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L310">            return -readBytes(src, position + 2);</span>
+        }
+
+        @Override
+        public long lastTransition(ByteBuffer src, int position, long positionLong)
+        {
+<span class="nc" id="L316">            return transition(src, position, positionLong, 0);</span>
+        }
+
+        @Override
+        public long greaterTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">            return (searchIndex == -1) ? transition(src, position, positionLong, 0) : defaultValue;</span>
+        }
+
+        @Override
+        public long lesserTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L328" title="All 4 branches missed.">            return searchIndex == 0 || searchIndex == -1 ? defaultValue : transition(src, position, positionLong, 0);</span>
+        }
+
+        @Override
+        public int transitionByte(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc bnc" id="L334" title="All 2 branches missed.">            return childIndex == 0 ? src.get(position + 1) &amp; 0xFF : Integer.MAX_VALUE;</span>
+        }
+
+        @Override
+        public int transitionRange(ByteBuffer src, int position)
+        {
+<span class="nc" id="L340">            return 1;</span>
+        }
+
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L345">            return 2 + bytesPerPointer;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L351">            int childCount = node.childCount();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            assert childCount == 1;</span>
+<span class="nc" id="L353">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+
+<span class="nc" id="L355">            dest.writeByte(node.transition(0));</span>
+<span class="nc" id="L356">            writeBytes(dest, -node.serializedPositionDelta(0, nodePosition));</span>
+<span class="nc" id="L357">        }</span>
+    }
+
+<span class="nc" id="L360">    static private class SingleNoPayload4 extends Single</span>
+    {
+        // 4-bit type ordinal
+        // 4-bit target delta
+        // byte transition
+        // no payload!
+        SingleNoPayload4(int ordinal)
+        {
+<span class="nc" id="L368">            super(ordinal, FRACTIONAL_BYTES);</span>
+<span class="nc" id="L369">        }</span>
+
+        @Override
+        public int payloadFlags(ByteBuffer src, int position)
+        {
+<span class="nc" id="L374">            return 0;</span>
+        }
+
+        // Although we don't have a payload position, provide one for calculating the size of the node.
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L381">            return position + 2;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L387">            return -(src.get(position) &amp; 0xF);</span>
+        }
+
+        @Override
+        boolean fits(long delta)
+        {
+<span class="nc bnc" id="L393" title="All 4 branches missed.">            return 0 &lt;= delta &amp;&amp; delta &lt;= 0xF;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            assert payloadBits == 0;</span>
+<span class="nc" id="L400">            int childCount = node.childCount();</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            assert childCount == 1;</span>
+<span class="nc" id="L402">            long pd = -node.serializedPositionDelta(0, nodePosition);</span>
+<span class="nc bnc" id="L403" title="All 4 branches missed.">            assert pd &gt; 0 &amp;&amp; pd &lt; 0x10;</span>
+<span class="nc" id="L404">            dest.writeByte((ordinal &lt;&lt; 4) + (int) (pd &amp; 0x0F));</span>
+<span class="nc" id="L405">            dest.writeByte(node.transition(0));</span>
+<span class="nc" id="L406">        }</span>
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L411">            return 2;</span>
+        }
+    }
+
+<span class="nc" id="L415">    static private class SingleNoPayload12 extends Single</span>
+    {
+        // 4-bit type ordinal
+        // 12-bit target delta
+        // byte transition
+        // no payload!
+        SingleNoPayload12(int ordinal)
+        {
+<span class="nc" id="L423">            super(ordinal, FRACTIONAL_BYTES);</span>
+<span class="nc" id="L424">        }</span>
+
+        @Override
+        public int payloadFlags(ByteBuffer src, int position)
+        {
+<span class="nc" id="L429">            return 0;</span>
+        }
+
+        // Although we don't have a payload position, provide one for calculating the size of the node.
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L436">            return position + 3;</span>
+        }
+
+        @Override
+        public int search(ByteBuffer src, int position, int transitionByte)
+        {
+<span class="nc" id="L442">            int c = src.get(position + 2) &amp; 0xFF;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">            if (transitionByte == c)</span>
+<span class="nc" id="L444">                return 0;</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">            return transitionByte &lt; c ? -1 : -2;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L451">            return -(src.getShort(position) &amp; 0xFFF);</span>
+        }
+
+        @Override
+        public int transitionByte(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc bnc" id="L457" title="All 2 branches missed.">            return childIndex == 0 ? src.get(position + 2) &amp; 0xFF : Integer.MAX_VALUE;</span>
+        }
+
+        @Override
+        boolean fits(long delta)
+        {
+<span class="nc bnc" id="L463" title="All 4 branches missed.">            return 0 &lt;= delta &amp;&amp; delta &lt;= 0xFFF;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            assert payloadBits == 0;</span>
+<span class="nc" id="L470">            int childCount = node.childCount();</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            assert childCount == 1;</span>
+<span class="nc" id="L472">            long pd = -node.serializedPositionDelta(0, nodePosition);</span>
+<span class="nc bnc" id="L473" title="All 4 branches missed.">            assert pd &gt; 0 &amp;&amp; pd &lt; 0x1000;</span>
+<span class="nc" id="L474">            dest.writeByte((ordinal &lt;&lt; 4) + (int) ((pd &gt;&gt; 8) &amp; 0x0F));</span>
+<span class="nc" id="L475">            dest.writeByte((byte) pd);</span>
+<span class="nc" id="L476">            dest.writeByte(node.transition(0));</span>
+<span class="nc" id="L477">        }</span>
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L482">            return 3;</span>
+        }
+    }
+
+<span class="nc" id="L486">    static private class Sparse extends TrieNode</span>
+    {
+        // byte flags
+        // byte count (&lt;= 255)
+        // count bytes transitions
+        // count ints transition targets
+        // var payload
+
+        Sparse(int ordinal, int bytesPerPointer)
+        {
+<span class="nc" id="L496">            super(ordinal, bytesPerPointer);</span>
+<span class="nc" id="L497">        }</span>
+
+        @Override
+        public int transitionRange(ByteBuffer src, int position)
+        {
+<span class="nc" id="L502">            return src.get(position + 1) &amp; 0xFF;</span>
+        }
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L508">            int count = transitionRange(src, position);</span>
+<span class="nc" id="L509">            return position + 2 + (bytesPerPointer + 1) * count;</span>
+        }
+
+        @Override
+        public int search(ByteBuffer src, int position, int key)
+        {
+<span class="nc" id="L515">            int l = -1; // known &lt; key</span>
+<span class="nc" id="L516">            int r = transitionRange(src, position);   // known &gt; key</span>
+<span class="nc" id="L517">            position += 2;</span>
+
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            while (l + 1 &lt; r)</span>
+            {
+<span class="nc" id="L521">                int m = (l + r + 1) / 2;</span>
+<span class="nc" id="L522">                int childTransition = src.get(position + m) &amp; 0xFF;</span>
+<span class="nc" id="L523">                int cmp = Integer.compare(key, childTransition);</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">                if (cmp &lt; 0)</span>
+<span class="nc" id="L525">                    r = m;</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                else if (cmp &gt; 0)</span>
+<span class="nc" id="L527">                    l = m;</span>
+                else
+<span class="nc" id="L529">                    return m;</span>
+<span class="nc" id="L530">            }</span>
+
+<span class="nc" id="L532">            return -r - 1;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">            assert childIndex &gt;= 0;</span>
+<span class="nc" id="L539">            int range = transitionRange(src, position);</span>
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            assert childIndex &lt; range;</span>
+<span class="nc" id="L541">            return -readBytes(src, position + 2 + range + bytesPerPointer * childIndex);</span>
+        }
+
+        @Override
+        public long greaterTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if (searchIndex &lt; 0)</span>
+<span class="nc" id="L548">                searchIndex = -1 - searchIndex;</span>
+            else
+<span class="nc" id="L550">                ++searchIndex;</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">            if (searchIndex &gt;= transitionRange(src, position))</span>
+<span class="nc" id="L552">                return defaultValue;</span>
+<span class="nc" id="L553">            return transition(src, position, positionLong, searchIndex);</span>
+        }
+
+        public long lesserTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L558" title="All 4 branches missed.">            if (searchIndex == 0 || searchIndex == -1)</span>
+<span class="nc" id="L559">                return defaultValue;</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (searchIndex &lt; 0)</span>
+<span class="nc" id="L561">                searchIndex = -2 - searchIndex;</span>
+            else
+<span class="nc" id="L563">                --searchIndex;</span>
+<span class="nc" id="L564">            return transition(src, position, positionLong, searchIndex);</span>
+        }
+
+        @Override
+        public int transitionByte(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            return childIndex &lt; transitionRange(src, position) ? src.get(position + 2 + childIndex) &amp; 0xFF : Integer.MAX_VALUE;</span>
+        }
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L576">            return 2 + node.childCount() * (1 + bytesPerPointer);</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L582">            int childCount = node.childCount();</span>
+<span class="nc bnc" id="L583" title="All 2 branches missed.">            assert childCount &gt; 0;</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">            assert childCount &lt; 256;</span>
+<span class="nc" id="L585">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+<span class="nc" id="L586">            dest.writeByte(childCount);</span>
+
+<span class="nc bnc" id="L588" title="All 2 branches missed.">            for (int i = 0; i &lt; childCount; ++i)</span>
+<span class="nc" id="L589">                dest.writeByte(node.transition(i));</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            for (int i = 0; i &lt; childCount; ++i)</span>
+<span class="nc" id="L591">                writeBytes(dest, -node.serializedPositionDelta(i, nodePosition));</span>
+<span class="nc" id="L592">        }</span>
+    }
+
+<span class="nc" id="L595">    static private class Sparse12 extends Sparse</span>
+    {
+        // byte flags
+        // byte count (&lt;= 255)
+        // count bytes transitions
+        // count 12-bits transition targets
+        // var payload
+        Sparse12(int ordinal)
+        {
+<span class="nc" id="L604">            super(ordinal, FRACTIONAL_BYTES);</span>
+<span class="nc" id="L605">        }</span>
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L610">            int count = transitionRange(src, position);</span>
+<span class="nc" id="L611">            return position + 2 + (5 * count + 1) / 2;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L617">            return -read12Bits(src, position + 2 + transitionRange(src, position), childIndex);</span>
+        }
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L623">            return 2 + (node.childCount() * 5 + 1) / 2;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L629">            int childCount = node.childCount();</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            assert childCount &lt; 256;</span>
+<span class="nc" id="L631">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+<span class="nc" id="L632">            dest.writeByte(childCount);</span>
+
+<span class="nc bnc" id="L634" title="All 2 branches missed.">            for (int i = 0; i &lt; childCount; ++i)</span>
+<span class="nc" id="L635">                dest.writeByte(node.transition(i));</span>
+            int i;
+<span class="nc bnc" id="L637" title="All 2 branches missed.">            for (i = 0; i + 2 &lt;= childCount; i += 2)</span>
+            {
+<span class="nc" id="L639">                int p0 = (int) -node.serializedPositionDelta(i, nodePosition);</span>
+<span class="nc" id="L640">                int p1 = (int) -node.serializedPositionDelta(i + 1, nodePosition);</span>
+<span class="nc bnc" id="L641" title="All 4 branches missed.">                assert p0 &gt; 0 &amp;&amp; p0 &lt; (1 &lt;&lt; 12);</span>
+<span class="nc bnc" id="L642" title="All 4 branches missed.">                assert p1 &gt; 0 &amp;&amp; p1 &lt; (1 &lt;&lt; 12);</span>
+<span class="nc" id="L643">                dest.writeByte(p0 &gt;&gt; 4);</span>
+<span class="nc" id="L644">                dest.writeByte((p0 &lt;&lt; 4) | (p1 &gt;&gt; 8));</span>
+<span class="nc" id="L645">                dest.writeByte(p1);</span>
+            }
+<span class="nc bnc" id="L647" title="All 2 branches missed.">            if (i &lt; childCount)</span>
+            {
+<span class="nc" id="L649">                long pd = -node.serializedPositionDelta(i, nodePosition);</span>
+<span class="nc bnc" id="L650" title="All 4 branches missed.">                assert pd &gt; 0 &amp;&amp; pd &lt; (1 &lt;&lt; 12);</span>
+<span class="nc" id="L651">                dest.writeShort((short) (pd &lt;&lt; 4));</span>
+            }
+<span class="nc" id="L653">        }</span>
+
+        @Override
+        boolean fits(long delta)
+        {
+<span class="nc bnc" id="L658" title="All 4 branches missed.">            return 0 &lt;= delta &amp;&amp; delta &lt;= 0xFFF;</span>
+        }
+    }
+
+<span class="nc" id="L662">    static private class Dense extends TrieNode</span>
+    {
+        // byte flags
+        // byte start
+        // byte length-1
+        // length ints transition targets (-1 for not present)
+        // var payload
+
+        static final int NULL_VALUE = 0;
+
+        Dense(int ordinal, int bytesPerPointer)
+        {
+<span class="nc" id="L674">            super(ordinal, bytesPerPointer);</span>
+<span class="nc" id="L675">        }</span>
+
+        @Override
+        public int transitionRange(ByteBuffer src, int position)
+        {
+<span class="nc" id="L680">            return 1 + (src.get(position + 2) &amp; 0xFF);</span>
+        }
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L686">            return position + 3 + transitionRange(src, position) * bytesPerPointer;</span>
+        }
+
+        @Override
+        public int search(ByteBuffer src, int position, int transitionByte)
+        {
+<span class="nc" id="L692">            int l = src.get(position + 1) &amp; 0xFF;</span>
+<span class="nc" id="L693">            int i = transitionByte - l;</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">            if (i &lt; 0)</span>
+<span class="nc" id="L695">                return -1;</span>
+<span class="nc" id="L696">            int len = transitionRange(src, position);</span>
+<span class="nc bnc" id="L697" title="All 2 branches missed.">            if (i &gt;= len)</span>
+<span class="nc" id="L698">                return -len - 1;</span>
+<span class="nc" id="L699">            long t = transition(src, position, 0L, i);</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">            return t != -1 ? i : -i - 1;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L706">            return -readBytes(src, position + 3 + childIndex * bytesPerPointer);</span>
+        }
+
+        @Override
+        public long transition(ByteBuffer src, int position, long positionLong, int childIndex)
+        {
+<span class="nc" id="L712">            long v = transitionDelta(src, position, childIndex);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            return v != NULL_VALUE ? v + positionLong : NONE;</span>
+        }
+
+        @Override
+        public long greaterTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L719" title="All 2 branches missed.">            if (searchIndex &lt; 0)</span>
+<span class="nc" id="L720">                searchIndex = -1 - searchIndex;</span>
+            else
+<span class="nc" id="L722">                ++searchIndex;</span>
+<span class="nc" id="L723">            int len = transitionRange(src, position);</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            for (; searchIndex &lt; len; ++searchIndex)</span>
+            {
+<span class="nc" id="L726">                long t = transition(src, position, positionLong, searchIndex);</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">                if (t != NONE)</span>
+<span class="nc" id="L728">                    return t;</span>
+            }
+<span class="nc" id="L730">            return defaultValue;</span>
+        }
+
+        @Override
+        public long lesserTransition(ByteBuffer src, int position, long positionLong, int searchIndex, long defaultValue)
+        {
+<span class="nc bnc" id="L736" title="All 4 branches missed.">            if (searchIndex == 0 || searchIndex == -1)</span>
+<span class="nc" id="L737">                return defaultValue;</span>
+
+<span class="nc bnc" id="L739" title="All 2 branches missed.">            if (searchIndex &lt; 0)</span>
+<span class="nc" id="L740">                searchIndex = -2 - searchIndex;</span>
+            else
+<span class="nc" id="L742">                --searchIndex;</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">            for (; searchIndex &gt;= 0; --searchIndex)</span>
+            {
+<span class="nc" id="L745">                long t = transition(src, position, positionLong, searchIndex);</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">                if (t != -1)</span>
+<span class="nc" id="L747">                    return t;</span>
+            }
+<span class="nc" id="L749">            assert false : &quot;transition must always exist at 0, and we should not be called for less of that&quot;;</span>
+<span class="nc" id="L750">            return defaultValue;</span>
+        }
+
+        @Override
+        public int transitionByte(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc bnc" id="L756" title="All 2 branches missed.">            if (childIndex &gt;= transitionRange(src, position))</span>
+<span class="nc" id="L757">                return Integer.MAX_VALUE;</span>
+<span class="nc" id="L758">            int l = src.get(position + 1) &amp; 0xFF;</span>
+<span class="nc" id="L759">            return l + childIndex;</span>
+        }
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L765">            int l = node.transition(0);</span>
+<span class="nc" id="L766">            int r = node.transition(node.childCount() - 1);</span>
+<span class="nc" id="L767">            return 3 + (r - l + 1) * bytesPerPointer;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L773">            int childCount = node.childCount();</span>
+<span class="nc" id="L774">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+<span class="nc" id="L775">            int l = node.transition(0);</span>
+<span class="nc" id="L776">            int r = node.transition(childCount - 1);</span>
+<span class="nc bnc" id="L777" title="All 6 branches missed.">            assert 0 &lt;= l &amp;&amp; l &lt;= r &amp;&amp; r &lt;= 255;</span>
+<span class="nc" id="L778">            dest.writeByte(l);</span>
+<span class="nc" id="L779">            dest.writeByte(r - l);      // r is included, i.e. this is len - 1</span>
+
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            for (int i = 0; i &lt; childCount; ++i)</span>
+            {
+<span class="nc" id="L783">                int next = node.transition(i);</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">                while (l &lt; next)</span>
+                {
+<span class="nc" id="L786">                    writeBytes(dest, NULL_VALUE);</span>
+<span class="nc" id="L787">                    ++l;</span>
+                }
+<span class="nc" id="L789">                writeBytes(dest, -node.serializedPositionDelta(i, nodePosition));</span>
+<span class="nc" id="L790">                ++l;</span>
+            }
+<span class="nc" id="L792">        }</span>
+    }
+
+<span class="nc" id="L795">    static private class Dense12 extends Dense</span>
+    {
+        // byte flags
+        // byte start
+        // byte length-1
+        // length 12-bits transition targets (-1 for not present)
+        // var payload
+
+        Dense12(int ordinal)
+        {
+<span class="nc" id="L805">            super(ordinal, FRACTIONAL_BYTES);</span>
+<span class="nc" id="L806">        }</span>
+
+        @Override
+        public int payloadPosition(ByteBuffer src, int position)
+        {
+<span class="nc" id="L811">            return position + 3 + (transitionRange(src, position) * 3 + 1) / 2;</span>
+        }
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L817">            return -read12Bits(src, position + 3, childIndex);</span>
+        }
+
+        @Override
+        public int sizeofNode(SerializationNode&lt;?&gt; node)
+        {
+<span class="nc" id="L823">            int l = node.transition(0);</span>
+<span class="nc" id="L824">            int r = node.transition(node.childCount() - 1);</span>
+<span class="nc" id="L825">            return 3 + ((r - l + 1) * 3 + 1) / 2;</span>
+        }
+
+        @Override
+        public void serialize(DataOutputPlus dest, SerializationNode&lt;?&gt; node, int payloadBits, long nodePosition) throws IOException
+        {
+<span class="nc" id="L831">            int childCount = node.childCount();</span>
+<span class="nc" id="L832">            dest.writeByte((ordinal &lt;&lt; 4) + (payloadBits &amp; 0x0F));</span>
+<span class="nc" id="L833">            int l = node.transition(0);</span>
+<span class="nc" id="L834">            int r = node.transition(childCount - 1);</span>
+<span class="nc bnc" id="L835" title="All 6 branches missed.">            assert 0 &lt;= l &amp;&amp; l &lt;= r &amp;&amp; r &lt;= 255;</span>
+<span class="nc" id="L836">            dest.writeByte(l);</span>
+<span class="nc" id="L837">            dest.writeByte(r - l);      // r is included, i.e. this is len - 1</span>
+
+<span class="nc" id="L839">            int carry = 0;</span>
+<span class="nc" id="L840">            int start = l;</span>
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            for (int i = 0; i &lt; childCount; ++i)</span>
+            {
+<span class="nc" id="L843">                int next = node.transition(i);</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">                while (l &lt; next)</span>
+                {
+<span class="nc" id="L846">                    carry = write12Bits(dest, NULL_VALUE, l - start, carry);</span>
+<span class="nc" id="L847">                    ++l;</span>
+                }
+<span class="nc" id="L849">                long pd = node.serializedPositionDelta(i, nodePosition);</span>
+<span class="nc" id="L850">                carry = write12Bits(dest, (int) -pd, l - start, carry);</span>
+<span class="nc" id="L851">                ++l;</span>
+            }
+<span class="nc bnc" id="L853" title="All 2 branches missed.">            if (((l - start) &amp; 1) == 1)</span>
+<span class="nc" id="L854">                dest.writeByte(carry);</span>
+<span class="nc" id="L855">        }</span>
+
+        @Override
+        boolean fits(long delta)
+        {
+<span class="nc bnc" id="L860" title="All 4 branches missed.">            return 0 &lt;= delta &amp;&amp; delta &lt;= 0xFFF;</span>
+        }
+    }
+
+    static private class LongDense extends Dense
+    {
+        // byte flags
+        // byte start
+        // byte length-1
+        // length long transition targets (-1 for not present)
+        // var payload
+        LongDense(int ordinal)
+        {
+<span class="nc" id="L873">            super(ordinal, 8);</span>
+<span class="nc" id="L874">        }</span>
+
+        @Override
+        public long transitionDelta(ByteBuffer src, int position, int childIndex)
+        {
+<span class="nc" id="L879">            return -src.getLong(position + 3 + childIndex * 8);</span>
+        }
+
+        @Override
+        public void writeBytes(DataOutputPlus dest, long ofs) throws IOException
+        {
+<span class="nc" id="L885">            dest.writeLong(ofs);</span>
+<span class="nc" id="L886">        }</span>
+
+        @Override
+        boolean fits(long delta)
+        {
+<span class="nc" id="L891">            return true;</span>
+        }
+    }
+
+
+    static int read12Bits(ByteBuffer src, int base, int searchIndex)
+    {
+<span class="nc" id="L898">        int word = src.getShort(base + (3 * searchIndex) / 2);</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        if ((searchIndex &amp; 1) == 0)</span>
+<span class="nc" id="L900">            word = (word &gt;&gt; 4);</span>
+<span class="nc" id="L901">        return word &amp; 0xFFF;</span>
+    }
+
+    static int write12Bits(DataOutput dest, int value, int index, int carry) throws IOException
+    {
+<span class="nc bnc" id="L906" title="All 4 branches missed.">        assert 0 &lt;= value &amp;&amp; value &lt;= 0xFFF;</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">        if ((index &amp; 1) == 0)</span>
+        {
+<span class="nc" id="L909">            dest.writeByte(value &gt;&gt; 4);</span>
+<span class="nc" id="L910">            return value &lt;&lt; 4;</span>
+        }
+        else
+        {
+<span class="nc" id="L914">            dest.writeByte(carry | (value &gt;&gt; 8));</span>
+<span class="nc" id="L915">            dest.writeByte(value);</span>
+<span class="nc" id="L916">            return 0;</span>
+        }
+    }
+
+    long readBytes(ByteBuffer src, int position)
+    {
+<span class="nc" id="L922">        return SizedInts.readUnsigned(src, position, bytesPerPointer);</span>
+    }
+
+    void writeBytes(DataOutputPlus dest, long ofs) throws IOException
+    {
+<span class="nc bnc" id="L927" title="All 2 branches missed.">        assert fits(ofs);</span>
+<span class="nc" id="L928">        SizedInts.write(dest, ofs, bytesPerPointer);</span>
+<span class="nc" id="L929">    }</span>
+
+    boolean fits(long delta)
+    {
+<span class="nc bnc" id="L933" title="All 4 branches missed.">        return 0 &lt;= delta &amp;&amp; delta &lt; (1L &lt;&lt; (bytesPerPointer * 8));</span>
+    }
+
+    @Override
+    public String toString()
+    {
+<span class="nc" id="L939">        String res = getClass().getSimpleName();</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">        if (bytesPerPointer &gt;= 1)</span>
+<span class="nc" id="L941">            res += (bytesPerPointer * 8);</span>
+<span class="nc" id="L942">        return res;</span>
+    }
+
+<span class="nc" id="L945">    static class Types</span>
+    {
+<span class="nc" id="L947">        static final TrieNode PAYLOAD_ONLY = new PayloadOnly(0);</span>
+<span class="nc" id="L948">        static final TrieNode SINGLE_NOPAYLOAD_4 = new SingleNoPayload4(1);</span>
+<span class="nc" id="L949">        static final TrieNode SINGLE_8 = new Single(2, 1);</span>
+<span class="nc" id="L950">        static final TrieNode SINGLE_NOPAYLOAD_12 = new SingleNoPayload12(3);</span>
+<span class="nc" id="L951">        static final TrieNode SINGLE_16 = new Single(4, 2);</span>
+<span class="nc" id="L952">        static final TrieNode SPARSE_8 = new Sparse(5, 1);</span>
+<span class="nc" id="L953">        static final TrieNode SPARSE_12 = new Sparse12(6);</span>
+<span class="nc" id="L954">        static final TrieNode SPARSE_16 = new Sparse(7, 2);</span>
+<span class="nc" id="L955">        static final TrieNode SPARSE_24 = new Sparse(8, 3);</span>
+<span class="nc" id="L956">        static final TrieNode SPARSE_40 = new Sparse(9, 5);</span>
+<span class="nc" id="L957">        static final TrieNode DENSE_12 = new Dense12(10);</span>
+<span class="nc" id="L958">        static final TrieNode DENSE_16 = new Dense(11, 2);</span>
+<span class="nc" id="L959">        static final TrieNode DENSE_24 = new Dense(12, 3);</span>
+<span class="nc" id="L960">        static final TrieNode DENSE_32 = new Dense(13, 4);</span>
+<span class="nc" id="L961">        static final TrieNode DENSE_40 = new Dense(14, 5);</span>
+<span class="nc" id="L962">        static final TrieNode LONG_DENSE = new LongDense(15);</span>
+
+        // The position of each type in this list must match its ordinal value. Checked by the static block below.
+<span class="nc" id="L965">        static final TrieNode[] values = new TrieNode[]{ PAYLOAD_ONLY,</span>
+                                                         SINGLE_NOPAYLOAD_4, SINGLE_8, SINGLE_NOPAYLOAD_12, SINGLE_16,
+                                                         SPARSE_8, SPARSE_12, SPARSE_16, SPARSE_24, SPARSE_40,
+                                                         DENSE_12, DENSE_16, DENSE_24, DENSE_32, DENSE_40,
+                                                         LONG_DENSE }; // Catch-all
+
+        // We can't fit all types * all sizes in 4 bits, so we use a selection. When we don't have a matching instance
+        // we just use something more general that can do its job.
+        // The arrays below must have corresponding types for all sizes specified by the singles row.
+        // Note: 12 bit sizes are important, because that size will fit any pointer within a page-packed branch.
+<span class="nc" id="L975">        static final TrieNode[] singles = new TrieNode[]{ SINGLE_NOPAYLOAD_4, SINGLE_8, SINGLE_NOPAYLOAD_12, SINGLE_16, DENSE_24, DENSE_32, DENSE_40, LONG_DENSE };</span>
+<span class="nc" id="L976">        static final TrieNode[] sparses = new TrieNode[]{ SPARSE_8, SPARSE_8, SPARSE_12, SPARSE_16, SPARSE_24, SPARSE_40, SPARSE_40, LONG_DENSE };</span>
+<span class="nc" id="L977">        static final TrieNode[] denses = new TrieNode[]{ DENSE_12, DENSE_12, DENSE_12, DENSE_16, DENSE_24, DENSE_32, DENSE_40, LONG_DENSE };</span>
+
+        static
+        {
+            //noinspection ConstantConditions
+<span class="nc bnc" id="L982" title="All 6 branches missed.">            assert sparses.length == singles.length &amp;&amp; denses.length == singles.length &amp;&amp; values.length &lt;= 16;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">            for (int i = 0; i &lt; values.length; ++i)</span>
+<span class="nc bnc" id="L984" title="All 2 branches missed.">                assert values[i].ordinal == i;</span>
+<span class="nc" id="L985">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

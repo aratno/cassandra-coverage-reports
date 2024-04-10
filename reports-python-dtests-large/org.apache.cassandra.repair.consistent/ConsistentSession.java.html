@@ -1,0 +1,343 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ConsistentSession.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.repair.consistent</a> &gt; <span class="el_source">ConsistentSession.java</span></div><h1>ConsistentSession.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.repair.consistent;
+
+import java.util.Collection;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.repair.messages.FailSession;
+import org.apache.cassandra.repair.messages.FinalizeCommit;
+import org.apache.cassandra.repair.messages.FinalizePromise;
+import org.apache.cassandra.repair.messages.FinalizePropose;
+import org.apache.cassandra.repair.messages.PrepareConsistentRequest;
+import org.apache.cassandra.repair.messages.PrepareConsistentResponse;
+import org.apache.cassandra.repair.messages.PrepareMessage;
+import org.apache.cassandra.repair.messages.RepairOption;
+import org.apache.cassandra.repair.messages.StatusRequest;
+import org.apache.cassandra.repair.messages.StatusResponse;
+import org.apache.cassandra.repair.messages.ValidationRequest;
+import org.apache.cassandra.repair.SharedContext;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.tools.nodetool.RepairAdmin;
+import org.apache.cassandra.utils.TimeUUID;
+
+/**
+ * Base class for consistent Local and Coordinator sessions
+ *
+ * &lt;p/&gt;
+ * There are 4 stages to a consistent incremental repair.
+ *
+ * &lt;h1&gt;Repair prepare&lt;/h1&gt;
+ *  First, the normal {@link ActiveRepairService#prepareForRepair(TimeUUID, InetAddressAndPort, Set, RepairOption, boolean, List)} stuff
+ *  happens, which sends out {@link PrepareMessage} and creates a {@link ActiveRepairService.ParentRepairSession}
+ *  on the coordinator and each of the neighbors.
+ *
+ * &lt;h1&gt;Consistent prepare&lt;/h1&gt;
+ *  The consistent prepare step promotes the parent repair session to a consistent session, and isolates the sstables
+ *  being repaired from  other sstables. First, the coordinator sends a {@link PrepareConsistentRequest} message to each repair
+ *  participant (including itself). When received, the node creates a {@link LocalSession} instance, sets it's state to
+ *  {@code PREPARING}, persists it, and begins a preparing the tables for incremental repair, which segregates the data
+ *  being repaired from the rest of the table data. When the preparation completes, the session state is set to
+ *  {@code PREPARED}, and a {@link PrepareConsistentResponse} is sent to the coordinator indicating success or failure.
+ *  If the pending anti-compaction fails, the local session state is set to {@code FAILED}.
+ *  &lt;p/&gt;
+ *  (see {@link LocalSessions#handlePrepareMessage(InetAddressAndPort, PrepareConsistentRequest)}
+ *  &lt;p/&gt;
+ *  Once the coordinator recieves positive {@code PrepareConsistentResponse} messages from all the participants, the
+ *  coordinator begins the normal repair process.
+ *  &lt;p/&gt;
+ *  (see {@link CoordinatorSession#handlePrepareResponse(InetAddressAndPort, boolean)}
+ *
+ * &lt;h1&gt;Repair&lt;/h1&gt;
+ *  The coordinator runs the normal data repair process against the sstables segregated in the previous step. When a
+ *  node recieves a {@link ValidationRequest}, it sets it's local session state to {@code REPAIRING}.
+ *  &lt;p/&gt;
+ *
+ *  If all of the RepairSessions complete successfully, the coordinator begins the {@code Finalization} process. Otherwise,
+ *  it begins the {@code Failure} process.
+ *
+ * &lt;h1&gt;Finalization&lt;/h1&gt;
+ *  The finalization step finishes the session and promotes the sstables to repaired. The coordinator begins by sending
+ *  {@link FinalizePropose} messages to each of the participants. Each participant will set it's state to {@code FINALIZE_PROMISED}
+ *  and respond with a {@link FinalizePromise} message. Once the coordinator has received promise messages from all participants,
+ *  it will send a {@link FinalizeCommit} message to all of them, ending the coordinator session. When a node receives the
+ *  {@code FinalizeCommit} message, it will set it's sessions state to {@code FINALIZED}, completing the {@code LocalSession}.
+ *  &lt;p/&gt;
+ *
+ *  For the sake of simplicity, finalization does not immediately mark pending repair sstables repaired because of potential
+ *  conflicts with in progress compactions. The sstables will be marked repaired as part of the normal compaction process.
+ *  &lt;p/&gt;
+ *
+ *  On the coordinator side, see {@link CoordinatorSession#finalizePropose()}, {@link CoordinatorSession#handleFinalizePromise(InetAddressAndPort, boolean)},
+ *  &amp; {@link CoordinatorSession#finalizeCommit()}
+ *  &lt;p/&gt;
+ *
+ *  On the local session side, see {@link LocalSessions#handleFinalizeProposeMessage(InetAddressAndPort, FinalizePropose)}
+ *  &amp; {@link LocalSessions#handleFinalizeCommitMessage(InetAddressAndPort, FinalizeCommit)}
+ *
+ * &lt;h1&gt;Failure&lt;/h1&gt;
+ *  If there are any failures or problems during the process above, the session will be failed. When a session is failed,
+ *  the coordinator will send {@link FailSession} messages to each of the participants. In some cases (basically those not
+ *  including Validation and Sync) errors are reported back to the coordinator by the local session, at which point, it
+ *  will send {@code FailSession} messages out.
+ *  &lt;p/&gt;
+ *  Just as with finalization, sstables aren't immediately moved back to unrepaired, but will be demoted as part of the
+ *  normal compaction process.
+ *
+ *  &lt;p/&gt;
+ *  See {@link LocalSessions#failSession(UUID, boolean)} and {@link CoordinatorSession#fail()}
+ *
+ * &lt;h1&gt;Failure Recovery &amp; Session Cleanup&lt;/h1&gt;
+ *  There are a few scenarios where sessions can get stuck. If a node fails mid session, or it misses a {@code FailSession}
+ *  or {@code FinalizeCommit} message, it will never finish. To address this, there is a cleanup task that runs every
+ *  10 minutes that attempts to complete idle sessions.
+ *
+ *  &lt;p/&gt;
+ *  If a session is not completed (not {@code FINALIZED} or {@code FAILED}) and there's been no activity on the session for
+ *  over an hour, the cleanup task will attempt to finish the session by learning the session state of the other participants.
+ *  To do this, it sends a {@link StatusRequest} message to the other session participants. The participants respond with a
+ *  {@link StatusResponse} message, notifying the sender of their state. If the sender receives a {@code FAILED} response
+ *  from any of the participants, it fails the session locally. If it receives a {@code FINALIZED} response from any of the
+ *  participants, it will set it's state to {@code FINALIZED} as well. Since the coordinator won't finalize sessions until
+ *  it's received {@code FinalizePromise} messages from &lt;i&gt;all&lt;/i&gt; participants, this is safe.
+ *
+ *
+ *  &lt;p/&gt;
+ *  If a session is not completed, and hasn't had any activity for over a day, the session is auto-failed.
+ *
+ *  &lt;p/&gt;
+ *  Once a session has been completed for over 2 days, it's deleted.
+ *
+ *  &lt;p/&gt;
+ *  Operators can also manually fail sessions with {@code nodetool repair_admin --cancel}
+ *
+ *  &lt;p/&gt;
+ *  See {@link LocalSessions#cleanup()} and {@link RepairAdmin}
+ *
+ */
+public abstract class ConsistentSession
+{
+    /**
+     * The possible states of a {@code ConsistentSession}. The typical progression is {@link State#PREPARING}, {@link State#PREPARED},
+     * {@link State#REPAIRING}, {@link State#FINALIZE_PROMISED}, and {@link State#FINALIZED}. With the exception of {@code FINALIZED},
+     * any state can be transitions to {@link State#FAILED}.
+     */
+<span class="fc" id="L154">    public enum State</span>
+    {
+<span class="fc" id="L156">        PREPARING(0),</span>
+<span class="fc" id="L157">        PREPARED(1),</span>
+<span class="fc" id="L158">        REPAIRING(2),</span>
+<span class="fc" id="L159">        FINALIZE_PROMISED(3),</span>
+<span class="fc" id="L160">        FINALIZED(4),</span>
+<span class="fc" id="L161">        FAILED(5);</span>
+
+        State(int expectedOrdinal)
+<span class="fc" id="L164">        {</span>
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">            assert ordinal() == expectedOrdinal;</span>
+<span class="fc" id="L166">        }</span>
+
+<span class="fc" id="L168">        private static final Map&lt;State, Set&lt;State&gt;&gt; transitions = new EnumMap&lt;State, Set&lt;State&gt;&gt;(State.class) {{</span>
+<span class="fc" id="L169">            put(PREPARING, ImmutableSet.of(PREPARED, FAILED));</span>
+<span class="fc" id="L170">            put(PREPARED, ImmutableSet.of(REPAIRING, FAILED));</span>
+<span class="fc" id="L171">            put(REPAIRING, ImmutableSet.of(FINALIZE_PROMISED, FAILED));</span>
+<span class="fc" id="L172">            put(FINALIZE_PROMISED, ImmutableSet.of(FINALIZED, FAILED));</span>
+<span class="fc" id="L173">            put(FINALIZED, ImmutableSet.of());</span>
+<span class="fc" id="L174">            put(FAILED, ImmutableSet.of());</span>
+<span class="fc" id="L175">        }};</span>
+
+        public boolean canTransitionTo(State state)
+        {
+            // redundant transitions are allowed because the failure recovery  mechanism can
+            // send redundant status changes out, and they shouldn't throw exceptions
+<span class="pc bpc" id="L181" title="2 of 4 branches missed.">            return state == this || transitions.get(this).contains(state);</span>
+        }
+
+        public static State valueOf(int ordinal)
+        {
+<span class="nc" id="L186">            return values()[ordinal];</span>
+        }
+    }
+
+    private volatile State state;
+    public final SharedContext ctx;
+    public final TimeUUID sessionID;
+    public final InetAddressAndPort coordinator;
+    public final ImmutableSet&lt;TableId&gt; tableIds;
+    public final long repairedAt;
+    public final ImmutableSet&lt;Range&lt;Token&gt;&gt; ranges;
+    public final ImmutableSet&lt;InetAddressAndPort&gt; participants;
+
+    ConsistentSession(AbstractBuilder builder)
+<span class="fc" id="L200">    {</span>
+<span class="fc" id="L201">        builder.validate();</span>
+<span class="fc" id="L202">        this.ctx = builder.ctx;</span>
+<span class="fc" id="L203">        this.state = builder.state;</span>
+<span class="fc" id="L204">        this.sessionID = builder.sessionID;</span>
+<span class="fc" id="L205">        this.coordinator = builder.coordinator;</span>
+<span class="fc" id="L206">        this.tableIds = ImmutableSet.copyOf(builder.ids);</span>
+<span class="fc" id="L207">        this.repairedAt = builder.repairedAt;</span>
+<span class="fc" id="L208">        this.ranges = ImmutableSet.copyOf(builder.ranges);</span>
+<span class="fc" id="L209">        this.participants = ImmutableSet.copyOf(builder.participants);</span>
+<span class="fc" id="L210">    }</span>
+
+    public State getState()
+    {
+<span class="fc" id="L214">        return state;</span>
+    }
+
+    public void setState(State state)
+    {
+<span class="fc" id="L219">        this.state = state;</span>
+<span class="fc" id="L220">    }</span>
+
+    public boolean intersects(Iterable&lt;Range&lt;Token&gt;&gt; otherRanges)
+    {
+<span class="nc" id="L224">        return Iterables.any(ranges, r -&gt; r.intersects(otherRanges));</span>
+    }
+
+    public boolean equals(Object o)
+    {
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L230" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L232">        ConsistentSession that = (ConsistentSession) o;</span>
+
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (repairedAt != that.repairedAt) return false;</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if (state != that.state) return false;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if (!sessionID.equals(that.sessionID)) return false;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (!coordinator.equals(that.coordinator)) return false;</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if (!tableIds.equals(that.tableIds)) return false;</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (!ranges.equals(that.ranges)) return false;</span>
+<span class="nc" id="L240">        return participants.equals(that.participants);</span>
+    }
+
+    public int hashCode()
+    {
+<span class="nc" id="L245">        int result = state.hashCode();</span>
+<span class="nc" id="L246">        result = 31 * result + sessionID.hashCode();</span>
+<span class="nc" id="L247">        result = 31 * result + coordinator.hashCode();</span>
+<span class="nc" id="L248">        result = 31 * result + tableIds.hashCode();</span>
+<span class="nc" id="L249">        result = 31 * result + (int) (repairedAt ^ (repairedAt &gt;&gt;&gt; 32));</span>
+<span class="nc" id="L250">        result = 31 * result + ranges.hashCode();</span>
+<span class="nc" id="L251">        result = 31 * result + participants.hashCode();</span>
+<span class="nc" id="L252">        return result;</span>
+    }
+
+    public String toString()
+    {
+<span class="nc" id="L257">        return &quot;ConsistentSession{&quot; +</span>
+               &quot;state=&quot; + state +
+               &quot;, sessionID=&quot; + sessionID +
+               &quot;, coordinator=&quot; + coordinator +
+               &quot;, tableIds=&quot; + tableIds +
+               &quot;, repairedAt=&quot; + repairedAt +
+               &quot;, ranges=&quot; + ranges +
+               &quot;, participants=&quot; + participants +
+               '}';
+    }
+
+    abstract static class AbstractBuilder
+    {
+        private final SharedContext ctx;
+        private State state;
+        private TimeUUID sessionID;
+        private InetAddressAndPort coordinator;
+        private Set&lt;TableId&gt; ids;
+        private long repairedAt;
+        private Collection&lt;Range&lt;Token&gt;&gt; ranges;
+        private Set&lt;InetAddressAndPort&gt; participants;
+
+        protected AbstractBuilder(SharedContext ctx)
+<span class="fc" id="L280">        {</span>
+<span class="fc" id="L281">            this.ctx = ctx;</span>
+<span class="fc" id="L282">        }</span>
+
+        void withState(State state)
+        {
+<span class="fc" id="L286">            this.state = state;</span>
+<span class="fc" id="L287">        }</span>
+
+        void withSessionID(TimeUUID sessionID)
+        {
+<span class="fc" id="L291">            this.sessionID = sessionID;</span>
+<span class="fc" id="L292">        }</span>
+
+        void withCoordinator(InetAddressAndPort coordinator)
+        {
+<span class="fc" id="L296">            this.coordinator = coordinator;</span>
+<span class="fc" id="L297">        }</span>
+
+        void withUUIDTableIds(Iterable&lt;UUID&gt; ids)
+        {
+<span class="nc" id="L301">            this.ids = ImmutableSet.copyOf(Iterables.transform(ids, TableId::fromUUID));</span>
+<span class="nc" id="L302">        }</span>
+
+        void withTableIds(Set&lt;TableId&gt; ids)
+        {
+<span class="fc" id="L306">            this.ids = ids;</span>
+<span class="fc" id="L307">        }</span>
+
+        void withRepairedAt(long repairedAt)
+        {
+<span class="fc" id="L311">            this.repairedAt = repairedAt;</span>
+<span class="fc" id="L312">        }</span>
+
+        void withRanges(Collection&lt;Range&lt;Token&gt;&gt; ranges)
+        {
+<span class="fc" id="L316">            this.ranges = ranges;</span>
+<span class="fc" id="L317">        }</span>
+
+        void withParticipants(Set&lt;InetAddressAndPort&gt; peers)
+        {
+<span class="fc" id="L321">            this.participants = peers;</span>
+<span class="fc" id="L322">        }</span>
+
+        void validate()
+        {
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">            Preconditions.checkArgument(state != null);</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">            Preconditions.checkArgument(sessionID != null);</span>
+<span class="pc bpc" id="L328" title="1 of 2 branches missed.">            Preconditions.checkArgument(coordinator != null);</span>
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">            Preconditions.checkArgument(ids != null);</span>
+<span class="pc bpc" id="L330" title="1 of 2 branches missed.">            Preconditions.checkArgument(!ids.isEmpty());</span>
+<span class="pc bpc" id="L331" title="3 of 4 branches missed.">            Preconditions.checkArgument(repairedAt &gt; 0</span>
+                                        || repairedAt == ActiveRepairService.UNREPAIRED_SSTABLE);
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">            Preconditions.checkArgument(ranges != null);</span>
+<span class="pc bpc" id="L334" title="1 of 2 branches missed.">            Preconditions.checkArgument(!ranges.isEmpty());</span>
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">            Preconditions.checkArgument(participants != null);</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">            Preconditions.checkArgument(!participants.isEmpty());</span>
+<span class="fc" id="L337">            Preconditions.checkArgument(participants.contains(coordinator));</span>
+<span class="fc" id="L338">        }</span>
+    }
+
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,824 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SimpleClient.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.transport</a> &gt; <span class="el_source">SimpleClient.java</span></div><h1>SimpleClient.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.transport;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.primitives.Ints;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
+import org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.handler.codec.MessageToMessageDecoder;
+import io.netty.handler.codec.MessageToMessageEncoder;
+import io.netty.handler.ssl.SslContext;
+import io.netty.util.concurrent.Promise; // checkstyle: permit this import
+import io.netty.util.concurrent.PromiseCombiner;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import io.netty.util.internal.logging.Slf4JLoggerFactory;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.net.*;
+import org.apache.cassandra.security.ISslContextFactory;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.transport.messages.*;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.net.SocketFactory.newSslHandler;
+import static org.apache.cassandra.transport.CQLMessageHandler.envelopeSize;
+import static org.apache.cassandra.transport.Flusher.MAX_FRAMED_PAYLOAD_SIZE;
+import static org.apache.cassandra.transport.PipelineConfigurator.SSL_FACTORY_CONTEXT_DESCRIPTION;
+import static org.apache.cassandra.utils.concurrent.NonBlockingRateLimiter.NO_OP_LIMITER;
+
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
+
+public class SimpleClient implements Closeable
+{
+
+    public static final int TIMEOUT_SECONDS = 10;
+
+    static
+    {
+<span class="nc" id="L71">        InternalLoggerFactory.setDefaultFactory(new Slf4JLoggerFactory());</span>
+    }
+
+<span class="nc" id="L74">    private static final Logger logger = LoggerFactory.getLogger(SimpleClient.class);</span>
+
+    public final String host;
+    public final int port;
+    private final EncryptionOptions encryptionOptions;
+    private final int largeMessageThreshold;
+
+<span class="nc" id="L81">    protected final ResponseHandler responseHandler = new ResponseHandler();</span>
+<span class="nc" id="L82">    protected final Connection.Tracker tracker = new ConnectionTracker();</span>
+    protected final ProtocolVersion version;
+    // We don't track connection really, so we don't need one Connection per channel
+    protected Connection connection;
+    protected Bootstrap bootstrap;
+    protected Channel channel;
+    protected ChannelFuture lastWriteFuture;
+
+    protected String compression;
+
+    public static class Builder
+    {
+        private final String host;
+        private final int port;
+        private EncryptionOptions encryptionOptions = new EncryptionOptions();
+        private ProtocolVersion version = ProtocolVersion.CURRENT;
+        private boolean useBeta = false;
+        private int largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE;
+
+        private Builder(String host, int port)
+        {
+            this.host = host;
+            this.port = port;
+        }
+
+        public Builder encryption(EncryptionOptions options)
+        {
+            this.encryptionOptions = options;
+            return this;
+        }
+
+        public Builder useBeta()
+        {
+            this.useBeta = true;
+            return this;
+        }
+
+        public Builder protocolVersion(ProtocolVersion version)
+        {
+            this.version = version;
+            return this;
+        }
+
+        public Builder largeMessageThreshold(int bytes)
+        {
+            largeMessageThreshold = bytes;
+            return this;
+        }
+
+        public SimpleClient build()
+        {
+            if (version.isBeta() &amp;&amp; !useBeta)
+                throw new IllegalArgumentException(String.format(&quot;Beta version of server used (%s), but USE_BETA flag is not set&quot;, version));
+            return new SimpleClient(this);
+        }
+    }
+
+    public static Builder builder(String host, int port)
+    {
+<span class="nc" id="L141">        return new Builder(host, port);</span>
+    }
+
+    private SimpleClient(Builder builder)
+<span class="nc" id="L145">    {</span>
+<span class="nc" id="L146">        this.host = builder.host;</span>
+<span class="nc" id="L147">        this.port = builder.port;</span>
+<span class="nc" id="L148">        this.version = builder.version;</span>
+<span class="nc" id="L149">        this.encryptionOptions = builder.encryptionOptions.applyConfig();</span>
+<span class="nc" id="L150">        this.largeMessageThreshold = builder.largeMessageThreshold;</span>
+<span class="nc" id="L151">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version, EncryptionOptions encryptionOptions)
+    {
+<span class="nc" id="L155">        this(host, port, version, false, encryptionOptions);</span>
+<span class="nc" id="L156">    }</span>
+
+    public SimpleClient(String host, int port, EncryptionOptions encryptionOptions)
+    {
+<span class="nc" id="L160">        this(host, port, ProtocolVersion.CURRENT, encryptionOptions);</span>
+<span class="nc" id="L161">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version)
+    {
+<span class="nc" id="L165">        this(host, port, version, new EncryptionOptions());</span>
+<span class="nc" id="L166">    }</span>
+
+    public SimpleClient(String host, int port, ProtocolVersion version, boolean useBeta, EncryptionOptions encryptionOptions)
+<span class="nc" id="L169">    {</span>
+<span class="nc" id="L170">        this.host = host;</span>
+<span class="nc" id="L171">        this.port = port;</span>
+<span class="nc bnc" id="L172" title="All 4 branches missed.">        if (version.isBeta() &amp;&amp; !useBeta)</span>
+<span class="nc" id="L173">            throw new IllegalArgumentException(String.format(&quot;Beta version of server used (%s), but USE_BETA flag is not set&quot;, version));</span>
+
+<span class="nc" id="L175">        this.version = version;</span>
+<span class="nc" id="L176">        this.encryptionOptions = new EncryptionOptions(encryptionOptions).applyConfig();</span>
+<span class="nc" id="L177">        this.largeMessageThreshold = FrameEncoder.Payload.MAX_SIZE -</span>
+<span class="nc" id="L178">                                        Math.max(FrameEncoderCrc.HEADER_AND_TRAILER_LENGTH,</span>
+                                                 FrameEncoderLZ4.HEADER_AND_TRAILER_LENGTH);
+<span class="nc" id="L180">    }</span>
+
+    public SimpleClient(String host, int port)
+    {
+<span class="nc" id="L184">        this(host, port, new EncryptionOptions());</span>
+<span class="nc" id="L185">    }</span>
+
+    public SimpleClient connect(boolean useCompression) throws IOException
+    {
+<span class="nc" id="L189">        return connect(useCompression, false);</span>
+    }
+
+    public SimpleClient connect(boolean useCompression, boolean throwOnOverload) throws IOException
+    {
+<span class="nc" id="L194">        establishConnection();</span>
+
+<span class="nc" id="L196">        Map&lt;String, String&gt; options = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L197">        options.put(StartupMessage.CQL_VERSION, &quot;3.0.0&quot;);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (throwOnOverload)</span>
+<span class="nc" id="L199">            options.put(StartupMessage.THROW_ON_OVERLOAD, &quot;1&quot;);</span>
+<span class="nc" id="L200">        connection.setThrowOnOverload(throwOnOverload);</span>
+
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (useCompression)</span>
+        {
+<span class="nc" id="L204">            options.put(StartupMessage.COMPRESSION, &quot;LZ4&quot;);</span>
+<span class="nc" id="L205">            connection.setCompressor(Compressor.LZ4Compressor.instance);</span>
+        }
+<span class="nc" id="L207">        execute(new StartupMessage(options));</span>
+
+<span class="nc" id="L209">        return this;</span>
+    }
+
+    public void setEventHandler(EventHandler eventHandler)
+    {
+<span class="nc" id="L214">        responseHandler.eventHandler = eventHandler;</span>
+<span class="nc" id="L215">    }</span>
+
+    @VisibleForTesting
+    void establishConnection() throws IOException
+    {
+        // Configure the client.
+<span class="nc" id="L221">        bootstrap = new Bootstrap()</span>
+<span class="nc" id="L222">                    .group(new NioEventLoopGroup(new NamedThreadFactory(&quot;SimpleClient-nioEventLoopGroup&quot;)))</span>
+<span class="nc" id="L223">                    .channel(io.netty.channel.socket.nio.NioSocketChannel.class)</span>
+<span class="nc" id="L224">                    .option(ChannelOption.TCP_NODELAY, true);</span>
+
+        // Configure the pipeline factory.
+<span class="nc bnc" id="L227" title="All 2 branches missed.">        if(encryptionOptions.getEnabled())</span>
+        {
+<span class="nc" id="L229">            bootstrap.handler(new SecureInitializer(largeMessageThreshold));</span>
+        }
+        else
+        {
+<span class="nc" id="L233">            bootstrap.handler(new Initializer(largeMessageThreshold));</span>
+        }
+<span class="nc" id="L235">        ChannelFuture future = bootstrap.connect(new InetSocketAddress(host, port));</span>
+
+        // Wait until the connection attempt succeeds or fails.
+<span class="nc" id="L238">        channel = future.awaitUninterruptibly().channel();</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if (!future.isSuccess())</span>
+        {
+<span class="nc" id="L241">            bootstrap.group().shutdownGracefully();</span>
+<span class="nc" id="L242">            throw new IOException(&quot;Connection Error&quot;, future.cause());</span>
+        }
+<span class="nc" id="L244">    }</span>
+
+    public ResultMessage execute(String query, ConsistencyLevel consistency)
+    {
+<span class="nc" id="L248">        return execute(query, Collections.&lt;ByteBuffer&gt;emptyList(), consistency);</span>
+    }
+
+    public ResultMessage execute(String query, List&lt;ByteBuffer&gt; values, ConsistencyLevel consistencyLevel)
+    {
+<span class="nc" id="L253">        Message.Response msg = execute(new QueryMessage(query, QueryOptions.forInternalCalls(consistencyLevel, values)));</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        assert msg instanceof ResultMessage;</span>
+<span class="nc" id="L255">        return (ResultMessage)msg;</span>
+    }
+
+    public ResultMessage.Prepared prepare(String query)
+    {
+<span class="nc" id="L260">        Message.Response msg = execute(new PrepareMessage(query, null));</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        assert msg instanceof ResultMessage.Prepared;</span>
+<span class="nc" id="L262">        return (ResultMessage.Prepared)msg;</span>
+    }
+
+    public ResultMessage executePrepared(ResultMessage.Prepared prepared, List&lt;ByteBuffer&gt; values, ConsistencyLevel consistency)
+    {
+<span class="nc" id="L267">        Message.Response msg = execute(new ExecuteMessage(prepared.statementId, prepared.resultMetadataId, QueryOptions.forInternalCalls(consistency, values)));</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        assert msg instanceof ResultMessage;</span>
+<span class="nc" id="L269">        return (ResultMessage)msg;</span>
+    }
+
+    public void close()
+    {
+        // Wait until all messages are flushed before closing the channel.
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        if (lastWriteFuture != null)</span>
+<span class="nc" id="L276">            lastWriteFuture.awaitUninterruptibly();</span>
+
+        // Close the connection.  Make sure the close operation ends because
+        // all I/O operations are asynchronous in Netty.
+<span class="nc" id="L280">        channel.close().awaitUninterruptibly();</span>
+
+        // Shut down all thread pools to exit.
+<span class="nc" id="L283">        bootstrap.group().shutdownGracefully();</span>
+<span class="nc" id="L284">    }</span>
+
+    public Message.Response execute(Message.Request request)
+    {
+<span class="nc" id="L288">        return execute(request, true);</span>
+    }
+
+    public Message.Response execute(Message.Request request, boolean throwOnErrorResponse)
+    {
+        try
+        {
+<span class="nc" id="L295">            request.attach(connection);</span>
+<span class="nc" id="L296">            lastWriteFuture = channel.writeAndFlush(Collections.singletonList(request));</span>
+<span class="nc" id="L297">            Message.Response msg = responseHandler.responses.poll(TIMEOUT_SECONDS, TimeUnit.SECONDS);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if (msg == null)</span>
+<span class="nc" id="L299">                throw new RuntimeException(&quot;timeout&quot;);</span>
+<span class="nc bnc" id="L300" title="All 4 branches missed.">            if (throwOnErrorResponse &amp;&amp; msg instanceof ErrorMessage)</span>
+<span class="nc" id="L301">                throw new RuntimeException((Throwable)((ErrorMessage)msg).error);</span>
+<span class="nc" id="L302">            return msg;</span>
+        }
+<span class="nc" id="L304">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L306">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    public Map&lt;Message.Request, Message.Response&gt; execute(List&lt;Message.Request&gt; requests)
+    {
+        try
+        {
+<span class="nc" id="L314">            Map&lt;Message.Request, Message.Response&gt; rrMap = new HashMap&lt;&gt;();</span>
+
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))</span>
+            {
+<span class="nc bnc" id="L318" title="All 2 branches missed.">                for (int i = 0; i &lt; requests.size(); i++)</span>
+                {
+<span class="nc" id="L320">                    Message.Request message = requests.get(i);</span>
+<span class="nc" id="L321">                    message.setStreamId(i);</span>
+<span class="nc" id="L322">                    message.attach(connection);</span>
+                }
+<span class="nc" id="L324">                lastWriteFuture = channel.writeAndFlush(requests);</span>
+
+<span class="nc" id="L326">                long deadline = currentTimeMillis() + TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                for (int i = 0; i &lt; requests.size(); i++)</span>
+                {
+<span class="nc" id="L329">                    Message.Response msg = responseHandler.responses.poll(deadline - currentTimeMillis(), TimeUnit.MILLISECONDS);</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                    if (msg == null)</span>
+<span class="nc" id="L331">                        throw new RuntimeException(&quot;timeout&quot;);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                    if (msg instanceof ErrorMessage)</span>
+<span class="nc" id="L333">                        throw new RuntimeException((Throwable) ((ErrorMessage) msg).error);</span>
+<span class="nc" id="L334">                    rrMap.put(requests.get(msg.getStreamId()), msg);</span>
+                }
+<span class="nc" id="L336">            }</span>
+            else
+            {
+                // V4 doesn't support batching
+<span class="nc bnc" id="L340" title="All 2 branches missed.">                for (Message.Request request : requests)</span>
+<span class="nc" id="L341">                    rrMap.put(request, execute(request));</span>
+            }
+
+<span class="nc" id="L344">            return rrMap;</span>
+        }
+<span class="nc" id="L346">        catch (InterruptedException e)</span>
+        {
+<span class="nc" id="L348">            throw new UncheckedInterruptedException(e);</span>
+        }
+    }
+
+    public interface EventHandler
+    {
+        void onEvent(Event event);
+    }
+
+    public static class SimpleEventHandler implements EventHandler
+    {
+        public final BlockingQueue&lt;Event&gt; queue = newBlockingQueue();
+
+        public void onEvent(Event event)
+        {
+            queue.add(event);
+        }
+    }
+
+    private static class ConnectionTracker implements Connection.Tracker
+    {
+        public void addConnection(Channel ch, Connection connection) {}
+    }
+
+    private static class HandlerNames
+    {
+        private static final String ENVELOPE_DECODER        = &quot;envelopeDecoder&quot;;
+        private static final String ENVELOPE_ENCODER        = &quot;envelopeEncoder&quot;;
+        private static final String COMPRESSOR              = &quot;compressor&quot;;
+        private static final String DECOMPRESSOR            = &quot;decompressor&quot;;
+        private static final String MESSAGE_DECODER         = &quot;messageDecoder&quot;;
+        private static final String MESSAGE_ENCODER         = &quot;messageEncoder&quot;;
+
+        private static final String INITIAL_HANDLER         = &quot;intitialHandler&quot;;
+        private static final String RESPONSE_HANDLER        = &quot;responseHandler&quot;;
+
+        private static final String FRAME_DECODER           = &quot;frameDecoder&quot;;
+        private static final String FRAME_ENCODER           = &quot;frameEncoder&quot;;
+        private static final String PROCESSOR               = &quot;processor&quot;;
+    }
+
+    private static class InitialHandler extends MessageToMessageDecoder&lt;Envelope&gt;
+    {
+        final ProtocolVersion version;
+        final ResponseHandler responseHandler;
+        final int largeMessageThreshold;
+        InitialHandler(ProtocolVersion version, ResponseHandler responseHandler, int largeMessageThreshold)
+        {
+            this.version = version;
+            this.responseHandler = responseHandler;
+            this.largeMessageThreshold = largeMessageThreshold;
+        }
+
+        protected void decode(ChannelHandlerContext ctx, Envelope response, List&lt;Object&gt; results)
+        {
+            switch(response.header.type)
+            {
+                case READY:
+                case AUTHENTICATE:
+                    if (response.header.version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                    {
+                        configureModernPipeline(ctx, response, largeMessageThreshold);
+                        // consuming the message is done when setting up the pipeline
+                    }
+                    else
+                    {
+                        configureLegacyPipeline(ctx);
+                        // really just removes self from the pipeline, so pass this message on
+                        ctx.pipeline().context(Envelope.Decoder.class).fireChannelRead(response);
+                    }
+                    break;
+                case SUPPORTED:
+                    // just pass through
+                    results.add(response);
+                    break;
+                default:
+                    throw new ProtocolException(String.format(&quot;Unexpected %s response expecting &quot; +
+                                                              &quot;READY, AUTHENTICATE or SUPPORTED&quot;,
+                                                              response.header.type));
+            }
+        }
+
+        private void configureModernPipeline(ChannelHandlerContext ctx, Envelope response, int largeMessageThreshold)
+        {
+            logger.info(&quot;Configuring modern pipeline&quot;);
+            ChannelPipeline pipeline = ctx.pipeline();
+            pipeline.remove(HandlerNames.ENVELOPE_DECODER);
+            pipeline.remove(HandlerNames.MESSAGE_DECODER);
+            pipeline.remove(HandlerNames.MESSAGE_ENCODER);
+            pipeline.remove(HandlerNames.RESPONSE_HANDLER);
+
+            BufferPoolAllocator allocator = GlobalBufferPoolAllocator.instance;
+            Channel channel = ctx.channel();
+            channel.config().setOption(ChannelOption.ALLOCATOR, allocator);
+            int queueCapacity = 1 &lt;&lt; 20;  // 1MiB
+
+            Envelope.Decoder envelopeDecoder = new Envelope.Decoder();
+            Message.Decoder&lt;Message.Response&gt; messageDecoder = Message.responseDecoder();
+            FrameDecoder frameDecoder = frameDecoder(ctx, allocator);
+            FrameEncoder frameEncoder = frameEncoder(ctx);
+            FrameEncoder.PayloadAllocator payloadAllocator = frameEncoder.allocator();
+
+            CQLMessageHandler.MessageConsumer&lt;Message.Response&gt; responseConsumer = (c, message, converter, backpressured) -&gt; {
+                responseHandler.handleResponse(c, message);
+            };
+
+            CQLMessageHandler.ErrorHandler errorHandler = (error) -&gt; {
+                throw new RuntimeException(&quot;Unexpected error&quot;, error);
+            };
+
+            ClientResourceLimits.ResourceProvider resources = new ClientResourceLimits.ResourceProvider()
+            {
+                final ResourceLimits.Limit endpointReserve = new ResourceLimits.Basic(1024 * 1024 * 64);
+                final AbstractMessageHandler.WaitQueue endpointQueue = AbstractMessageHandler.WaitQueue.endpoint(endpointReserve);
+
+                final ResourceLimits.Limit globalReserve = new ResourceLimits.Basic(1024 * 1024 * 64);
+                final AbstractMessageHandler.WaitQueue globalQueue = AbstractMessageHandler.WaitQueue.global(endpointReserve);
+
+                public ResourceLimits.Limit globalLimit()
+                {
+                    return globalReserve;
+                }
+
+                public AbstractMessageHandler.WaitQueue globalWaitQueue()
+                {
+                    return globalQueue;
+                }
+
+                public ResourceLimits.Limit endpointLimit()
+                {
+                    return endpointReserve;
+                }
+
+                public AbstractMessageHandler.WaitQueue endpointWaitQueue()
+                {
+                    return endpointQueue;
+                }
+
+                @Override
+                public NonBlockingRateLimiter requestRateLimiter()
+                {
+                    return NO_OP_LIMITER;
+                }
+
+                public void release()
+                {
+                }
+            };
+
+            CQLMessageHandler&lt;Message.Response&gt; processor =
+                new CQLMessageHandler&lt;Message.Response&gt;(ctx.channel(),
+                                        version,
+                                        frameDecoder,
+                                        envelopeDecoder,
+                                        messageDecoder,
+                                        responseConsumer,
+                                        payloadAllocator,
+                                        queueCapacity,
+                                        resources,
+                                        handler -&gt; {},
+                                        errorHandler,
+                                        ctx.channel().attr(Connection.attributeKey).get().isThrowOnOverload())
+                {
+                    protected boolean processRequest(Envelope request)
+                    {
+                        boolean continueProcessing = super.processRequest(request);
+                        releaseCapacity(Ints.checkedCast(request.header.bodySizeInBytes));
+                        return continueProcessing;
+                    }
+                };
+
+            pipeline.addLast(HandlerNames.FRAME_DECODER, frameDecoder);
+            pipeline.addLast(HandlerNames.FRAME_ENCODER, frameEncoder);
+            pipeline.addLast(HandlerNames.PROCESSOR, processor);
+            pipeline.addLast(HandlerNames.MESSAGE_ENCODER, new ChannelOutboundHandlerAdapter() {
+
+                public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception
+                {
+                    if (!(msg instanceof List))
+                    {
+                        ctx.write(msg, promise);
+                        return;
+                    }
+                    Connection connection = ctx.channel().attr(Connection.attributeKey).get();
+                    // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
+                    ProtocolVersion version = connection == null ? ProtocolVersion.CURRENT : connection.getVersion();
+                    SimpleFlusher flusher = new SimpleFlusher(frameEncoder, largeMessageThreshold);
+                    for (Message message : (List&lt;Message&gt;) msg)
+                        flusher.enqueue(message.encode(version));
+
+                    flusher.maybeWrite(ctx, promise);
+                }
+            });
+            pipeline.remove(this);
+
+            Message.Response message = messageDecoder.decode(ctx.channel(), response);
+            responseConsumer.accept(channel, message, (ch, req, resp) -&gt; null, Overload.NONE);
+        }
+
+        private FrameDecoder frameDecoder(ChannelHandlerContext ctx, BufferPoolAllocator allocator)
+        {
+            Connection conn = ctx.channel().attr(Connection.attributeKey).get();
+            if (conn.getCompressor() == null)
+                return FrameDecoderCrc.create(allocator);
+            if (conn.getCompressor() instanceof Compressor.LZ4Compressor)
+                return FrameDecoderLZ4.fast(allocator);
+            throw new ProtocolException(&quot;Unsupported compressor: &quot; + conn.getCompressor().getClass().getCanonicalName());
+        }
+
+        private FrameEncoder frameEncoder(ChannelHandlerContext ctx)
+        {
+            Connection conn = ctx.channel().attr(Connection.attributeKey).get();
+            if (conn.getCompressor() == null)
+                return FrameEncoderCrc.instance;
+            if (conn.getCompressor() instanceof Compressor.LZ4Compressor)
+                return FrameEncoderLZ4.fastInstance;
+            throw new ProtocolException(&quot;Unsupported compressor: &quot; + conn.getCompressor().getClass().getCanonicalName());
+        }
+
+        private void configureLegacyPipeline(ChannelHandlerContext ctx)
+        {
+            logger.info(&quot;Configuring legacy pipeline&quot;);
+            ChannelPipeline pipeline = ctx.pipeline();
+            pipeline.remove(this);
+            pipeline.addAfter(HandlerNames.ENVELOPE_ENCODER, HandlerNames.DECOMPRESSOR, Envelope.Decompressor.instance);
+            pipeline.addAfter(HandlerNames.DECOMPRESSOR, HandlerNames.COMPRESSOR, Envelope.Compressor.instance);
+        }
+    }
+
+    @ChannelHandler.Sharable
+     static class MessageBatchEncoder extends MessageToMessageEncoder&lt;List&lt;Message&gt;&gt;
+    {
+        public static final MessageBatchEncoder instance = new MessageBatchEncoder();
+        private MessageBatchEncoder(){}
+
+        public void encode(ChannelHandlerContext ctx, List&lt;Message&gt; messages, List&lt;Object&gt; results)
+        {
+            Connection connection = ctx.channel().attr(Connection.attributeKey).get();
+            // The only case the connection can be null is when we send the initial STARTUP message (client side thus)
+            ProtocolVersion version = connection == null ? ProtocolVersion.CURRENT : connection.getVersion();
+            assert messages.size() == 1;
+            results.add(messages.get(0).encode(version));
+        }
+    }
+
+    private class Initializer extends ChannelInitializer&lt;Channel&gt;
+    {
+        private int largeMessageThreshold;
+        Initializer(int largeMessageThreshold)
+        {
+            this.largeMessageThreshold = largeMessageThreshold;
+        }
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+            connection = new Connection(channel, version, tracker);
+            channel.attr(Connection.attributeKey).set(connection);
+
+            ChannelPipeline pipeline = channel.pipeline();
+//            pipeline.addLast(&quot;debug&quot;, new LoggingHandler(LogLevel.INFO));
+            pipeline.addLast(HandlerNames.ENVELOPE_DECODER, new Envelope.Decoder());
+            pipeline.addLast(HandlerNames.ENVELOPE_ENCODER, Envelope.Encoder.instance);
+            pipeline.addLast(HandlerNames.INITIAL_HANDLER, new InitialHandler(version, responseHandler, largeMessageThreshold));
+            pipeline.addLast(HandlerNames.MESSAGE_DECODER, PreV5Handlers.ProtocolDecoder.instance);
+            pipeline.addLast(HandlerNames.MESSAGE_ENCODER, MessageBatchEncoder.instance);
+            pipeline.addLast(HandlerNames.RESPONSE_HANDLER,  responseHandler);
+        }
+    }
+
+    private class SecureInitializer extends Initializer
+    {
+        SecureInitializer(int largeMessageThreshold)
+        {
+            super(largeMessageThreshold);
+        }
+
+        protected void initChannel(Channel channel) throws Exception
+        {
+            super.initChannel(channel);
+            SslContext sslContext = SSLFactory.getOrCreateSslContext(encryptionOptions, encryptionOptions.require_client_auth,
+                                                                     ISslContextFactory.SocketType.CLIENT, SSL_FACTORY_CONTEXT_DESCRIPTION);
+            InetSocketAddress peer = encryptionOptions.require_endpoint_verification ? new InetSocketAddress(host, port) : null;
+            channel.pipeline().addFirst(&quot;ssl&quot;, newSslHandler(channel, sslContext, peer));
+        }
+    }
+
+    @ChannelHandler.Sharable
+    static class ResponseHandler extends SimpleChannelInboundHandler&lt;Message.Response&gt;
+    {
+        public final BlockingQueue&lt;Message.Response&gt; responses = new SynchronousQueue&lt;&gt;(true);
+        public EventHandler eventHandler;
+
+        @Override
+        public void channelRead0(ChannelHandlerContext ctx, Message.Response r)
+        {
+            handleResponse(ctx.channel(), r);
+        }
+
+        public void handleResponse(Channel channel, Message.Response r)
+        {
+            try
+            {
+                Envelope cloned = r.getSource().clone();
+                r.getSource().release();
+                r.setSource(cloned);
+
+                if (r instanceof EventMessage)
+                {
+                    if (eventHandler != null)
+                        eventHandler.onEvent(((EventMessage) r).event);
+                }
+                else
+                    responses.put(r);
+            }
+            catch (InterruptedException e)
+            {
+                throw new UncheckedInterruptedException(e);
+            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
+        {
+            if (this == ctx.pipeline().last())
+            {
+                logger.error(&quot;Exception in response&quot;, cause);
+            }
+            else
+            {
+                ctx.fireExceptionCaught(cause);
+            }
+        }
+    }
+
+    // Simple stand-in for Flusher for use in test code. Writers push CQL messages onto a queue and
+    // this collates them into frames and flushes them to the channel.
+    // Can be either scheduled to run on an EventExecutor or fired manually. If calling maybeWrite manually,
+    // as SimpleClient itself does, the call must be made on the event loop.
+    public static class SimpleFlusher
+    {
+        private static final ChannelFuture[] EMPTY_FUTURES_ARRAY = new ChannelFuture[0];
+        final Queue&lt;Envelope&gt; outbound = new ConcurrentLinkedQueue&lt;&gt;();
+        final FrameEncoder frameEncoder;
+        private final AtomicBoolean scheduled = new AtomicBoolean(false);
+        private final int largeMessageThreshold;
+
+        SimpleFlusher(FrameEncoder frameEncoder, int largeMessageThreshold)
+        {
+            this.frameEncoder = frameEncoder;
+            this.largeMessageThreshold = largeMessageThreshold;
+        }
+
+        SimpleFlusher(FrameEncoder frameEncoder)
+        {
+            this(frameEncoder, MAX_FRAMED_PAYLOAD_SIZE);
+        }
+
+        public void enqueue(Envelope message)
+        {
+            outbound.offer(message);
+        }
+
+        public void releaseAll()
+        {
+            Envelope e;
+            while ((e = outbound.poll()) != null)
+                e.release();
+        }
+
+        public void schedule(ChannelHandlerContext ctx)
+        {
+            if (scheduled.compareAndSet(false, true))
+                ctx.executor().scheduleAtFixedRate(() -&gt; maybeWrite(ctx, ctx.voidPromise()),
+                                                   10, 10, TimeUnit.MILLISECONDS);
+        }
+
+        public void maybeWrite(ChannelHandlerContext ctx, Promise&lt;Void&gt; promise)
+        {
+            if (outbound.isEmpty())
+            {
+                promise.setSuccess(null);
+                return;
+            }
+
+            PromiseCombiner combiner = new PromiseCombiner(ctx.executor());
+            List&lt;Envelope&gt; buffer = new ArrayList&lt;&gt;();
+            long bufferSize = 0L;
+            boolean pending = false;
+            Envelope f;
+            while ((f = outbound.poll()) != null)
+            {
+                if (f.header.bodySizeInBytes &gt; largeMessageThreshold)
+                {
+                    combiner.addAll(writeLargeMessage(ctx, f));
+                }
+                else
+                {
+                    int messageSize = envelopeSize(f.header);
+                    if (bufferSize + messageSize &gt;= largeMessageThreshold)
+                    {
+                        combiner.add(flushBuffer(ctx, buffer, bufferSize));
+                        buffer = new ArrayList&lt;&gt;();
+                        bufferSize = 0;
+                    }
+                    buffer.add(f);
+                    bufferSize += messageSize;
+                    pending = true;
+                }
+            }
+
+            if (pending)
+                combiner.add(flushBuffer(ctx, buffer, bufferSize));
+            combiner.finish(promise);
+        }
+
+        private ChannelFuture flushBuffer(ChannelHandlerContext ctx, List&lt;Envelope&gt; messages, long bufferSize)
+        {
+            FrameEncoder.Payload payload = allocate(Ints.checkedCast(bufferSize), true);
+
+            for (Envelope e : messages)
+                e.encodeInto(payload.buffer);
+
+            payload.finish();
+            ChannelPromise release = AsyncChannelPromise.withListener(ctx, future -&gt; {
+                for (Envelope e : messages)
+                    e.release();
+            });
+            return ctx.writeAndFlush(payload, release);
+        }
+
+        private FrameEncoder.Payload allocate(int size, boolean selfContained)
+        {
+            FrameEncoder.Payload payload = frameEncoder.allocator()
+                                                       .allocate(selfContained, Math.min(size, largeMessageThreshold));
+            if (size &gt;= largeMessageThreshold)
+                payload.buffer.limit(largeMessageThreshold);
+
+            return payload;
+        }
+
+        private ChannelFuture[] writeLargeMessage(ChannelHandlerContext ctx, Envelope f)
+        {
+            List&lt;ChannelFuture&gt; futures = new ArrayList&lt;&gt;();
+            FrameEncoder.Payload payload;
+            ByteBuffer buf;
+            boolean firstFrame = true;
+            while (f.body.readableBytes() &gt; 0 || firstFrame)
+            {
+                int payloadSize = Math.min(f.body.readableBytes(), largeMessageThreshold);
+                payload = allocate(f.body.readableBytes(), false);
+
+                buf = payload.buffer;
+                // BufferPool may give us a buffer larger than we asked for.
+                // FrameEncoder may object if buffer.remaining is &gt;= MAX_SIZE.
+                if (payloadSize &gt;= largeMessageThreshold)
+                    buf.limit(largeMessageThreshold);
+
+                if (firstFrame)
+                {
+                    f.encodeHeaderInto(buf);
+                    firstFrame = false;
+                }
+
+                int remaining = Math.min(buf.remaining(), f.body.readableBytes());
+                if (remaining &gt; 0)
+                    buf.put(f.body.slice(f.body.readerIndex(), remaining).nioBuffer());
+
+                f.body.readerIndex(f.body.readerIndex() + remaining);
+                payload.finish();
+                futures.add(ctx.writeAndFlush(payload, ctx.newPromise()));
+            }
+            f.release();
+            return futures.toArray(EMPTY_FUTURES_ARRAY);
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

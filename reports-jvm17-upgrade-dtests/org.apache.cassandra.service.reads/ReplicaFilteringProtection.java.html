@@ -1,0 +1,551 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ReplicaFilteringProtection.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.service.reads</a> &gt; <span class="el_source">ReplicaFilteringProtection.java</span></div><h1>ReplicaFilteringProtection.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.service.reads;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.NavigableSet;
+import java.util.concurrent.TimeUnit;
+import java.util.Queue;
+import java.util.function.Function;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Columns;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionIterators;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.exceptions.ReadTimeoutException;
+import org.apache.cassandra.exceptions.UnavailableException;
+import org.apache.cassandra.locator.Endpoints;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.locator.ReplicaPlans;
+import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.service.reads.repair.NoopReadRepair;
+import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.btree.BTreeSet;
+
+/**
+ * Helper in charge of collecting additional queries to be done on the coordinator to protect against invalid results
+ * being included due to replica-side filtering (secondary indexes or {@code ALLOW * FILTERING}).
+ * &lt;p&gt;
+ * When using replica-side filtering with CL&gt;ONE, a replica can send a stale result satisfying the filter, while updated
+ * replicas won't send a corresponding tombstone to discard that result during reconciliation. This helper identifies
+ * the rows in a replica response that don't have a corresponding row in other replica responses, and requests them by
+ * primary key to the &quot;silent&quot; replicas in a second fetch round.
+ * &lt;p&gt;
+ * See CASSANDRA-8272, CASSANDRA-8273, and CASSANDRA-15907 for further details.
+ */
+public class ReplicaFilteringProtection&lt;E extends Endpoints&lt;E&gt;&gt;
+{
+<span class="fc" id="L90">    private static final Logger logger = LoggerFactory.getLogger(ReplicaFilteringProtection.class);</span>
+<span class="fc" id="L91">    private static final NoSpamLogger oneMinuteLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);</span>
+
+<span class="fc" id="L93">    private static final Function&lt;UnfilteredRowIterator, EncodingStats&gt; NULL_TO_NO_STATS =</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">        rowIterator -&gt; rowIterator == null ? EncodingStats.NO_STATS : rowIterator.stats();</span>
+
+    private final Keyspace keyspace;
+    private final ReadCommand command;
+    private final ConsistencyLevel consistency;
+    private final long queryStartNanoTime;
+    private final E sources;
+    private final TableMetrics tableMetrics;
+
+    private final int cachedRowsWarnThreshold;
+    private final int cachedRowsFailThreshold;
+
+    /** Tracks whether or not we've already hit the warning threshold while evaluating a partition. */
+<span class="fc" id="L107">    private boolean hitWarningThreshold = false;</span>
+
+<span class="fc" id="L109">    private int currentRowsCached = 0; // tracks the current number of cached rows</span>
+<span class="fc" id="L110">    private int maxRowsCached = 0; // tracks the high watermark for the number of cached rows</span>
+
+    /**
+     * Per-source list of the pending partitions seen by the merge listener, to be merged with the extra fetched rows.
+     */
+    private final List&lt;Queue&lt;PartitionBuilder&gt;&gt; originalPartitions;
+
+    ReplicaFilteringProtection(Keyspace keyspace,
+                               ReadCommand command,
+                               ConsistencyLevel consistency,
+                               long queryStartNanoTime,
+                               E sources,
+                               int cachedRowsWarnThreshold,
+                               int cachedRowsFailThreshold)
+<span class="fc" id="L124">    {</span>
+<span class="fc" id="L125">        this.keyspace = keyspace;</span>
+<span class="fc" id="L126">        this.command = command;</span>
+<span class="fc" id="L127">        this.consistency = consistency;</span>
+<span class="fc" id="L128">        this.queryStartNanoTime = queryStartNanoTime;</span>
+<span class="fc" id="L129">        this.sources = sources;</span>
+<span class="fc" id="L130">        this.originalPartitions = new ArrayList&lt;&gt;(sources.size());</span>
+
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        for (int i = 0; i &lt; sources.size(); i++)</span>
+        {
+<span class="fc" id="L134">            originalPartitions.add(new ArrayDeque&lt;&gt;());</span>
+        }
+
+<span class="fc" id="L137">        tableMetrics = ColumnFamilyStore.metricsFor(command.metadata().id);</span>
+
+<span class="fc" id="L139">        this.cachedRowsWarnThreshold = cachedRowsWarnThreshold;</span>
+<span class="fc" id="L140">        this.cachedRowsFailThreshold = cachedRowsFailThreshold;</span>
+<span class="fc" id="L141">    }</span>
+
+    private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; replicaPlan)
+    {
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L146">        DataResolver&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; resolver =</span>
+            new DataResolver&lt;&gt;(cmd, replicaPlan, (NoopReadRepair&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt;) NoopReadRepair.instance, queryStartNanoTime);
+
+<span class="fc" id="L149">        ReadCallback&lt;EndpointsForToken, ReplicaPlan.ForTokenRead&gt; handler = new ReadCallback&lt;&gt;(resolver, cmd, replicaPlan, queryStartNanoTime);</span>
+
+<span class="fc bfc" id="L151" title="All 2 branches covered.">        if (source.isSelf())</span>
+        {
+<span class="fc" id="L153">            Stage.READ.maybeExecuteImmediately(new StorageProxy.LocalReadRunnable(cmd, handler));</span>
+        }
+        else
+        {
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">            if (source.isTransient())</span>
+<span class="nc" id="L158">                cmd = cmd.copyAsTransientQuery(source);</span>
+<span class="fc" id="L159">            MessagingService.instance().sendWithCallback(cmd.createMessage(false), source.endpoint(), handler);</span>
+        }
+
+        // We don't call handler.get() because we want to preserve tombstones since we're still in the middle of merging node results.
+<span class="fc" id="L163">        handler.awaitResults();</span>
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">        assert resolver.getMessages().size() == 1;</span>
+<span class="fc" id="L165">        return resolver.getMessages().get(0).payload.makeIterator(command);</span>
+    }
+
+    /**
+     * Returns a merge listener that skips the merged rows for which any of the replicas doesn't have a version,
+     * pessimistically assuming that they are outdated. It is intended to be used during a first merge of per-replica
+     * query results to ensure we fetch enough results from the replicas to ensure we don't miss any potentially
+     * outdated result.
+     * &lt;p&gt;
+     * The listener will track both the accepted data and the primary keys of the rows that are considered as outdated.
+     * That way, once the query results would have been merged using this listener, further calls to
+     * {@link #queryProtectedPartitions(PartitionIterator, int)} will use the collected data to return a copy of the
+     * data originally collected from the specified replica, completed with the potentially outdated rows.
+     */
+    UnfilteredPartitionIterators.MergeListener mergeController()
+    {
+<span class="fc" id="L181">        return new UnfilteredPartitionIterators.MergeListener()</span>
+<span class="fc" id="L182">        {</span>
+            @Override
+            public void close()
+            {
+                // If we hit the failure threshold before consuming a single partition, record the current rows cached.
+<span class="fc" id="L187">                tableMetrics.rfpRowsCachedPerQuery.update(Math.max(currentRowsCached, maxRowsCached));</span>
+<span class="fc" id="L188">            }</span>
+
+            @Override
+            public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List&lt;UnfilteredRowIterator&gt; versions)
+            {
+<span class="fc" id="L193">                List&lt;PartitionBuilder&gt; builders = new ArrayList&lt;&gt;(sources.size());</span>
+<span class="fc" id="L194">                RegularAndStaticColumns columns = columns(versions);</span>
+<span class="fc" id="L195">                EncodingStats stats = EncodingStats.merge(versions, NULL_TO_NO_STATS);</span>
+
+<span class="fc bfc" id="L197" title="All 2 branches covered.">                for (int i = 0; i &lt; sources.size(); i++)</span>
+<span class="fc" id="L198">                    builders.add(i, new PartitionBuilder(partitionKey, sources.get(i), columns, stats));</span>
+
+<span class="fc" id="L200">                return new UnfilteredRowIterators.MergeListener()</span>
+<span class="fc" id="L201">                {</span>
+                    @Override
+                    public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+                    {
+                        // cache the deletion time versions to be able to regenerate the original row iterator
+<span class="fc bfc" id="L206" title="All 2 branches covered.">                        for (int i = 0; i &lt; versions.length; i++)</span>
+<span class="fc" id="L207">                            builders.get(i).setDeletionTime(versions[i]);</span>
+<span class="fc" id="L208">                    }</span>
+
+                    @Override
+                    public Row onMergedRows(Row merged, Row[] versions)
+                    {
+                        // cache the row versions to be able to regenerate the original row iterator
+<span class="fc bfc" id="L214" title="All 2 branches covered.">                        for (int i = 0; i &lt; versions.length; i++)</span>
+<span class="fc" id="L215">                            builders.get(i).addRow(versions[i]);</span>
+
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">                        if (merged.isEmpty())</span>
+<span class="nc" id="L218">                            return merged;</span>
+
+<span class="fc" id="L220">                        boolean isPotentiallyOutdated = false;</span>
+<span class="fc" id="L221">                        boolean isStatic = merged.isStatic();</span>
+<span class="fc bfc" id="L222" title="All 2 branches covered.">                        for (int i = 0; i &lt; versions.length; i++)</span>
+                        {
+<span class="fc" id="L224">                            Row version = versions[i];</span>
+<span class="pc bpc" id="L225" title="3 of 6 branches missed.">                            if (version == null || (isStatic &amp;&amp; version.isEmpty()))</span>
+                            {
+<span class="fc" id="L227">                                isPotentiallyOutdated = true;</span>
+<span class="fc" id="L228">                                builders.get(i).addToFetch(merged);</span>
+                            }
+                        }
+
+                        // If the row is potentially outdated (because some replica didn't send anything and so it _may_ be
+                        // an outdated result that is only present because other replica have filtered the up-to-date result
+                        // out), then we skip the row. In other words, the results of the initial merging of results by this
+                        // protection assume the worst case scenario where every row that might be outdated actually is.
+                        // This ensures that during this first phase (collecting additional row to fetch) we are guaranteed
+                        // to look at enough data to ultimately fulfill the query limit.
+<span class="fc bfc" id="L238" title="All 2 branches covered.">                        return isPotentiallyOutdated ? null : merged;</span>
+                    }
+
+                    @Override
+                    public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions)
+                    {
+                        // cache the marker versions to be able to regenerate the original row iterator
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                        for (int i = 0; i &lt; versions.length; i++)</span>
+<span class="nc" id="L246">                            builders.get(i).addRangeTombstoneMarker(versions[i]);</span>
+<span class="nc" id="L247">                    }</span>
+
+                    @Override
+                    public void close()
+                    {
+<span class="fc bfc" id="L252" title="All 2 branches covered.">                        for (int i = 0; i &lt; sources.size(); i++)</span>
+<span class="fc" id="L253">                            originalPartitions.get(i).add(builders.get(i));</span>
+<span class="fc" id="L254">                    }</span>
+                };
+            }
+        };
+    }
+
+    private void incrementCachedRows()
+    {
+<span class="fc" id="L262">        currentRowsCached++;</span>
+
+<span class="pc bpc" id="L264" title="1 of 2 branches missed.">        if (currentRowsCached == cachedRowsFailThreshold + 1)</span>
+        {
+<span class="nc" id="L266">            String message = String.format(&quot;Replica filtering protection has cached over %d rows during query %s. &quot; +</span>
+                                           &quot;(See 'cached_replica_rows_fail_threshold' in cassandra.yaml.)&quot;,
+<span class="nc" id="L268">                                           cachedRowsFailThreshold, command.toCQLString());</span>
+
+<span class="nc" id="L270">            logger.error(message);</span>
+<span class="nc" id="L271">            Tracing.trace(message);</span>
+<span class="nc" id="L272">            throw new OverloadedException(message);</span>
+        }
+<span class="pc bpc" id="L274" title="3 of 4 branches missed.">        else if (currentRowsCached == cachedRowsWarnThreshold + 1 &amp;&amp; !hitWarningThreshold)</span>
+        {
+<span class="nc" id="L276">            hitWarningThreshold = true;</span>
+
+<span class="nc" id="L278">            String message = String.format(&quot;Replica filtering protection has cached over %d rows during query %s. &quot; +</span>
+                                           &quot;(See 'cached_replica_rows_warn_threshold' in cassandra.yaml.)&quot;,
+<span class="nc" id="L280">                                           cachedRowsWarnThreshold, command.toCQLString());</span>
+
+<span class="nc" id="L282">            ClientWarn.instance.warn(message);</span>
+<span class="nc" id="L283">            oneMinuteLogger.warn(message);</span>
+<span class="nc" id="L284">            Tracing.trace(message);</span>
+        }
+<span class="fc" id="L286">    }</span>
+
+    private void releaseCachedRows(int count)
+    {
+<span class="fc" id="L290">        maxRowsCached = Math.max(maxRowsCached, currentRowsCached);</span>
+<span class="fc" id="L291">        currentRowsCached -= count;</span>
+<span class="fc" id="L292">    }</span>
+
+    private static RegularAndStaticColumns columns(List&lt;UnfilteredRowIterator&gt; versions)
+    {
+<span class="fc" id="L296">        Columns statics = Columns.NONE;</span>
+<span class="fc" id="L297">        Columns regulars = Columns.NONE;</span>
+<span class="fc bfc" id="L298" title="All 2 branches covered.">        for (UnfilteredRowIterator iter : versions)</span>
+        {
+<span class="fc bfc" id="L300" title="All 2 branches covered.">            if (iter == null)</span>
+<span class="fc" id="L301">                continue;</span>
+
+<span class="fc" id="L303">            RegularAndStaticColumns cols = iter.columns();</span>
+<span class="fc" id="L304">            statics = statics.mergeTo(cols.statics);</span>
+<span class="fc" id="L305">            regulars = regulars.mergeTo(cols.regulars);</span>
+<span class="fc" id="L306">        }</span>
+<span class="fc" id="L307">        return new RegularAndStaticColumns(statics, regulars);</span>
+    }
+
+    /**
+     * Returns the protected results for the specified replica. These are generated fetching the extra rows and merging
+     * them with the cached original filtered results for that replica.
+     *
+     * @param merged the first iteration partitions, that should have been read used with the {@link #mergeController()}
+     * @param source the source
+     * @return the protected results for the specified replica
+     */
+    UnfilteredPartitionIterator queryProtectedPartitions(PartitionIterator merged, int source)
+    {
+<span class="fc" id="L320">        return new UnfilteredPartitionIterator()</span>
+<span class="fc" id="L321">        {</span>
+<span class="fc" id="L322">            final Queue&lt;PartitionBuilder&gt; partitions = originalPartitions.get(source);</span>
+
+            @Override
+            public TableMetadata metadata()
+            {
+<span class="fc" id="L327">                return command.metadata();</span>
+            }
+
+            @Override
+<span class="fc" id="L331">            public void close() { }</span>
+
+            @Override
+            public boolean hasNext()
+            {
+                // If there are no cached partition builders for this source, advance the first phase iterator, which
+                // will force the RFP merge listener to load at least the next protected partition. Note that this may
+                // load more than one partition if any divergence between replicas is discovered by the merge listener.
+<span class="fc bfc" id="L339" title="All 2 branches covered.">                if (partitions.isEmpty())</span>
+                {
+<span class="fc" id="L341">                    PartitionIterators.consumeNext(merged);</span>
+                }
+
+<span class="fc bfc" id="L344" title="All 2 branches covered.">                return !partitions.isEmpty();</span>
+            }
+
+            @Override
+            public UnfilteredRowIterator next()
+            {
+<span class="fc" id="L350">                PartitionBuilder builder = partitions.poll();</span>
+<span class="pc bpc" id="L351" title="1 of 2 branches missed.">                assert builder != null;</span>
+<span class="fc" id="L352">                return builder.protectedPartition();</span>
+            }
+        };
+    }
+
+<span class="fc" id="L357">    private class PartitionBuilder</span>
+    {
+        private final DecoratedKey key;
+        private final Replica source;
+        private final RegularAndStaticColumns columns;
+        private final EncodingStats stats;
+
+        private DeletionTime deletionTime;
+<span class="fc" id="L365">        private Row staticRow = Rows.EMPTY_STATIC_ROW;</span>
+<span class="fc" id="L366">        private final Queue&lt;Unfiltered&gt; contents = new ArrayDeque&lt;&gt;();</span>
+        private BTreeSet.Builder&lt;Clustering&lt;?&gt;&gt; toFetch;
+        private int partitionRowsCached;
+
+        private PartitionBuilder(DecoratedKey key, Replica source, RegularAndStaticColumns columns, EncodingStats stats)
+<span class="fc" id="L371">        {</span>
+<span class="fc" id="L372">            this.key = key;</span>
+<span class="fc" id="L373">            this.source = source;</span>
+<span class="fc" id="L374">            this.columns = columns;</span>
+<span class="fc" id="L375">            this.stats = stats;</span>
+<span class="fc" id="L376">        }</span>
+
+        private void setDeletionTime(DeletionTime deletionTime)
+        {
+<span class="fc" id="L380">            this.deletionTime = deletionTime;</span>
+<span class="fc" id="L381">        }</span>
+
+        private void addRow(Row row)
+        {
+<span class="fc" id="L385">            partitionRowsCached++;</span>
+
+<span class="fc" id="L387">            incrementCachedRows();</span>
+
+            // Note that even null rows are counted against the row caching limit. The assumption is that
+            // a subsequent protection query will later fetch the row onto the heap anyway.
+<span class="fc bfc" id="L391" title="All 2 branches covered.">            if (row == null)</span>
+<span class="fc" id="L392">                return;</span>
+
+<span class="pc bpc" id="L394" title="1 of 2 branches missed.">            if (row.isStatic())</span>
+<span class="nc" id="L395">                staticRow = row;</span>
+            else
+<span class="fc" id="L397">                contents.add(row);</span>
+<span class="fc" id="L398">        }</span>
+
+        private void addRangeTombstoneMarker(RangeTombstoneMarker marker)
+        {
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            if (marker != null)</span>
+<span class="nc" id="L403">                contents.add(marker);</span>
+<span class="nc" id="L404">        }</span>
+
+        private void addToFetch(Row row)
+        {
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">            if (toFetch == null)</span>
+<span class="fc" id="L409">                toFetch = BTreeSet.builder(command.metadata().comparator);</span>
+
+            // Note that for static, we shouldn't add the clustering to the clustering set (the
+            // ClusteringIndexNamesFilter we'll build from this later does not expect it), but the fact
+            // we created a builder in the first place will act as a marker that the static row must be
+            // fetched, even if no other rows are added for this partition.
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">            if (!row.isStatic())</span>
+<span class="fc" id="L416">                toFetch.add(row.clustering());</span>
+<span class="fc" id="L417">        }</span>
+
+        private UnfilteredRowIterator originalPartition()
+        {
+<span class="fc" id="L421">            return new UnfilteredRowIterator()</span>
+<span class="fc" id="L422">            {</span>
+                @Override
+                public DeletionTime partitionLevelDeletion()
+                {
+<span class="fc" id="L426">                    return deletionTime;</span>
+                }
+
+                @Override
+                public EncodingStats stats()
+                {
+<span class="fc" id="L432">                    return stats;</span>
+                }
+
+                @Override
+                public TableMetadata metadata()
+                {
+<span class="fc" id="L438">                    return command.metadata();</span>
+                }
+
+                @Override
+                public boolean isReverseOrder()
+                {
+<span class="fc" id="L444">                    return command.isReversed();</span>
+                }
+
+                @Override
+                public RegularAndStaticColumns columns()
+                {
+<span class="fc" id="L450">                    return columns;</span>
+                }
+
+                @Override
+                public DecoratedKey partitionKey()
+                {
+<span class="fc" id="L456">                    return key;</span>
+                }
+
+                @Override
+                public Row staticRow()
+                {
+<span class="nc" id="L462">                    return staticRow;</span>
+                }
+
+                @Override
+                public void close()
+                {
+<span class="fc" id="L468">                    releaseCachedRows(partitionRowsCached);</span>
+<span class="fc" id="L469">                }</span>
+
+                @Override
+                public boolean hasNext()
+                {
+<span class="fc bfc" id="L474" title="All 2 branches covered.">                    return !contents.isEmpty();</span>
+                }
+
+                @Override
+                public Unfiltered next()
+                {
+<span class="fc" id="L480">                    return contents.poll();</span>
+                }
+            };
+        }
+
+        private UnfilteredRowIterator protectedPartition()
+        {
+<span class="fc" id="L487">            UnfilteredRowIterator original = originalPartition();</span>
+
+<span class="fc bfc" id="L489" title="All 2 branches covered.">            if (toFetch != null)</span>
+            {
+<span class="fc" id="L491">                try (UnfilteredPartitionIterator partitions = fetchFromSource())</span>
+                {
+<span class="pc bpc" id="L493" title="1 of 2 branches missed.">                    if (partitions.hasNext())</span>
+                    {
+<span class="nc" id="L495">                        try (UnfilteredRowIterator fetchedRows = partitions.next())</span>
+                        {
+<span class="nc" id="L497">                            return UnfilteredRowIterators.merge(Arrays.asList(original, fetchedRows));</span>
+                        }
+                    }
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                }</span>
+            }
+
+<span class="fc" id="L503">            return original;</span>
+        }
+
+        private UnfilteredPartitionIterator fetchFromSource()
+        {
+<span class="pc bpc" id="L508" title="1 of 2 branches missed.">            assert toFetch != null;</span>
+
+<span class="fc" id="L510">            NavigableSet&lt;Clustering&lt;?&gt;&gt; clusterings = toFetch.build();</span>
+<span class="fc" id="L511">            tableMetrics.replicaFilteringProtectionRequests.mark();</span>
+
+<span class="pc bpc" id="L513" title="1 of 2 branches missed.">            if (logger.isTraceEnabled())</span>
+<span class="nc" id="L514">                logger.trace(&quot;Requesting rows {} in partition {} from {} for replica filtering protection&quot;,</span>
+                             clusterings, key, source);
+
+<span class="fc" id="L517">            Tracing.trace(&quot;Requesting {} rows in partition {} from {} for replica filtering protection&quot;,</span>
+<span class="fc" id="L518">                          clusterings.size(), key, source);</span>
+
+            // build the read command taking into account that we could be requesting only in the static row
+<span class="pc bpc" id="L521" title="1 of 2 branches missed.">            DataLimits limits = clusterings.isEmpty() ? DataLimits.cqlLimits(1) : DataLimits.NONE;</span>
+<span class="fc" id="L522">            ClusteringIndexFilter filter = new ClusteringIndexNamesFilter(clusterings, command.isReversed());</span>
+<span class="fc" id="L523">            SinglePartitionReadCommand cmd = SinglePartitionReadCommand.create(command.metadata(),</span>
+<span class="fc" id="L524">                                                                               command.nowInSec(),</span>
+<span class="fc" id="L525">                                                                               command.columnFilter(),</span>
+<span class="fc" id="L526">                                                                               RowFilter.none(),</span>
+                                                                               limits,
+                                                                               key,
+                                                                               filter);
+
+<span class="fc" id="L531">            ReplicaPlan.ForTokenRead replicaPlan = ReplicaPlans.forSingleReplicaRead(keyspace, key.getToken(), source);</span>
+<span class="fc" id="L532">            ReplicaPlan.SharedForTokenRead sharedReplicaPlan = ReplicaPlan.shared(replicaPlan);</span>
+
+            try
+            {
+<span class="fc" id="L536">                return executeReadCommand(cmd, source, sharedReplicaPlan);</span>
+            }
+<span class="nc" id="L538">            catch (ReadTimeoutException e)</span>
+            {
+<span class="nc" id="L540">                int blockFor = consistency.blockFor(replicaPlan.replicationStrategy());</span>
+<span class="nc" id="L541">                throw new ReadTimeoutException(consistency, blockFor - 1, blockFor, true);</span>
+            }
+<span class="nc" id="L543">            catch (UnavailableException e)</span>
+            {
+<span class="nc" id="L545">                int blockFor = consistency.blockFor(replicaPlan.replicationStrategy());</span>
+<span class="nc" id="L546">                throw UnavailableException.create(consistency, blockFor, blockFor - 1);</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>

@@ -1,0 +1,512 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SortedTableWriter.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">JaCoCo Cassandara Coverage Report</a> &gt; <a href="index.source.html" class="el_package">org.apache.cassandra.io.sstable.format</a> &gt; <span class="el_source">SortedTableWriter.java</span></div><h1>SortedTableWriter.java</h1><pre class="source lang-java linenums">/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.io.sstable.format;
+
+import java.io.IOException;
+import java.nio.BufferOverflowException;
+import java.util.Collection;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.guardrails.Threshold;
+import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.rows.ComplexColumnData;
+import org.apache.cassandra.db.rows.PartitionSerializationException;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundaryMarker;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.compress.CompressedSequentialWriter;
+import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.sstable.AbstractRowIndexEntry;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.DataPosition;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.FilterFactory;
+import org.apache.cassandra.utils.IFilter;
+import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.Transactional;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+
+/**
+ * A generic implementation of a writer which assumes the existence of some partition index and bloom filter.
+ */
+public abstract class SortedTableWriter&lt;P extends SortedTablePartitionWriter, I extends SortedTableWriter.AbstractIndexWriter&gt; extends SSTableWriter
+{
+<span class="fc" id="L78">    private final static Logger logger = LoggerFactory.getLogger(SortedTableWriter.class);</span>
+
+    // TODO dataWriter is not needed to be directly accessible - we can access everything we need for the dataWriter
+    //   from a partition writer
+    protected final SequentialWriter dataWriter;
+    protected final I indexWriter;
+    protected final P partitionWriter;
+<span class="fc" id="L85">    private final FileHandle.Builder dataFileBuilder = new FileHandle.Builder(descriptor.fileFor(Components.DATA));</span>
+    private DecoratedKey lastWrittenKey;
+    private DataPosition dataMark;
+    private long lastEarlyOpenLength;
+
+    public SortedTableWriter(Builder&lt;P, I, ?, ?&gt; builder, LifecycleNewTracker lifecycleNewTracker, SSTable.Owner owner)
+    {
+<span class="fc" id="L92">        super(builder, lifecycleNewTracker, owner);</span>
+
+<span class="fc" id="L94">        SequentialWriter dataWriter = null;</span>
+<span class="fc" id="L95">        I indexWriter = null;</span>
+<span class="fc" id="L96">        P partitionWriter = null;</span>
+        try
+        {
+<span class="fc" id="L99">            dataWriter = builder.openDataWriter();</span>
+<span class="fc" id="L100">            checkNotNull(dataWriter);</span>
+
+<span class="fc" id="L102">            indexWriter = builder.openIndexWriter(dataWriter);</span>
+<span class="fc" id="L103">            checkNotNull(indexWriter);</span>
+
+<span class="fc" id="L105">            partitionWriter = builder.openPartitionWriter(dataWriter, indexWriter);</span>
+<span class="fc" id="L106">            checkNotNull(partitionWriter);</span>
+
+<span class="fc" id="L108">            this.dataWriter = dataWriter;</span>
+<span class="fc" id="L109">            this.indexWriter = indexWriter;</span>
+<span class="fc" id="L110">            this.partitionWriter = partitionWriter;</span>
+        }
+<span class="nc" id="L112">        catch (RuntimeException | Error ex)</span>
+        {
+<span class="nc" id="L114">            Throwables.closeNonNullAndAddSuppressed(ex, partitionWriter, indexWriter, dataWriter);</span>
+<span class="nc" id="L115">            handleConstructionFailure(ex);</span>
+<span class="nc" id="L116">            throw ex;</span>
+<span class="fc" id="L117">        }</span>
+<span class="fc" id="L118">    }</span>
+
+    /**
+     * Appends partition data to this writer.
+     *
+     * @param partition the partition to write
+     * @return the created index entry if something was written, that is if {@code iterator} wasn't empty,
+     * {@code null} otherwise.
+     * @throws FSWriteError if write to the dataFile fails
+     */
+    @Override
+    public final AbstractRowIndexEntry append(UnfilteredRowIterator partition)
+    {
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">        if (partition.isEmpty())</span>
+<span class="nc" id="L132">            return null;</span>
+
+        try
+        {
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">            if (!verifyPartition(partition.partitionKey()))</span>
+<span class="nc" id="L137">                return null;</span>
+
+<span class="fc" id="L139">            startPartition(partition.partitionKey(), partition.partitionLevelDeletion());</span>
+
+            AbstractRowIndexEntry indexEntry;
+<span class="fc bfc" id="L142" title="All 2 branches covered.">            if (header.hasStatic())</span>
+<span class="fc" id="L143">                addStaticRow(partition.partitionKey(), partition.staticRow());</span>
+
+<span class="fc bfc" id="L145" title="All 2 branches covered.">            while (partition.hasNext())</span>
+<span class="fc" id="L146">                addUnfiltered(partition.partitionKey(), partition.next());</span>
+
+<span class="fc" id="L148">            indexEntry = endPartition(partition.partitionKey(), partition.partitionLevelDeletion());</span>
+
+<span class="fc" id="L150">            return indexEntry;</span>
+        }
+<span class="nc" id="L152">        catch (BufferOverflowException boe)</span>
+        {
+<span class="nc" id="L154">            throw new PartitionSerializationException(partition, boe);</span>
+        }
+<span class="nc" id="L156">        catch (IOException e)</span>
+        {
+<span class="nc" id="L158">            throw new FSWriteError(e, getFilename());</span>
+        }
+    }
+
+    private boolean verifyPartition(DecoratedKey key)
+    {
+<span class="pc bpc" id="L164" title="1 of 2 branches missed.">        assert key != null : &quot;Keys must not be null&quot;; // empty keys ARE allowed b/c of indexed column values</span>
+
+<span class="pc bpc" id="L166" title="1 of 2 branches missed.">        if (key.getKey().remaining() &gt; FBUtilities.MAX_UNSIGNED_SHORT)</span>
+        {
+<span class="nc" id="L168">            logger.error(&quot;Key size {} exceeds maximum of {}, skipping row&quot;, key.getKey().remaining(), FBUtilities.MAX_UNSIGNED_SHORT);</span>
+<span class="nc" id="L169">            return false;</span>
+        }
+
+<span class="pc bpc" id="L172" title="1 of 4 branches missed.">        if (lastWrittenKey != null &amp;&amp; lastWrittenKey.compareTo(key) &gt;= 0)</span>
+<span class="nc" id="L173">            throw new RuntimeException(String.format(&quot;Last written key %s &gt;= current key %s, writing into %s&quot;, lastWrittenKey, key, getFilename()));</span>
+
+<span class="fc" id="L175">        return true;</span>
+    }
+
+    private void startPartition(DecoratedKey key, DeletionTime partitionLevelDeletion) throws IOException
+    {
+<span class="fc" id="L180">        partitionWriter.start(key, partitionLevelDeletion);</span>
+<span class="fc" id="L181">        metadataCollector.updatePartitionDeletion(partitionLevelDeletion);</span>
+
+<span class="fc" id="L183">        onStartPartition(key);</span>
+<span class="fc" id="L184">    }</span>
+
+    private void addStaticRow(DecoratedKey key, Row row) throws IOException
+    {
+<span class="fc" id="L188">        guardCollectionSize(key, row);</span>
+
+<span class="fc" id="L190">        partitionWriter.addStaticRow(row);</span>
+<span class="fc bfc" id="L191" title="All 2 branches covered.">        if (!row.isEmpty())</span>
+<span class="fc" id="L192">            Rows.collectStats(row, metadataCollector);</span>
+
+<span class="fc" id="L194">        onStaticRow(row);</span>
+<span class="fc" id="L195">    }</span>
+
+    private void addUnfiltered(DecoratedKey key, Unfiltered unfiltered) throws IOException
+    {
+<span class="fc bfc" id="L199" title="All 2 branches covered.">        if (unfiltered.isRow())</span>
+<span class="fc" id="L200">            addRow(key, (Row) unfiltered);</span>
+        else
+<span class="fc" id="L202">            addRangeTomstoneMarker((RangeTombstoneMarker) unfiltered);</span>
+<span class="fc" id="L203">    }</span>
+
+    private void addRow(DecoratedKey key, Row row) throws IOException
+    {
+<span class="fc" id="L207">        guardCollectionSize(key, row);</span>
+
+<span class="fc" id="L209">        partitionWriter.addUnfiltered(row);</span>
+<span class="fc" id="L210">        metadataCollector.updateClusteringValues(row.clustering());</span>
+<span class="fc" id="L211">        Rows.collectStats(row, metadataCollector);</span>
+
+<span class="fc" id="L213">        onRow(row);</span>
+<span class="fc" id="L214">    }</span>
+
+    private void addRangeTomstoneMarker(RangeTombstoneMarker marker) throws IOException
+    {
+<span class="fc" id="L218">        partitionWriter.addUnfiltered(marker);</span>
+
+<span class="fc" id="L220">        metadataCollector.updateClusteringValuesByBoundOrBoundary(marker.clustering());</span>
+<span class="fc bfc" id="L221" title="All 2 branches covered.">        if (marker.isBoundary())</span>
+        {
+<span class="fc" id="L223">            RangeTombstoneBoundaryMarker bm = (RangeTombstoneBoundaryMarker) marker;</span>
+<span class="fc" id="L224">            metadataCollector.update(bm.endDeletionTime());</span>
+<span class="fc" id="L225">            metadataCollector.update(bm.startDeletionTime());</span>
+<span class="fc" id="L226">        }</span>
+        else
+        {
+<span class="fc" id="L229">            metadataCollector.update(((RangeTombstoneBoundMarker) marker).deletionTime());</span>
+        }
+
+<span class="fc" id="L232">        onRangeTombstoneMarker(marker);</span>
+<span class="fc" id="L233">    }</span>
+
+    private AbstractRowIndexEntry endPartition(DecoratedKey key, DeletionTime partitionLevelDeletion) throws IOException
+    {
+<span class="fc" id="L237">        long finishResult = partitionWriter.finish();</span>
+
+<span class="fc" id="L239">        long endPosition = dataWriter.position();</span>
+<span class="fc" id="L240">        long rowSize = endPosition - partitionWriter.getInitialPosition();</span>
+<span class="fc" id="L241">        guardPartitionThreshold(Guardrails.partitionSize, key, rowSize);</span>
+<span class="fc" id="L242">        guardPartitionThreshold(Guardrails.partitionTombstones, key, metadataCollector.totalTombstones);</span>
+<span class="fc" id="L243">        metadataCollector.addPartitionSizeInBytes(rowSize);</span>
+<span class="fc" id="L244">        metadataCollector.addKey(key.getKey());</span>
+<span class="fc" id="L245">        metadataCollector.addCellPerPartitionCount();</span>
+
+<span class="fc" id="L247">        lastWrittenKey = key;</span>
+<span class="fc" id="L248">        last = lastWrittenKey;</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">        if (first == null)</span>
+<span class="fc" id="L250">            first = lastWrittenKey;</span>
+
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">        if (logger.isTraceEnabled())</span>
+<span class="nc" id="L253">            logger.trace(&quot;wrote {} at {}&quot;, key, endPosition);</span>
+
+<span class="fc" id="L255">        return createRowIndexEntry(key, partitionLevelDeletion, finishResult);</span>
+    }
+
+    protected void onStartPartition(DecoratedKey key)
+    {
+<span class="nc" id="L260">        notifyObservers(o -&gt; o.startPartition(key, partitionWriter.getInitialPosition(), partitionWriter.getInitialPosition()));</span>
+<span class="nc" id="L261">    }</span>
+
+    protected void onStaticRow(Row row)
+    {
+<span class="pc" id="L265">        notifyObservers(o -&gt; o.staticRow(row));</span>
+<span class="fc" id="L266">    }</span>
+
+    protected void onRow(Row row)
+    {
+<span class="pc" id="L270">        notifyObservers(o -&gt; o.nextUnfilteredCluster(row));</span>
+<span class="fc" id="L271">    }</span>
+
+    protected void onRangeTombstoneMarker(RangeTombstoneMarker marker)
+    {
+<span class="pc" id="L275">        notifyObservers(o -&gt; o.nextUnfilteredCluster(marker));</span>
+<span class="fc" id="L276">    }</span>
+
+    protected abstract AbstractRowIndexEntry createRowIndexEntry(DecoratedKey key, DeletionTime partitionLevelDeletion, long finishResult) throws IOException;
+
+    protected final void notifyObservers(Consumer&lt;SSTableFlushObserver&gt; action)
+    {
+<span class="pc bpc" id="L282" title="2 of 4 branches missed.">        if (observers != null &amp;&amp; !observers.isEmpty())</span>
+<span class="nc" id="L283">            observers.forEach(action);</span>
+<span class="fc" id="L284">    }</span>
+
+    @Override
+    public void mark()
+    {
+<span class="nc" id="L289">        dataMark = dataWriter.mark();</span>
+<span class="nc" id="L290">        indexWriter.mark();</span>
+<span class="nc" id="L291">    }</span>
+
+    @Override
+    public void resetAndTruncate()
+    {
+<span class="nc" id="L296">        dataWriter.resetAndTruncate(dataMark);</span>
+<span class="nc" id="L297">        partitionWriter.reset();</span>
+<span class="nc" id="L298">        indexWriter.resetAndTruncate();</span>
+<span class="nc" id="L299">    }</span>
+
+    @Override
+    protected SSTableWriter.TransactionalProxy txnProxy()
+    {
+<span class="fc" id="L304">        return new TransactionalProxy(() -&gt; FBUtilities.immutableListWithFilteredNulls(indexWriter, dataWriter));</span>
+    }
+
+    protected class TransactionalProxy extends SSTableWriter.TransactionalProxy
+    {
+        public TransactionalProxy(Supplier&lt;ImmutableList&lt;Transactional&gt;&gt; transactionals)
+<span class="fc" id="L310">        {</span>
+<span class="fc" id="L311">            super(transactionals);</span>
+<span class="fc" id="L312">        }</span>
+
+        @Override
+        protected Throwable doPostCleanup(Throwable accumulate)
+        {
+<span class="fc" id="L317">            accumulate = Throwables.close(accumulate, partitionWriter);</span>
+<span class="fc" id="L318">            accumulate = super.doPostCleanup(accumulate);</span>
+<span class="fc" id="L319">            return accumulate;</span>
+        }
+    }
+
+    @Override
+    public long getFilePointer()
+    {
+<span class="fc" id="L326">        return dataWriter.position();</span>
+    }
+
+    @Override
+    public long getOnDiskFilePointer()
+    {
+<span class="nc" id="L332">        return dataWriter.getOnDiskFilePointer();</span>
+    }
+
+    @Override
+    public long getEstimatedOnDiskBytesWritten()
+    {
+<span class="fc" id="L338">        return dataWriter.getEstimatedOnDiskBytesWritten();</span>
+    }
+
+    protected FileHandle openDataFile(long lengthOverride, StatsMetadata statsMetadata)
+    {
+<span class="fc" id="L343">        int dataBufferSize = ioOptions.diskOptimizationStrategy.bufferSize(statsMetadata.estimatedPartitionSize.percentile(ioOptions.diskOptimizationEstimatePercentile));</span>
+
+
+        FileHandle dataFile;
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">        try (CompressionMetadata compressionMetadata = compression ? ((CompressedSequentialWriter) dataWriter).open(lengthOverride) : null)</span>
+        {
+<span class="fc" id="L349">            dataFile = dataFileBuilder.mmapped(ioOptions.defaultDiskAccessMode)</span>
+<span class="fc" id="L350">                                      .withMmappedRegionsCache(mmappedRegionsCache)</span>
+<span class="fc" id="L351">                                      .withChunkCache(chunkCache)</span>
+<span class="fc" id="L352">                                      .withCompressionMetadata(compressionMetadata)</span>
+<span class="fc" id="L353">                                      .bufferSize(dataBufferSize)</span>
+<span class="fc" id="L354">                                      .withLengthOverride(lengthOverride)</span>
+<span class="fc" id="L355">                                      .complete();</span>
+        }
+
+        try
+        {
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">            if (chunkCache != null)</span>
+            {
+<span class="pc bpc" id="L362" title="3 of 4 branches missed.">                if (lastEarlyOpenLength != 0 &amp;&amp; dataFile.dataLength() &gt; lastEarlyOpenLength)</span>
+<span class="nc" id="L363">                    chunkCache.invalidatePosition(dataFile, lastEarlyOpenLength);</span>
+            }
+<span class="fc" id="L365">            lastEarlyOpenLength = dataFile.dataLength();</span>
+        }
+<span class="nc" id="L367">        catch (RuntimeException | Error ex)</span>
+        {
+<span class="nc" id="L369">            Throwables.closeNonNullAndAddSuppressed(ex, dataFile);</span>
+<span class="nc" id="L370">            throw ex;</span>
+<span class="fc" id="L371">        }</span>
+
+<span class="fc" id="L373">        return dataFile;</span>
+    }
+
+    private void guardPartitionThreshold(Threshold guardrail, DecoratedKey key, long size)
+    {
+<span class="pc bpc" id="L378" title="1 of 2 branches missed.">        if (guardrail.triggersOn(size, null))</span>
+        {
+<span class="nc" id="L380">            String message = String.format(&quot;%s.%s:%s on sstable %s&quot;,</span>
+                                           metadata.keyspace,
+                                           metadata.name,
+<span class="nc" id="L383">                                           metadata().partitionKeyType.getString(key.getKey()),</span>
+<span class="nc" id="L384">                                           getFilename());</span>
+<span class="nc" id="L385">            guardrail.guard(size, message, true, null);</span>
+        }
+<span class="fc" id="L387">    }</span>
+
+    private void guardCollectionSize(DecoratedKey partitionKey, Row row)
+    {
+<span class="pc bpc" id="L391" title="2 of 4 branches missed.">        if (!Guardrails.collectionSize.enabled() &amp;&amp; !Guardrails.itemsPerCollection.enabled())</span>
+<span class="fc" id="L392">            return;</span>
+
+<span class="nc bnc" id="L394" title="All 4 branches missed.">        if (row.isEmpty() || SchemaConstants.isSystemKeyspace(metadata.keyspace))</span>
+<span class="nc" id="L395">            return;</span>
+
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        for (ColumnMetadata column : row.columns())</span>
+        {
+<span class="nc bnc" id="L399" title="All 4 branches missed.">            if (!column.type.isCollection() || !column.type.isMultiCell())</span>
+<span class="nc" id="L400">                continue;</span>
+
+<span class="nc" id="L402">            ComplexColumnData cells = row.getComplexColumnData(column);</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            if (cells == null)</span>
+<span class="nc" id="L404">                continue;</span>
+
+<span class="nc" id="L406">            ComplexColumnData liveCells = cells.purge(DeletionPurger.PURGE_ALL, FBUtilities.nowInSeconds());</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if (liveCells == null)</span>
+<span class="nc" id="L408">                continue;</span>
+
+<span class="nc" id="L410">            int cellsSize = liveCells.dataSize();</span>
+<span class="nc" id="L411">            int cellsCount = liveCells.cellsCount();</span>
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (!Guardrails.collectionSize.triggersOn(cellsSize, null) &amp;&amp;</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                !Guardrails.itemsPerCollection.triggersOn(cellsCount, null))</span>
+<span class="nc" id="L415">                continue;</span>
+
+<span class="nc" id="L417">            String keyString = metadata.getLocal().primaryKeyAsCQLLiteral(partitionKey.getKey(), row.clustering());</span>
+<span class="nc" id="L418">            String msg = String.format(&quot;%s in row %s in table %s&quot;,</span>
+<span class="nc" id="L419">                                       column.name.toString(),</span>
+                                       keyString,
+                                       metadata);
+<span class="nc" id="L422">            Guardrails.collectionSize.guard(cellsSize, msg, true, null);</span>
+<span class="nc" id="L423">            Guardrails.itemsPerCollection.guard(cellsCount, msg, true, null);</span>
+<span class="nc" id="L424">        }</span>
+<span class="nc" id="L425">    }</span>
+
+    protected static abstract class AbstractIndexWriter extends AbstractTransactional implements Transactional
+    {
+        protected final Descriptor descriptor;
+        protected final TableMetadataRef metadata;
+        protected final Set&lt;Component&gt; components;
+
+        protected final IFilter bf;
+
+        protected AbstractIndexWriter(Builder&lt;?, ?, ?, ?&gt; b)
+<span class="fc" id="L436">        {</span>
+<span class="fc" id="L437">            this.descriptor = b.descriptor;</span>
+<span class="fc" id="L438">            this.metadata = b.getTableMetadataRef();</span>
+<span class="fc" id="L439">            this.components = b.getComponents();</span>
+
+<span class="fc" id="L441">            bf = FilterFactory.getFilter(b.getKeyCount(), b.getTableMetadataRef().getLocal().params.bloomFilterFpChance);</span>
+<span class="fc" id="L442">        }</span>
+
+        protected void flushBf()
+        {
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">            if (components.contains(Components.FILTER))</span>
+            {
+                try
+                {
+<span class="fc" id="L450">                    FilterComponent.save(bf, descriptor, true);</span>
+                }
+<span class="nc" id="L452">                catch (IOException ex)</span>
+                {
+<span class="nc" id="L454">                    throw new FSWriteError(ex, descriptor.fileFor(Components.FILTER));</span>
+<span class="fc" id="L455">                }</span>
+            }
+<span class="fc" id="L457">        }</span>
+
+        public abstract void mark();
+
+        public abstract void resetAndTruncate();
+
+        protected void doPrepare()
+        {
+<span class="fc" id="L465">            flushBf();</span>
+<span class="fc" id="L466">        }</span>
+
+        @Override
+        protected Throwable doPostCleanup(Throwable accumulate)
+        {
+<span class="fc" id="L471">            accumulate = bf.close(accumulate);</span>
+<span class="fc" id="L472">            return accumulate;</span>
+        }
+
+        public IFilter getFilterCopy()
+        {
+<span class="fc" id="L477">            return bf.sharedCopy();</span>
+        }
+    }
+
+    public abstract static class Builder&lt;P extends SortedTablePartitionWriter,
+                                        I extends AbstractIndexWriter,
+                                        W extends SortedTableWriter&lt;P, I&gt;,
+                                        B extends Builder&lt;P, I, W, B&gt;&gt; extends SSTableWriter.Builder&lt;W, B&gt;
+    {
+
+        public Builder(Descriptor descriptor)
+        {
+<span class="fc" id="L489">            super(descriptor);</span>
+<span class="fc" id="L490">        }</span>
+
+        @Override
+        public B addDefaultComponents(Collection&lt;Index.Group&gt; indexGroups)
+        {
+<span class="fc" id="L495">            super.addDefaultComponents(indexGroups);</span>
+
+<span class="pc bpc" id="L497" title="1 of 2 branches missed.">            if (FilterComponent.shouldUseBloomFilter(getTableMetadataRef().getLocal().params.bloomFilterFpChance))</span>
+            {
+<span class="fc" id="L499">                addComponents(ImmutableSet.of(SSTableFormat.Components.FILTER));</span>
+            }
+
+<span class="fc" id="L502">            return (B) this;</span>
+        }
+
+        protected abstract SequentialWriter openDataWriter();
+
+        protected abstract I openIndexWriter(SequentialWriter dataWriter);
+
+        protected abstract P openPartitionWriter(SequentialWriter dataWriter, I indexWriter);
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.8.202204050719</span></div></body></html>
